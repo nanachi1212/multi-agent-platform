@@ -31,6 +31,8 @@ Start: double-click `start-studio.cmd` (needs Node.js). The browser opens `http:
 - Home page: today's finished cards, Leader office (hand the request to the Leader), staff seats showing model, effort, current card and last finished card.
 - 接手當 Leader works mid-run: the new Leader gets the original request and the current cards; Workers keep their cards.
 - 暫停 keeps cards and agent conversations; the paused job is shown again after restarting the Studio and 繼續 picks it up. Older paused jobs can be continued from 歷史紀錄.
+- Plan limits: Claude (5-hour + weekly) and Codex (weekly) usage bars with reset time on each seat. Claude is read with one tiny Haiku request that is not saved as a session (on start, after each job, or 更新); Codex is read from Studio's own Codex logs. Antigravity does not report limits.
+- Notifications (🔔 button): when a job finishes or fails, the open page plays a sound and shows a browser notification; with no page open, a Windows notification is sent instead.
 - Paseo: status light and 用 Paseo 開啟目前專案 (opens Paseo and registers the folder as a Paseo workspace) for Paseo's own remote / phone features.
 - First start downloads AionCore v0.2.2 (official release, SHA-256 checked) into `runtime/`.
 - Studio runs Codex with its own home (`runtime/studio/codex-home`), so Studio sessions never show up in your normal Codex history. Log in once with the 登入 Codex（Studio 專用） button on the Codex card.
