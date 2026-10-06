@@ -12,6 +12,8 @@ const AION = path.join(RT, 'aioncore', 'aioncore.exe');
 const AION_URL = 'https://github.com/iOfficeAI/AionCore/releases/download/v0.2.2/aioncore-v0.2.2-x86_64-pc-windows-msvc.zip';
 const AION_ZIP_SHA256 = 'd1ed8d1da869230c18701747d07e8f068db5b8c9442e65261304aeb4c27eacf6';
 const PORT = Number(process.env.STUDIO_PORT || 4848);
+// Studio's Codex gets its own home so its sessions never show up in the user's own Codex history.
+const CODEX_HOME = path.join(RT, 'studio', 'codex-home');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Agents are just a catalog; any of them can be Leader or Worker.
@@ -95,8 +97,10 @@ async function startAion() {
   const data = path.join(RT, 'studio', 'data');
   const work = path.join(RT, 'studio', 'work');
   for (const d of [data, work]) fs.mkdirSync(d, { recursive: true });
+  fs.mkdirSync(CODEX_HOME, { recursive: true });
   const logFile = fs.createWriteStream(path.join(RT, 'studio', 'aioncore.out.txt'));
-  const p = spawn(AION, ['--local', '--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+  const p = spawn(AION, ['--local', '--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)],
+    { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, CODEX_HOME } });
   process.on('exit', () => p.kill());
   await new Promise((res, rej) => {
     let buf = '';
@@ -423,6 +427,8 @@ const routes = {
   'POST /api/check': () => { checkAll(); },
   'POST /api/recent/remove': (b) => removeRecent(b.path),
   'POST /api/agent-config': (b) => setAgentCfg(b.agent, b.model, b.effort),
+  // One-time login for Studio's separate Codex home, in a visible console window.
+  'POST /api/codex-login': () => { spawn('cmd', ['/c', 'start', 'Codex login (Studio)', 'cmd', '/k', 'codex', 'login'], { env: { ...process.env, CODEX_HOME }, detached: true, stdio: 'ignore' }); },
   'GET /api/history': () => listHistory(),
 };
 

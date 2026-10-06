@@ -284,6 +284,8 @@ function render() {
       <div class="seat-status">${status}</div>
       <div class="seat-last">${esc(lastTxt)}</div>
       ${cfgHtml(a)}
+      ${a.id === 'codex' && a.status === 'unavailable' ? `<div class="cfg-note">Studio 的 Codex 使用獨立資料夾，不會出現在你平常的 Codex 對話紀錄。第一次使用需登入一次，完成後按「重新檢查 Agent」。</div>
+        <button class="btn small" data-codex-login>登入 Codex（Studio 專用）</button>` : ''}
       ${lead ? '' : `<button class="btn small" data-leader="${a.id}" ${off || running ? 'disabled' : ''}>設為 Leader</button>`}
     </div>`;
   }).join('');
@@ -352,6 +354,7 @@ document.addEventListener('click', (e) => {
   if (h) return openHistory(h.dataset.hist);
   const b = e.target.closest('button');
   b?.blur();
+  if (b?.hasAttribute('data-codex-login')) post('/api/codex-login');
   if (b?.dataset.leader) post('/api/leader', { agent: b.dataset.leader });
   if (b?.dataset.reassign) post('/api/reassign', { taskId: b.dataset.reassign, agent: document.querySelector(`select[data-task="${b.dataset.reassign}"]`).value });
 });
