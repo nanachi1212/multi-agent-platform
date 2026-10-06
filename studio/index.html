@@ -8,90 +8,105 @@
   :root {
     --bg:#f4f1ec; --panel:#fffdf9; --panel2:#f8f5ef; --line:#e6e0d6; --text:#24211c; --muted:#857d70;
     --accent:#5b5bd6; --accent-soft:#ebebfb; --ok:#2f8f5b; --ok-soft:#e3f3ea; --bad:#c94a3f; --bad-soft:#fbe8e5;
-    --work:#d98a1e; --work-soft:#fbf0dc; --wait:#8d8678; --wait-soft:#efebe4; --shadow:0 1px 2px rgba(40,30,10,.06), 0 4px 16px rgba(40,30,10,.05);
+    --work:#d98a1e; --work-soft:#fbf0dc; --wait:#8d8678; --wait-soft:#efebe4; --pause:#3f7fbf; --pause-soft:#e2eef9;
+    --shadow:0 1px 2px rgba(40,30,10,.06), 0 4px 16px rgba(40,30,10,.05);
   }
   @media (prefers-color-scheme: dark) {
     :root { --bg:#17181b; --panel:#1f2024; --panel2:#26272c; --line:#33353b; --text:#ecebe8; --muted:#9a978f;
       --accent:#8b8bf0; --accent-soft:#2b2b48; --ok:#5cc28a; --ok-soft:#1f3328; --bad:#ec7a6f; --bad-soft:#3b2220;
-      --work:#f0a948; --work-soft:#3a2e1a; --wait:#a39d92; --wait-soft:#2c2c2f; --shadow:none; }
+      --work:#f0a948; --work-soft:#3a2e1a; --wait:#a39d92; --wait-soft:#2c2c2f; --pause:#7fb3e8; --pause-soft:#1d2c3b; --shadow:none; }
   }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font:14px/1.55 "Segoe UI","Microsoft JhengHei UI","Microsoft JhengHei",sans-serif; }
   button, input, textarea, select { font:inherit; color:inherit; }
 
-  .topbar { position:sticky; top:0; z-index:5; display:flex; align-items:center; gap:14px; padding:12px 24px; background:var(--panel); border-bottom:1px solid var(--line); }
-  .brand { display:flex; align-items:center; gap:10px; font-weight:700; font-size:16px; letter-spacing:.2px; }
+  .topbar { position:sticky; top:0; z-index:5; display:flex; align-items:center; gap:12px; padding:10px 24px; background:var(--panel); border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  .brand { display:flex; align-items:center; gap:10px; font-weight:700; font-size:16px; }
   .logo { width:28px; height:28px; border-radius:8px; background:linear-gradient(135deg,#d97757,#5b5bd6 55%,#10a37f); }
-  .proj-chip { padding:4px 12px; border-radius:999px; background:var(--panel2); border:1px solid var(--line); color:var(--muted); max-width:46vw; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .proj-chip { padding:4px 12px; border-radius:999px; background:var(--panel2); border:1px solid var(--line); color:var(--muted); max-width:36vw; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .spacer { flex:1; }
-  .pill { display:inline-flex; align-items:center; gap:6px; padding:4px 12px; border-radius:999px; font-weight:600; font-size:13px; background:var(--wait-soft); color:var(--wait); }
-  .pill.on { background:var(--work-soft); color:var(--work); }
-  .pill.on::before { content:""; width:8px; height:8px; border-radius:50%; background:currentColor; animation:pulse 1.2s infinite; }
+  .pill { display:inline-flex; align-items:center; gap:6px; padding:4px 12px; border-radius:999px; font-weight:600; font-size:13px; background:var(--wait-soft); color:var(--wait); white-space:nowrap; }
+  .pill::before { content:""; width:8px; height:8px; border-radius:50%; background:currentColor; }
+  .pill.on { background:var(--work-soft); color:var(--work); } .pill.on::before { animation:pulse 1.2s infinite; }
+  .pill.ok { background:var(--ok-soft); color:var(--ok); } .pill.pz { background:var(--pause-soft); color:var(--pause); }
   @keyframes pulse { 50% { opacity:.25; } }
 
-  .btn { padding:8px 16px; border-radius:10px; border:1px solid var(--line); background:var(--panel); cursor:pointer; transition:background .15s, border-color .15s; }
+  .btn { padding:8px 16px; border-radius:10px; border:1px solid var(--line); background:var(--panel); cursor:pointer; transition:border-color .15s; white-space:nowrap; }
   .btn:hover:not(:disabled) { border-color:var(--accent); }
   .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; padding:9px 22px; }
   .btn.danger { background:var(--bad); border-color:var(--bad); color:#fff; font-weight:600; }
+  .btn.pz { background:var(--pause); border-color:var(--pause); color:#fff; font-weight:600; }
   .btn.ghost { background:transparent; }
   .btn.small { padding:4px 10px; font-size:12px; border-radius:8px; }
   .btn:disabled { opacity:.45; cursor:not-allowed; }
 
-  .layout { display:grid; grid-template-columns:290px 1fr; gap:20px; padding:20px 24px; max-width:1500px; margin:0 auto; }
+  .kpis { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:14px; }
+  @media (max-width:900px) { .kpis { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  .kpi { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:12px 16px; box-shadow:var(--shadow); }
+  .kpi .v { font-size:26px; font-weight:700; line-height:1.2; }
+  .kpi .l { color:var(--muted); font-size:12px; font-weight:600; }
+
+  .layout { display:grid; grid-template-columns:280px 1fr; gap:20px; padding:20px 24px; max-width:1500px; margin:0 auto; }
   @media (max-width:980px) { .layout { grid-template-columns:1fr; padding:16px; } }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px; box-shadow:var(--shadow); }
   h3 { margin:0 0 12px; font-size:13px; font-weight:700; color:var(--muted); letter-spacing:.4px; display:flex; align-items:center; gap:8px; }
+  h2.zone { margin:4px 0 -8px; font-size:15px; font-weight:700; }
   .sub { color:var(--muted); font-size:12px; margin:14px 0 6px; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   input[type=text], textarea, select { width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:10px; background:var(--panel2); outline:none; }
   input[type=text]:focus, textarea:focus, select:focus { border-color:var(--accent); }
   .sidebar { display:flex; flex-direction:column; gap:16px; }
   .sidebar .row { margin-top:8px; }
-
-  .recent { display:flex; flex-direction:column; gap:6px; }
-  .chip { display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:10px; border:1px solid var(--line); background:var(--panel2); cursor:pointer; text-align:left; width:100%; }
-  .chip:hover { border-color:var(--accent); }
-  .chip.on { border-color:var(--accent); background:var(--accent-soft); }
-  .chip .nm { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
-  .chip .x { color:var(--muted); padding:0 4px; border-radius:6px; }
-  .chip .x:hover { color:var(--bad); }
   .empty { color:var(--muted); font-size:13px; padding:6px 0; }
 
-  .history { display:flex; flex-direction:column; gap:6px; max-height:420px; overflow:auto; }
+  .recent { display:flex; flex-direction:column; gap:6px; }
+  .chip { display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:10px; border:1px solid var(--line); background:var(--panel2); cursor:pointer; }
+  .chip:hover { border-color:var(--accent); } .chip.on { border-color:var(--accent); background:var(--accent-soft); }
+  .chip .nm { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
+  .chip .x { color:var(--muted); padding:0 4px; } .chip .x:hover { color:var(--bad); }
+  .history { display:flex; flex-direction:column; gap:6px; max-height:460px; overflow:auto; }
   .hitem { padding:8px 10px; border-radius:10px; border:1px solid var(--line); background:var(--panel2); cursor:pointer; text-align:left; width:100%; }
   .hitem:hover { border-color:var(--accent); }
   .hitem .req { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .hitem .meta { color:var(--muted); font-size:12px; display:flex; gap:8px; align-items:center; }
+  .hitem .meta { color:var(--muted); font-size:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .tag { font-size:11px; font-weight:700; padding:1px 8px; border-radius:999px; background:var(--wait-soft); color:var(--wait); letter-spacing:.3px; white-space:nowrap; }
+  .tag.lead { background:var(--c); color:#fff; } .tag.ok { background:var(--ok-soft); color:var(--ok); } .tag.bad { background:var(--bad-soft); color:var(--bad); }
+  .tag.pz { background:var(--pause-soft); color:var(--pause); }
 
   .stage { display:flex; flex-direction:column; gap:20px; min-width:0; }
-  .seats { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:14px; }
-  .seat { position:relative; background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:16px; box-shadow:var(--shadow); display:flex; flex-direction:column; gap:10px; border-top:4px solid var(--c); }
-  .seat.leader { box-shadow:0 0 0 2px var(--c), var(--shadow); }
+  .office { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.15fr); gap:16px; padding:0; overflow:hidden; border-top:4px solid var(--c); }
+  @media (max-width:1100px) { .office { grid-template-columns:1fr; } }
+  .office .seat { border:none; box-shadow:none; border-radius:0; border-right:1px solid var(--line); }
+  .office .desk { padding:16px; display:flex; flex-direction:column; gap:10px; }
+  .office .desk textarea { min-height:120px; resize:vertical; border-radius:12px; font-size:15px; flex:1; }
+  .err { color:var(--bad); font-weight:600; }
+  .now { background:var(--panel2); border-radius:10px; padding:8px 12px; font-size:13px; }
+  .now b { color:var(--muted); font-size:12px; }
+
+  .seats { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:14px; }
+  .seat { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:16px; box-shadow:var(--shadow); display:flex; flex-direction:column; gap:10px; border-top:4px solid var(--c); min-width:0; }
   .seat.off { opacity:.62; }
   .seat-top { display:flex; align-items:center; gap:12px; }
   .avatar { width:44px; height:44px; border-radius:12px; display:grid; place-items:center; color:#fff; font-weight:700; background:var(--c); flex:none; }
+  .office .avatar { width:56px; height:56px; font-size:18px; border-radius:14px; }
   .seat-name { font-weight:700; font-size:15px; }
   .tags { display:flex; gap:6px; flex-wrap:wrap; margin-top:2px; }
-  .tag { font-size:11px; font-weight:700; padding:1px 8px; border-radius:999px; background:var(--wait-soft); color:var(--wait); letter-spacing:.3px; }
-  .tag.lead { background:var(--c); color:#fff; }
-  .tag.ok { background:var(--ok-soft); color:var(--ok); } .tag.bad { background:var(--bad-soft); color:var(--bad); }
+  .facts { display:grid; grid-template-columns:auto 1fr; gap:3px 10px; font-size:13px; }
+  .facts dt { color:var(--muted); } .facts dd { margin:0; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .seat-status { display:flex; align-items:center; gap:8px; font-weight:600; min-height:22px; }
   .dot { width:9px; height:9px; border-radius:50%; background:var(--wait); flex:none; }
-  .dot.work { background:var(--work); animation:pulse 1.2s infinite; } .dot.bad { background:var(--bad); }
+  .dot.work { background:var(--work); animation:pulse 1.2s infinite; } .dot.bad { background:var(--bad); } .dot.pz { background:var(--pause); }
   .seat-last { color:var(--muted); font-size:13px; background:var(--panel2); border-radius:10px; padding:8px 10px; min-height:40px; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; white-space:pre-wrap; word-break:break-word; }
-  .seat .btn { align-self:flex-start; }
-  .cfg { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  details.cfg-box summary { cursor:pointer; color:var(--muted); font-size:12px; font-weight:600; }
+  .cfg { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }
   .cfg label { display:flex; flex-direction:column; gap:3px; font-size:11px; font-weight:700; color:var(--muted); }
   .cfg select { padding:5px 8px; font-size:13px; font-weight:400; border-radius:8px; }
-  .cfg-note { grid-column:1 / -1; font-size:11.5px; color:var(--muted); }
-
-  .composer textarea { min-height:96px; resize:vertical; border-radius:12px; font-size:15px; }
-  .composer .row { margin-top:10px; }
-  .err { color:var(--bad); font-weight:600; }
+  .cfg-note { font-size:11.5px; color:var(--muted); }
+  .seat .btn { align-self:flex-start; }
 
   .board { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
   @media (max-width:1100px) { .board { grid-template-columns:repeat(2,minmax(0,1fr)); } }
-  .lane { background:var(--panel2); border-radius:12px; padding:10px; min-height:120px; }
+  .lane { background:var(--panel2); border-radius:12px; padding:10px; min-height:110px; }
   .lane-h { display:flex; align-items:center; gap:6px; font-size:12px; font-weight:700; color:var(--muted); margin-bottom:8px; }
   .lane-h .n { margin-left:auto; background:var(--panel); border-radius:999px; padding:0 8px; }
   .card { background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--c); border-radius:10px; padding:10px; margin-bottom:8px; }
@@ -108,12 +123,10 @@
   .msg { display:flex; gap:10px; align-items:flex-start; max-width:88%; }
   .msg .av { width:30px; height:30px; border-radius:9px; background:var(--c); color:#fff; font-size:11px; font-weight:700; display:grid; place-items:center; flex:none; }
   .bubble { background:var(--panel2); border:1px solid var(--line); border-radius:4px 14px 14px 14px; padding:8px 12px; white-space:pre-wrap; word-break:break-word; }
-  .bubble .hd { font-size:12px; color:var(--muted); margin-bottom:2px; }
-  .bubble .hd b { color:var(--text); }
+  .bubble .hd { font-size:12px; color:var(--muted); margin-bottom:2px; } .bubble .hd b { color:var(--text); }
   .msg.me { align-self:flex-end; }
   .msg.me .bubble { background:var(--accent); color:#fff; border-color:var(--accent); border-radius:14px 4px 14px 14px; }
-  .msg.me .bubble .hd { color:rgba(255,255,255,.8); }
-  .msg.me .bubble .hd b { color:#fff; }
+  .msg.me .bubble .hd, .msg.me .bubble .hd b { color:rgba(255,255,255,.85); }
   .sys { align-self:center; color:var(--muted); font-size:12px; background:var(--panel2); border-radius:999px; padding:3px 12px; text-align:center; max-width:90%; }
   #progress { white-space:pre-wrap; margin:0; max-height:520px; overflow:auto; background:var(--panel2); border-radius:10px; padding:10px; font:12.5px/1.6 Consolas,"Microsoft JhengHei",monospace; }
 
@@ -127,8 +140,11 @@
 <header class="topbar">
   <div class="brand"><span class="logo"></span>Multi-Agent Studio</div>
   <div class="proj-chip" id="projChip">尚未選擇專案</div>
-  <div class="spacer"></div>
+  <span class="spacer"></span>
+  <span class="pill" id="paseoPill">Paseo</span>
+  <button class="btn small" id="paseoOpen">用 Paseo 開啟目前專案</button>
   <span class="pill" id="runPill">待命</span>
+  <button class="btn pz" id="pauseResume">暫停</button>
   <button class="btn danger" id="stop">Stop</button>
 </header>
 
@@ -148,23 +164,16 @@
   </aside>
 
   <main class="stage">
+    <section class="kpis" id="kpis"></section>
+
+    <h2 class="zone">Leader 辦公室</h2>
+    <section class="panel office" id="office"></section>
+
+    <h2 class="zone">員工席位</h2>
     <section class="seats" id="seats"></section>
 
-    <section class="panel composer">
-      <h3>需求</h3>
-      <textarea id="request" placeholder="你想讓團隊做什麼？（Ctrl + Enter 開始）"></textarea>
-      <div class="row">
-        <span class="err" id="err"></span>
-        <span class="spacer"></span>
-        <button class="btn ghost" id="recheck">重新檢查 Agent</button>
-        <button class="btn primary" id="start">開始工作</button>
-      </div>
-    </section>
-
-    <section class="panel">
-      <h3>工作看板</h3>
-      <div id="board"></div>
-    </section>
+    <h2 class="zone">進行中的任務</h2>
+    <section class="panel"><div id="board"></div></section>
 
     <div class="cols">
       <section class="panel">
@@ -181,7 +190,7 @@
 </div>
 
 <dialog id="histDlg">
-  <div class="dlg-h"><b id="histTitle">歷史紀錄</b><span class="spacer"></span><button class="btn small" id="histClose">關閉</button></div>
+  <div class="dlg-h"><b id="histTitle">歷史紀錄</b><span class="spacer"></span><button class="btn pz small" id="histResume" hidden>繼續這個工作</button><button class="btn small" id="histClose">關閉</button></div>
   <div class="dlg-b">
     <div class="panel" id="histMeta"></div>
     <div class="panel"><h3>工作看板</h3><div id="histBoard"></div></div>
@@ -195,106 +204,151 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<
 const LOOK = { claude: { c:'#d97757', ab:'CC' }, codex: { c:'#10a37f', ab:'CX' }, antigravity: { c:'#4285f4', ab:'AG' } };
 const look = (id) => LOOK[id] || { c:'#8d8678', ab:String(id).slice(0, 2).toUpperCase() };
 const LANES = [['WAITING','等待中'], ['WORKING','進行中'], ['DONE','完成'], ['FAILED','失敗 / 停止']];
-const STATUS = { done:'完成', failed:'有失敗', stopped:'已停止' };
-let S = null, last = '', histRev = -1, shownProject = null;
+const STATUS = { done:'完成', failed:'有失敗', stopped:'已停止', paused:'暫停中' };
+let S = null, last = '', histRev = -1, shownProject = null, histOpenId = null;
 
 async function post(url, body) {
-  $('err').textContent = '';
+  $('err') && ($('err').textContent = '');
   const r = await fetch(url, { method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify(body || {}) });
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) { $('err').textContent = j.error || ('錯誤 ' + r.status); throw new Error(j.error); }
+  if (!r.ok) { if ($('err')) $('err').textContent = j.error || ('錯誤 ' + r.status); else alert(j.error); throw new Error(j.error); }
   refresh();
   return j;
 }
 
-const name = (id, agents = S.agents) => agents.find((a) => a.id === id)?.name || id;
+const name = (id) => S.agents.find((a) => a.id === id)?.name || id;
 const base = (p) => String(p).split(/[\\/]/).filter(Boolean).pop() || p;
 const fmt = (iso) => new Date(iso).toLocaleString('zh-TW', { month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit', hour12:false });
+const when = (iso) => new Date(iso).toDateString() === new Date().toDateString() ? new Date(iso).toLocaleTimeString('zh-TW', { hour:'2-digit', minute:'2-digit', hour12:false }) : fmt(iso);
+
+function modelLabel(a) {
+  const cfg = S.agentCfg[a.id] || {};
+  if (!a.models.length) return a.status === 'checking' ? '讀取中…' : '預設';
+  if (cfg.model) return a.models.find((m) => m.value === cfg.model)?.name || cfg.model;
+  const def = a.models.find((m) => m.value === 'default');
+  return def ? `預設（${def.description.split(' · ')[0]}）` : '預設';
+}
+const effortLabel = (a) => (S.agentCfg[a.id] || {}).effort || (a.efforts.length ? '預設' : '—');
+
+function cfgHtml(a) {
+  if (!a.models.length && !a.efforts.length) return `<div class="cfg-note">${a.status === 'checking' ? '讀取模型清單中…' : '此 Agent 使用預設模型（不支援切換）'}</div>`;
+  const cfg = S.agentCfg[a.id] || {}, busy = S.run?.active;
+  return `<details class="cfg-box"><summary>調整模型／推理強度${busy ? '（下一次開始工作生效）' : ''}</summary><div class="cfg">
+    <label>模型<select data-cfg="${a.id}" data-k="model"><option value="">預設</option>${a.models.map((m) => `<option value="${esc(m.value)}" title="${esc(m.description)}" ${m.value === cfg.model ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select></label>
+    <label>推理強度<select data-cfg="${a.id}" data-k="effort" ${a.efforts.length ? '' : 'disabled'}><option value="">預設</option>${a.efforts.map((v) => `<option value="${esc(v)}" ${v === cfg.effort ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></label>
+  </div></details>`;
+}
+
+function statusHtml(a) {
+  const r = S.run, lead = a.id === S.leader;
+  if (a.status === 'checking') return '<span class="dot"></span>檢查中…';
+  if (a.status === 'unavailable') return '<span class="dot bad"></span>無法使用';
+  const work = S.tasks.find((t) => t.status === 'WORKING' && t.agent === a.id);
+  if (work) return `<span class="dot work"></span>工作中：${esc(work.title)}`;
+  if (lead && r?.active) return `<span class="dot work"></span>${{ planning:'規劃與派工中', summarizing:'整理總結中' }[r.phase] || '監督進度中'}`;
+  const pz = S.tasks.find((t) => t.status === 'PAUSED' && t.agent === a.id);
+  if (r?.paused && (pz || lead)) return `<span class="dot pz"></span>已暫停${pz ? '：' + esc(pz.title) : ''}`;
+  return '<span class="dot"></span>待命';
+}
+
+function seatHtml(a) {
+  const l = look(a.id), lead = a.id === S.leader, off = a.status !== 'available';
+  const lastMsg = [...S.activity].reverse().find((m) => m.who === a.id);
+  const done = S.lastDone[a.id];
+  const lastTxt = a.status === 'unavailable' ? a.note : lastMsg?.text || (lead ? '把需求交給我，我會拆成工作卡分給大家。' : '等待 Leader 派工。');
+  const busy = S.run?.active || S.run?.paused;
+  return `<div class="seat ${off ? 'off' : ''}" style="--c:${l.c}">
+    <div class="seat-top"><div class="avatar">${l.ab}</div><div>
+      <div class="seat-name">${esc(a.name)}</div>
+      <div class="tags">${lead ? '<span class="tag lead">LEADER</span>' : '<span class="tag">WORKER</span>'}${a.status === 'available' ? '<span class="tag ok">可用</span>' : a.status === 'unavailable' ? '<span class="tag bad">不可用</span>' : ''}</div>
+    </div></div>
+    <div class="seat-status">${statusHtml(a)}</div>
+    <dl class="facts">
+      <dt>模型</dt><dd title="${esc(modelLabel(a))}">${esc(modelLabel(a))}</dd>
+      <dt>推理強度</dt><dd>${esc(effortLabel(a))}</dd>
+      <dt>最近完成</dt><dd title="${esc(done?.title || '')}">${done ? `${esc(done.title)} · ${when(done.at)}` : '—'}</dd>
+    </dl>
+    <div class="seat-last">${esc(lastTxt)}</div>
+    ${cfgHtml(a)}
+    ${a.id === 'codex' && a.status === 'unavailable' ? `<div class="cfg-note">Studio 的 Codex 使用獨立資料夾，不會出現在你平常的 Codex 紀錄。登入一次後按「重新檢查 Agent」。</div><button class="btn small" data-codex-login>登入 Codex（Studio 專用）</button>` : ''}
+    ${lead ? '' : `<button class="btn small" data-leader="${a.id}" ${off ? 'disabled' : ''}>${busy ? '接手當 Leader' : '設為 Leader'}</button>`}
+  </div>`;
+}
 
 function boardHtml(tasks, agents, editable) {
-  if (!tasks.length) return '<div class="empty">還沒有工作。輸入需求並按「開始工作」，Leader 會拆解並派工。</div>';
+  if (!tasks.length) return '<div class="empty">還沒有工作。把需求交給 Leader，它會拆成工作卡派給員工。</div>';
   const avail = agents.filter((a) => a.status === 'available');
   return `<div class="board">${LANES.map(([st, label]) => {
-    const list = tasks.filter((t) => t.status === st);
+    const list = tasks.filter((t) => t.status === st || (st === 'WAITING' && t.status === 'PAUSED'));
     return `<div class="lane"><div class="lane-h">${label}<span class="n">${list.length}</span></div>${list.map((t) => `
       <div class="card" style="--c:${look(t.agent).c}">
-        <div class="t">${esc(t.title)}</div>
-        <span class="who"><i></i>${esc(name(t.agent, agents))}</span>
-        ${t.result ? `<div class="res">${esc(t.result)}</div>` : ''}
+        <div class="t">${esc(t.title)} ${t.status === 'PAUSED' ? '<span class="tag pz">已暫停</span>' : ''}</div>
+        <span class="who"><i></i>${esc(agents.find((a) => a.id === t.agent)?.name || t.agent)}</span>
+        ${t.result && t.status !== 'PAUSED' ? `<div class="res">${esc(t.result)}</div>` : ''}
         ${editable && st !== 'WORKING' && st !== 'DONE' ? `<div class="re"><select data-task="${t.id}">${avail.map((a) => `<option value="${a.id}" ${a.id === t.agent ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><button class="btn small" data-reassign="${t.id}">改派</button></div>` : ''}
       </div>`).join('')}</div>`;
   }).join('')}</div>`;
 }
 
-function chatHtml(activity, agents) {
+function chatHtml(activity) {
   if (!activity.length) return '<div class="empty">尚無對話。</div>';
   return activity.map((m) => {
     if (m.role === 'system') return `<div class="sys">${esc(m.time)} · ${esc(m.text)}</div>`;
     if (m.role === 'user') return `<div class="msg me"><div class="bubble"><div class="hd"><b>你</b> · ${esc(m.time)}</div>${esc(m.text)}</div></div>`;
     const l = look(m.who);
-    return `<div class="msg" style="--c:${l.c}"><div class="av">${l.ab}</div><div class="bubble"><div class="hd"><b>${esc(name(m.who, agents))}</b> · ${m.role === 'leader' ? 'Leader' : 'Worker'} · ${esc(m.time)}</div>${esc(m.text)}</div></div>`;
+    return `<div class="msg" style="--c:${l.c}"><div class="av">${l.ab}</div><div class="bubble"><div class="hd"><b>${esc(name(m.who))}</b> · ${m.role === 'leader' ? 'Leader' : 'Worker'} · ${esc(m.time)}</div>${esc(m.text)}</div></div>`;
   }).join('');
-}
-
-function cfgHtml(a) {
-  const cfg = S.agentCfg[a.id] || {};
-  if (!a.models.length && !a.efforts.length) {
-    return `<div class="cfg"><span class="cfg-note">${a.status === 'checking' ? '讀取模型清單中…' : '此 Agent 使用預設模型（不支援切換）'}</span></div>`;
-  }
-  return `<div class="cfg">
-    <label>模型<select data-cfg="${a.id}" data-k="model" ${S.run?.active ? 'disabled' : ''}>
-      <option value="">預設</option>${a.models.map((m) => `<option value="${esc(m.value)}" title="${esc(m.description)}" ${m.value === cfg.model ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}
-    </select></label>
-    <label>推理強度<select data-cfg="${a.id}" data-k="effort" ${S.run?.active || !a.efforts.length ? 'disabled' : ''}>
-      <option value="">預設</option>${a.efforts.map((v) => `<option value="${esc(v)}" ${v === cfg.effort ? 'selected' : ''}>${esc(v)}</option>`).join('')}
-    </select></label>
-  </div>`;
 }
 
 function render() {
-  const running = !!S.run?.active;
+  const r = S.run, running = !!r?.active, paused = !!r?.paused;
   $('projChip').textContent = S.project ? '📁 ' + S.project : '尚未選擇專案';
   $('projChip').title = S.project;
   if (S.project !== shownProject) { shownProject = S.project; $('project').value = S.project || ''; }
-  $('runPill').textContent = running ? `團隊工作中 · Leader ${name(S.leader)}` : (S.run?.stopped ? '已停止' : '待命');
-  $('runPill').classList.toggle('on', running);
-  $('start').disabled = running;
-  $('stop').disabled = !running;
+
+  const pz = { running:['Paseo 執行中','ok'], stopped:['Paseo 未開啟',''], missing:['Paseo 未安裝',''], checking:['Paseo 檢查中…',''] }[S.paseo] || ['Paseo',''];
+  $('paseoPill').textContent = pz[0];
+  $('paseoPill').className = 'pill ' + pz[1];
+  $('paseoOpen').hidden = S.paseo === 'missing';
+  if (!$('paseoOpen').dataset.busy) $('paseoOpen').disabled = !S.project;
+
+  $('runPill').textContent = running ? `團隊工作中 · Leader ${name(r.leader)}` : paused ? '已暫停 · 可稍後繼續' : (r?.stopped ? '已停止' : '待命');
+  $('runPill').className = 'pill ' + (running ? 'on' : paused ? 'pz' : '');
+  $('pauseResume').textContent = paused ? '繼續' : '暫停';
+  $('pauseResume').disabled = !running && !paused;
+  $('stop').disabled = !running && !paused;
   $('setProject').disabled = $('browse').disabled = running;
 
-  $('recent').innerHTML = S.recent.length ? S.recent.map((p) => `
-    <div class="chip ${p === S.project ? 'on' : ''}" data-project="${esc(p)}" title="${esc(p)}">
-      <span class="nm">${esc(base(p))}</span><span class="x" data-remove="${esc(p)}" title="從清單移除">✕</span>
-    </div>`).join('') : '<div class="empty">用過的專案會出現在這裡。</div>';
+  const avail = S.agents.filter((a) => a.status === 'available').length;
+  const kpi = (v, l) => `<div class="kpi"><div class="v">${v}</div><div class="l">${l}</div></div>`;
+  $('kpis').innerHTML = kpi(S.todayDone, '今日完成的工作卡') + kpi(S.tasks.filter((t) => t.status === 'WORKING').length, '進行中') +
+    kpi(S.tasks.filter((t) => t.status === 'WAITING' || t.status === 'PAUSED').length, paused ? '等待／已暫停' : '等待中') + kpi(`${avail}/${S.agents.length}`, '可用的 Agent');
 
-  if (!$('seats').contains(document.activeElement)) $('seats').innerHTML = S.agents.map((a) => {
-    const l = look(a.id), lead = a.id === S.leader, off = a.status !== 'available';
-    const task = S.tasks.find((t) => t.status === 'WORKING' && t.agent === a.id);
-    const lastMsg = [...S.activity].reverse().find((m) => m.who === a.id);
-    let status = '<span class="dot"></span>待命';
-    if (a.status === 'checking') status = '<span class="dot"></span>檢查中…';
-    else if (a.status === 'unavailable') status = '<span class="dot bad"></span>無法使用';
-    else if (a.working) status = `<span class="dot work"></span>${task ? '工作中：' + esc(task.title) : lead ? (S.tasks.length ? '整理總結中' : '規劃與派工中') : '工作中'}`;
-    const lastTxt = a.status === 'unavailable' ? a.note : lastMsg?.text || (lead ? '我會把你的需求拆成工作卡，分給大家。' : '等待 Leader 派工。');
-    return `<div class="seat ${lead ? 'leader' : ''} ${off ? 'off' : ''}" style="--c:${l.c}">
-      <div class="seat-top"><div class="avatar">${l.ab}</div><div>
-        <div class="seat-name">${esc(a.name)}</div>
-        <div class="tags">${lead ? '<span class="tag lead">LEADER</span>' : '<span class="tag">WORKER</span>'}${a.status === 'available' ? '<span class="tag ok">可用</span>' : a.status === 'unavailable' ? '<span class="tag bad">不可用</span>' : ''}</div>
-      </div></div>
-      <div class="seat-status">${status}</div>
-      <div class="seat-last">${esc(lastTxt)}</div>
-      ${cfgHtml(a)}
-      ${a.id === 'codex' && a.status === 'unavailable' ? `<div class="cfg-note">Studio 的 Codex 使用獨立資料夾，不會出現在你平常的 Codex 對話紀錄。第一次使用需登入一次，完成後按「重新檢查 Agent」。</div>
-        <button class="btn small" data-codex-login>登入 Codex（Studio 專用）</button>` : ''}
-      ${lead ? '' : `<button class="btn small" data-leader="${a.id}" ${off || running ? 'disabled' : ''}>設為 Leader</button>`}
+  const leader = S.agents.find((a) => a.id === S.leader);
+  if (!$('office').contains(document.activeElement)) {
+    const keep = $('request')?.value || '';
+    $('office').style.setProperty('--c', look(S.leader).c);
+    $('office').innerHTML = seatHtml(leader) + `<div class="desk">
+      <h3 style="margin:0">交辦給 Leader</h3>
+      ${r && (running || paused) ? `<div class="now"><b>目前的工作</b><br>${esc(r.request)}</div>` : ''}
+      <textarea id="request" placeholder="你想讓團隊做什麼？（Ctrl + Enter 開始）">${esc(keep)}</textarea>
+      <div class="row"><span class="err" id="err"></span><span class="spacer"></span>
+        <button class="btn ghost" id="recheck">重新檢查 Agent</button>
+        <button class="btn primary" id="start" ${running ? 'disabled' : ''}>開始工作</button></div>
     </div>`;
-  }).join('');
+  }
+
+  if (!$('seats').contains(document.activeElement)) $('seats').innerHTML = S.agents.filter((a) => a.id !== S.leader).map((a) => seatHtml(a)).join('');
+
+  $('recent').innerHTML = S.recent.length ? S.recent.map((p) => `
+    <div class="chip ${p === S.project ? 'on' : ''}" data-project="${esc(p)}" title="${esc(p)}"><span class="nm">${esc(base(p))}</span><span class="x" data-remove="${esc(p)}" title="從清單移除">✕</span></div>`).join('')
+    : '<div class="empty">用過的專案會出現在這裡。</div>';
 
   if (!$('board').contains(document.activeElement)) $('board').innerHTML = boardHtml(S.tasks, S.agents, true);
 
   const box = $('chat');
   const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
-  box.innerHTML = chatHtml(S.activity, S.agents);
+  box.innerHTML = chatHtml(S.activity);
   if (atBottom) box.scrollTop = box.scrollHeight;
 
   $('progressPath').textContent = S.progress?.exists ? S.progress.file : '專案裡的 .ai-workspace/progress.md';
@@ -308,24 +362,26 @@ async function loadHistory() {
   $('history').innerHTML = list.length ? list.map((h) => `
     <button class="hitem" data-hist="${h.id}">
       <div class="req">${esc(h.request)}</div>
-      <div class="meta"><span>${fmt(h.startedAt)}</span><span>${esc(base(h.project))}</span><span>${STATUS[h.status] || h.status} ${h.done}/${h.total}</span></div>
+      <div class="meta"><span>${fmt(h.startedAt)}</span><span>${esc(base(h.project))}</span>${h.status === 'paused' ? '<span class="tag pz">暫停中</span>' : `<span>${STATUS[h.status] || h.status} ${h.done}/${h.total}</span>`}</div>
     </button>`).join('') : '<div class="empty">完成的工作會保存在這裡。</div>';
 }
 
 async function openHistory(id) {
   const r = await (await fetch('/api/history/' + id)).json();
+  histOpenId = id;
   $('histTitle').textContent = fmt(r.startedAt) + ' 的工作紀錄';
   $('histMeta').innerHTML = `<div><b>需求：</b>${esc(r.request)}</div>
     <div class="sub" style="margin:6px 0 0">專案 ${esc(r.project)} · Leader ${esc(name(r.leader))} · ${STATUS[r.status] || r.status}</div>`;
   $('histBoard').innerHTML = boardHtml(r.tasks, S.agents, false);
-  $('histChat').innerHTML = chatHtml(r.activity, S.agents);
+  $('histChat').innerHTML = chatHtml(r.activity);
+  $('histResume').hidden = !(r.status === 'paused' && !S.run?.active);
   $('histDlg').showModal();
 }
 
 async function refresh() {
   try {
-    const r = await fetch('/api/state');
-    const txt = await r.text();
+    const res = await fetch('/api/state');
+    const txt = await res.text();
     if (txt === last) return;
     last = txt; S = JSON.parse(txt); render();
   } catch { $('runPill').textContent = '無法連到 Studio（視窗是否已關閉？）'; }
@@ -333,11 +389,16 @@ async function refresh() {
 
 $('browse').onclick = () => post('/api/browse').then((j) => { if (j.path) $('project').value = j.path; });
 $('setProject').onclick = () => post('/api/project', { path: $('project').value });
-$('recheck').onclick = () => post('/api/check');
-$('start').onclick = () => post('/api/start', { request: $('request').value });
-$('stop').onclick = () => post('/api/stop');
+$('stop').onclick = () => confirm('確定要停止嗎？停止後未完成的工作卡會標成失敗（想晚點再做請用「暫停」）。') && post('/api/stop');
+$('pauseResume').onclick = () => post(S.run?.paused ? '/api/resume' : '/api/pause');
 $('histClose').onclick = () => $('histDlg').close();
-$('request').addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.ctrlKey && !$('start').disabled) $('start').click(); });
+$('histResume').onclick = () => post('/api/resume', { id: histOpenId }).then(() => $('histDlg').close());
+$('paseoOpen').onclick = async () => {
+  const b = $('paseoOpen');
+  b.dataset.busy = '1'; b.disabled = true; b.textContent = '開啟中…';
+  try { await post('/api/paseo/open'); } catch {} finally { delete b.dataset.busy; b.disabled = false; b.textContent = '用 Paseo 開啟目前專案'; }
+};
+document.addEventListener('keydown', (e) => { if (e.target.id === 'request' && e.key === 'Enter' && e.ctrlKey && !$('start').disabled) $('start').click(); });
 document.addEventListener('change', (e) => {
   const s = e.target.closest('select[data-cfg]');
   if (!s) return;
@@ -353,10 +414,16 @@ document.addEventListener('click', (e) => {
   const h = e.target.closest('[data-hist]');
   if (h) return openHistory(h.dataset.hist);
   const b = e.target.closest('button');
-  b?.blur();
-  if (b?.hasAttribute('data-codex-login')) post('/api/codex-login');
-  if (b?.dataset.leader) post('/api/leader', { agent: b.dataset.leader });
-  if (b?.dataset.reassign) post('/api/reassign', { taskId: b.dataset.reassign, agent: document.querySelector(`select[data-task="${b.dataset.reassign}"]`).value });
+  if (!b) return;
+  if (b.id === 'start') return post('/api/start', { request: $('request').value }).then(() => { $('request').value = ''; b.blur(); }).catch(() => {});
+  if (b.id === 'recheck') return post('/api/check');
+  b.blur();
+  if (b.hasAttribute('data-codex-login')) post('/api/codex-login');
+  if (b.dataset.leader) {
+    const busy = S.run?.active || S.run?.paused;
+    if (!busy || confirm(`把 Leader 交接給 ${name(b.dataset.leader)}？\n新 Leader 會接手原始需求和目前的工作卡，不用重新輸入；正在工作的員工會繼續做。`)) post('/api/leader', { agent: b.dataset.leader });
+  }
+  if (b.dataset.reassign) post('/api/reassign', { taskId: b.dataset.reassign, agent: document.querySelector(`select[data-task="${b.dataset.reassign}"]`).value });
 });
 refresh();
 setInterval(refresh, 1000);
