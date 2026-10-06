@@ -22,8 +22,54 @@ const AGENTS = {
   antigravity: { name: 'Antigravity', create: (ws, lead) => ({ type: 'antigravity', extra: { backend: 'antigravity', workspace: ws, session_mode: lead ? 'plan' : 'yolo' } }) },
 };
 
-const S = { project: '', leader: 'codex', agents: {}, tasks: [], activity: [], run: null };
-for (const [id, a] of Object.entries(AGENTS)) S.agents[id] = { id, name: a.name, status: 'checking', note: '', working: 0 };
+const S = { project: '', leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, tasks: [], activity: [], run: null };
+for (const [id, a] of Object.entries(AGENTS)) {
+  // models / efforts are the catalogs the agent itself reports (filled from AionCore events).
+  S.agents[id] = { id, name: a.name, status: 'checking', note: '', working: 0, models: [], efforts: [] };
+  S.agentCfg[id] = { model: '', effort: '' }; // '' = agent default
+}
+
+// ---------- Settings & history (plain JSON files under runtime/studio) ----------
+const SETTINGS = path.join(RT, 'studio', 'settings.json');
+const HISTORY = path.join(RT, 'studio', 'history');
+const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
+
+try {
+  const saved = JSON.parse(fs.readFileSync(SETTINGS, 'utf8'));
+  if (AGENTS[saved.leader]) S.leader = saved.leader;
+  if (isDir(saved.project)) S.project = saved.project;
+  S.recent = (saved.recent || []).filter(isDir);
+  for (const id in S.agentCfg) Object.assign(S.agentCfg[id], saved.agentCfg?.[id]);
+} catch { /* first start: defaults */ }
+
+function saveSettings() {
+  fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
+  fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, project: S.project, recent: S.recent, agentCfg: S.agentCfg }, null, 2));
+}
+
+function saveRun(status) {
+  const run = S.run;
+  if (!run) return;
+  fs.mkdirSync(HISTORY, { recursive: true });
+  const rec = { id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, project: run.project, leader: run.leader, request: run.request, tasks: S.tasks, activity: S.activity };
+  fs.writeFileSync(path.join(HISTORY, run.id + '.json'), JSON.stringify(rec, null, 2));
+  S.historyRev++;
+}
+
+function listHistory() {
+  if (!isDir(HISTORY)) return [];
+  return fs.readdirSync(HISTORY).filter((f) => f.endsWith('.json')).sort().reverse().slice(0, 50).flatMap((f) => {
+    try {
+      const r = JSON.parse(fs.readFileSync(path.join(HISTORY, f), 'utf8'));
+      return [{ id: r.id, startedAt: r.startedAt, status: r.status, project: r.project, leader: r.leader, request: String(r.request).slice(0, 120), done: r.tasks.filter((t) => t.status === 'DONE').length, total: r.tasks.length }];
+    } catch { return []; }
+  });
+}
+
+function readHistory(id) {
+  if (!/^[\w-]+$/.test(id)) throw new Error('bad id');
+  return JSON.parse(fs.readFileSync(path.join(HISTORY, id + '.json'), 'utf8'));
+}
 
 function log(who, role, text) {
   S.activity.push({ time: new Date().toLocaleTimeString('zh-TW', { hour12: false }), who, role, text: String(text) });
@@ -72,12 +118,48 @@ async function api(method, p, body) {
   return j.data;
 }
 
-async function createConv(agent, ws, lead) {
+const convAgent = new Map(); // conversationId -> agent id (to route catalog events)
+
+async function createConv(agent, ws, lead, useCfg = true) {
+  const body = AGENTS[agent].create(ws, lead);
+  const cfg = S.agentCfg[agent];
+  if (useCfg && cfg.model) body.extra.current_model_id = cfg.model;
+  if (useCfg && cfg.effort) body.extra.thought_level = cfg.effort;
   // Right after READY, create can briefly 400 (assistant catalog race seen in P0).
   for (let i = 0; ; i++) {
-    try { return (await api('POST', '/api/conversations', AGENTS[agent].create(ws, lead))).id; }
-    catch (e) { if (i >= 4) throw e; await sleep(1000); }
+    try {
+      const id = (await api('POST', '/api/conversations', body)).id;
+      convAgent.set(id, agent);
+      return id;
+    } catch (e) { if (i >= 4) throw e; await sleep(1000); }
   }
+}
+
+// AionCore pushes each agent's model / effort catalog as `acp_config_option` events on its WebSocket.
+function watchCatalogs() {
+  const ws = new WebSocket(BASE.replace('http', 'ws') + '/ws');
+  ws.onmessage = (e) => {
+    let d;
+    try { d = JSON.parse(e.data).data; } catch { return; }
+    const agent = convAgent.get(d?.conversation_id);
+    if (!agent || d.type !== 'acp_config_option') return;
+    const a = S.agents[agent];
+    for (const o of d.data?.config_options || []) {
+      const opts = (o.options || []).map((x) => ({ value: x.value, name: x.name || x.value, description: x.description || '' }));
+      if (o.category === 'model' && opts.length) a.models = opts;
+      if (o.category === 'thought_level' && opts.length) a.efforts = opts.map((x) => x.value);
+    }
+  };
+  ws.onclose = () => setTimeout(watchCatalogs, 2000);
+}
+
+function setAgentCfg(agent, model, effort) {
+  const a = S.agents[agent];
+  if (!a) throw new Error('未知的 Agent');
+  if (model && !a.models.some((m) => m.value === model)) throw new Error(`${a.name} 沒有這個模型：${model}`);
+  if (effort && !a.efforts.includes(effort)) throw new Error(`${a.name} 不支援這個推理強度：${effort}`);
+  S.agentCfg[agent] = { model: model || '', effort: effort || '' };
+  saveSettings();
 }
 
 const active = new Map(); // conversationId -> turnId (for Stop)
@@ -130,7 +212,8 @@ async function checkAgent(id) {
   try {
     const ws = path.join(RT, 'studio', 'check');
     fs.mkdirSync(ws, { recursive: true });
-    const reply = await turn(id, await createConv(id, ws, true), 'Reply with exactly: OK', { lead: true, check: true, timeout: 120e3 });
+    // The check uses agent defaults so a bad saved model can't make the agent look unavailable.
+    const reply = await turn(id, await createConv(id, ws, true, false), 'Reply with exactly: OK', { lead: true, check: true, timeout: 120e3 });
     if (!/OK/i.test(reply)) throw new Error('沒有正常回覆：' + (reply || '(空白)'));
     a.status = 'available';
   } catch (e) {
@@ -158,7 +241,9 @@ ${request}
 
 Rules:
 - Do NOT do the work yourself. Do NOT create or modify any files. Only plan and delegate.
-- Split the request into 1 to 3 small subtasks. Each subtask goes to exactly one worker id from the list above.
+- Split the request into 1 to 4 small subtasks. Each subtask goes to exactly one worker id from the list above.
+- Workers run in parallel, one task at a time each. When the request has independent parts, spread them across different workers so they work at the same time.
+- Never let two subtasks edit the same file. A trivial request may stay a single subtask.
 - "instructions" must be complete and self-contained; the worker only sees that text and works in the project folder.
 
 Reply with ONLY one JSON object, no markdown fences, in exactly this shape:
@@ -185,7 +270,9 @@ async function start(request) {
 
   S.tasks = [];
   S.activity = [];
-  const run = (S.run = { request, convs: {}, active: true, stopped: false, summarizing: false });
+  const now = new Date();
+  const id = now.toISOString().slice(0, 19).replace(/[-:T]/g, '') + '-' + crypto.randomUUID().slice(0, 4);
+  const run = (S.run = { id, startedAt: now.toISOString(), project: S.project, leader: lead, request, convs: {}, active: true, stopped: false, summarizing: false });
   log('user', 'user', request);
   log('studio', 'system', `Leader：${AGENTS[lead].name}；Workers：${workers.map((w) => AGENTS[w].name).join('、')}`);
   (async () => {
@@ -203,6 +290,7 @@ async function start(request) {
     } catch (e) {
       log('studio', 'system', (run.stopped ? '已停止：' : 'Leader 失敗：') + e.message);
       run.active = false;
+      saveRun(run.stopped ? 'stopped' : 'failed');
     }
   })();
 }
@@ -260,6 +348,7 @@ Do not modify files. Write a short final report to the user (2-4 sentences, in t
   }
   run.summarizing = false;
   run.active = false;
+  saveRun(S.tasks.every((t) => t.status === 'DONE') ? 'done' : 'failed');
 }
 
 function stop() {
@@ -270,6 +359,7 @@ function stop() {
   for (const [cid, turnId] of active) api('POST', `/api/conversations/${cid}/cancel`, { turn_id: turnId }).catch(() => {});
   for (const t of S.tasks) if (t.status === 'WAITING') { t.status = 'FAILED'; t.result = '已停止'; }
   log('studio', 'system', '已按下 Stop：所有 Agent 停止目前工作。');
+  saveRun('stopped');
 }
 
 function reassign(taskId, agent) {
@@ -290,12 +380,21 @@ function setLeader(agent) {
   if (!available(agent)) throw new Error(`${AGENTS[agent].name} 目前不可用`);
   if (S.leader !== agent) log('studio', 'system', `Leader 換成 ${AGENTS[agent].name}`);
   S.leader = agent;
+  saveSettings();
 }
 
 function setProject(p) {
   p = path.resolve(String(p || '').trim());
-  if (!fs.existsSync(p) || !fs.statSync(p).isDirectory()) throw new Error('資料夾不存在：' + p);
+  if (!isDir(p)) throw new Error('資料夾不存在：' + p);
+  if (S.run?.active) throw new Error('團隊工作中，請等工作結束再換專案');
   S.project = p;
+  S.recent = [p, ...S.recent.filter((x) => x.toLowerCase() !== p.toLowerCase())].slice(0, 8);
+  saveSettings();
+}
+
+function removeRecent(p) {
+  S.recent = S.recent.filter((x) => x !== p);
+  saveSettings();
 }
 
 function readProjectProgress() {
@@ -322,6 +421,9 @@ const routes = {
   'POST /api/stop': () => stop(),
   'POST /api/reassign': (b) => reassign(b.taskId, b.agent),
   'POST /api/check': () => { checkAll(); },
+  'POST /api/recent/remove': (b) => removeRecent(b.path),
+  'POST /api/agent-config': (b) => setAgentCfg(b.agent, b.model, b.effort),
+  'GET /api/history': () => listHistory(),
 };
 
 const server = http.createServer(async (req, res) => {
@@ -329,7 +431,8 @@ const server = http.createServer(async (req, res) => {
   // Local-only: reject other hosts (DNS rebinding) and non-JSON POSTs (cross-site form posts).
   if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(req.headers.host || '')) return send(403, { error: 'forbidden' });
   if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) return send(200, fs.readFileSync(path.join(import.meta.dirname, 'index.html')), 'text/html; charset=utf-8');
-  const fn = routes[`${req.method} ${req.url}`];
+  const hist = req.method === 'GET' && req.url.match(/^\/api\/history\/([\w-]+)$/);
+  const fn = hist ? () => readHistory(hist[1]) : routes[`${req.method} ${req.url}`];
   if (!fn) return send(404, { error: 'not found' });
   if (req.method === 'POST' && !String(req.headers['content-type']).startsWith('application/json')) return send(415, { error: 'json only' });
   try {
@@ -342,6 +445,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 await startAion();
+watchCatalogs();
 server.listen(PORT, '127.0.0.1', () => {
   const url = `http://127.0.0.1:${PORT}`;
   console.log(`Multi-Agent Studio 已啟動：${url}  （關閉此視窗即停止）`);
