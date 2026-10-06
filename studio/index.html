@@ -103,6 +103,15 @@
   .cfg select { padding:5px 8px; font-size:13px; font-weight:400; border-radius:8px; }
   .cfg-note { font-size:11.5px; color:var(--muted); }
   .seat .btn { align-self:flex-start; }
+  .limits { display:flex; flex-direction:column; gap:7px; }
+  .lim-h { display:flex; justify-content:space-between; gap:8px; font-size:12px; }
+  .lim-h b { font-weight:700; } .lim-h span { color:var(--muted); }
+  .bar { height:8px; border-radius:999px; background:var(--panel2); border:1px solid var(--line); overflow:hidden; }
+  .bar i { display:block; height:100%; background:var(--ok); border-radius:999px; }
+  .bar.warn i { background:var(--work); } .bar.hot i { background:var(--bad); }
+  .tbar { height:3px; margin-top:3px; border-radius:999px; background:var(--panel2); overflow:hidden; }
+  .tbar i { display:block; height:100%; background:var(--muted); opacity:.45; }
+  .lim-f { display:flex; align-items:center; gap:8px; font-size:11.5px; color:var(--muted); }
 
   .board { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
   @media (max-width:1100px) { .board { grid-template-columns:repeat(2,minmax(0,1fr)); } }
@@ -141,6 +150,7 @@
   <div class="brand"><span class="logo"></span>Multi-Agent Studio</div>
   <div class="proj-chip" id="projChip">尚未選擇專案</div>
   <span class="spacer"></span>
+  <button class="btn small" id="notifyBtn" title="工作完成或失敗時通知你（網頁開著時用網頁通知和提示音；網頁沒開時用 Windows 通知）">🔔 通知：開</button>
   <span class="pill" id="paseoPill">Paseo</span>
   <button class="btn small" id="paseoOpen">用 Paseo 開啟目前專案</button>
   <span class="pill" id="runPill">待命</span>
@@ -239,6 +249,28 @@ function cfgHtml(a) {
   </div></details>`;
 }
 
+// 5-hour / weekly plan limits: usage bar + thin bar for how far the window is toward its reset.
+function limitsHtml(a) {
+  const L = S.limits[a.id];
+  if (!L) {
+    const why = a.id === 'antigravity' ? 'Antigravity 不提供額度資訊' : a.id === 'codex' ? '額度：Studio 的 Codex 工作過一次後顯示' : '額度：讀取中…';
+    return `<div class="lim-f">${why}</div>`;
+  }
+  const now = Date.now() / 1000;
+  const rows = L.windows.map((w) => {
+    const label = w.windowMin >= 10080 ? '每週額度' : w.windowMin === 300 ? '5 小時額度' : `${Math.round(w.windowMin / 60)} 小時額度`;
+    const reset = w.resetsAt <= now;
+    const pct = reset ? 0 : Math.round(w.used * 100);
+    const elapsed = reset ? 100 : Math.min(100, Math.max(0, 100 - ((w.resetsAt - now) / (w.windowMin * 60)) * 100));
+    const at = new Date(w.resetsAt * 1000);
+    const resetTxt = reset ? '已重置，等待更新' : `${at.toDateString() === new Date().toDateString() ? '今天 ' : (at.getMonth() + 1) + '/' + at.getDate() + ' '}${at.toLocaleTimeString('zh-TW', { hour:'2-digit', minute:'2-digit', hour12:false })} 重置`;
+    return `<div><div class="lim-h"><b>${label}：已用 ${pct}%</b><span>${resetTxt}</span></div>
+      <div class="bar ${pct >= 95 ? 'hot' : pct >= 80 ? 'warn' : ''}"><i style="width:${pct}%"></i></div>
+      <div class="tbar" title="這個額度週期已經過了 ${Math.round(elapsed)}%"><i style="width:${elapsed}%"></i></div></div>`;
+  }).join('');
+  return `<div class="limits">${rows}<div class="lim-f">${new Date(L.updatedAt).toLocaleTimeString('zh-TW', { hour:'2-digit', minute:'2-digit', hour12:false })} 更新${a.id === 'claude' ? ' · <a href="#" data-limits-refresh>更新</a>' : ''}</div></div>`;
+}
+
 function statusHtml(a) {
   const r = S.run, lead = a.id === S.leader;
   if (a.status === 'checking') return '<span class="dot"></span>檢查中…';
@@ -269,6 +301,7 @@ function seatHtml(a) {
       <dt>最近完成</dt><dd title="${esc(done?.title || '')}">${done ? `${esc(done.title)} · ${when(done.at)}` : '—'}</dd>
     </dl>
     <div class="seat-last">${esc(lastTxt)}</div>
+    ${limitsHtml(a)}
     ${cfgHtml(a)}
     ${a.id === 'codex' && a.status === 'unavailable' ? `<div class="cfg-note">Studio 的 Codex 使用獨立資料夾，不會出現在你平常的 Codex 紀錄。登入一次後按「重新檢查 Agent」。</div><button class="btn small" data-codex-login>登入 Codex（Studio 專用）</button>` : ''}
     ${lead ? '' : `<button class="btn small" data-leader="${a.id}" ${off ? 'disabled' : ''}>${busy ? '接手當 Leader' : '設為 Leader'}</button>`}
@@ -355,6 +388,7 @@ function render() {
   $('progress').textContent = S.progress?.exists ? S.progress.text : '尚未建立 .ai-workspace/progress.md';
 
   if (S.historyRev !== histRev) { histRev = S.historyRev; loadHistory(); }
+  renderNotifyBtn();
 }
 
 async function loadHistory() {
@@ -382,10 +416,56 @@ async function refresh() {
   try {
     const res = await fetch('/api/state');
     const txt = await res.text();
-    if (txt === last) return;
-    last = txt; S = JSON.parse(txt); render();
+    if (txt === last && Date.now() - lastRender < 30000) return; // re-render now and then so reset bars move
+    last = txt; S = JSON.parse(txt); render(); lastRender = Date.now();
+    handleNotices();
   } catch { $('runPill').textContent = '無法連到 Studio（視窗是否已關閉？）'; }
 }
+
+// ---------- Notifications: sound + browser notification (the server falls back to a Windows toast when no page is open) ----------
+let seenNotice = null, lastRender = 0, audio = null;
+document.addEventListener('pointerdown', () => { audio ??= new AudioContext(); }); // browsers only allow sound after a click
+
+function handleNotices() {
+  if (seenNotice === null) { seenNotice = S.noticeSeq; return; } // don't replay old notices on page load
+  for (const n of S.notices) if (n.id > seenNotice && S.notify) announce(n);
+  seenNotice = S.noticeSeq;
+}
+
+function announce(n) {
+  chime(n.kind === 'done');
+  if ('Notification' in window && Notification.permission === 'granted') {
+    const x = new Notification('Multi-Agent Studio：' + n.title, { body: n.body, tag: 'studio-' + n.id });
+    x.onclick = () => { window.focus(); x.close(); };
+  }
+}
+
+function chime(ok) {
+  try {
+    const ac = audio ?? (audio = new AudioContext());
+    (ok ? [660, 880] : [440, 330]).forEach((f, i) => {
+      const o = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime + i * 0.18;
+      o.frequency.value = f;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.25, t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.3);
+      o.connect(g).connect(ac.destination);
+      o.start(t); o.stop(t + 0.32);
+    });
+  } catch { /* no audio device */ }
+}
+
+function renderNotifyBtn() {
+  const denied = 'Notification' in window && Notification.permission === 'denied';
+  $('notifyBtn').textContent = S.notify ? (denied ? '🔔 通知：開（只有聲音）' : '🔔 通知：開') : '🔕 通知：關';
+}
+
+$('notifyBtn').onclick = async () => {
+  const on = !S.notify;
+  if (on && 'Notification' in window && Notification.permission === 'default') await Notification.requestPermission();
+  await post('/api/notify', { on });
+  if (on) chime(true);
+};
 
 $('browse').onclick = () => post('/api/browse').then((j) => { if (j.path) $('project').value = j.path; });
 $('setProject').onclick = () => post('/api/project', { path: $('project').value });
@@ -413,6 +493,7 @@ document.addEventListener('click', (e) => {
   if (chip && !S.run?.active) return post('/api/project', { path: chip.dataset.project });
   const h = e.target.closest('[data-hist]');
   if (h) return openHistory(h.dataset.hist);
+  if (e.target.closest('[data-limits-refresh]')) { e.preventDefault(); return post('/api/limits/refresh'); }
   const b = e.target.closest('button');
   if (!b) return;
   if (b.id === 'start') return post('/api/start', { request: $('request').value }).then(() => { $('request').value = ''; b.blur(); }).catch(() => {});

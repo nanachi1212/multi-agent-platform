@@ -24,7 +24,8 @@ const AGENTS = {
   antigravity: { name: 'Antigravity', create: (ws, lead) => ({ type: 'antigravity', extra: { backend: 'antigravity', workspace: ws, session_mode: lead ? 'plan' : 'yolo' } }) },
 };
 
-const S = { project: '', leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, tasks: [], activity: [], run: null };
+const S = { project: '', leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, tasks: [], activity: [], run: null,
+  limits: {}, notify: true, notices: [], noticeSeq: 0 };
 for (const [id, a] of Object.entries(AGENTS)) {
   // models / efforts are the catalogs the agent itself reports (filled from AionCore events).
   S.agents[id] = { id, name: a.name, status: 'checking', note: '', working: 0, models: [], efforts: [] };
@@ -42,11 +43,12 @@ try {
   if (isDir(saved.project)) S.project = saved.project;
   S.recent = (saved.recent || []).filter(isDir);
   for (const id in S.agentCfg) Object.assign(S.agentCfg[id], saved.agentCfg?.[id]);
+  if (saved.notify === false) S.notify = false;
 } catch { /* first start: defaults */ }
 
 function saveSettings() {
   fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
-  fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, project: S.project, recent: S.recent, agentCfg: S.agentCfg }, null, 2));
+  fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, project: S.project, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify }, null, 2));
 }
 
 function saveRun(status) {
@@ -218,6 +220,7 @@ async function turn(agent, convId, text, { lead = false, check = false, timeout 
   } finally {
     active.delete(convId);
     if (!check) S.agents[agent].working--;
+    if (agent === 'codex') refreshCodexLimits();
   }
   if (!check && (run?.stopped || run?.paused)) throw new Halt(run.stopped ? '已停止' : '已暫停');
   const items = (await api('GET', `/api/conversations/${convId}/messages`)).items || [];
@@ -300,6 +303,72 @@ function finish(run, status) {
   run.paused = false;
   run.phase = 'finished';
   saveRun(status);
+  if (status === 'done' || status === 'failed') {
+    const done = S.tasks.filter((t) => t.status === 'DONE').length;
+    notify(status === 'done' ? '團隊工作完成' : '團隊工作結束（有失敗）', `${done}/${S.tasks.length} 張工作卡完成：${String(run.request).slice(0, 80)}`, status);
+  }
+  refreshClaudeLimits();
+}
+
+// ---------- Plan limits (5-hour / weekly) ----------
+const WINDOW_MIN = { five_hour: 300, seven_day: 10080 };
+
+// Codex reports its limits inside its own session logs (Studio's separate home), so reading them costs nothing.
+function refreshCodexLimits() {
+  try {
+    const dir = path.join(CODEX_HOME, 'sessions');
+    if (!isDir(dir)) return;
+    const newest = fs.readdirSync(dir, { recursive: true }).filter((f) => String(f).endsWith('.jsonl'))
+      .map((f) => path.join(dir, String(f))).sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0];
+    if (!newest) return;
+    const line = fs.readFileSync(newest, 'utf8').split('\n').reverse().find((l) => l.includes('"rate_limits":{'));
+    if (!line) return;
+    const ev = JSON.parse(line);
+    const rl = ev.payload.rate_limits;
+    const windows = [rl.primary, rl.secondary].filter(Boolean).map((w) => ({ used: w.used_percent / 100, resetsAt: w.resets_at, windowMin: w.window_minutes }));
+    if (windows.length) S.limits.codex = { windows, updatedAt: ev.timestamp };
+  } catch { /* keep the last known numbers */ }
+}
+
+// Claude reports its limits on every request; one tiny Haiku request that is not saved as a session.
+let claudeProbe = null;
+function refreshClaudeLimits() {
+  if (claudeProbe || !available('claude')) return claudeProbe;
+  const cwd = path.join(RT, 'studio', 'check');
+  fs.mkdirSync(cwd, { recursive: true });
+  const args = ['-p', 'Reply with exactly: OK', '--output-format', 'stream-json', '--verbose', '--no-session-persistence', '--strict-mcp-config', '--model', 'haiku'];
+  claudeProbe = new Promise((res) => execFile('claude', args, { cwd, windowsHide: true, timeout: 90000, maxBuffer: 4 << 20 }, (e, out) => {
+    for (const l of String(out || '').split('\n')) {
+      if (!l.includes('"rate_limit_event"')) continue;
+      try {
+        const uw = JSON.parse(l).rate_limit_info?.unifiedWindows || {};
+        const windows = Object.entries(uw).filter(([k]) => WINDOW_MIN[k]).map(([k, w]) => ({ used: w.utilization, resetsAt: w.resetsAt, windowMin: WINDOW_MIN[k] }));
+        if (windows.length) S.limits.claude = { windows, updatedAt: new Date().toISOString() };
+      } catch { /* ignore malformed line */ }
+    }
+    claudeProbe = null;
+    res();
+  }));
+  return claudeProbe;
+}
+
+// ---------- Notifications ----------
+let lastPoll = 0; // last time a Studio page asked for state
+
+function notify(title, body, kind) {
+  if (!S.notify) return;
+  S.notices = [...S.notices, { id: ++S.noticeSeq, title, body, kind }].slice(-20);
+  // No page polling → Windows toast instead. 75 s because browsers slow background tabs to about one poll a minute.
+  if (Date.now() - lastPoll > 75000) windowsToast(title, body);
+}
+
+function windowsToast(title, body) {
+  const ps = `[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+$x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$t = $x.GetElementsByTagName('text'); [void]$t[0].AppendChild($x.CreateTextNode($env:STUDIO_TITLE)); [void]$t[1].AppendChild($x.CreateTextNode($env:STUDIO_BODY))
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))`;
+  // Text goes through env vars, never into the script itself.
+  execFile('powershell.exe', ['-NoProfile', '-Command', ps], { windowsHide: true, env: { ...process.env, STUDIO_TITLE: 'Multi-Agent Studio：' + title, STUDIO_BODY: body } }, () => {});
 }
 
 async function start(request) {
@@ -556,7 +625,10 @@ async function openInPaseo() {
 
 // ---------- HTTP ----------
 const routes = {
+  'POST /api/limits/refresh': async () => { refreshCodexLimits(); await refreshClaudeLimits(); },
+  'POST /api/notify': (b) => { S.notify = !!b.on; saveSettings(); },
   'GET /api/state': () => {
+    lastPoll = Date.now();
     const r = S.run;
     return { ...S, ...teamStats(), agents: Object.values(S.agents), progress: readProjectProgress(),
       run: r && { id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, project: r.project } };
@@ -570,7 +642,7 @@ const routes = {
   'POST /api/start': (b) => start(String(b.request || '')),
   'POST /api/stop': () => stop(),
   'POST /api/reassign': (b) => reassign(b.taskId, b.agent),
-  'POST /api/check': () => { checkAll(); },
+  'POST /api/check': () => { checkAll().then(refreshClaudeLimits); },
   'POST /api/recent/remove': (b) => removeRecent(b.path),
   'POST /api/agent-config': (b) => setAgentCfg(b.agent, b.model, b.effort),
   // One-time login for Studio's separate Codex home, in a visible console window.
@@ -609,4 +681,5 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log(`Multi-Agent Studio 已啟動：${url}  （關閉此視窗即停止）`);
   if (!process.env.STUDIO_NO_OPEN) spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore' });
 });
-checkAll();
+refreshCodexLimits();
+checkAll().then(refreshClaudeLimits);
