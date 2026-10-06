@@ -29,6 +29,7 @@ Start: double-click `start-studio.cmd` (needs Node.js). The browser opens `http:
 - Leader, project, recent projects and model choices are saved in `runtime/studio/settings.json`. Every run is saved in `runtime/studio/history/` and can be reopened from the 歷史紀錄 list.
 - The Leader spreads independent subtasks across Workers, which run at the same time (one task per Worker at a time).
 - First start downloads AionCore v0.2.2 (official release, SHA-256 checked) into `runtime/`.
+- Studio runs Codex with its own home (`runtime/studio/codex-home`), so Studio sessions never show up in your normal Codex history. Log in once with the 登入 Codex（Studio 專用） button on the Codex card.
 - Agents must already be installed and logged in (`claude auth login`, `codex login`). The Team panel shows `Unavailable` with the reason otherwise; click 重新檢查 Agent after fixing.
 - Workers can edit files and run commands in the chosen folder without asking (Claude: `bypassPermissions`, Codex: `auto`). Use disposable or version-controlled projects only.
 - Known limits: AionCore writes an `.agents/` folder into the project when Antigravity works there. Restarting the Studio clears the current board (past runs stay in history).
