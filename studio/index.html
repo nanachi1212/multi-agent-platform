@@ -5,138 +5,319 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Multi-Agent Studio</title>
 <style>
-  :root { --bg:#f5f6f8; --card:#fff; --line:#dde1e6; --text:#1d2329; --muted:#6b7480; --accent:#2f6fde;
-          --done:#1f8a4c; --fail:#c63b3b; --work:#d9822b; --wait:#7a8494; }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 "Segoe UI","Microsoft JhengHei",sans-serif; }
-  header { padding:14px 20px; background:#1d2329; color:#fff; font-size:18px; font-weight:600; }
-  main { display:grid; grid-template-columns: 380px 1fr; gap:16px; padding:16px; max-width:1400px; margin:auto; }
-  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
-  section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; margin-bottom:16px; }
-  h2 { margin:0 0 10px; font-size:15px; color:var(--muted); font-weight:600; }
-  input[type=text], textarea, select { width:100%; padding:8px; border:1px solid var(--line); border-radius:6px; font:inherit; }
-  textarea { min-height:120px; resize:vertical; }
-  button { padding:8px 14px; border:1px solid var(--line); border-radius:6px; background:#fff; font:inherit; cursor:pointer; }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
-  button.danger { background:var(--fail); border-color:var(--fail); color:#fff; }
-  button:disabled { opacity:.5; cursor:not-allowed; }
-  .row { display:flex; gap:8px; align-items:center; margin-top:8px; flex-wrap:wrap; }
-  .agent { border:1px solid var(--line); border-radius:6px; padding:10px; margin-bottom:8px; }
-  .agent.leader { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
-  .agent .name { font-weight:600; }
-  .note { color:var(--muted); font-size:12px; word-break:break-word; }
-  .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; color:#fff; margin-left:4px; }
-  .b-available, .b-DONE { background:var(--done); } .b-unavailable, .b-FAILED { background:var(--fail); }
-  .b-checking, .b-WAITING, .b-Waiting { background:var(--wait); } .b-WORKING, .b-Working { background:var(--work); }
-  .b-Leader { background:var(--accent); } .b-Worker { background:#5b6b80; }
-  table { width:100%; border-collapse:collapse; }
-  th, td { text-align:left; padding:8px; border-bottom:1px solid var(--line); vertical-align:top; }
-  th { color:var(--muted); font-weight:600; font-size:13px; }
-  td.result { white-space:pre-wrap; font-size:13px; max-width:420px; }
-  #activity { max-height:480px; overflow:auto; }
-  .msg { padding:6px 0; border-bottom:1px dashed var(--line); white-space:pre-wrap; word-break:break-word; }
-  .msg .who { font-weight:600; } .msg .time { color:var(--muted); font-size:12px; margin-right:6px; }
-  .r-leader .who { color:var(--accent); } .r-worker .who { color:var(--work); } .r-system .who { color:var(--muted); } .r-user .who { color:var(--done); }
-  #err { color:var(--fail); min-height:1.5em; }
-  #progress { white-space:pre-wrap; margin:0; max-height:360px; overflow:auto; background:#f8f9fb; border:1px solid var(--line); border-radius:6px; padding:10px; font:13px/1.55 Consolas,"Microsoft JhengHei",monospace; }
+  :root {
+    --bg:#f4f1ec; --panel:#fffdf9; --panel2:#f8f5ef; --line:#e6e0d6; --text:#24211c; --muted:#857d70;
+    --accent:#5b5bd6; --accent-soft:#ebebfb; --ok:#2f8f5b; --ok-soft:#e3f3ea; --bad:#c94a3f; --bad-soft:#fbe8e5;
+    --work:#d98a1e; --work-soft:#fbf0dc; --wait:#8d8678; --wait-soft:#efebe4; --shadow:0 1px 2px rgba(40,30,10,.06), 0 4px 16px rgba(40,30,10,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#17181b; --panel:#1f2024; --panel2:#26272c; --line:#33353b; --text:#ecebe8; --muted:#9a978f;
+      --accent:#8b8bf0; --accent-soft:#2b2b48; --ok:#5cc28a; --ok-soft:#1f3328; --bad:#ec7a6f; --bad-soft:#3b2220;
+      --work:#f0a948; --work-soft:#3a2e1a; --wait:#a39d92; --wait-soft:#2c2c2f; --shadow:none; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.55 "Segoe UI","Microsoft JhengHei UI","Microsoft JhengHei",sans-serif; }
+  button, input, textarea, select { font:inherit; color:inherit; }
+
+  .topbar { position:sticky; top:0; z-index:5; display:flex; align-items:center; gap:14px; padding:12px 24px; background:var(--panel); border-bottom:1px solid var(--line); }
+  .brand { display:flex; align-items:center; gap:10px; font-weight:700; font-size:16px; letter-spacing:.2px; }
+  .logo { width:28px; height:28px; border-radius:8px; background:linear-gradient(135deg,#d97757,#5b5bd6 55%,#10a37f); }
+  .proj-chip { padding:4px 12px; border-radius:999px; background:var(--panel2); border:1px solid var(--line); color:var(--muted); max-width:46vw; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .spacer { flex:1; }
+  .pill { display:inline-flex; align-items:center; gap:6px; padding:4px 12px; border-radius:999px; font-weight:600; font-size:13px; background:var(--wait-soft); color:var(--wait); }
+  .pill.on { background:var(--work-soft); color:var(--work); }
+  .pill.on::before { content:""; width:8px; height:8px; border-radius:50%; background:currentColor; animation:pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity:.25; } }
+
+  .btn { padding:8px 16px; border-radius:10px; border:1px solid var(--line); background:var(--panel); cursor:pointer; transition:background .15s, border-color .15s; }
+  .btn:hover:not(:disabled) { border-color:var(--accent); }
+  .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; padding:9px 22px; }
+  .btn.danger { background:var(--bad); border-color:var(--bad); color:#fff; font-weight:600; }
+  .btn.ghost { background:transparent; }
+  .btn.small { padding:4px 10px; font-size:12px; border-radius:8px; }
+  .btn:disabled { opacity:.45; cursor:not-allowed; }
+
+  .layout { display:grid; grid-template-columns:290px 1fr; gap:20px; padding:20px 24px; max-width:1500px; margin:0 auto; }
+  @media (max-width:980px) { .layout { grid-template-columns:1fr; padding:16px; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px; box-shadow:var(--shadow); }
+  h3 { margin:0 0 12px; font-size:13px; font-weight:700; color:var(--muted); letter-spacing:.4px; display:flex; align-items:center; gap:8px; }
+  .sub { color:var(--muted); font-size:12px; margin:14px 0 6px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  input[type=text], textarea, select { width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:10px; background:var(--panel2); outline:none; }
+  input[type=text]:focus, textarea:focus, select:focus { border-color:var(--accent); }
+  .sidebar { display:flex; flex-direction:column; gap:16px; }
+  .sidebar .row { margin-top:8px; }
+
+  .recent { display:flex; flex-direction:column; gap:6px; }
+  .chip { display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:10px; border:1px solid var(--line); background:var(--panel2); cursor:pointer; text-align:left; width:100%; }
+  .chip:hover { border-color:var(--accent); }
+  .chip.on { border-color:var(--accent); background:var(--accent-soft); }
+  .chip .nm { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
+  .chip .x { color:var(--muted); padding:0 4px; border-radius:6px; }
+  .chip .x:hover { color:var(--bad); }
+  .empty { color:var(--muted); font-size:13px; padding:6px 0; }
+
+  .history { display:flex; flex-direction:column; gap:6px; max-height:420px; overflow:auto; }
+  .hitem { padding:8px 10px; border-radius:10px; border:1px solid var(--line); background:var(--panel2); cursor:pointer; text-align:left; width:100%; }
+  .hitem:hover { border-color:var(--accent); }
+  .hitem .req { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .hitem .meta { color:var(--muted); font-size:12px; display:flex; gap:8px; align-items:center; }
+
+  .stage { display:flex; flex-direction:column; gap:20px; min-width:0; }
+  .seats { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:14px; }
+  .seat { position:relative; background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:16px; box-shadow:var(--shadow); display:flex; flex-direction:column; gap:10px; border-top:4px solid var(--c); }
+  .seat.leader { box-shadow:0 0 0 2px var(--c), var(--shadow); }
+  .seat.off { opacity:.62; }
+  .seat-top { display:flex; align-items:center; gap:12px; }
+  .avatar { width:44px; height:44px; border-radius:12px; display:grid; place-items:center; color:#fff; font-weight:700; background:var(--c); flex:none; }
+  .seat-name { font-weight:700; font-size:15px; }
+  .tags { display:flex; gap:6px; flex-wrap:wrap; margin-top:2px; }
+  .tag { font-size:11px; font-weight:700; padding:1px 8px; border-radius:999px; background:var(--wait-soft); color:var(--wait); letter-spacing:.3px; }
+  .tag.lead { background:var(--c); color:#fff; }
+  .tag.ok { background:var(--ok-soft); color:var(--ok); } .tag.bad { background:var(--bad-soft); color:var(--bad); }
+  .seat-status { display:flex; align-items:center; gap:8px; font-weight:600; min-height:22px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--wait); flex:none; }
+  .dot.work { background:var(--work); animation:pulse 1.2s infinite; } .dot.bad { background:var(--bad); }
+  .seat-last { color:var(--muted); font-size:13px; background:var(--panel2); border-radius:10px; padding:8px 10px; min-height:40px; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; white-space:pre-wrap; word-break:break-word; }
+  .seat .btn { align-self:flex-start; }
+  .cfg { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .cfg label { display:flex; flex-direction:column; gap:3px; font-size:11px; font-weight:700; color:var(--muted); }
+  .cfg select { padding:5px 8px; font-size:13px; font-weight:400; border-radius:8px; }
+  .cfg-note { grid-column:1 / -1; font-size:11.5px; color:var(--muted); }
+
+  .composer textarea { min-height:96px; resize:vertical; border-radius:12px; font-size:15px; }
+  .composer .row { margin-top:10px; }
+  .err { color:var(--bad); font-weight:600; }
+
+  .board { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
+  @media (max-width:1100px) { .board { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  .lane { background:var(--panel2); border-radius:12px; padding:10px; min-height:120px; }
+  .lane-h { display:flex; align-items:center; gap:6px; font-size:12px; font-weight:700; color:var(--muted); margin-bottom:8px; }
+  .lane-h .n { margin-left:auto; background:var(--panel); border-radius:999px; padding:0 8px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--c); border-radius:10px; padding:10px; margin-bottom:8px; }
+  .card .t { font-weight:600; margin-bottom:6px; word-break:break-word; }
+  .who { display:inline-flex; align-items:center; gap:6px; font-size:12px; font-weight:600; }
+  .who i { width:8px; height:8px; border-radius:50%; background:var(--c); display:inline-block; }
+  .card .res { color:var(--muted); font-size:12px; margin-top:6px; white-space:pre-wrap; word-break:break-word; max-height:110px; overflow:auto; }
+  .card .re { display:flex; gap:6px; margin-top:8px; }
+  .card select { padding:4px 6px; font-size:12px; border-radius:8px; }
+
+  .cols { display:grid; grid-template-columns:minmax(0,2fr) minmax(0,1fr); gap:20px; }
+  @media (max-width:1100px) { .cols { grid-template-columns:1fr; } }
+  .chat { display:flex; flex-direction:column; gap:10px; max-height:560px; overflow:auto; padding-right:4px; }
+  .msg { display:flex; gap:10px; align-items:flex-start; max-width:88%; }
+  .msg .av { width:30px; height:30px; border-radius:9px; background:var(--c); color:#fff; font-size:11px; font-weight:700; display:grid; place-items:center; flex:none; }
+  .bubble { background:var(--panel2); border:1px solid var(--line); border-radius:4px 14px 14px 14px; padding:8px 12px; white-space:pre-wrap; word-break:break-word; }
+  .bubble .hd { font-size:12px; color:var(--muted); margin-bottom:2px; }
+  .bubble .hd b { color:var(--text); }
+  .msg.me { align-self:flex-end; }
+  .msg.me .bubble { background:var(--accent); color:#fff; border-color:var(--accent); border-radius:14px 4px 14px 14px; }
+  .msg.me .bubble .hd { color:rgba(255,255,255,.8); }
+  .msg.me .bubble .hd b { color:#fff; }
+  .sys { align-self:center; color:var(--muted); font-size:12px; background:var(--panel2); border-radius:999px; padding:3px 12px; text-align:center; max-width:90%; }
+  #progress { white-space:pre-wrap; margin:0; max-height:520px; overflow:auto; background:var(--panel2); border-radius:10px; padding:10px; font:12.5px/1.6 Consolas,"Microsoft JhengHei",monospace; }
+
+  dialog { width:min(1100px,94vw); max-height:88vh; border:1px solid var(--line); border-radius:16px; padding:0; background:var(--bg); color:var(--text); box-shadow:0 20px 60px rgba(0,0,0,.25); }
+  dialog::backdrop { background:rgba(20,18,14,.45); }
+  .dlg-h { position:sticky; top:0; display:flex; align-items:center; gap:12px; padding:14px 18px; background:var(--panel); border-bottom:1px solid var(--line); }
+  .dlg-b { padding:18px; display:flex; flex-direction:column; gap:16px; }
 </style>
 </head>
 <body>
-<header>Multi-Agent Studio</header>
-<main>
-  <div>
-    <section>
-      <h2>Project 專案資料夾</h2>
-      <input type="text" id="project" placeholder="例如 D:\my-project">
-      <div class="row"><button id="browse">瀏覽…</button><button id="setProject">使用這個資料夾</button></div>
-      <div class="note" id="projectNow"></div>
+<header class="topbar">
+  <div class="brand"><span class="logo"></span>Multi-Agent Studio</div>
+  <div class="proj-chip" id="projChip">尚未選擇專案</div>
+  <div class="spacer"></div>
+  <span class="pill" id="runPill">待命</span>
+  <button class="btn danger" id="stop">Stop</button>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <section class="panel">
+      <h3>專案</h3>
+      <input type="text" id="project" placeholder="貼上資料夾路徑，例如 D:\my-project">
+      <div class="row"><button class="btn" id="browse">瀏覽…</button><button class="btn" id="setProject">使用這個資料夾</button></div>
+      <div class="sub">常用專案（點一下切換）</div>
+      <div class="recent" id="recent"></div>
     </section>
-    <section>
-      <h2>Team 團隊</h2>
-      <div id="team"></div>
-      <div class="row"><button id="recheck">重新檢查 Agent</button></div>
+    <section class="panel">
+      <h3>歷史紀錄</h3>
+      <div class="history" id="history"></div>
     </section>
-  </div>
-  <div>
-    <section>
-      <h2>Request 需求</h2>
-      <textarea id="request" placeholder="你想讓團隊做什麼？"></textarea>
+  </aside>
+
+  <main class="stage">
+    <section class="seats" id="seats"></section>
+
+    <section class="panel composer">
+      <h3>需求</h3>
+      <textarea id="request" placeholder="你想讓團隊做什麼？（Ctrl + Enter 開始）"></textarea>
       <div class="row">
-        <button class="primary" id="start">開始工作</button>
-        <button class="danger" id="stop">Stop</button>
-        <span id="runState" class="note"></span>
+        <span class="err" id="err"></span>
+        <span class="spacer"></span>
+        <button class="btn ghost" id="recheck">重新檢查 Agent</button>
+        <button class="btn primary" id="start">開始工作</button>
       </div>
-      <div id="err"></div>
     </section>
-    <section>
-      <h2>Task Board 工作卡</h2>
-      <div id="tasks"></div>
+
+    <section class="panel">
+      <h3>工作看板</h3>
+      <div id="board"></div>
     </section>
-    <section>
-      <h2>Product First · 共用專案進度</h2>
-      <div class="note" id="progressPath"></div>
-      <pre id="progress">尚未建立 .ai-workspace/progress.md</pre>
-    </section>
-    <section>
-      <h2>Activity 活動紀錄</h2>
-      <div id="activity"></div>
-    </section>
+
+    <div class="cols">
+      <section class="panel">
+        <h3>團隊對話</h3>
+        <div class="chat" id="chat"></div>
+      </section>
+      <section class="panel">
+        <h3>Product First · 共用專案進度</h3>
+        <div class="sub" id="progressPath" style="margin-top:0"></div>
+        <pre id="progress"></pre>
+      </section>
+    </div>
+  </main>
+</div>
+
+<dialog id="histDlg">
+  <div class="dlg-h"><b id="histTitle">歷史紀錄</b><span class="spacer"></span><button class="btn small" id="histClose">關閉</button></div>
+  <div class="dlg-b">
+    <div class="panel" id="histMeta"></div>
+    <div class="panel"><h3>工作看板</h3><div id="histBoard"></div></div>
+    <div class="panel"><h3>團隊對話</h3><div class="chat" id="histChat" style="max-height:none"></div></div>
   </div>
-</main>
+</dialog>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
-let S = null, last = '';
+const LOOK = { claude: { c:'#d97757', ab:'CC' }, codex: { c:'#10a37f', ab:'CX' }, antigravity: { c:'#4285f4', ab:'AG' } };
+const look = (id) => LOOK[id] || { c:'#8d8678', ab:String(id).slice(0, 2).toUpperCase() };
+const LANES = [['WAITING','等待中'], ['WORKING','進行中'], ['DONE','完成'], ['FAILED','失敗 / 停止']];
+const STATUS = { done:'完成', failed:'有失敗', stopped:'已停止' };
+let S = null, last = '', histRev = -1, shownProject = null;
 
 async function post(url, body) {
   $('err').textContent = '';
-  const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  const r = await fetch(url, { method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify(body || {}) });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) { $('err').textContent = j.error || ('錯誤 ' + r.status); throw new Error(j.error); }
   refresh();
   return j;
 }
 
-function name(id) { return S.agents.find((a) => a.id === id)?.name || id; }
+const name = (id, agents = S.agents) => agents.find((a) => a.id === id)?.name || id;
+const base = (p) => String(p).split(/[\\/]/).filter(Boolean).pop() || p;
+const fmt = (iso) => new Date(iso).toLocaleString('zh-TW', { month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit', hour12:false });
+
+function boardHtml(tasks, agents, editable) {
+  if (!tasks.length) return '<div class="empty">還沒有工作。輸入需求並按「開始工作」，Leader 會拆解並派工。</div>';
+  const avail = agents.filter((a) => a.status === 'available');
+  return `<div class="board">${LANES.map(([st, label]) => {
+    const list = tasks.filter((t) => t.status === st);
+    return `<div class="lane"><div class="lane-h">${label}<span class="n">${list.length}</span></div>${list.map((t) => `
+      <div class="card" style="--c:${look(t.agent).c}">
+        <div class="t">${esc(t.title)}</div>
+        <span class="who"><i></i>${esc(name(t.agent, agents))}</span>
+        ${t.result ? `<div class="res">${esc(t.result)}</div>` : ''}
+        ${editable && st !== 'WORKING' && st !== 'DONE' ? `<div class="re"><select data-task="${t.id}">${avail.map((a) => `<option value="${a.id}" ${a.id === t.agent ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><button class="btn small" data-reassign="${t.id}">改派</button></div>` : ''}
+      </div>`).join('')}</div>`;
+  }).join('')}</div>`;
+}
+
+function chatHtml(activity, agents) {
+  if (!activity.length) return '<div class="empty">尚無對話。</div>';
+  return activity.map((m) => {
+    if (m.role === 'system') return `<div class="sys">${esc(m.time)} · ${esc(m.text)}</div>`;
+    if (m.role === 'user') return `<div class="msg me"><div class="bubble"><div class="hd"><b>你</b> · ${esc(m.time)}</div>${esc(m.text)}</div></div>`;
+    const l = look(m.who);
+    return `<div class="msg" style="--c:${l.c}"><div class="av">${l.ab}</div><div class="bubble"><div class="hd"><b>${esc(name(m.who, agents))}</b> · ${m.role === 'leader' ? 'Leader' : 'Worker'} · ${esc(m.time)}</div>${esc(m.text)}</div></div>`;
+  }).join('');
+}
+
+function cfgHtml(a) {
+  const cfg = S.agentCfg[a.id] || {};
+  if (!a.models.length && !a.efforts.length) {
+    return `<div class="cfg"><span class="cfg-note">${a.status === 'checking' ? '讀取模型清單中…' : '此 Agent 使用預設模型（不支援切換）'}</span></div>`;
+  }
+  return `<div class="cfg">
+    <label>模型<select data-cfg="${a.id}" data-k="model" ${S.run?.active ? 'disabled' : ''}>
+      <option value="">預設</option>${a.models.map((m) => `<option value="${esc(m.value)}" title="${esc(m.description)}" ${m.value === cfg.model ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}
+    </select></label>
+    <label>推理強度<select data-cfg="${a.id}" data-k="effort" ${S.run?.active || !a.efforts.length ? 'disabled' : ''}>
+      <option value="">預設</option>${a.efforts.map((v) => `<option value="${esc(v)}" ${v === cfg.effort ? 'selected' : ''}>${esc(v)}</option>`).join('')}
+    </select></label>
+  </div>`;
+}
 
 function render() {
   const running = !!S.run?.active;
-  $('projectNow').textContent = S.project ? '目前專案：' + S.project : '尚未選擇專案';
-  if (!$('project').value && S.project) $('project').value = S.project;
+  $('projChip').textContent = S.project ? '📁 ' + S.project : '尚未選擇專案';
+  $('projChip').title = S.project;
+  if (S.project !== shownProject) { shownProject = S.project; $('project').value = S.project || ''; }
+  $('runPill').textContent = running ? `團隊工作中 · Leader ${name(S.leader)}` : (S.run?.stopped ? '已停止' : '待命');
+  $('runPill').classList.toggle('on', running);
+  $('start').disabled = running;
+  $('stop').disabled = !running;
+  $('setProject').disabled = $('browse').disabled = running;
 
-  const statusText = { available: 'Available', unavailable: 'Unavailable', checking: '檢查中…' };
-  $('team').innerHTML = S.agents.map((a) => {
-    const lead = a.id === S.leader;
-    return `<div class="agent ${lead ? 'leader' : ''}">
-      <span class="name">${esc(a.name)}</span>
-      <span class="badge b-${a.status}">${statusText[a.status]}</span>
-      <span class="badge b-${lead ? 'Leader' : 'Worker'}">${lead ? 'Leader' : 'Worker'}</span>
-      <span class="badge b-${a.working ? 'Working' : 'Waiting'}">${a.working ? 'Working' : 'Waiting'}</span>
-      ${a.note ? `<div class="note">${esc(a.note)}</div>` : ''}
-      ${lead ? '' : `<div class="row"><button data-leader="${a.id}" ${a.status !== 'available' || running ? 'disabled' : ''}>設為 Leader</button></div>`}
+  $('recent').innerHTML = S.recent.length ? S.recent.map((p) => `
+    <div class="chip ${p === S.project ? 'on' : ''}" data-project="${esc(p)}" title="${esc(p)}">
+      <span class="nm">${esc(base(p))}</span><span class="x" data-remove="${esc(p)}" title="從清單移除">✕</span>
+    </div>`).join('') : '<div class="empty">用過的專案會出現在這裡。</div>';
+
+  if (!$('seats').contains(document.activeElement)) $('seats').innerHTML = S.agents.map((a) => {
+    const l = look(a.id), lead = a.id === S.leader, off = a.status !== 'available';
+    const task = S.tasks.find((t) => t.status === 'WORKING' && t.agent === a.id);
+    const lastMsg = [...S.activity].reverse().find((m) => m.who === a.id);
+    let status = '<span class="dot"></span>待命';
+    if (a.status === 'checking') status = '<span class="dot"></span>檢查中…';
+    else if (a.status === 'unavailable') status = '<span class="dot bad"></span>無法使用';
+    else if (a.working) status = `<span class="dot work"></span>${task ? '工作中：' + esc(task.title) : lead ? (S.tasks.length ? '整理總結中' : '規劃與派工中') : '工作中'}`;
+    const lastTxt = a.status === 'unavailable' ? a.note : lastMsg?.text || (lead ? '我會把你的需求拆成工作卡，分給大家。' : '等待 Leader 派工。');
+    return `<div class="seat ${lead ? 'leader' : ''} ${off ? 'off' : ''}" style="--c:${l.c}">
+      <div class="seat-top"><div class="avatar">${l.ab}</div><div>
+        <div class="seat-name">${esc(a.name)}</div>
+        <div class="tags">${lead ? '<span class="tag lead">LEADER</span>' : '<span class="tag">WORKER</span>'}${a.status === 'available' ? '<span class="tag ok">可用</span>' : a.status === 'unavailable' ? '<span class="tag bad">不可用</span>' : ''}</div>
+      </div></div>
+      <div class="seat-status">${status}</div>
+      <div class="seat-last">${esc(lastTxt)}</div>
+      ${cfgHtml(a)}
+      ${lead ? '' : `<button class="btn small" data-leader="${a.id}" ${off || running ? 'disabled' : ''}>設為 Leader</button>`}
     </div>`;
   }).join('');
 
-  $('start').disabled = running;
-  $('stop').disabled = !running;
-  $('runState').textContent = running ? `團隊工作中（Leader：${name(S.leader)}）` : (S.run?.stopped ? '已停止' : '');
-  $('progressPath').textContent = S.progress?.exists ? S.progress.file : 'Claude / Codex 共用：.ai-workspace/progress.md';
+  if (!$('board').contains(document.activeElement)) $('board').innerHTML = boardHtml(S.tasks, S.agents, true);
+
+  const box = $('chat');
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  box.innerHTML = chatHtml(S.activity, S.agents);
+  if (atBottom) box.scrollTop = box.scrollHeight;
+
+  $('progressPath').textContent = S.progress?.exists ? S.progress.file : '專案裡的 .ai-workspace/progress.md';
   $('progress').textContent = S.progress?.exists ? S.progress.text : '尚未建立 .ai-workspace/progress.md';
 
-  if (!$('tasks').contains(document.activeElement)) {
-    $('tasks').innerHTML = S.tasks.length ? `<table><tr><th>Task</th><th>Assigned Agent</th><th>Status</th><th>結果</th><th>Reassign</th></tr>${S.tasks.map((t) => `
-      <tr><td>${esc(t.title)}</td><td>${esc(name(t.agent))}</td>
-      <td><span class="badge b-${t.status}">${t.status}</span></td>
-      <td class="result">${esc(t.result)}</td>
-      <td>${t.status === 'WORKING' ? '' : `<select data-task="${t.id}">${S.agents.filter((a) => a.status === 'available').map((a) => `<option value="${a.id}" ${a.id === t.agent ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select>
-        <button data-reassign="${t.id}">重新指派</button>`}</td></tr>`).join('')}</table>`
-      : '<div class="note">還沒有工作。輸入需求並按「開始工作」，Leader 會拆解並派工。</div>';
-  }
+  if (S.historyRev !== histRev) { histRev = S.historyRev; loadHistory(); }
+}
 
-  const box = $('activity');
-  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
-  box.innerHTML = S.activity.map((m) => `<div class="msg r-${m.role}"><span class="time">${esc(m.time)}</span><span class="who">${esc(m.who === 'user' ? '你' : m.who === 'studio' ? 'Studio' : name(m.who) + (m.role === 'leader' ? '（Leader）' : '（Worker）'))}</span>：${esc(m.text)}</div>`).join('') || '<div class="note">尚無活動。</div>';
-  if (atBottom) box.scrollTop = box.scrollHeight;
+async function loadHistory() {
+  const list = await (await fetch('/api/history')).json();
+  $('history').innerHTML = list.length ? list.map((h) => `
+    <button class="hitem" data-hist="${h.id}">
+      <div class="req">${esc(h.request)}</div>
+      <div class="meta"><span>${fmt(h.startedAt)}</span><span>${esc(base(h.project))}</span><span>${STATUS[h.status] || h.status} ${h.done}/${h.total}</span></div>
+    </button>`).join('') : '<div class="empty">完成的工作會保存在這裡。</div>';
+}
+
+async function openHistory(id) {
+  const r = await (await fetch('/api/history/' + id)).json();
+  $('histTitle').textContent = fmt(r.startedAt) + ' 的工作紀錄';
+  $('histMeta').innerHTML = `<div><b>需求：</b>${esc(r.request)}</div>
+    <div class="sub" style="margin:6px 0 0">專案 ${esc(r.project)} · Leader ${esc(name(r.leader))} · ${STATUS[r.status] || r.status}</div>`;
+  $('histBoard').innerHTML = boardHtml(r.tasks, S.agents, false);
+  $('histChat').innerHTML = chatHtml(r.activity, S.agents);
+  $('histDlg').showModal();
 }
 
 async function refresh() {
@@ -145,7 +326,7 @@ async function refresh() {
     const txt = await r.text();
     if (txt === last) return;
     last = txt; S = JSON.parse(txt); render();
-  } catch { $('runState').textContent = '無法連到 Studio（視窗是否已關閉？）'; }
+  } catch { $('runPill').textContent = '無法連到 Studio（視窗是否已關閉？）'; }
 }
 
 $('browse').onclick = () => post('/api/browse').then((j) => { if (j.path) $('project').value = j.path; });
@@ -153,7 +334,22 @@ $('setProject').onclick = () => post('/api/project', { path: $('project').value 
 $('recheck').onclick = () => post('/api/check');
 $('start').onclick = () => post('/api/start', { request: $('request').value });
 $('stop').onclick = () => post('/api/stop');
+$('histClose').onclick = () => $('histDlg').close();
+$('request').addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.ctrlKey && !$('start').disabled) $('start').click(); });
+document.addEventListener('change', (e) => {
+  const s = e.target.closest('select[data-cfg]');
+  if (!s) return;
+  const id = s.dataset.cfg, pick = (k) => document.querySelector(`select[data-cfg="${id}"][data-k="${k}"]`).value;
+  s.blur();
+  post('/api/agent-config', { agent: id, model: pick('model'), effort: pick('effort') }).catch(() => {});
+});
 document.addEventListener('click', (e) => {
+  const rm = e.target.closest('[data-remove]');
+  if (rm) { e.stopPropagation(); return post('/api/recent/remove', { path: rm.dataset.remove }); }
+  const chip = e.target.closest('[data-project]');
+  if (chip && !S.run?.active) return post('/api/project', { path: chip.dataset.project });
+  const h = e.target.closest('[data-hist]');
+  if (h) return openHistory(h.dataset.hist);
   const b = e.target.closest('button');
   b?.blur();
   if (b?.dataset.leader) post('/api/leader', { agent: b.dataset.leader });

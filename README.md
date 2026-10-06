@@ -25,10 +25,13 @@ A local web page where Claude Code, Codex and Antigravity work as one team. Pick
 
 Start: double-click `start-studio.cmd` (needs Node.js). The browser opens `http://127.0.0.1:4848`. Close the console window to stop the Studio.
 
+- Each agent has a seat card with its model and reasoning-effort picker (lists come from the agent itself; Antigravity uses its default). Changes apply from the next run.
+- Leader, project, recent projects and model choices are saved in `runtime/studio/settings.json`. Every run is saved in `runtime/studio/history/` and can be reopened from the 歷史紀錄 list.
+- The Leader spreads independent subtasks across Workers, which run at the same time (one task per Worker at a time).
 - First start downloads AionCore v0.2.2 (official release, SHA-256 checked) into `runtime/`.
 - Agents must already be installed and logged in (`claude auth login`, `codex login`). The Team panel shows `Unavailable` with the reason otherwise; click 重新檢查 Agent after fixing.
 - Workers can edit files and run commands in the chosen folder without asking (Claude: `bypassPermissions`, Codex: `auto`). Use disposable or version-controlled projects only.
-- Known limits: AionCore writes an `.agents/` folder into the project when Antigravity works there. State lives in memory; restarting the Studio clears the board.
+- Known limits: AionCore writes an `.agents/` folder into the project when Antigravity works there. Restarting the Studio clears the current board (past runs stay in history).
 
 ## Documentation
 
