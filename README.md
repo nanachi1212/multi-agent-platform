@@ -19,6 +19,17 @@ Core direction:
 
 This is an experimental research project and is not ready for product use.
 
+## Multi-Agent Studio (MVP)
+
+A local web page where Claude Code, Codex and Antigravity work as one team. Pick any available agent as Leader; the others are Workers. The Leader splits your request into tasks and assigns them, Workers do the work in your project folder, and the Leader writes a final report.
+
+Start: double-click `start-studio.cmd` (needs Node.js). The browser opens `http://127.0.0.1:4848`. Close the console window to stop the Studio.
+
+- First start downloads AionCore v0.2.2 (official release, SHA-256 checked) into `runtime/`.
+- Agents must already be installed and logged in (`claude auth login`, `codex login`). The Team panel shows `Unavailable` with the reason otherwise; click 重新檢查 Agent after fixing.
+- Workers can edit files and run commands in the chosen folder without asking (Claude: `bypassPermissions`, Codex: `auto`). Use disposable or version-controlled projects only.
+- Known limits: AionCore writes an `.agents/` folder into the project when Antigravity works there. State lives in memory; restarting the Studio clears the board.
+
 ## Documentation
 
 - [Architecture V1](docs/architecture/MULTI_AGENT_PLATFORM_ARCHITECTURE_V1.md)

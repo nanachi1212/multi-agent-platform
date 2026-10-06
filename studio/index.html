@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multi-Agent Studio</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --line:#dde1e6; --text:#1d2329; --muted:#6b7480; --accent:#2f6fde;
+          --done:#1f8a4c; --fail:#c63b3b; --work:#d9822b; --wait:#7a8494; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 "Segoe UI","Microsoft JhengHei",sans-serif; }
+  header { padding:14px 20px; background:#1d2329; color:#fff; font-size:18px; font-weight:600; }
+  main { display:grid; grid-template-columns: 380px 1fr; gap:16px; padding:16px; max-width:1400px; margin:auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; margin-bottom:16px; }
+  h2 { margin:0 0 10px; font-size:15px; color:var(--muted); font-weight:600; }
+  input[type=text], textarea, select { width:100%; padding:8px; border:1px solid var(--line); border-radius:6px; font:inherit; }
+  textarea { min-height:120px; resize:vertical; }
+  button { padding:8px 14px; border:1px solid var(--line); border-radius:6px; background:#fff; font:inherit; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  button.danger { background:var(--fail); border-color:var(--fail); color:#fff; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .row { display:flex; gap:8px; align-items:center; margin-top:8px; flex-wrap:wrap; }
+  .agent { border:1px solid var(--line); border-radius:6px; padding:10px; margin-bottom:8px; }
+  .agent.leader { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .agent .name { font-weight:600; }
+  .note { color:var(--muted); font-size:12px; word-break:break-word; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; color:#fff; margin-left:4px; }
+  .b-available, .b-DONE { background:var(--done); } .b-unavailable, .b-FAILED { background:var(--fail); }
+  .b-checking, .b-WAITING, .b-Waiting { background:var(--wait); } .b-WORKING, .b-Working { background:var(--work); }
+  .b-Leader { background:var(--accent); } .b-Worker { background:#5b6b80; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:13px; }
+  td.result { white-space:pre-wrap; font-size:13px; max-width:420px; }
+  #activity { max-height:480px; overflow:auto; }
+  .msg { padding:6px 0; border-bottom:1px dashed var(--line); white-space:pre-wrap; word-break:break-word; }
+  .msg .who { font-weight:600; } .msg .time { color:var(--muted); font-size:12px; margin-right:6px; }
+  .r-leader .who { color:var(--accent); } .r-worker .who { color:var(--work); } .r-system .who { color:var(--muted); } .r-user .who { color:var(--done); }
+  #err { color:var(--fail); min-height:1.5em; }
+  #progress { white-space:pre-wrap; margin:0; max-height:360px; overflow:auto; background:#f8f9fb; border:1px solid var(--line); border-radius:6px; padding:10px; font:13px/1.55 Consolas,"Microsoft JhengHei",monospace; }
+</style>
+</head>
+<body>
+<header>Multi-Agent Studio</header>
+<main>
+  <div>
+    <section>
+      <h2>Project 專案資料夾</h2>
+      <input type="text" id="project" placeholder="例如 D:\my-project">
+      <div class="row"><button id="browse">瀏覽…</button><button id="setProject">使用這個資料夾</button></div>
+      <div class="note" id="projectNow"></div>
+    </section>
+    <section>
+      <h2>Team 團隊</h2>
+      <div id="team"></div>
+      <div class="row"><button id="recheck">重新檢查 Agent</button></div>
+    </section>
+  </div>
+  <div>
+    <section>
+      <h2>Request 需求</h2>
+      <textarea id="request" placeholder="你想讓團隊做什麼？"></textarea>
+      <div class="row">
+        <button class="primary" id="start">開始工作</button>
+        <button class="danger" id="stop">Stop</button>
+        <span id="runState" class="note"></span>
+      </div>
+      <div id="err"></div>
+    </section>
+    <section>
+      <h2>Task Board 工作卡</h2>
+      <div id="tasks"></div>
+    </section>
+    <section>
+      <h2>Product First · 共用專案進度</h2>
+      <div class="note" id="progressPath"></div>
+      <pre id="progress">尚未建立 .ai-workspace/progress.md</pre>
+    </section>
+    <section>
+      <h2>Activity 活動紀錄</h2>
+      <div id="activity"></div>
+    </section>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+let S = null, last = '';
+
+async function post(url, body) {
+  $('err').textContent = '';
+  const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { $('err').textContent = j.error || ('錯誤 ' + r.status); throw new Error(j.error); }
+  refresh();
+  return j;
+}
+
+function name(id) { return S.agents.find((a) => a.id === id)?.name || id; }
+
+function render() {
+  const running = !!S.run?.active;
+  $('projectNow').textContent = S.project ? '目前專案：' + S.project : '尚未選擇專案';
+  if (!$('project').value && S.project) $('project').value = S.project;
+
+  const statusText = { available: 'Available', unavailable: 'Unavailable', checking: '檢查中…' };
+  $('team').innerHTML = S.agents.map((a) => {
+    const lead = a.id === S.leader;
+    return `<div class="agent ${lead ? 'leader' : ''}">
+      <span class="name">${esc(a.name)}</span>
+      <span class="badge b-${a.status}">${statusText[a.status]}</span>
+      <span class="badge b-${lead ? 'Leader' : 'Worker'}">${lead ? 'Leader' : 'Worker'}</span>
+      <span class="badge b-${a.working ? 'Working' : 'Waiting'}">${a.working ? 'Working' : 'Waiting'}</span>
+      ${a.note ? `<div class="note">${esc(a.note)}</div>` : ''}
+      ${lead ? '' : `<div class="row"><button data-leader="${a.id}" ${a.status !== 'available' || running ? 'disabled' : ''}>設為 Leader</button></div>`}
+    </div>`;
+  }).join('');
+
+  $('start').disabled = running;
+  $('stop').disabled = !running;
+  $('runState').textContent = running ? `團隊工作中（Leader：${name(S.leader)}）` : (S.run?.stopped ? '已停止' : '');
+  $('progressPath').textContent = S.progress?.exists ? S.progress.file : 'Claude / Codex 共用：.ai-workspace/progress.md';
+  $('progress').textContent = S.progress?.exists ? S.progress.text : '尚未建立 .ai-workspace/progress.md';
+
+  if (!$('tasks').contains(document.activeElement)) {
+    $('tasks').innerHTML = S.tasks.length ? `<table><tr><th>Task</th><th>Assigned Agent</th><th>Status</th><th>結果</th><th>Reassign</th></tr>${S.tasks.map((t) => `
+      <tr><td>${esc(t.title)}</td><td>${esc(name(t.agent))}</td>
+      <td><span class="badge b-${t.status}">${t.status}</span></td>
+      <td class="result">${esc(t.result)}</td>
+      <td>${t.status === 'WORKING' ? '' : `<select data-task="${t.id}">${S.agents.filter((a) => a.status === 'available').map((a) => `<option value="${a.id}" ${a.id === t.agent ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select>
+        <button data-reassign="${t.id}">重新指派</button>`}</td></tr>`).join('')}</table>`
+      : '<div class="note">還沒有工作。輸入需求並按「開始工作」，Leader 會拆解並派工。</div>';
+  }
+
+  const box = $('activity');
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+  box.innerHTML = S.activity.map((m) => `<div class="msg r-${m.role}"><span class="time">${esc(m.time)}</span><span class="who">${esc(m.who === 'user' ? '你' : m.who === 'studio' ? 'Studio' : name(m.who) + (m.role === 'leader' ? '（Leader）' : '（Worker）'))}</span>：${esc(m.text)}</div>`).join('') || '<div class="note">尚無活動。</div>';
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/state');
+    const txt = await r.text();
+    if (txt === last) return;
+    last = txt; S = JSON.parse(txt); render();
+  } catch { $('runState').textContent = '無法連到 Studio（視窗是否已關閉？）'; }
+}
+
+$('browse').onclick = () => post('/api/browse').then((j) => { if (j.path) $('project').value = j.path; });
+$('setProject').onclick = () => post('/api/project', { path: $('project').value });
+$('recheck').onclick = () => post('/api/check');
+$('start').onclick = () => post('/api/start', { request: $('request').value });
+$('stop').onclick = () => post('/api/stop');
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  b?.blur();
+  if (b?.dataset.leader) post('/api/leader', { agent: b.dataset.leader });
+  if (b?.dataset.reassign) post('/api/reassign', { taskId: b.dataset.reassign, agent: document.querySelector(`select[data-task="${b.dataset.reassign}"]`).value });
+});
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
