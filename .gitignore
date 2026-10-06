@@ -1,0 +1,51 @@
+# Local runtime, experiment state, and sensitive data
+/runtime/
+/p0-sandbox/
+/reports/evidence/
+/evidence/
+/logs/
+/tmp/
+/temp/
+/worktrees/
+/data/
+/.codex/
+/.claude/
+/.agents/
+.env
+.env.*
+*.log
+*.db
+*.db-*
+*.db*
+*.sqlite
+*.sqlite3
+*.sqlite*
+*.zip
+*.7z
+*.tar
+*.gz
+*.exe
+*.dll
+*.pdb
+*.bin
+*.key
+*.pem
+*.crt
+*.token
+*.secret
+
+# Dependencies and generated output
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Nested Git metadata (including experimental repositories)
+.git/
