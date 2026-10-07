@@ -337,21 +337,26 @@ async function sendMessage(convId, text) {
 // Changes whenever the agent adds or updates a message: the sign that a long step is still making progress.
 async function progressMark(convId) {
   const items = (await api('GET', `/api/conversations/${convId}/messages`)).items || [];
-  return items.length + '|' + items.slice(-3).map((m) => `${m.id}:${m.status}:${m.created_at}`).join(',');
+  const last = items.at(-1);
+  return { mark: items.length + '|' + items.slice(-3).map((m) => `${m.id}:${m.status}:${m.created_at}`).join(','),
+    tool: last?.type === 'tool_call' && last.status !== 'finish' ? clip(toolText(last.content), 140) : '' }; // a command that is still running
 }
+// conversationId -> { at: last time the agent showed progress, tool: command still running, confirm: waiting for a permission answer }
+const convActivity = new Map();
 
 const HARD_CAP_MS = 3 * 3600e3; // no single step may run longer than this
 // timeout = how long the agent may show NO progress (new messages); a long job that keeps working is never cut off.
-async function turn(agent, convId, text, { w, lead = false, check = false, allowStart, timeout = 25 * 60e3, progressEvery = 30000 } = {}) {
+async function turn(agent, convId, text, { w, lead = false, check = false, allowStart, ask = false, timeout = 25 * 60e3, progressEvery = 30000 } = {}) {
   const run = w?.run;
   if (!check && (run?.stopped || run?.paused || allowStart && !allowStart())) throw new Halt('執行已停止');
   const sent = await sendMessage(convId, text);
   active.set(convId, sent.turn_id);
+  convActivity.set(convId, { at: Date.now(), tool: '', confirm: false }); // a fresh turn starts with fresh activity
   if (!check) S.agents[agent].working++;
   let confirmedIdle = false;
   try {
     if (!check && (run?.stopped || run?.paused || allowStart && !allowStart())) throw new Halt('執行已停止');
-    let mark = '', markAt = Date.now(), checkedAt = 0;
+    let mark = '', markAt = Date.now(), checkedAt = 0, tool = '';
     for (const t0 = Date.now(); ;) {
       await sleep(1500);
       const rt = (await api('GET', `/api/conversations/${convId}`)).runtime || {};
@@ -360,9 +365,11 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
       const now = Date.now();
       if (now - checkedAt >= progressEvery) {
         checkedAt = now;
-        const m = await progressMark(convId).catch(() => mark);
-        if (m !== mark) { mark = m; markAt = now; }
+        const m = await progressMark(convId).catch(() => null);
+        if (m && m.mark !== mark) { mark = m.mark; markAt = now; }
+        if (m) tool = m.tool;
       }
+      convActivity.set(convId, { at: markAt, tool, confirm: !!rt.pending_confirmations });
       if (now - markAt > timeout || now - t0 > HARD_CAP_MS) {
         const mins = Math.round((now - markAt) / 60e3);
         confirmedIdle = await stopTurn(convId); // never leave the conversation busy: the next card on it would bounce with "already running"
@@ -374,6 +381,7 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
     throw e;
   } finally {
     active.delete(convId);
+    convActivity.delete(convId);
     if (!check) S.agents[agent].working--;
     if (agent === 'codex') refreshCodexLimits();
   }
@@ -381,7 +389,7 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
   const items = (await api('GET', `/api/conversations/${convId}/messages`)).items || [];
   const after = items.slice(items.findIndex((m) => m.id === sent.msg_id) + 1);
   // A failed tool call mid-turn is normal (agents retry); only a failed text reply means the turn failed.
-  const texts = after.filter((m) => m.type === 'text' && m.position === 'left');
+  const texts = after.filter((m) => m.type === 'text' && m.position === 'left' && (ask || !isAskAnswer(m))); // a progress answer is never a card's result
   const last = texts.at(-1);
   const err = last?.status === 'error' ? last : !last && after.find((m) => m.status === 'error');
   if (err) throw new Error(String(err.content?.content ?? JSON.stringify(err.content)).slice(0, 1000));
@@ -1225,7 +1233,7 @@ function writerHandoffNote(from, to, prior) {
 }
 async function lastAgentText(cid) {
   if (!cid) return '';
-  try { const items = (await api('GET', `/api/conversations/${cid}/messages`)).items || []; const m = items.filter((x) => x.type === 'text' && x.position === 'left').at(-1); return clip(m?.content?.content || '', 700); } catch { return ''; }
+  try { const items = (await api('GET', `/api/conversations/${cid}/messages`)).items || []; const m = items.filter((x) => x.type === 'text' && x.position === 'left' && !isAskAnswer(x)).at(-1); return clip(m?.content?.content || '', 700); } catch { return ''; }
 }
 async function handoffWriter(w, toAgent, taskId) {
   if (!AGENTS[toAgent]) throw new Error('未知的 Agent');
@@ -1348,6 +1356,8 @@ async function runCard(w, t) {
   const note = t.wakeNote;
   const startAgent = t.agent;
   t.status = 'WORKING';
+  t.workingSince = nowIso(); // this work spell (shown as 已執行)
+  t.firstStartedAt ||= t.workingSince;
   t.wakeNote = '';
   log(w, t.agent, 'worker', (note ? '收到等待的結果，繼續：' : t.resumed ? '繼續工作：' : '開始工作：') + t.title);
   try {
@@ -1371,7 +1381,17 @@ When you end your turn, reply with a short summary of what you did (1-3 sentence
 ${STATUS_RULES}`;
     const cid = await conv(w, t.agent, false, t.hard, t.workdir);
     // A step stopped by 立刻打斷 ends early (maybe with an error): park the card until the Leader has read the note.
-    const step = async (text) => { try { return await turn(t.agent, cid, text, { w, allowStart: () => t.agent === startAgent && !t.hold && run.active }); } catch (e) { if (t.interrupted && !(e instanceof Halt)) return ''; throw e; } };
+    const step = async (text) => {
+      cardStep.add(cid);
+      try {
+        if (askBusy.has(cid)) { // a progress question is being answered: Stop / Pause / 打斷 / handoff meanwhile cancelled that turn, not this step
+          await askBusy.get(cid);
+          if (t.interrupted) return '';
+          if (run.stopped || run.paused) throw new Halt(run.stopped ? '已停止' : '已暫停');
+        }
+        return await turn(t.agent, cid, text, { w, allowStart: () => t.agent === startAgent && !t.hold && run.active });
+      } catch (e) { if (t.interrupted && !(e instanceof Halt)) return ''; throw e; } finally { cardStep.delete(cid); t.stepEndAt = Date.now(); }
+    };
     const park = () => {
       Object.assign(t, { status: 'WAITING', interrupted: false, resumed: true,
         wakeNote: 'The user stopped your previous step midway to give you a new instruction. First check the current state of the files (your last step may be half done), then continue the task.'
@@ -1468,6 +1488,125 @@ function applyStatus(w, t, st, reply) {
   notify(`${label(w)}：${who} 需要你處理`, t.ask.question.slice(0, 160), 'ask', w.project);
 }
 
+// ---------- Work details and progress questions ----------
+// Observation only: asking never makes a card, never takes a lease, never interrupts the work.
+const STUCK_MS = 8 * 60e3; // no new activity for this long = "可能卡住" (a hint only; nothing is stopped)
+const cardStep = new Set(); // conversations a card step is using right now
+const askBusy = new Map(); // conversationId -> a progress question being answered between steps
+const ASKABLE = ['WORKING', 'WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'];
+const ASK_DEFAULT = '目前做到哪裡？現在正在做什麼？有沒有卡住？預計下一步是什麼？';
+const askPrompt = (q, title) => `Question from the user (Nana) about your task "${title}". This is only a question, not a new instruction:
+"${q}"
+Reply now with ONE separate text message that starts with "${ASK_MARK}" and answers briefly in the user's language (2-5 short lines): how far you are, what you are doing right now, whether you are stuck (and why), and your next step. Write it as a visible reply, not only in your thoughts.
+Do not change your plan, do not edit files or run commands for this question, and do not add a STATUS line.`;
+const convOf = (w, t) => w.run?.convs?.[workKey(t)];
+const ASK_MARK = 'PROGRESS ANSWER:';
+const isAskAnswer = (m) => String(m.content?.content || '').toUpperCase().includes(ASK_MARK);
+const answerText = (x) => String(x || '').replace(/^\s*STATUS:.*$/gim, '').replace(/^[\s*_]*PROGRESS ANSWER:[\s*_]*/i, '').trim();
+
+// Leader / work-memory view of a working card: time, last activity, possibly stuck.
+function workInfo(w, t) {
+  if (t.status !== 'WORKING' || !t.workingSince) return '';
+  const a = convActivity.get(convOf(w, t)), mins = (ms) => Math.max(0, Math.round(ms / 60e3));
+  const idle = a ? Date.now() - a.at : 0;
+  return ` | working ${mins(Date.now() - Date.parse(t.workingSince))} min, last activity ${mins(idle)} min ago`
+    + (a?.confirm ? ', waiting for a tool permission' : a?.tool ? `, running: ${a.tool}` : '')
+    + (idle >= STUCK_MS && !a?.tool ? ' (no progress for a while: possibly stuck; long work alone is fine)' : '');
+}
+
+async function askAgent(w, id, text) {
+  const t = w.tasks.find((x) => x.id === id);
+  if (!t) throw new Error('找不到這張工作卡');
+  if (!ASKABLE.includes(t.status)) throw new Error('這張卡現在沒有在工作，沒有可以詢問的對象');
+  const cid = convOf(w, t);
+  if (!cid) throw new Error('這位 AI 員工還沒開始這張卡，等它開始後再問');
+  const q = { id: crypto.randomUUID().slice(0, 8), at: nowIso(), text: clip(String(text || '').trim(), 500) || ASK_DEFAULT, state: 'queued', answer: '', agent: t.agent };
+  (t.asks ||= []).push(q);
+  if (t.asks.length > 20) t.asks.shift();
+  const rt = (await api('GET', `/api/conversations/${cid}`).catch(() => ({}))).runtime || {};
+  if (t.status === 'WORKING' && cardStep.has(cid) && !askBusy.has(cid) && active.has(cid) && rt.is_processing && rt.supports_midturn_delivery) { // only into this card's own working step
+    // The backend takes a message in the middle of a turn: ask now, the work goes on.
+    try { Object.assign(q, { state: 'sent', how: 'now', msgId: (await api('POST', `/api/conversations/${cid}/messages`, { content: askPrompt(q.text, t.title) })).msg_id }); return q; }
+    catch { /* not taken right now: ask at the next safe point */ }
+  }
+  q.how = 'later';
+  deliverAsk(w, t, cid, q);
+  return q;
+}
+
+// Between steps: when the conversation is idle, ask in a short turn of its own (a card step waits for it).
+async function deliverAsk(w, t, cid, q) {
+  const run = w.run;
+  for (const t0 = Date.now(); ; await sleep(2000)) {
+    if (run.stopped || w.run !== run) return Object.assign(q, { state: 'failed', answer: '工作已停止，問題沒有送出。' });
+    if (Date.now() - t0 > HARD_CAP_MS) return Object.assign(q, { state: 'failed', answer: '一直等不到安全的時點，問題沒有送出。' });
+    if (!run.paused && !active.has(cid) && !cardStep.has(cid) && !askBusy.has(cid)) break;
+  }
+  if (!ASKABLE.includes(t.status)) return Object.assign(q, { state: 'closed', answer: '問題送達前這張卡已經結束，沒有再問。它最後的回報：' + clip(t.result, 600) });
+  const why = t.agent !== q.agent ? '這張卡已經交給別的 AI 員工，問題沒有送給原本的那位。'
+    : convOf(w, t) !== cid ? '這張卡換了新的對話，問題沒有送出，請再問一次。' : '';
+  if (why) return Object.assign(q, { state: 'failed', answer: why });
+  let done;
+  askBusy.set(cid, new Promise((r) => { done = r; }));
+  try {
+    q.state = 'sent';
+    const reply = await turn(t.agent, cid, askPrompt(q.text, t.title), { w, check: true, ask: true, timeout: 5 * 60e3 });
+    if (run.stopped || run.paused) Object.assign(q, { state: 'failed', answer: '工作被' + (run.stopped ? '停止' : '暫停') + '，這個問題沒有得到回答。' });
+    else Object.assign(q, { state: 'answered', answer: answerText(reply.toUpperCase().includes(ASK_MARK) ? reply.slice(reply.toUpperCase().indexOf(ASK_MARK)) : reply) || '（沒有文字回覆）', answeredAt: nowIso() });
+  } catch (e) { Object.assign(q, { state: 'failed', answer: '沒有得到回覆：' + clip(e.message, 200) }); }
+  finally { askBusy.delete(cid); done(); }
+}
+
+// A question sent in the middle of a turn: its answer is the first AI text after it.
+// Only a message carrying the marker counts: the agent's own progress lines are not the answer.
+function resolveAsks(t, items) {
+  for (const q of t.asks || []) {
+    if (q.state !== 'sent' || !q.msgId) continue;
+    const i = items.findIndex((m) => m.id === q.msgId);
+    const a = i < 0 ? null : items.slice(i + 1).find((m) => m.type === 'text' && m.position === 'left' && String(m.content?.content || '').toUpperCase().includes(ASK_MARK));
+    if (!a) continue;
+    const x = String(a.content.content);
+    Object.assign(q, { state: 'answered', answer: clip(answerText(x.slice(x.toUpperCase().indexOf(ASK_MARK))), 1500), answeredAt: new Date(a.created_at || Date.now()).toISOString() });
+  }
+}
+async function pollAsks() {
+  for (const w of S.workspaces) for (const t of w.tasks) {
+    const cid = convOf(w, t);
+    if (!t.asks?.some((q) => q.state === 'sent' && q.msgId) || !cid) continue;
+    const items = (await api('GET', `/api/conversations/${cid}/messages`).catch(() => null))?.items;
+    if (!items) continue;
+    resolveAsks(t, items);
+    // The step ended without an answer (it may have answered only in its thoughts): ask again between steps.
+    if (active.has(cid) || cardStep.has(cid)) continue;
+    for (const q of t.asks.filter((x) => x.state === 'sent' && x.msgId)) { Object.assign(q, { state: 'queued', how: 'later', msgId: '' }); deliverAsk(w, t, cid, q); }
+  }
+}
+
+// A tool call reads as its name plus the command it runs (backends put the command in different places).
+function toolText(c = {}) {
+  const name = String(c.name || ''), cmd = String(c.input?.command || c.args?.CommandLine || c.args?.command || c.input?.file_path || '');
+  return cmd && !name.includes(cmd.slice(0, 20)) ? name + '：' + cmd : name;
+}
+const itemText = (m) => (m.type === 'tool_call' ? toolText(m.content) : typeof m.content?.content === 'string' ? m.content.content : '') || '';
+// What one card's agent is doing: plain lines, newest first; the raw conversation only on request.
+async function cardDetail(w, id) {
+  const t = w.tasks.find((x) => x.id === id);
+  if (!t) throw new Error('找不到這張工作卡');
+  const cid = convOf(w, t);
+  const items = cid ? (await api('GET', `/api/conversations/${cid}/messages`).catch(() => ({}))).items || [] : [];
+  resolveAsks(t, items);
+  const since = Date.parse(t.firstStartedAt || 0) - 2000; // one conversation may hold several cards of this agent
+  const until = t.status === 'WORKING' || !t.stepEndAt ? Infinity : t.stepEndAt + 2000; // the same agent may already work on another card in this conversation
+  const mine = items.filter((m) => (m.created_at || 0) >= since && (m.created_at || 0) <= until);
+  const say = (m) => m.type === 'text' && m.position === 'left' && answerText(m.content?.content);
+  const acts = mine.filter((m) => m.type === 'tool_call' || say(m)).slice(-12).reverse()
+    .map((m) => ({ at: m.created_at, kind: m.type === 'tool_call' ? 'tool' : 'say', text: clip(m.type === 'tool_call' ? itemText(m) : answerText(itemText(m)).split('\n')[0], 160), running: m.type === 'tool_call' && m.status !== 'finish' }));
+  const last = [...mine].reverse().find(say);
+  return { id: t.id, title: t.title, agent: t.agent, status: t.status, workingSince: t.workingSince, firstStartedAt: t.firstStartedAt, wait: t.wait, result: t.result,
+    activity: convActivity.get(cid) || null, acts, lastSay: last ? clip(answerText(itemText(last)), 800) : '', asks: t.asks || [],
+    log: mine.slice(-50).map((m) => ({ at: m.created_at, who: m.position === 'right' ? 'Studio' : 'AI', kind: m.type, text: clip(itemText(m), 600) })) };
+}
+
 // ---------- Instructions from the user while a job runs ----------
 // The user's note goes to the Leader, who decides: tell a worker (on its card), cancel cards that
 // have not started, or add cards. A busy Leader (planning / final check) gets the notes right after.
@@ -1510,7 +1649,7 @@ async function processNotes(w) {
 ${notes.join('\n')}
 """
 Current cards:
-${w.tasks.map((t) => `- id ${t.id} [${t.status}] ${t.title} (${t.agent})`).join('\n')}
+${w.tasks.map((t) => `- id ${t.id} [${t.status}] ${t.title} (${t.agent})${workInfo(w, t)}`).join('\n')}
 Workers you can assign: ${workers.map((x) => `${x} (${agentName(x)})`).join(', ')}
 
 Decide how to apply the instructions. Do not modify files, open files or run commands.
@@ -2246,7 +2385,7 @@ const routes = {
           const raw = String(t.wait.error).trim();
           blocked_reason = raw.startsWith('Blocked') ? raw.replace(/^Blocked\s*[:：]\s*/i, 'Blocked：') : `Blocked：${raw}`;
         }
-        return { ...t, blocked_reason: blocked_reason || null };
+        return { ...t, blocked_reason: blocked_reason || null, ...(t.status === 'WORKING' ? { activity: convActivity.get(convOf(w, t)) || null } : {}) };
       });
       return { wsInfo: w.wsInfo, lease, workspace_summary, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, delivery: w.delivery, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
         run: r && { extMod: r.extMod, claimedBy: r.claimedBy, id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
@@ -2282,6 +2421,8 @@ const routes = {
   'POST /api/strategy': (b) => setStrategy(wsOf(b.ws), b.strategy),
   'POST /api/answer': (b) => answer(wsOf(b.ws), b.taskId, b.text),
   'POST /api/continue-card': (b) => continueCard(wsOf(b.ws), b.taskId),
+  'POST /api/card/detail': (b) => cardDetail(wsOf(b.ws), b.taskId),
+  'POST /api/card/ask': (b) => askAgent(wsOf(b.ws), b.taskId, b.text),
   'POST /api/check': () => { checkAll().then(refreshClaudeLimits); },
   'POST /api/recent/remove': (b) => removeRecent(b.path),
   'POST /api/agent-config': (b) => setAgentCfg(wsOf(b.ws), b.agent, b.model, b.effort, b.hardModel, b.hardEffort),
@@ -2340,6 +2481,7 @@ await refreshRuntimeReadiness();
 setInterval(() => refreshRuntimeReadiness().catch(() => {}), 10000);
 setInterval(watchBackendWaits, 5000); // owned backend recovery is readiness-gated
 setInterval(beatLeases, LEASE_BEAT_MS); // heartbeat of the leases this Studio holds
+setInterval(() => pollAsks().catch(() => {}), 10000); // answers to questions sent in the middle of a turn
 setInterval(() => checkWorkspaces().catch(() => {}), 15000); // unknown changes to a tree Studio holds
 // Port taken (e.g. another Studio copy is open): use the next free one, unless STUDIO_PORT asked for an exact port.
 server.on('error', (e) => {

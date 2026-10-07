@@ -27,6 +27,7 @@ module.exports = async function () {
     STATE_LOOK: { need: ['🔴', 'bad'], open: ['🟡', 'on'], wait: ['🟡', 'on'], done: ['✅', 'ok'], idle: ['⚪', ''] },
     wsStatus: () => ['ok', '正常', 'ok'],
     when: () => '剛剛',
+    workState: () => null, workButtons: () => '', ASKABLE: ['WORKING', 'WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'], // work-progress helpers (own tests in lifecycle-check 17)
   };
 
   // Extract functions from index.html:
