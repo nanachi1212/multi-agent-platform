@@ -500,6 +500,9 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     await assert.rejects(ED2.api.resume(wD2), /工作區已由另一個 Agent 接手，本工作保持暫停/);
     assert.strictEqual(ran2.length, 0, 'nothing runs after the restart');
     assert.ok(writeLeases(ED2.env).every((l) => l.owner.agent === 'claude'), 'the writer is still Claude');
+    const staleCodex = await ED2.api.acquireWrite(wD2, wD2.tasks[0], await ED2.api.workspaceOf(repoD.d));
+    assert.strictEqual(staleCodex.ok, false, 'the restarted pre-handoff Codex snapshot cannot reacquire the workspace');
+    assert.ok(writeLeases(ED2.env).every((l) => l.owner.agent === 'claude'), 'the stale job did not replace Claude as writer');
   }
 
   // E) STOP: the job ends for good, the lease is released, a restart does not bring it back

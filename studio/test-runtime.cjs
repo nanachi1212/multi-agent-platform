@@ -103,27 +103,47 @@ async function runRuntimeTests() {
       root_pid: smokeProc.pid,
       process_identity: await registry.getProcessInfo(smokeProc.pid),
       executable: process.execPath,
-      command: `smoke backend on port ${smokeEnv.port}`,
-      port: smokeEnv.port,
+      command: 'smoke backend on port 3028',
+      port: 3028,
       data_dir: smokeEnv.dataDir,
       temp_dir: smokeEnv.tempRoot,
       rtDir: mockProdDir
     });
     assert.strictEqual(rt.purpose, 'smoke');
-    assert.strictEqual(rt.port, smokeEnv.port);
+    assert.strictEqual(rt.port, 3028);
 
-    // 3. Verify: while smoke backend is alive holding its lock on 3028/smoke DATA_DIR,
-    // the production backend (mockProdDir) can independently acquire its OWN lock on prodDataDir!
+    // 3. While the smoke lock remains held on 3028, a separate fake production process
+    // acquires its own lock and reports healthy through the 3018 readiness contract.
     const prodLockFile = path.join(prodDataDir, '.mining_process.lock');
-    const prodFd = fs.openSync(prodLockFile, 'wx');
-    fs.writeSync(prodFd, 'locked by prod');
-    fs.closeSync(prodFd);
+    const prodLockScript = `const fs = require('fs'); const fd = fs.openSync(process.argv[1], 'wx'); fs.writeSync(fd, 'locked by prod'); console.log('LOCKED'); setInterval(() => {}, 1000);`;
+    const prodProc = spawn(process.execPath, ['-e', prodLockScript, prodLockFile], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    SPAWNED_PROCS.push(prodProc);
+    await waitOutput(prodProc, /LOCKED/);
     assert.ok(fs.existsSync(prodLockFile), 'production data lock successfully created and acquired');
+    const prodRuntime = registry.registerRuntime({
+      job_id: 'production-3018-h-1234', purpose: 'dev_backend', root_pid: prodProc.pid,
+      process_identity: await registry.getProcessInfo(prodProc.pid), executable: process.execPath,
+      command: 'fake production backend with isolated lock', port: 3018, data_dir: prodDataDir, rtDir: mockProdDir
+    });
+    const prodReady = await readiness.checkBackendReadiness(prodRuntime, {
+      isPidAlive: registry.isPidAlive,
+      verifyOwnership: async (runtime) => ({ ok: runtime.runtime_id === prodRuntime.runtime_id && runtime.data_dir === prodDataDir,
+        reason: 'production runtime identity mismatch' }),
+      // Keep the regression deterministic and avoid binding the host's real 3018 port.
+      portReachable: async (port) => port === 3018,
+      getHealth: async (port) => port === 3018
+        ? { httpStatus: 200, body: { status: 'ok' } }
+        : { httpStatus: 503, body: { error: 'wrong port' } }
+    });
+    assert.strictEqual(registry.isPidAlive(smokeProc.pid), true, 'the stale smoke lock owner remains present during the regression');
+    assert.strictEqual(prodReady.status, 'BACKEND_READY', '3028 smoke lock residue does not prevent the isolated 3018 backend from becoming ready');
+    assert.strictEqual(prodReady.health_http_status, 200);
 
     // Clean up smoke process
     safeKill(smokeProc);
+    safeKill(prodProc);
     smokeEnv.cleanup();
-    console.log('Case H: smoke 隔離（正式與 smoke DATA_DIR 分離、3028 活著時 3018 仍可取鎖）: PASS');
+    console.log('Case H: 3028 smoke lock retained; isolated 3018 production lock acquired and readiness BACKEND_READY: PASS');
   }
 
   // =========================================================================
