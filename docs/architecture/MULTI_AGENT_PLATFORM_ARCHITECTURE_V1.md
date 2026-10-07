@@ -111,7 +111,7 @@
 
 ### 2.4 升級門檻（不可跳過）
 
-處理 **hostile repository、sensitive credentials、production remote 或 TWstock 等正式 repo** 之前，必須先完成以下至少一項並通過對應 acceptance test：
+處理 **hostile repository、sensitive credentials、production remote 或其他正式 repo** 之前，必須先完成以下至少一項並通過對應 acceptance test：
 
 - OS-level isolation：專用低權限 Windows 帳號、VM、Windows Sandbox、WSL/container 或 AppContainer；或
 - Authenticated + scoped AionCore client：Agent 的 runtime token 不能呼叫 conversation create / message send / confirmation confirm（需 upstream 支援或經 §12.3 程序核准的最小 patch）。
@@ -560,7 +560,7 @@ REJECT：**0 項**。本輪沒有取得能推翻任何 Codex P0/P1 finding 的�
 ## 15. Open Decisions（不阻擋本文件；P0 前需使用者決定）
 
 1. **P0 授權**：下載並執行 `aioncore-v0.2.2-x86_64-pc-windows-msvc.zip`（約數十 MB，`UNVERIFIED` 實際大小）；是否允許 `--managed-resources-mode download` 的啟動下載（若 `bundled` 不可用）。
-2. **Disposable repo 位置**（建議新建空 repo，不使用 TWstock 或任何正式 repo）。
+2. **Disposable repo 位置**（建議新建空 repo，不使用任何正式 repo）。
 3. **P0 納入哪些 agent**：預設 Claude、Codex、agy；Gemini 選填。
 4. **agy approval**：接受 workspace hook gate 與約 30 秒逾時自動 deny，或 MVP-0 只讓 agy 擔任唯讀角色。
 5. **Identity mode 風險**：若 R3 webui 失敗，是否接受 local mode 進 MVP-0（§4.3）。

@@ -45,7 +45,6 @@ W1 有兩個彼此獨立的缺陷，分別只有一方能修。另有一個殘�
 
 | 文件 | 用到的結論 |
 |---|---|
-| [HANDOFF_HOME_2026-10-06.md](../HANDOFF_HOME_2026-10-06.md) | 本輪範圍、版本、哪些 evidence 不在家用電腦上 |
 | [Architecture V1][v1] | W1 定義（§9）、NO-GO 處理順序（§12.3）、禁止修改 PATH/Registry（§1.2） |
 | [P0 Spike Report][p0] | W1 原始失敗；Claude tool shell 所在 Job 的 immediate flags 是 `0x800` |
 | [W1 Root-Cause Review][review] | AionCore source path；packaged/unpackaged/policy-2 的 native 對照（TESTED） |
@@ -343,7 +342,6 @@ pwsh 44312 的 **immediate Job**：
 9. AppContainer、silo 等機制能否處理 D1/R1（本輪沒有評估到可實作的程度）。
 10. 家用 Claude Code 2.1.268 與辦公室 2.1.290、AionCore 已驗證的 2.1.236 之間的行為差異。
 
-[handoff]: ../HANDOFF_HOME_2026-10-06.md
 [v1]: ../architecture/MULTI_AGENT_PLATFORM_ARCHITECTURE_V1.md
 [p0]: ./P0_SPIKE_REPORT.md
 [review]: ./W1_ROOT_CAUSE_REVIEW_CODEX.md

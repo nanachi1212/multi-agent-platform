@@ -200,7 +200,7 @@ Attribution（`w10-attribution.log`）：
 ## 9. Incidents
 
 ### Incident 1 — PID reuse 誤殺（`reports/evidence/INCIDENT-w1-pid-reuse.md`）
-- 約 14:16（+08:00），W1 cleanup 對 4 個被誤判為 AionCore descendant 的 PID 執行 `taskkill /F`：TWstock frontend 的一組 Vite dev server（pnpm / vite / node / esbuild）。
+- 約 14:16（+08:00），W1 cleanup 對 4 個被誤判為 AionCore descendant 的 PID 執行 `taskkill /F`：另一個專案前端的一組 Vite dev server（pnpm / vite / node / esbuild）。
 - 原因：只依 ParentProcessId 走訪，PID reuse 造成誤判（`INFERRED`）。
 - 損害：該 dev server 實例停止。沒有任何 repo 檔案被讀取、修改或刪除；未自行重啟。
 - 修正：
@@ -265,6 +265,6 @@ Attribution（`w10-attribution.log`）：
 - **未做**：
   - 未安裝 AionUi，未 fork 或 patch AionCore；
   - 未修改 PATH / Registry / Git global / MCP / Agent 全域設定，未升降級任何 CLI；
-  - 未修改 TWstock 或其他 repo；
+  - 未修改其他專案的 repo；
   - 未 commit、push、PR 或 deploy，未開始 MVP-0。
 - **目前狀態**：AionCore 已全部停止，無殘留 spike 程序，無 endpoint file。
