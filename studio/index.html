@@ -459,6 +459,9 @@ function boardHtml(tasks, agents, editable) {
         <span class="who"><i></i>${esc(agents.find((a) => a.id === t.agent)?.name || t.agent)}</span>
         ${t.result && t.status !== 'PAUSED' ? `<div class="res">${esc(t.result)}</div>` : ''}
         ${PARKED.includes(t.status) ? `<div class="res"><b>${esc(waitLine(t))}</b></div>` : ''}
+        ${t.blocked && editable ? blockedHtml(S.workspaces.find((x) => x.project === curPath()) || {}, t) : ''}
+        ${t.worktree ? `<div class="res">🌿 獨立 worktree：${esc(t.worktree.branch)}${t.worktree.cleaned ? '（已清掉）' : ''}</div>` : ''}
+        ${t.handoffs?.length ? `<div class="res">🤝 交接：${t.handoffs.map((h) => esc(name(h.from)) + ' → ' + esc(name(h.to))).join('、')}</div>` : ''}
         ${t.detail ? `<details class="tech"><summary>查看技術細節</summary><pre>${esc(t.detail)}</pre></details>` : ''}
         ${editable && st !== 'WORKING' && st !== 'DONE' ? `<div class="re"><select data-task="${t.id}">${avail.map((a) => `<option value="${a.id}" ${a.id === t.agent ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><button class="btn small" data-reassign="${t.id}">改派</button></div>` : ''}
       </div>`).join('')}</div>`;
@@ -485,6 +488,31 @@ const STEP_WORD = { DONE:'已完成', WORKING:'工作中', WAITING:'待做', PAU
 const prShort = (pr) => (/^\d+$/.test(String(pr)) ? '#' + pr : '#' + String(pr).split('/').pop());
 
 // One honest line about what a parked card waits for and what happens next.
+// Who may write this working tree, and the ways out when a card is refused.
+const LEASE_WORD = { ACTIVE: '修改中', RESERVED: '保留中（暫停／等待）', STALE: '已失效', RELEASED: '已釋放' };
+function leaseHtml(w) {
+  const L = w.lease || {}, wr = L.writer, info = w.wsInfo || {};
+  const readers = (L.readers || []).map((x) => esc(x.owner) + (x.card ? '（' + esc(x.card) + '）' : '')).join('、');
+  const tag = (st) => `<span class="tag ${st === 'ACTIVE' ? 'lead' : st === 'STALE' ? 'bad' : 'pz'}">${esc(st)}</span>`;
+  const others = S.agents.filter((a) => a.status === 'available' && (!wr || wr.kind !== 'studio' || a.id !== wr.agent));
+  const buttons = [
+    wr && wr.kind === 'studio' && w.run ? `<select data-handoff style="width:auto;padding:3px 6px;font-size:12px" title="先停下現在的寫入者、等它真的停住，再把寫入權和這張卡交給另一位"><option value="">改由…接手</option>${others.map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select>` : '',
+    wr && wr.kind === 'external' ? '<button class="btn small" data-release-claim title="外部 Agent 做完了，把工作區還給 Studio">外部已歸還</button>' : '<button class="btn small ghost" data-claim title="另一個 AI 視窗或你自己要改這個資料夾：Studio 會停下自己的寫入並保護這個工作區">外部 Agent／我要自己改</button>',
+    wr && wr.state === 'STALE' ? `<button class="btn small" data-release-lease="${esc(wr.id)}">釋放失效的租約</button>` : '',
+  ].join(' ');
+  return `<div class="team-line" style="display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center">
+    <span>✍️ <b>寫入者</b>：${wr ? `<b>${esc(wr.owner)}</b> ${LEASE_WORD[wr.state] || esc(wr.state)}${wr.card ? '：「' + esc(wr.card) + '」' : ''} ${tag(wr.state)}${wr.flag ? `<span class="tag bad">${esc(wr.flag)}</span>` : ''}` : '目前沒有人'}</span>
+    <span title="${esc(info.path || w.project)}">📁 ${esc(info.repo || base(info.path || w.project))}${info.branch ? ' · branch ' + esc(info.branch) : ''}</span>
+    ${readers ? `<span>👁 唯讀：${readers}</span>` : ''}${buttons}</div>`;
+}
+// A refused card: who has the tree, and the three ways out.
+function blockedHtml(w, t) {
+  const b = t.blocked;
+  return `<div class="askbox" style="border-color:var(--work)"><div class="q">${esc(t.blockReason || '')}</div>
+    <div class="hint">${esc(b?.owner || '')}${b?.card ? ' · 卡「' + esc(b.card) + '」' : ''}${b?.branch ? ' · branch ' + esc(b.branch) : ''} · 狀態 ${esc(b?.state || '')}</div>
+    <div class="row"><span class="hint">① 等待（Studio 會自動再試）</span><button class="btn small" data-readonly="${t.id}" title="這張卡只讀程式、做審查或報告，不修改檔案，可以和寫入者同時進行">② 唯讀 Review</button><button class="btn small" data-worktree="${t.id}" title="建立自己的 worktree 和 branch，各自有寫入權，互不干擾">③ 使用獨立 worktree</button></div></div>`;
+}
+
 function waitLine(t) {
   const wt = t.wait || {};
   if (t.status === 'NEEDS_USER') return `需要 Nana：${t.ask?.question || ''}`;
@@ -504,6 +532,9 @@ function attention(w) {
   if (!r) return { ic:'⚪', cls:'', text:'待命：還沒有交辦工作' };
   const askCard = ts.find((t) => t.status === 'NEEDS_USER');
   if (r.active && (askCard || (r.ask && !r.summarizing))) return { ic:'🔴', cls:'bad', need:true, text:'需要 Nana：' + (askCard ? askCard.ask?.question : r.ask.question) };
+  const refused = ts.find((t) => t.blocked && t.status === 'WAITING');
+  if (r.active && refused && !ts.some((t) => t.status === 'WORKING')) return { ic:'🟠', cls:'on', text: refused.blockReason };
+  if (r.paused && r.extMod) return { ic:'🔴', cls:'bad', need:true, text:'偵測到來源不明的修改（EXTERNAL_MODIFICATION_DETECTED）：' + r.extMod.why };
   const manual = ts.find((t) => t.status === 'WAITING_EXTERNAL' && t.wait?.manual);
   if (r.active && manual) return { ic:'🟠', cls:'bad', need:true, text:`需要你按「繼續」：${name(manual.agent)} 在等「${manual.wait.what}」，Studio 無法自動確認` };
   if (r.paused) return { ic:'🔵', cls:'pz', text:ts.some((t) => t.status === 'INTERRUPTED') ? '已中斷：按「繼續」從中斷的地方接著做' : '已暫停：按「繼續」接著做' };
@@ -550,6 +581,7 @@ function officeHtml(w) {
       </select><span class="hint" style="font-size:13px;margin-left:8px">交付：</span>
       <select data-delivery style="width:auto;padding:4px 8px;font-size:13px" title="需求清楚、沒有高風險時，AI 要做到哪裡才停">${[['auto', '🚚 自動做到 merge'], ['pr', '✋ 做到 PR 就停（merge 等我）']].map(([k, t]) => `<option value="${k}" ${(w.delivery || 'auto') === k ? 'selected' : ''}>${t}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">模型策略：</span>
       <select data-strategy style="width:auto;padding:4px 8px;font-size:13px" title="工頭自己判斷普通卡／困難卡；普通卡失敗會自動改用強模型重試一次">${STRATEGY.map(([k, t]) => `<option value="${k}" ${(w.strategy || 'save') === k ? 'selected' : ''}>${t}</option>`).join('')}</select>${w.afterDone === 'auto' ? `<span class="tag pz">🔁 自動中 ${w.autoRounds || 0}/5</span>` : ''}</div>
+    ${leaseHtml(w)}
     <div class="team-line">${esc(lead.name)} 工頭 · ${crew.length ? esc(crew.join(' + ')) + ' 協作' : '目前沒有可用的成員'} · Product First · 自動派工</div>
     <details class="rules"><summary>查看 AI 工作規則 ▾</summary><div class="rules-b">${r && (running || paused) ? `<b>目前交辦的內容</b>${esc(r.request)}` : ''}<b>工頭的工作方式</b>${esc(RULES)}</div></details>
     ${!running && !paused && ['open', 'wait', 'need'].includes(w.pstate?.level) ? '<div class="hint" style="border-top:1px dashed var(--line);padding-top:10px;font-weight:700">或者，開始新的工作</div>' : ''}
@@ -623,6 +655,8 @@ function nowHtml(w, att) {
       ${ask.opts.length ? `<div class="row">${ask.opts.map((o) => `<button class="btn" data-answer="${esc(o)}" data-for="${ask.id}">${esc(o)}</button>`).join('')}</div>` : ''}
       <textarea id="answerText" placeholder="${ask.opts.length ? '或直接打字回覆…' : '在這裡回覆…'}"></textarea>
       <div class="row"><span class="spacer"></span><button class="btn primary" data-answer-send data-for="${ask.id}">送出回覆</button></div></div>`;
+  else if (ts.some((t) => t.blocked && t.status === 'WAITING')) you = ts.filter((t) => t.blocked && t.status === 'WAITING').map((t) => blockedHtml(w, t)).join('');
+  else if (r.paused && r.extMod) you = '<button class="btn pz small" data-resume-confirm>確認接手並繼續</button> 這些修改不是 Studio 的 Agent 做的，Studio 什麼都沒有動。';
   else if (manual.length) you = manual.map((t) => `<div class="row" style="margin-bottom:6px">「${esc(t.wait.what)}」好了嗎？<button class="btn small pz" data-continue-card="${t.id}">好了，繼續</button></div>`).join('');
   else if (r.paused) you = '<button class="btn pz small" data-resume-job>▶ 繼續</button>';
   else if (!r.active && r.result !== 'done' && !r.stopped) you = '看一下下面的結果，或按「↻ 接著上次的工作」';
@@ -659,6 +693,7 @@ function projCardHtml(w) {
       ${r?.active || r?.paused ? `<button class="btn small ${r.paused ? 'pz' : ''}" data-pz="${esc(w.project)}">${r.paused ? '繼續' : '暫停'}</button>` : ''}</div>
     <div class="sub" style="margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(w.project)}">${esc(w.project)}</div>
     <div class="att ${attention(w).cls}">${attention(w).ic} ${esc(attention(w).text)}</div>
+    ${w.lease?.writer ? `<div class="lim-f">✍️ ${esc(w.lease.writer.owner)} ${esc(LEASE_WORD[w.lease.writer.state] || w.lease.writer.state)}${w.lease.writer.card ? '：「' + esc(w.lease.writer.card) + '」' : ''}</div>` : ''}
     ${w.afterDone === 'auto' ? `<div class="lim-f"><span class="tag pz">🔁 自動持續開發 ${w.autoRounds || 0}/5</span></div>` : w.afterDone === 'suggest' && !w.run?.active && w.pstate?.suggestions?.length ? `<div class="lim-f"><b>建議</b> ${esc(w.pstate.suggestions.map((x) => x.title).join('、'))}</div>` : ''}
     ${attention(w).state && attention(w).state.level !== 'idle' ? `<div class="lim-f"><b>下一步</b> ${esc(attention(w).state.next)}</div><div class="lim-f"><b>Nana</b> ${esc(attention(w).state.you)}</div>` : ''}
     <div class="pc-req">${r?.active || r?.paused ? esc(r.request) : w.pstate?.goal ? '上次目標：' + esc(w.pstate.goal) : r ? esc(r.request) : '<span class="empty">還沒有工作，點進來交給團隊。</span>'}</div>
@@ -841,7 +876,11 @@ const browse = () => post('/api/browse').then((j) => { if (j.project) go(j.proje
 $('browse').onclick = browse;
 $('setProject').onclick = () => openProject($('project').value).then(() => { $('project').value = ''; });
 $('stop').onclick = () => confirm('停止這件工作？\n\n• 成員馬上停下，未完成的工作卡標成失敗\n• 這件工作不能再按「繼續」，之後要用「▶ 接著處理」開新的一輪\n\n只是想晚點再做、保留進度，請按「暫停」。') && post('/api/stop', { ws: ws() });
-$('pauseResume').onclick = () => post(W()?.run?.paused ? '/api/resume' : '/api/pause', { ws: ws() });
+$('pauseResume').onclick = () => {
+  const w = W();
+  if (w?.run?.paused && w.run.extMod && !confirm('偵測到來源不明的修改：' + w.run.extMod.why + '\n\nStudio 什麼都沒有動。要確認接手並繼續嗎？')) return;
+  return post(w?.run?.paused ? '/api/resume' : '/api/pause', { ws: ws(), confirmExternal: !!w?.run?.extMod });
+};
 $('renameWs').onclick = () => { const n = prompt('這個專案的顯示名稱（留空 = 用資料夾名稱）', W()?.name || ''); if (n !== null) post('/api/workspace/rename', { ws: ws(), name: n }); };
 $('closeWs').onclick = () => post('/api/workspace/close', { ws: ws() }).then(() => go(''));
 $('histClose').onclick = () => $('histDlg').close();
@@ -862,6 +901,13 @@ document.addEventListener('input', (e) => {
 });
 document.addEventListener('toggle', (e) => { if (e.target.id === 'doneDrop') doneOpen = e.target.open; }, true);
 document.addEventListener('change', (e) => {
+  const ho = e.target.closest('select[data-handoff]');
+  if (ho) {
+    const id = ho.value, wr = W()?.lease?.writer;
+    ho.value = '';
+    if (id && confirm('把寫入權交給 ' + name(id) + '？\n\n' + (wr ? name(wr.agent) || wr.owner : '現在的寫入者') + ' 會先停下（等它真的停住），這張卡的紀錄和對話都保留，但它不再是這個工作區的寫入者；' + name(id) + ' 從目前的資料夾和 branch 接續。')) return post('/api/handoff', { ws: ws(), agent: id }).catch(() => {});
+    return;
+  }
   const dl = e.target.closest('select[data-delivery]');
   if (dl) return post('/api/delivery', { ws: ws(), mode: dl.value }).catch(() => {});
   const sg = e.target.closest('select[data-strategy]');
@@ -903,6 +949,12 @@ document.addEventListener('click', (e) => {
   const b = e.target.closest('button');
   if (!b) return;
   if (b.id === 'tabAdd') return browse();
+  if (b.dataset.readonly) return post('/api/card/readonly', { ws: ws(), taskId: b.dataset.readonly }).catch(() => {});
+  if (b.dataset.worktree) return confirm('為這張卡建立獨立 worktree（自己的 branch 和資料夾）？\n\n它會和目前的寫入者同時進行；merge 之後 Studio 會自動清掉這個 worktree 和 branch。') && post('/api/card/worktree', { ws: ws(), taskId: b.dataset.worktree }).catch(() => {});
+  if (b.hasAttribute('data-claim')) { const l = prompt('誰要改這個工作區？（例如：Claude 視窗、我自己）', '外部 Agent'); return l && post('/api/workspace/claim', { ws: ws(), label: l }).catch(() => {}); }
+  if (b.hasAttribute('data-release-claim')) return post('/api/workspace/release-claim', { ws: ws() }).catch(() => {});
+  if (b.dataset.releaseLease) return confirm('釋放這個已失效的租約？') && post('/api/lease/release', { id: b.dataset.releaseLease }).catch(() => {});
+  if (b.hasAttribute('data-resume-confirm')) return post('/api/resume', { ws: ws(), confirmExternal: true }).catch(() => {});
   if (b.dataset.suggest !== undefined) {
     const x = W()?.pstate?.suggestions?.[+b.dataset.suggest];
     if (x) { b.disabled = true; return post('/api/start', { ws: ws(), request: x.request, continue: true }).catch(() => {}); }
