@@ -17,9 +17,11 @@ export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, A
   }
   // Serialize admission and persistence between processes; malformed/live locks fail closed.
   let inTransaction = false;
+  let pendingUnlockToken = null;
   function withLeaseTransaction(fn) {
     if (inTransaction) return fn();
     const f = leasesFile() + '.lock';
+    const token = crypto.randomUUID();
     fs.mkdirSync(path.dirname(f), { recursive: true });
     let fd;
     try { fd = fs.openSync(f, 'wx'); }
@@ -27,22 +29,39 @@ export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, A
       if (e.code !== 'EEXIST') throw e;
       let owner;
       try { owner = JSON.parse(fs.readFileSync(f, 'utf8')); } catch { throw new Error('Workspace lease store is locked'); }
-      if (!owner.pid || pidAlive(owner.pid)) throw new Error('Workspace lease store is locked');
-      let recovery;
-      try { recovery = fs.openSync(f + '.reclaim', 'wx'); } catch { throw new Error('Workspace lease store is locked'); }
-      try {
-        const current = JSON.parse(fs.readFileSync(f, 'utf8'));
-        if (!current.pid || pidAlive(current.pid)) throw new Error('Workspace lease store is locked');
-        fs.unlinkSync(f); fd = fs.openSync(f, 'wx');
-      } finally { fs.closeSync(recovery); fs.unlinkSync(f + '.reclaim'); }
+      // A previous transaction in this same Studio may have committed but encountered a
+      // transient Windows EPERM/EBUSY while deleting its lock file. Reclaim only our exact
+      // random token; every other live lock continues to fail closed.
+      if (owner.pid === process.pid && owner.instance === INSTANCE && owner.token && owner.token === pendingUnlockToken) {
+        try { fs.unlinkSync(f); fd = fs.openSync(f, 'wx'); pendingUnlockToken = null; }
+        catch { throw new Error('Workspace lease store is locked'); }
+      }
+      if (!fd) {
+        if (!owner.pid || pidAlive(owner.pid)) throw new Error('Workspace lease store is locked');
+        let recovery;
+        try { recovery = fs.openSync(f + '.reclaim', 'wx'); } catch { throw new Error('Workspace lease store is locked'); }
+        try {
+          const current = JSON.parse(fs.readFileSync(f, 'utf8'));
+          if (!current.pid || pidAlive(current.pid)) throw new Error('Workspace lease store is locked');
+          fs.unlinkSync(f); fd = fs.openSync(f, 'wx');
+        } finally { fs.closeSync(recovery); fs.unlinkSync(f + '.reclaim'); }
+      }
     }
     let snapshot;
     try {
-      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, instance: INSTANCE }));
+      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, instance: INSTANCE, token }));
       mergeLeasesFromDisk(); snapshot = structuredClone(S.leases); inTransaction = true;
       return fn();
     } catch (e) { if (snapshot) S.leases = snapshot; throw e; }
-    finally { inTransaction = false; fs.closeSync(fd); fs.unlinkSync(f); }
+    finally {
+      inTransaction = false;
+      fs.closeSync(fd);
+      try { fs.unlinkSync(f); if (pendingUnlockToken === token) pendingUnlockToken = null; }
+      catch (e) {
+        if (['EPERM', 'EBUSY'].includes(e.code)) pendingUnlockToken = token;
+        else throw e;
+      }
+    }
   }
   function saveLeases() {
     return withLeaseTransaction(() => {
