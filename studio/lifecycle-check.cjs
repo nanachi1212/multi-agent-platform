@@ -17,7 +17,8 @@ function makeEnv(script) {
     started: [], start: async (w, request, cont) => { env.started.push({ request, cont }); }, setTimeout: (fn) => queueMicrotask(fn),
     Halt: class extends Error {}, active: new Map(), busyConvs: () => [], cancelTurn() {}, convAgent: new Map(),
     available: () => true, workersFor: (w, lead) => w.workers.filter((x) => x !== lead),
-    conv: async (w, agent, lead) => agent + (lead ? ':lead' : ':work'),
+    workKey: (t) => t.agent + ':work' + (t.hard ? ':hard' : ''),
+    conv: async (w, agent, lead, hard) => agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : ''),
     turn: async (agent, cid, text) => { prompts.push({ agent, text }); await new Promise((r) => setTimeout(r, 5)); return script(agent, text); },
     execFile: (cmd, args, opts, cb) => cb(new Error('no git / gh in test'), '', ''), isDir: () => true, readHistory() {}, openWorkspace() {}, wsOf() {},
   };
@@ -165,6 +166,32 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
   assert.ok(env.logs.some((l) => l.text === '你的指示：改用藍色，不要寫文件'));
   assert.strictEqual(w.run.result, 'done');
   console.log('8 instructions mid-job (tell working card / cancel / add): PASS');
+
+  // 9) hard cards use the hard conversation; 立刻打斷 stops the working step and the card continues with the note
+  let stopped = false;
+  ({ env, api } = makeEnv(async (agent, text) => {
+    if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"impl","agent":"codex","instructions":"build","hard":true},{"title":"docs","agent":"antigravity","instructions":"docs"}]}';
+    if (text.includes('the user sent new instructions')) {
+      const id = text.match(/id (\w+) \[\w+\] impl/)[1];
+      return JSON.stringify({ message: '改好了', tell: [{ card: id, note: 'use blue' }], cancel: [], add: [] });
+    }
+    if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+    if (text.includes('Task: impl')) { for (let i = 0; i < 40 && !w.tasks[0].interrupted; i++) await new Promise((r) => setTimeout(r, 10)); stopped = w.tasks[0].interrupted; return ''; }
+    if (text.startsWith('Update from Multi-Agent Studio')) return (text.includes('use blue') && text.includes('stopped your previous step') ? 'Blue now.' : 'no note?') + '\nSTATUS: DONE';
+    return 'ok\nSTATUS: DONE';
+  }));
+  w = newW(); env.S.workspaces.push(w);
+  await api.planPhase(w);
+  await new Promise((r) => setTimeout(r, 30));
+  api.instruct(w, '改藍色', true);
+  await settle(); await settle();
+  assert.ok(stopped, 'the working step saw the interrupt');
+  assert.ok(env.prompts.some((p) => p.agent === 'codex' && p.text.includes('Task: impl')), 'hard card ran');
+  assert.deepStrictEqual([w.tasks[0].status, w.tasks[0].result, w.tasks[0].hard], ['DONE', 'Blue now.', true]);
+  assert.ok(env.logs.some((l) => l.text.startsWith('已打斷 Codex')));
+  assert.ok(!w.tasks.some((t) => t.hold), 'holds cleared');
+  assert.strictEqual(w.run.result, 'done');
+  console.log('9 hard card + interrupt now (stop, Leader note, continue): PASS');
 
   // status-line parser
   const { parseStatus } = api;

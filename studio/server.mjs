@@ -210,15 +210,34 @@ function watchCatalogs() {
   ws.onclose = () => setTimeout(watchCatalogs, 2000);
 }
 
-// Per project; the last choice is also the default for the next opened project.
-function setAgentCfg(w, agent, model, effort) {
+// Per project, two tiers: normal (most cards and every Leader turn) and hard (cards the Leader marks "hard").
+// The last choice is also the default for the next opened project.
+function setAgentCfg(w, agent, model, effort, hardModel = '', hardEffort = '') {
   const a = S.agents[agent];
   if (!a) throw new Error('未知的 Agent');
-  if (model && !a.models.some((m) => m.value === model)) throw new Error(`${a.name} 沒有這個模型：${model}`);
-  if (effort && !a.efforts.includes(effort)) throw new Error(`${a.name} 不支援這個推理強度：${effort}`);
-  w.agentCfg[agent] = { model: model || '', effort: effort || '' };
+  for (const m of [model, hardModel]) if (m && !a.models.some((x) => x.value === m)) throw new Error(`${a.name} 沒有這個模型：${m}`);
+  for (const e of [effort, hardEffort]) if (e && !a.efforts.includes(e)) throw new Error(`${a.name} 不支援這個思考強度：${e}`);
+  w.agentCfg[agent] = { model: model || '', effort: effort || '', hardModel: hardModel || '', hardEffort: hardEffort || '' };
   S.agentCfg[agent] = { ...w.agentCfg[agent] };
   saveSettings();
+}
+
+// 省額度預設: cheaper model for normal cards and the Leader, a stronger one for hard cards.
+// Patterns match the catalogs the agents report (first match = newest in their list).
+const PRESET = {
+  claude: { model: /^sonnet$/, effort: 'medium', hardModel: /^opus$/, hardEffort: 'high' },
+  codex: { model: /luna/, effort: 'medium', hardModel: /sol/, hardEffort: 'high' },
+};
+function applyModelPreset(w) {
+  for (const [id, p] of Object.entries(PRESET)) {
+    const a = S.agents[id];
+    if (!a.models.length) continue; // catalog not known yet (agent unavailable): keep its settings
+    const pick = (re) => a.models.find((m) => re.test(m.value))?.value || '';
+    const eff = (e) => (a.efforts.includes(e) ? e : '');
+    w.agentCfg[id] = { model: pick(p.model), effort: eff(p.effort), hardModel: pick(p.hardModel), hardEffort: eff(p.hardEffort) };
+  }
+  saveSettings();
+  return w.agentCfg;
 }
 
 // Which agents may take this project's cards (the Leader is never a Worker).
@@ -291,9 +310,14 @@ async function checkAgent(id) {
 const checkAll = () => Promise.all(Object.keys(AGENTS).map(checkAgent));
 const available = (id) => S.agents[id]?.status === 'available';
 
-async function conv(w, agent, lead) {
-  const key = agent + (lead ? ':lead' : ':work');
-  return (w.run.convs[key] ??= await createConv(agent, w.run.project, lead, w.agentCfg[agent]));
+// One conversation per agent and role; hard cards get their own conversation on the hard model.
+// The Leader always uses the normal tier (it should be cheap: it only plans and checks).
+const workKey = (t) => t.agent + ':work' + (t.hard ? ':hard' : '');
+async function conv(w, agent, lead, hard = false) {
+  const key = agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : '');
+  const c = w.agentCfg[agent] || {};
+  const cfg = hard ? { model: c.hardModel || c.model, effort: c.hardEffort || c.effort } : c;
+  return (w.run.convs[key] ??= await createConv(agent, w.run.project, lead, cfg));
 }
 // This run's conversations that have a turn in progress (other projects keep working).
 const busyConvs = (run) => Object.values(run.convs).filter((c) => active.has(c));
@@ -313,7 +337,9 @@ const SUBTASK_RULES = `- Each subtask goes to exactly one worker id from the lis
 - Use "after" (0-based indexes of EARLIER subtasks in this list) when a subtask needs their results first, e.g. a review after the implementation, a fix after the review, a merge after the fix. Independent subtasks have no "after".
 - When the request needs it, include review, verification and delivery (PR / merge) steps as their own subtasks.
 - Never let two subtasks edit the same file at the same time. A trivial request may stay a single subtask.
-- "instructions" must be complete and self-contained; the worker only sees that text, the results of its "after" subtasks, and the project folder.`;
+- "instructions" must be complete and self-contained; the worker only sees that text, the results of its "after" subtasks, and the project folder.
+- Claude Code has the smallest quota: give it a subtask only when codex and antigravity cannot do it.
+- Set "hard": true only when a subtask needs deep reasoning (a tricky bug, a design across many files, a security-sensitive change). Most subtasks are not hard; hard ones run on a stronger, more expensive model.`;
 
 // The project's work memory inside a Leader prompt.
 function memoryNote(run) {
@@ -329,7 +355,7 @@ ${run.context}
 
 const FIX_JSON = 'Your last reply was not the JSON object Studio needs. Reply again with ONLY that JSON object: no markdown fences, no other text.';
 
-const SUBTASK_SHAPE = `{"title":"<short title>","agent":"<worker id>","instructions":"<full instructions>","after":[<indexes>]}`;
+const SUBTASK_SHAPE = `{"title":"<short title>","agent":"<worker id>","instructions":"<full instructions>","after":[<indexes>],"hard":false}`;
 
 function planPrompt(run, workers) {
   return `You are the LEADER (foreman) of a small AI team in "Multi-Agent Studio".
@@ -343,6 +369,7 @@ ${run.request}
 ${memoryNote(run)}
 Rules:
 - Do NOT do the work yourself. Do NOT create or modify any files. Only plan and delegate.
+- Do not read files, search the repository or run commands yourself (your quota is precious): plan from the request and the work context. When facts are missing, make a short investigation subtask for a worker.
 - Split the request into 1 to 6 small subtasks.
 - Never ask the user for facts that are in the work context, the project folder, or git / GitHub: make looking them up a subtask instead.
 ${SUBTASK_RULES}
@@ -357,7 +384,7 @@ function parseSubtasks(list, workers) {
   return (list || []).filter((x) => x && (x.instructions || x.title)).slice(0, 6).map((x, i) => {
     const a = String(x.agent || '').toLowerCase();
     const after = (Array.isArray(x.after) ? x.after : []).map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n < i);
-    return { title: String(x.title || x.instructions).slice(0, 120), instructions: String(x.instructions || x.title), agent: workers.find((w) => a.includes(w)) || workers[0], after };
+    return { hard: x.hard === true, title: String(x.title || x.instructions).slice(0, 120), instructions: String(x.instructions || x.title), agent: workers.find((w) => a.includes(w)) || workers[0], after };
   });
 }
 
@@ -370,7 +397,7 @@ function parsePlan(reply, workers) {
 function addCards(w, subtasks, lead) {
   const ids = subtasks.map(() => crypto.randomUUID().slice(0, 8));
   subtasks.forEach((st, i) => {
-    w.tasks.push({ id: ids[i], title: st.title, instructions: st.instructions, agent: st.agent, after: st.after.map((n) => ids[n]), status: 'WAITING', result: '' });
+    w.tasks.push({ id: ids[i], hard: st.hard, title: st.title, instructions: st.instructions, agent: st.agent, after: st.after.map((n) => ids[n]), status: 'WAITING', result: '' });
     log(w, lead, 'leader', `派工給 ${AGENTS[st.agent].name}：${st.title}${st.after.length ? `（等「${st.after.map((n) => subtasks[n].title).join('」「')}」完成後開始）` : ''}`);
   });
 }
@@ -436,7 +463,6 @@ function finish(w, status) {
       : failed ? `「${failed.title}」失敗：${failed.result}`.slice(0, 160) : '工頭沒有完成派工，打開專案查看';
     notify(title, body, status, w.project);
   }
-  refreshClaudeLimits();
   refreshState(w); // save the project state at job end
   if (status === 'done' && w.afterDone === 'auto') setTimeout(() => autoNext(w, run), 5000);
 }
@@ -639,7 +665,7 @@ function pump(w) {
     const deps = (t.after || []).map(byId).filter(Boolean);
     if (deps.some((d) => d.status === 'FAILED')) { Object.assign(t, { status: 'FAILED', result: '前一張工作卡失敗，這張沒有開始；交給工頭決定下一步。' }); continue; }
     if (deps.some((d) => d.status !== 'DONE')) continue;
-    if (!w.tasks.some((x) => x.status === 'WORKING' && x.agent === t.agent)) runTask(w, t);
+    if (!t.hold && !w.tasks.some((x) => x.status === 'WORKING' && x.agent === t.agent)) runTask(w, t);
   }
   // Cards that only wait on each other would wait forever.
   const onAgents = w.tasks.filter((t) => t.status === 'WAITING_AGENT');
@@ -670,11 +696,21 @@ ${t.instructions}
 ${deps.length ? `\nResults of the earlier cards this task builds on:\n${deps.map((d) => `- ${d.title} (${AGENTS[d.agent].name}): ${d.result}`).join('\n')}\n` : ''}
 When you end your turn, reply with a short summary of what you did (1-3 sentences).
 ${STATUS_RULES}`;
-    const cid = await conv(w, t.agent, false);
-    const reply = await turn(t.agent, cid, prompt, { w });
+    const cid = await conv(w, t.agent, false, t.hard);
+    // A step stopped by 立刻打斷 ends early (maybe with an error): park the card until the Leader has read the note.
+    const step = async (text) => { try { return await turn(t.agent, cid, text, { w }); } catch (e) { if (t.interrupted && !(e instanceof Halt)) return ''; throw e; } };
+    const park = () => {
+      Object.assign(t, { status: 'WAITING', interrupted: false, resumed: true,
+        wakeNote: 'The user stopped your previous step midway to give you a new instruction. First check the current state of the files (your last step may be half done), then continue the task.'
+          + (t.notes?.length ? '\nNew instruction from the user (via the leader): ' + t.notes.splice(0).join('\n') : '') }); // the note may arrive before the stop
+      log(w, t.agent, 'worker', '已停下，等工頭轉達你的新指示：' + t.title);
+    };
+    const reply = await step(prompt);
+    if (t.interrupted) { park(); return pump(w); }
     let st = parseStatus(reply);
     if (!st) { // ask once instead of guessing
-      const again = await turn(t.agent, cid, `Your last reply had no STATUS line. Reply with only the status line now.\n${STATUS_RULES}`, { w });
+      const again = await step(`Your last reply had no STATUS line. Reply with only the status line now.\n${STATUS_RULES}`);
+      if (t.interrupted) { park(); return pump(w); }
       st = parseStatus(again);
       if (st) st.text = reply.trim();
     }
@@ -683,7 +719,8 @@ ${STATUS_RULES}`;
     while (t.notes?.length) {
       const note = t.notes.splice(0).join('\n');
       log(w, 'studio', 'system', `把你的指示交給 ${AGENTS[t.agent].name}，接著調整「${t.title}」。`);
-      last = await turn(t.agent, cid, `New instruction from the user (via the leader) for your task "${t.title}":\n${note}\n\nApply it to this task now. End your reply with a short summary (1-3 sentences).\n${STATUS_RULES}`, { w });
+      last = await step(`New instruction from the user (via the leader) for your task "${t.title}":\n${note}\n\nApply it to this task now. End your reply with a short summary (1-3 sentences).\n${STATUS_RULES}`);
+      if (t.interrupted) { park(); return pump(w); }
       st = parseStatus(last) || { kind: 'DONE', detail: '', options: [], text: last.trim() };
     }
     applyStatus(w, t, st, last);
@@ -739,13 +776,23 @@ function applyStatus(w, t, st, reply) {
 // ---------- Instructions from the user while a job runs ----------
 // The user's note goes to the Leader, who decides: tell a worker (on its card), cancel cards that
 // have not started, or add cards. A busy Leader (planning / final check) gets the notes right after.
-function instruct(w, text) {
+// interrupt = stop the working cards' current step now; they continue after the Leader has read the note.
+function instruct(w, text, interrupt = false) {
   text = String(text || '').trim();
   if (!text) throw new Error('請輸入指示');
   const run = w.run;
   if (!run?.active && !run?.paused) throw new Error('目前沒有進行中的工作；新的工作請用「交給團隊」');
   if (run.active && run.ask && !run.summarizing) return answer(w, '', text); // the Leader is waiting for an answer: this is it
-  log(w, 'user', 'user', '你的指示：' + text);
+  log(w, 'user', 'user', (interrupt ? '你的指示（立刻打斷）：' : '你的指示：') + text);
+  if (interrupt && run.active) {
+    const working = w.tasks.filter((t) => t.status === 'WORKING');
+    for (const t of working) {
+      Object.assign(t, { hold: true, interrupted: true });
+      const cid = run.convs[workKey(t)];
+      if (cid && active.has(cid)) cancelTurn(cid);
+    }
+    if (working.length) log(w, 'studio', 'system', `已打斷 ${working.map((t) => AGENTS[t.agent].name).join('、')}：等工頭看完你的指示再接著做。`);
+  }
   (run.notes ??= []).push(text);
   if (run.paused) return log(w, 'studio', 'system', '工作暫停中：指示先保留，按「繼續」後交給工頭。');
   processNotes(w);
@@ -771,7 +818,7 @@ Current cards:
 ${w.tasks.map((t) => `- id ${t.id} [${t.status}] ${t.title} (${t.agent})`).join('\n')}
 Workers you can assign: ${workers.map((x) => `${x} (${AGENTS[x].name})`).join(', ')}
 
-Decide how to apply the instructions. Do not modify files.
+Decide how to apply the instructions. Do not modify files, open files or run commands.
 - "tell" reaches that card's worker right away (a working worker gets it as soon as its current step ends; a card that has not started gets it before it starts).
 - "cancel" only cards that are WAITING or waiting on something; never DONE or WORKING cards.
 - "add" new cards; their "after" may only use indexes inside "add".
@@ -795,6 +842,7 @@ ${SUBTASK_RULES}`;
       if (!t || !note) continue;
       if (t.status === 'WORKING') (t.notes ??= []).push(note);
       else if (PARKED.includes(t.status)) wake(w, t, 'New instruction from the user (via the leader): ' + note);
+      else if (t.status === 'WAITING' && t.wakeNote) t.wakeNote += '\nNew instruction from the user (via the leader): ' + note; // an interrupted card
       else if (['WAITING', 'PAUSED', 'INTERRUPTED'].includes(t.status)) t.instructions += '\n\nInstruction added by the user during the job: ' + note;
       else continue;
       log(w, 'studio', 'system', `已把指示轉給 ${AGENTS[t.agent].name}（「${t.title}」）。`);
@@ -812,6 +860,7 @@ ${SUBTASK_RULES}`;
     log(w, 'studio', 'system', '工頭這次沒能處理你的指示，請再送一次。', e.message);
   } finally {
     run.noting = false;
+    for (const t of w.tasks) t.hold = false; // interrupted cards continue now
   }
   pump(w);
   processNotes(w); // more notes may have arrived meanwhile
@@ -1002,7 +1051,7 @@ async function summarize(w, userAnswer = '') {
   run.ask = null;
   const gen = run.leaderGen, lead = run.leader;
   const workers = workersFor(w, lead);
-  const results = w.tasks.map((t) => `- [${t.status}] ${t.title} (${AGENTS[t.agent].name}): ${t.result}`).join('\n');
+  const results = w.tasks.map((t) => `- [${t.status}] ${t.title} (${AGENTS[t.agent].name}): ${clip(t.result, 500)}`).join('\n');
   try {
     const reply = await turn(lead, await conv(w, lead, true), `You are the LEADER. Every current card has ended.${handoffNote(run)}
 Original user request:
@@ -1012,7 +1061,7 @@ ${run.request}
 Cards so far:
 ${results}
 ${memoryNote(run)}${userAnswer ? `\nThe user answered your question:\n"""\n${userAnswer}\n"""\n` : ''}
-Decide whether the user's WHOLE request is complete: built, reviewed, verified, and delivered or merged when the request asks for it. Do not modify files.
+Decide whether the user's WHOLE request is complete: built, reviewed, verified, and delivered or merged when the request asks for it. Do not modify files, open files or run commands: judge from the card results (add a verification subtask if they are not enough).
 Workers you can assign: ${workers.map((x) => `${x} (${AGENTS[x].name})`).join(', ') || '(none available)'}
 
 Reply with ONLY one JSON object, no markdown fences, one of:
@@ -1121,6 +1170,7 @@ function loadRun(w, r) {
   // (goal / refs / context / continues come back too: the work memory survives a restart)
   // Cards that were mid-work when the Studio closed are interrupted; waiting cards keep waiting.
   for (const t of r.tasks) if (t.status === 'WORKING') Object.assign(t, { status: 'INTERRUPTED', result: '已中斷', resumed: true });
+  for (const t of r.tasks) Object.assign(t, { hold: false, interrupted: false });
   w.tasks = r.tasks;
   w.activity = r.activity;
   w.run = { id: r.id, startedAt: r.startedAt, project: r.project, leader: r.leader, request: r.request, convs: r.convs || {}, phase: r.phase || 'working', leaderGen: 0, rounds: r.rounds || 0, ask: r.ask || null, notes: r.notes || [], goal: r.goal, refs: r.refs, context: r.context, continues: r.continues, active: false, paused: true, stopped: false, summarizing: false };
@@ -1287,12 +1337,13 @@ const routes = {
   'POST /api/reassign': (b) => reassign(wsOf(b.ws), b.taskId, b.agent),
   'POST /api/continue': (b) => { const w = wsOf(b.ws); w.autoRounds = 0; return continueProject(w); },
   'POST /api/project-state/refresh': (b) => refreshState(wsOf(b.ws)),
-  'POST /api/instruct': (b) => instruct(wsOf(b.ws), b.text),
+  'POST /api/instruct': (b) => instruct(wsOf(b.ws), b.text, !!b.interrupt),
+  'POST /api/model-preset': (b) => applyModelPreset(wsOf(b.ws)),
   'POST /api/answer': (b) => answer(wsOf(b.ws), b.taskId, b.text),
   'POST /api/continue-card': (b) => continueCard(wsOf(b.ws), b.taskId),
   'POST /api/check': () => { checkAll().then(refreshClaudeLimits); },
   'POST /api/recent/remove': (b) => removeRecent(b.path),
-  'POST /api/agent-config': (b) => setAgentCfg(wsOf(b.ws), b.agent, b.model, b.effort),
+  'POST /api/agent-config': (b) => setAgentCfg(wsOf(b.ws), b.agent, b.model, b.effort, b.hardModel, b.hardEffort),
   'POST /api/workers': (b) => setWorker(wsOf(b.ws), b.agent, !!b.on),
   // One-time login for Studio's separate Codex home, in a visible console window.
   'POST /api/codex-login': () => { spawn('cmd', ['/c', 'start', 'Codex login (Studio)', 'cmd', '/k', 'codex', 'login'], { env: { ...process.env, CODEX_HOME }, detached: true, stdio: 'ignore' }); },
