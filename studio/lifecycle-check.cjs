@@ -6,7 +6,7 @@ const src = require('fs').readFileSync(require('path').join(__dirname, 'server.m
 const region = (a, b) => { const i = src.indexOf(a), j = src.indexOf(b, i); if (i < 0 || j < 0) throw new Error('region ' + a); return src.slice(i, j); };
 const code = region('function handoffNote(run)', '// ---------- Plan limits') + region('async function planPhase(w)', '// Changing the Leader mid-run');
 
-function makeEnv(script) {
+function makeEnv(script, overrides = {}) {
   const logs = [], notices = [], prompts = [];
   const env = {
     AGENTS: { claude: { name: 'Claude Code' }, codex: { name: 'Codex' }, antigravity: { name: 'Antigravity' } },
@@ -14,17 +14,19 @@ function makeEnv(script) {
     log: (w, who, role, text, detail) => logs.push({ who, role, text, detail }),
     notify: (title, body, kind) => notices.push({ title, body, kind }),
     label: () => 'TestProj', refreshClaudeLimits() {}, saveRun() {}, saveSettings() {}, latestJob: () => null, clip: (x, n) => String(x ?? '').slice(0, n), AUTO_MAX: 5, AFTER_DONE: ['stop', 'suggest', 'auto'],
-    started: [], start: async (w, request, cont) => { env.started.push({ request, cont }); }, setTimeout: (fn) => queueMicrotask(fn),
+    started: [], start: async (w, request, cont) => { env.started.push({ request, cont }); }, setTimeout: (fn, ms) => (ms === 5000 ? queueMicrotask(fn) : globalThis.setTimeout(fn, ms)), // only the 5 s auto-continue delay is skipped
     Halt: class extends Error {}, active: new Map(), busyConvs: () => [], cancelTurn() {}, convAgent: new Map(),
     available: () => true, workersFor: (w, lead) => w.workers.filter((x) => x !== lead),
     tierCfg: (w, agent, hard) => ({ model: hard ? 'strong' : 'cheap', effort: '' }),
+    fs: require('fs'), path: require('path'), refreshState() {},
     workKey: (t) => t.agent + ':work' + (t.hard ? ':hard' : ''),
     conv: async (w, agent, lead, hard) => agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : ''),
     turn: async (agent, cid, text) => { prompts.push({ agent, cid, text }); await new Promise((r) => setTimeout(r, 5)); return script(agent, text); },
     execFile: (cmd, args, opts, cb) => cb(new Error('no git / gh in test'), '', ''), isDir: () => true, readHistory() {}, openWorkspace() {}, wsOf() {},
   };
+  Object.assign(env, overrides);
   const names = Object.keys(env);
-  const api = new Function(...names, code + '\nreturn { planPhase, pump, summarize, answer, continueCard, wake, parseStatus, finish, autoNext, instruct };')(...names.map((k) => env[k])); // test harness: our own code
+  const api = new Function(...names, code + '\nreturn { planPhase, pump, summarize, answer, continueCard, wake, parseStatus, finish, autoNext, instruct, pause, resume, stop };')(...names.map((k) => env[k])); // test harness: our own code
   return { env, api };
 }
 const newW = () => ({ project: 'P', leader: 'claude', workers: ['claude', 'codex', 'antigravity'], tasks: [], activity: [],
@@ -59,7 +61,7 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
   // 2) NEEDS_USER on a card → user answers → card continues; external wait without PR → manual continue
   let askTurns = 0, extTurns = 0;
   ({ env, api } = makeEnv((agent, text) => {
-    if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"design","agent":"codex","instructions":"x"},{"title":"build","agent":"antigravity","instructions":"y"}]}';
+    if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"design","agent":"codex","instructions":"x"},{"title":"build","agent":"antigravity","instructions":"y","writes":false}]}';
     if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
     if (text.includes('Task: design') || (agent === 'codex' && text.startsWith('Update'))) { askTurns++; return askTurns === 1 ? 'Two layouts.\nSTATUS: NEEDS_USER: 要 A 還是 B？\nOPTIONS: A | B' : 'Used ' + (text.includes('"""\nB\n"""') ? 'B' : '?') + '.\nSTATUS: DONE'; }
     extTurns++; return extTurns === 1 ? 'Started nightly build.\nSTATUS: WAITING_EXTERNAL: the nightly build' : 'Build fine.\nSTATUS: DONE';
@@ -283,6 +285,156 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
   const check12 = env.prompts.find((p) => p.text.includes('Every current card has ended')).text;
   assert.ok(check12.includes('[technical reason: 逾時：25 分鐘沒有任何新進度') && check12.includes('never ask the user to read logs'));
   console.log('12 stuck conversation reset + failure reason reaches the 工頭: PASS');
+
+  // 13) delivery policy reaches the 工頭 (plan + final check) and every worker; 'pr' mode stops before merging
+  for (const mode of ['auto', 'pr']) {
+    ({ env, api } = makeEnv((agent, text) => {
+      if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"ship","agent":"codex","instructions":"x"}]}';
+      if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+      return 'ok' + String.fromCharCode(10) + 'STATUS: DONE';
+    }));
+    w = Object.assign(newW(), { delivery: mode }); env.S.workspaces.push(w);
+    await api.planPhase(w); await settle(); await settle();
+    const plan = env.prompts.find((p) => p.text.includes('LEADER (foreman)')).text;
+    const work = env.prompts.find((p) => p.text.includes('Task: ship')).text;
+    const check = env.prompts.find((p) => p.text.includes('Every current card has ended')).text;
+    for (const [name, text] of [['plan', plan], ['worker', work], ['check', check]]) {
+      assert.ok(text.includes(mode === 'auto' ? 'Delivery policy (autonomous)' : 'Delivery policy (stop at the pull request)'), mode + ' ' + name + ': policy present');
+      assert.ok(text.includes('a destructive operation that could permanently lose the user'), mode + ' ' + name + ': stop conditions present');
+      assert.ok(text.includes('Ordinary P1/P2 review findings are fixed inside the original PR scope'), mode + ' ' + name + ': P1/P2 rule present');
+      assert.strictEqual(text.includes('squash merge'), mode === 'auto', mode + ' ' + name + ': merge only in auto');
+    }
+    assert.ok(plan.includes('ONE worker card') && work.includes('STATUS: NEEDS_USER') && !plan.includes('STATUS: NEEDS_USER'), mode + ': role-specific wording');
+    assert.strictEqual(check.includes('complete only when the work is delivered'), mode === 'auto');
+    assert.ok(mode === 'auto' || (plan.includes('Do NOT merge') && work.includes('Do NOT merge')));
+  }
+  console.log('13 delivery policy in plan / worker / final check (auto to merge, pr stops): PASS');
+
+  // 14) one writer per working tree; read-only cards run alongside it
+  const nfs = require('fs'), nos = require('os'), npath = require('path'), { execFileSync } = require('child_process');
+  const waitFor = async (cond, ms = 6000) => { for (let t0 = Date.now(); Date.now() - t0 < ms;) { if (await cond()) return true; await new Promise((r) => setTimeout(r, 25)); } return false; };
+  const planOf = (subtasks) => JSON.stringify({ message: 'ok', subtasks });
+  for (const readerB of [false, true]) {
+    const running = new Set(); let maxRunning = 0;
+    ({ env, api } = makeEnv(async (agent, text) => {
+      if (text.includes('LEADER (foreman)')) return planOf([{ title: 'edit A', agent: 'codex', instructions: 'a' }, { title: 'edit B', agent: 'antigravity', instructions: 'b', writes: !readerB }]);
+      if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+      running.add(agent); maxRunning = Math.max(maxRunning, running.size);
+      await new Promise((r) => setTimeout(r, 80)); running.delete(agent);
+      return 'ok' + String.fromCharCode(10) + 'STATUS: DONE';
+    }));
+    w = newW(); env.S.workspaces.push(w);
+    await api.planPhase(w);
+    assert.ok(await waitFor(() => w.run.result === 'done'), 'job done (readerB=' + readerB + ')');
+    assert.strictEqual(maxRunning, readerB ? 2 : 1, readerB ? 'a read-only card runs alongside the writer' : 'two writers never overlap');
+    const bPrompt = env.prompts.find((p) => p.text.includes('Task: edit B')).text;
+    assert.ok(readerB ? bPrompt.includes('READ-ONLY card') : bPrompt.includes('only one allowed to modify'), 'access rules in the card brief');
+  }
+
+  // 15) lock file, outside writer, tree changed meanwhile, pause / stop meaning (real git repo)
+  const tmpRepos = [];
+  const mkRepo = () => {
+    const d = nfs.mkdtempSync(npath.join(nos.tmpdir(), 'studio-lock-'));
+    tmpRepos.push(d);
+    const g = (...a) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { cwd: d, stdio: 'pipe' });
+    g('init', '-q'); nfs.writeFileSync(npath.join(d, 'a.txt'), '1'); g('add', '.'); g('commit', '-q', '-m', 'init');
+    return { d, g, lock: npath.join(d, '.git', 'studio-writer.lock') };
+  };
+  const repoEnv = (repo, script) => {
+    return makeEnv(script, { execFile: (cmd, args, opts, cb) => require('child_process').execFile(cmd, args, opts, cb) }); // the real git for the repo checks
+  };
+  const oneCard = (title, extra = {}) => planOf([{ title, agent: 'codex', instructions: 'x', ...extra }]);
+  const stdScript = (title, onWork) => async (agent, text) => {
+    if (text.includes('LEADER (foreman)')) return oneCard(title);
+    if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+    if (onWork) return onWork(text);
+    return 'ok' + String.fromCharCode(10) + 'STATUS: DONE';
+  };
+  const mkW = (repo) => { const x = newW(); x.project = repo.d; x.run.project = repo.d; return x; };
+  const LOCKS = {};
+
+  // a) the lock file exists while a writer works and is gone afterwards; the fingerprint is saved
+  let repo = mkRepo(), sawLock = false;
+  ({ env, api } = repoEnv(repo, stdScript('ship', () => { sawLock = nfs.existsSync(repo.lock) && JSON.parse(nfs.readFileSync(repo.lock, 'utf8')).owner === 'Multi-Agent Studio'; return 'ok' + String.fromCharCode(10) + 'STATUS: DONE'; })));
+  w = mkW(repo); env.S.workspaces.push(w);
+  await api.planPhase(w);
+  assert.ok(await waitFor(() => w.run.result === 'done'));
+  assert.ok(sawLock, 'lock file present while the writer works');
+  assert.ok(!nfs.existsSync(repo.lock), 'lock file removed when no writer is left');
+  assert.ok(w.run.treeStamp && w.run.leftAt, 'fingerprint of the tree saved');
+
+  // b) another program holds a fresh lock: the writer waits, then goes when the lock is gone
+  repo = mkRepo();
+  nfs.writeFileSync(repo.lock, JSON.stringify({ owner: 'Other Agent', instance: 'zzzz', pid: process.pid, card: 'their edit', beat: new Date().toISOString() }));
+  ({ env, api } = repoEnv(repo, stdScript('ship')));
+  w = mkW(repo); env.S.workspaces.push(w);
+  await api.planPhase(w);
+  assert.ok(await waitFor(() => /Other Agent/.test(w.tasks[0]?.blockReason || '')), 'writer waits for the outside lock');
+  assert.strictEqual(w.tasks[0].status, 'WAITING'); assert.ok(env.logs.some((l) => l.text.includes('先不動')));
+  nfs.rmSync(repo.lock); api.pump(w);
+  assert.ok(await waitFor(() => w.run.result === 'done'), 'goes after the lock is gone');
+  // a stale lock (owner dead / old heartbeat) does not block
+  repo = mkRepo();
+  nfs.writeFileSync(repo.lock, JSON.stringify({ owner: 'Gone', instance: 'zzzz', pid: process.pid, card: 'old', beat: new Date(Date.now() - 10 * 60e3).toISOString() }));
+  ({ env, api } = repoEnv(repo, stdScript('ship')));
+  w = mkW(repo); env.S.workspaces.push(w);
+  await api.planPhase(w);
+  assert.ok(await waitFor(() => w.run.result === 'done'), 'a stale lock is ignored');
+
+  // c) an automatic wake (CI result) after somebody committed meanwhile: Studio asks before writing
+  for (const answerIs of ['接手', '暫停']) {
+    repo = mkRepo(); let turns = 0;
+    ({ env, api } = repoEnv(repo, stdScript('ship', () => (++turns === 1 ? 'PR open' + String.fromCharCode(10) + 'STATUS: WAITING_EXTERNAL: the nightly build' : 'ok' + String.fromCharCode(10) + 'STATUS: DONE'))));
+    w = mkW(repo); env.S.workspaces.push(w);
+    await api.planPhase(w);
+    assert.ok(await waitFor(() => w.tasks[0]?.status === 'WAITING_EXTERNAL' && w.run.treeStamp), 'parked on the external wait, tree fingerprint saved');
+    repo.g('commit', '-q', '--allow-empty', '-m', 'somebody else');
+    api.wake(w, w.tasks[0], 'CI finished');
+    assert.ok(await waitFor(() => w.tasks[0].status === 'NEEDS_USER' && w.tasks[0].takeover), 'asks before writing over changes');
+    assert.deepStrictEqual(w.tasks[0].ask.options, ['確認接手，繼續', '先不要（暫停）']);
+    assert.strictEqual(turns, 1, 'no second turn before the user decides');
+    api.answer(w, w.tasks[0].id, answerIs === '接手' ? '確認接手，繼續' : '先不要（暫停）');
+    if (answerIs === '接手') { assert.ok(await waitFor(() => w.run.result === 'done'), 'continues after 確認接手'); assert.strictEqual(turns, 2); }
+    else { assert.ok(await waitFor(() => w.run.paused === true), '先不要 pauses'); assert.strictEqual(turns, 1); }
+  }
+  // d) somebody is editing right now (file changed after Studio left): wait
+  repo = mkRepo(); let turns4 = 0;
+  ({ env, api } = repoEnv(repo, stdScript('ship', () => (++turns4 === 1 ? 'x' + String.fromCharCode(10) + 'STATUS: WAITING_EXTERNAL: build' : 'ok' + String.fromCharCode(10) + 'STATUS: DONE'))));
+  w = mkW(repo); env.S.workspaces.push(w);
+  await api.planPhase(w);
+  assert.ok(await waitFor(() => w.tasks[0]?.status === 'WAITING_EXTERNAL' && w.run.leftAt));
+  await new Promise((r) => setTimeout(r, 30)); nfs.writeFileSync(npath.join(repo.d, 'b.txt'), 'someone is typing');
+  api.wake(w, w.tasks[0], 'CI finished');
+  assert.ok(await waitFor(() => /秒前有檔案被改過/.test(w.tasks[0].blockReason || '')), 'waits while someone edits');
+  assert.strictEqual(turns4, 1);
+
+  // e) PAUSE: the writer stops, the lock is released, nothing resumes by itself; 繼續 (manual) continues even if files changed
+  repo = mkRepo(); let turns5 = 0;
+  ({ env, api } = repoEnv(repo, stdScript('ship', async () => { if (++turns5 === 1) { await new Promise((r) => setTimeout(r, 120)); if (w.run.paused) throw new env.Halt('已暫停'); } return 'ok' + String.fromCharCode(10) + 'STATUS: DONE'; })));
+  w = mkW(repo); env.S.workspaces.push(w);
+  await api.planPhase(w);
+  assert.ok(await waitFor(() => w.tasks[0]?.status === 'WORKING' && nfs.existsSync(repo.lock)));
+  api.pause(w);
+  assert.ok(await waitFor(() => !nfs.existsSync(repo.lock) && w.tasks[0].status === 'PAUSED'), 'paused: writer stopped, lock released');
+  api.wake(w, w.tasks[0], 'CI finished'); // not parked -> no effect; and a paused run never starts anything
+  await new Promise((r) => setTimeout(r, 150)); assert.strictEqual(turns5, 1, 'nothing runs while paused');
+  repo.g('commit', '-q', '--allow-empty', '-m', 'edited while paused');
+  api.resume(w);
+  assert.ok(await waitFor(() => w.run.result === 'done'), '繼續 continues without asking');
+  assert.ok(!w.tasks.some((t) => t.takeover));
+
+  // f) STOP ends the job for good: no 繼續, nothing wakes
+  repo = mkRepo();
+  ({ env, api } = repoEnv(repo, stdScript('ship', async () => { await new Promise((r) => setTimeout(r, 120)); if (w.run.stopped) throw new env.Halt('已停止'); return 'ok' + String.fromCharCode(10) + 'STATUS: DONE'; })));
+  w = mkW(repo); env.S.workspaces.push(w);
+  await api.planPhase(w);
+  assert.ok(await waitFor(() => w.tasks[0]?.status === 'WORKING'));
+  api.stop(w);
+  assert.ok(await waitFor(() => w.tasks[0].status === 'FAILED' && !nfs.existsSync(repo.lock)), 'stopped: the card ends and the lock is released');
+  assert.strictEqual(w.tasks[0].status, 'FAILED'); assert.strictEqual(w.tasks[0].result, '已停止');
+  assert.throws(() => api.resume(w), /已經停止，不能繼續/);
+  for (const d of tmpRepos) nfs.rmSync(d, { recursive: true, force: true }); // the temporary repos made above
+  console.log('14 one writer per tree + lock file + outside writer + changed-while-away + pause / stop meaning: PASS');
 
   // status-line parser
   const { parseStatus } = api;
