@@ -629,14 +629,14 @@ function wakeWaiters(w, done) {
 }
 
 function finish(w, status) {
-  const run = w.run;
+  const run = w.run, finishedCards = [...w.tasks];
   run.active = false;
   run.paused = false;
   run.phase = 'finished';
   markRuntimeStops(w);
   releaseJobLeases(w, 'job ended');
   if (typeof cleanupJobRuntimes === 'function') {
-    run.runtimeCleanup = cleanupCardRuntimes(w, w.tasks).then(() => {
+    run.runtimeCleanup = Promise.all([...w.recoverySteps?.values() || [], ...w.runtimeStarts?.values() || []].map((step) => step.catch(() => {}))).then(() => cleanupCardRuntimes(w, finishedCards, run.id)).then(() => {
       if (w.run === run) { releaseJobLeases(w, 'runtime stopped'); saveRun(w, status); }
     }).catch((error) => log(w, 'studio', 'system', error.message));
   }
@@ -800,7 +800,7 @@ async function start(w, request, cont = false, inherit = false) {
   cont = cont || CONTINUE_RE.test(request);
   if (cont && w.run?.paused) return resume(w); // the paused job itself picks up where it stopped
   if (w.run?.active) throw new Error('這個專案的團隊正在工作中，請先等待、暫停或按 Stop');
-  if (w.executingSteps?.size || w.tasks.some((t) => t.stopUnconfirmed)) throw new Error('Agent 還在停下中，不能啟動新工作');
+  if (w.executingSteps?.size || w.recoverySteps?.size || w.runtimeStarts?.size || w.tasks.some((t) => t.stopUnconfirmed || t.runtimeStopPending)) throw new Error('Agent 還在停下中，不能啟動新工作');
   if (!isDir(w.project)) throw new Error('專案資料夾不存在：' + w.project);
   if (!request.trim()) throw new Error('請輸入需求');
   const lead = w.leader;
@@ -1062,6 +1062,7 @@ async function takeWriteSlot(w, t) {
 // After a writing step: remember what the tree looks like, and keep or give back the lease of the agent that ran the step.
 async function endWriteStep(w, t, ranAs = t.agent) {
   if (!isWriter(t)) { releaseCardLeases(w, t, 'read finished', ranAs); return; }
+  if (w.run?.paused || w.run?.stopped || ['DONE', 'FAILED'].includes(t.status)) await w.runtimeStarts?.get(t.id)?.catch(() => {});
   if (typeof cleanupJobRuntimes === 'function' && (w.run?.paused || w.run?.stopped || ['DONE', 'FAILED'].includes(t.status))) {
     try { await cleanupCardRuntimes(w, [t]); }
     catch { t.runtimeStopPending = true; }
@@ -1120,15 +1121,16 @@ async function leaseBlocker(w) {
 
 // Runtime ownership hook: stopTurn must confirm cancellation, then all card cleanup must finish.
 function markRuntimeStops(w) {
+  for (const task of w.tasks) if (w.recoverySteps?.has(task.id) || w.runtimeStarts?.has(task.id)) task.runtimeStopPending = true;
   if (typeof listRuntimes !== 'function') return;
   for (const runtime of listRuntimes({ rtDir: RT })) if (runtime.job_id === w.run?.id && ['running', 'exited', 'stale'].includes(runtime.status)) {
     const task = w.tasks.find((t) => t.id === runtime.card_id);
     if (task) task.runtimeStopPending = true;
   }
 }
-async function cleanupCardRuntimes(w, cards) {
+async function cleanupCardRuntimes(w, cards, jobId = w.run.id) {
   if (typeof cleanupJobRuntimes !== 'function') return;
-  const result = await cleanupJobRuntimes(w.run.id, { rtDir: RT, cardIds: cards.map((t) => t.id) });
+  const result = await cleanupJobRuntimes(jobId, { rtDir: RT, cardIds: cards.map((t) => t.id) });
   if (result.blocked?.length) {
     for (const t of cards) t.runtimeStopPending = true;
     throw new Error('Runtime 尚未確認停止；保留租約: ' + result.blocked.map((r) => r.reason).join('; '));

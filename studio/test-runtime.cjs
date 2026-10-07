@@ -343,6 +343,35 @@ async function runRuntimeTests() {
     console.log('Case K: process + port + HTTP 200 + application ready; startup failure reason: PASS');
   }
 
+  // Actual HTTP listener with failed startup must stay blocked until app reports ready.
+  {
+    const rtDir = mkTmp('studio-http-ready-');
+    const script = `let ready = false; const server = require('http').createServer((req,res) => {
+      if (req.url === '/make-ready') ready = true;
+      res.setHeader('content-type', 'application/json'); res.statusCode = ready ? 200 : 503;
+      res.end(JSON.stringify(ready ? {status:'ok'} : {ready:false,error:'MiningProcessLockError: startup failed'}));
+    }); server.listen(0, '127.0.0.1', () => console.log('PORT:' + server.address().port));`;
+    const proc = spawn(process.execPath, ['-e', script], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+    SPAWNED_PROCS.push(proc);
+    const port = Number((await waitOutput(proc, /PORT:(\d+)/))[1]);
+    const runtime = registry.registerRuntime({ job_id: 'http-ready', root_pid: proc.pid,
+      process_identity: await registry.getProcessInfo(proc.pid), executable: process.execPath,
+      command: 'HTTP startup fixture', port, data_dir: rtDir, rtDir });
+    const failed = await readiness.checkBackendReadiness({ ...runtime, rtDir });
+    assert.strictEqual(failed.process_alive, true);
+    assert.strictEqual(failed.port_reachable, true);
+    assert.strictEqual(failed.ownership_verified, true);
+    assert.strictEqual(failed.status, 'BLOCKED');
+    assert.match(failed.reason, /MiningProcessLockError/);
+    await fetch('http://127.0.0.1:' + port + '/make-ready');
+    const ready = await readiness.checkBackendReadiness({ ...runtime, rtDir });
+    assert.strictEqual(ready.status, 'BACKEND_READY');
+    const otherOwner = await registry.checkPortOwnership(port, { desiredJobId: 'http-ready', desiredDataDir: rtDir + '-other', rtDir });
+    assert.strictEqual(otherOwner.available, false, 'same job does not imply same data owner');
+    safeKill(proc);
+    console.log('Case K real HTTP: listener + MiningProcessLockError blocked, existing status ok accepted: PASS');
+  }
+
   // Safe automatic recovery is ordered cleanup -> restart -> readiness -> smoke -> continue.
   {
     const events = [];
@@ -409,6 +438,7 @@ async function runRuntimeTests() {
     console.log('Runtime recovery: known Studio owner auto-continues in order; unknown owner blocks: PASS');
   }
 
+  await require('./test-runtime-server.cjs')();
   } finally {
   // Teardown temp resources
   for (const p of SPAWNED_PROCS) safeKill(p);

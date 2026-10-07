@@ -108,3 +108,9 @@ Multi-Agent Studio 管理多個 Agent、背景進程與測試執行。為確保�
 ## 恢復與 workspace 生命週期銜接
 
 恢復採用該 job／card／port 最新的 runtime 紀錄，先檢查 write lease、OS 程序身分與 DATA_DIR owner。健康 runtime 直接通過 health／smoke 後續卡；stale runtime 才 cleanup → restart → health → smoke → continue。每個非同步階段重新確認原 job、card 與 lease generation；PAUSE、STOP、handoff 或 external claim 會阻止重啟／續卡，並等待在途的恢復與 managed start 結束後清理程序樹，再釋放租約。已知 ownership 的 startup failure 保持自動 health 輪詢並顯示 blocked 原因，不會每五秒重啟同一 replacement。未知 PID／data owner 或無法安全重建命令才要求人工。
+
+## 驗證範圍
+
+`test-runtime.cjs` 除 H/I/J/L、readiness predicate 與恢復階段的取消外，亦啟動 OS 配置埠的真實 HTTP fixture：程序存活且 listener 可連線時，`MiningProcessLockError` 的 503 仍須 BLOCKED；同一程序改回既有 `status: "ok"` 契約後才 BACKEND_READY。`test-runtime-server.cjs` 執行 production server hooks，涵蓋最新 replacement、未知 PID／command、已知 startup failure 自動輪詢、不重複 restart、STOP 在 cleanup 期間的租約保留、handoff 前 OS drain，以及 write lease admission。延遲清理會固定原 job／card 範圍；前一輪 runtime 未停妥時禁止啟動新一輪。Auto CI 與 lifecycle-check 會執行上述回歸及 A–M 情境。
+
+本次測試使用隔離資料與子程序 fixture，未啟動真實 AionCore 或使用正式 TWstock DATA_DIR。Agent 直接在 shell 啟動的服務必須改由 `/api/runtime/start` 管理，才能使用此 registry 的 ownership 與自動恢復；本卡沒有新增 AionCore 內部程序追蹤 API。
