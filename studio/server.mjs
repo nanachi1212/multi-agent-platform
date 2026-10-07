@@ -30,7 +30,7 @@ const STRATEGY_IDS = ['save', 'balanced', 'quality', 'custom']; // model strateg
 const DELIVERY_IDS = ['auto', 'pr']; // delivery: auto = all the way to merge (default), pr = stop at the pull request
 const AUTO_MAX = 5; // auto-started jobs in a row before Studio stops and waits for the user
 // S.leader is the default Leader for newly opened projects.
-const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [],
+const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [], leases: [],
   limits: {}, notify: true, notices: [], noticeSeq: 0 };
 // One workspace per project folder: its own Leader, board, team chat and run, so projects work side by side.
 // name = optional display name (tabs, cards, notifications); the folder name is used when empty.
@@ -87,7 +87,7 @@ function saveRun(w, status) {
   if (!run) return;
   fs.mkdirSync(HISTORY, { recursive: true });
   // phase + convs let a paused run continue in the same agent conversations after a Studio restart.
-  const rec = { treeStamp: run.treeStamp, leftAt: run.leftAt, id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, notes: run.notes, suggestions: run.suggestions, convs: run.convs, tasks: w.tasks, activity: w.activity };
+  const rec = { treeStamp: run.treeStamp, leftAt: run.leftAt, extMod: run.extMod, claimedBy: run.claimedBy, id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, notes: run.notes, suggestions: run.suggestions, convs: run.convs, tasks: w.tasks, activity: w.activity };
   fs.writeFileSync(path.join(HISTORY, run.id + '.json'), JSON.stringify(rec, null, 2));
   S.historyRev++;
 }
@@ -371,10 +371,11 @@ const available = (id) => S.agents[id]?.status === 'available';
 
 // One conversation per agent and role; hard cards get their own conversation on the hard model.
 // The Leader always uses the normal tier (it should be cheap: it only plans and checks).
-const workKey = (t) => t.agent + ':work' + (t.hard ? ':hard' : '');
-async function conv(w, agent, lead, hard = false) {
-  const key = agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : '');
-  return (w.run.convs[key] ??= await createConv(agent, w.run.project, lead, tierCfg(w, agent, hard)));
+const dirTag = (d) => (d ? '@' + crypto.createHash('sha1').update(String(d)).digest('hex').slice(0, 6) : '');
+const workKey = (t) => t.agent + ':work' + (t.hard ? ':hard' : '') + dirTag(t.workdir);
+async function conv(w, agent, lead, hard = false, workdir = '') {
+  const key = agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : '') + dirTag(workdir);
+  return (w.run.convs[key] ??= await createConv(agent, workdir || w.run.project, lead, tierCfg(w, agent, hard)));
 }
 // This run's conversations that have a turn in progress (other projects keep working).
 const busyConvs = (run) => Object.values(run.convs).filter((c) => active.has(c));
@@ -408,7 +409,7 @@ function deliveryRules(mode, role, afterDone = 'stop') {
   if (mode === 'pr') {
     return `Delivery policy (stop at the pull request): when the request is clear and nothing high-risk is involved, carry the work through change -> targeted validation -> commit -> push -> pull request -> CI without stopping, then report. Do NOT merge: the user merges. ${role === 'leader' ? 'Give the whole chain to ONE worker card (it parks on CI with STATUS: WAITING_EXTERNAL and the PR URL, and continues when woken).' : ''} ${stops}`;
   }
-  const chain = 'change -> targeted validation -> commit -> push -> pull request -> CI -> one review (the repository\'s own review bot if it has one, otherwise one independent review by a different worker) -> fix by the review triage below -> CI again -> squash merge -> sync main -> delete the branch -> next card';
+  const chain = 'change -> targeted validation -> commit -> push -> pull request -> CI -> one review (the repository\'s own review bot if it has one, otherwise one independent review by a different worker) -> fix by the review triage below -> CI again -> squash merge -> sync main -> clean up: delete this PR\'s branch (and its worktree, if Studio made one) now that it is merged -> next card';
   const how = role === 'leader' ? `Plan the whole chain, not just the code: give it to ONE worker card (that worker parks the card on CI with STATUS: WAITING_EXTERNAL and the PR URL, and continues when woken); add a review card for a different worker only when the repository has no review bot.`
     : role === 'check' ? 'A request that changes a repository is complete only when the work is delivered (merged, main synced, branch deleted); if it is not, add cards for the missing steps instead of reporting it done or asking the user. Findings that were recorded as not fixed (other P2, P3) are NOT a reason to add cards or to ask for another review: list them briefly in your report under "Recorded, not fixed"' + (afterDone === 'stop' ? '.' : ', and use the worthwhile ones as candidates for the next steps.')
     : 'Carry YOUR card through this chain; when CI is pending report STATUS: WAITING_EXTERNAL with the PR URL instead of waiting inside your turn. In your final reply list the findings you did not fix under "Recorded, not fixed".';
@@ -523,6 +524,7 @@ function finish(w, status) {
   run.active = false;
   run.paused = false;
   run.phase = 'finished';
+  releaseJobLeases(w, 'job ended');
   run.result = status;
   run.ask = null;
   saveRun(w, status);
@@ -758,31 +760,109 @@ function pump(w) {
   if (!run.summarizing && w.tasks.length && w.tasks.every((t) => t.status === 'DONE' || t.status === 'FAILED')) summarize(w);
 }
 
-// ---------- Writer lock: one writer per working tree ----------
-// Inside Studio only one WRITING card runs per project; read-only cards (review, reading, investigation) run alongside.
-// Against outside agents (another AI session, another Studio, the user's editor): a lock file in the git dir, plus a
-// fingerprint of the tree (HEAD, branch, uncommitted files) taken whenever Studio stops writing. Studio never starts or
-// resumes writing on its own while someone else is editing, or when the tree changed while it was away.
+// ---------- Workspace lease: who may write which working tree ----------
+// A lease records WHO holds a physical working tree, doing WHAT (job / card), on which branch, and whether the holder
+// is still alive. Leases are persisted (runtime/studio/leases.json), so after a restart Studio still knows who held a
+// tree. One working tree has at most ONE write lease; any number of read leases. Different worktrees of one repository
+// are different trees and can each have a writer.
+//   write lease status: ACTIVE (the owner is executing) / RESERVED (paused or waiting, still the owner's) /
+//   STALE (the owner is gone: crashed Studio, dead pid, silent too long) / RELEASED.
+// Studio never takes a lease from a live owner; a STALE lease is retired when somebody reclaims it.
 const INSTANCE = crypto.randomUUID().slice(0, 8);
 const LOCK_STALE_MS = 3 * 60e3, RECENT_EDIT_MS = 90e3, LOCK_BEAT_MS = 30e3;
+const LEASE_BEAT_MS = 20e3, LEASE_HUNG_MS = 30 * 60e3, LEASE_RESERVED_TTL_MS = 12 * 3600e3;
 const isWriter = (t) => t.writes !== false;
+const sameTree = (a, b) => (a.workdir || '') === (b.workdir || '');
 const holdsWriteLock = (t) => isWriter(t) && ['WORKING', 'WAITING_EXTERNAL', 'NEEDS_USER'].includes(t.status);
-const writerBusy = (w, t) => w.tasks.some((x) => x !== t && holdsWriteLock(x));
+const writerBusy = (w, t) => w.tasks.some((x) => x !== t && sameTree(x, t) && holdsWriteLock(x));
+const nowIso = () => new Date().toISOString();
 
 function accessRules(t) {
-  return isWriter(t)
-    ? 'ACCESS: you are the only one allowed to modify this working tree right now; other cards only read. Do not leave it half changed when you finish or wait: commit, or say clearly what is uncommitted.'
-    : 'ACCESS: READ-ONLY card. Another card may be editing this working tree at the same time. Read files and run read-only commands (git log / diff / show, gh pr view / diff, searches). Do NOT modify, create or delete files in the working tree and do not run commands that change it (no commit, checkout, switch, stash, pull, merge, rebase, reset, formatters, installs). You may post review comments with gh. If something must change, say exactly what in your reply; do not change it yourself.';
+  if (!isWriter(t)) return 'ACCESS: READ-ONLY card. Another card may be editing this working tree at the same time. Read files and run read-only commands (git log / diff / show, gh pr view / diff, searches). Do NOT modify, create or delete files in the working tree and do not run commands that change it (no commit, checkout, switch, stash, pull, merge, rebase, reset, formatters, installs). You may post review comments with gh. If something must change, say exactly what in your reply; do not change it yourself.';
+  if (t.worktree) return `ACCESS: you work in your own git worktree ${t.workdir} on branch ${t.worktree.branch}. Commit and push from there; never touch the main working tree. Do not leave it half changed when you finish or wait.`;
+  return 'ACCESS: you are the only one allowed to modify this working tree right now; other cards only read. Do not leave it half changed when you finish or wait: commit, or say clearly what is uncommitted. All file changes must happen inside your own turn: never leave a background process that changes files after your turn ends (Studio treats changes made while you are not running as changes by another party).';
 }
 
-async function lockFile(w) {
-  if (w.lockPath === undefined) { const r = await git(w.project, 'rev-parse', '--absolute-git-dir'); w.lockPath = r.out ? path.join(r.out.trim(), 'studio-writer.lock') : null; }
-  return w.lockPath;
+// ----- identity of a working tree -----
+const pidAlive = (pid) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+const canonPath = (p) => { let r = String(p || ''); try { r = fs.realpathSync.native(r); } catch { r = path.resolve(r); } return r.replace(/[\\/]+$/, ''); };
+const treeKey = (p) => { const c = canonPath(p).split('/').join('\\'); return process.platform === 'win32' ? c.toLowerCase() : c; };
+
+// The physical working tree a folder belongs to: key (same for any spelling of the path), top folder, branch, repository.
+async function workspaceOf(dir) {
+  const top = (await git(dir, 'rev-parse', '--show-toplevel')).out?.trim();
+  const base = top || dir;
+  return { key: treeKey(base), path: canonPath(base), isGit: !!top,
+    branch: top ? (await git(dir, 'rev-parse', '--abbrev-ref', 'HEAD')).out?.trim() || '' : '', repo: top ? await originRepo(dir) : '' };
 }
 
-// A fresh lock from another Studio / program (not ours, owner still alive).
-async function foreignLock(w) {
-  const f = await lockFile(w);
+// ----- persistence -----
+const leasesFile = () => path.join(RT, 'studio', 'leases.json');
+function saveLeases() {
+  try {
+    const f = leasesFile();
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    S.leases = S.leases.filter((l) => l.status !== 'RELEASED').concat(S.leases.filter((l) => l.status === 'RELEASED').slice(-80));
+    fs.writeFileSync(f + '.tmp', JSON.stringify(S.leases, null, 1));
+    fs.renameSync(f + '.tmp', f);
+  } catch { /* the in-memory leases still protect this run */ }
+}
+function loadLeases() {
+  try { S.leases = JSON.parse(fs.readFileSync(leasesFile(), 'utf8')); } catch { S.leases = []; }
+  for (const l of S.leases) if (l.mode === 'read' && l.status !== 'RELEASED') Object.assign(l, { status: 'RELEASED', releasedAt: nowIso(), reason: 'Studio restarted' });
+  saveLeases();
+}
+
+// ----- is the holder still alive? -----
+function leaseState(l) {
+  if (l.status === 'RELEASED') return 'RELEASED';
+  const age = Date.now() - (Date.parse(l.heartbeatAt || l.acquiredAt) || 0);
+  if (l.owner.kind === 'external') return l.pid && !pidAlive(l.pid) ? 'STALE' : l.status; // a claim stays until released (or its process is gone)
+  if (l.instance === INSTANCE) return l.status; // this Studio: its own memory is the truth
+  if (l.status === 'RESERVED') return pidAlive(l.pid) || age < LEASE_RESERVED_TTL_MS ? 'RESERVED' : 'STALE';
+  return pidAlive(l.pid) && age < LEASE_HUNG_MS ? 'ACTIVE' : 'STALE'; // another Studio: alive and beating, or it is not
+}
+const writerOf = (key) => S.leases.find((l) => l.key === key && l.mode === 'write' && ['ACTIVE', 'RESERVED'].includes(leaseState(l))) || null;
+const retire = (l, reason) => Object.assign(l, { status: 'RELEASED', releasedAt: nowIso(), reason });
+const ownerName = (l) => (l.owner.kind === 'external' ? '外部：' + (l.owner.label || 'external') : AGENTS[l.owner.agent]?.name || l.owner.agent);
+const sameCard = (l, w, t) => l.owner.kind === 'studio' && l.jobId === w.run?.id && l.cardId === t.id && l.owner.agent === t.agent;
+const leaseView = (l) => ({ id: l.id, mode: l.mode, state: leaseState(l), kind: l.owner.kind, agent: l.owner.agent || '', owner: ownerName(l), card: l.cardTitle || '', cardId: l.cardId || '', jobId: l.jobId || '',
+  branch: l.branch || '', path: l.path, repo: l.repo || '', since: l.acquiredAt, beat: l.heartbeatAt, reason: l.reason || '', flag: l.flag || '' });
+
+function newLease(w, t, info, mode) {
+  const l = { id: crypto.randomUUID().slice(0, 8), key: info.key, path: info.path, repo: info.repo, branch: info.branch, mode, owner: { kind: 'studio', agent: t.agent },
+    jobId: w.run?.id, cardId: t.id, cardTitle: t.title, project: w.project, status: 'ACTIVE', acquiredAt: nowIso(), heartbeatAt: nowIso(), instance: INSTANCE, pid: process.pid };
+  S.leases.push(l);
+  return l;
+}
+
+// Write lease for a card about to modify files. { ok:false, holder } when somebody else holds the tree: nothing is taken.
+async function acquireWrite(w, t, info) {
+  const cur = writerOf(info.key);
+  if (cur && !sameCard(cur, w, t)) return { ok: false, holder: cur };
+  for (const l of S.leases) if (l.key === info.key && l.mode === 'write' && l.status !== 'RELEASED' && leaseState(l) === 'STALE') retire(l, 'stale: reclaimed by ' + ownerName({ owner: { kind: 'studio', agent: t.agent } }));
+  const l = cur || newLease(w, t, info, 'write');
+  Object.assign(l, { branch: info.branch, status: 'ACTIVE', heartbeatAt: nowIso(), instance: INSTANCE, pid: process.pid, reason: '', cardTitle: t.title });
+  saveLeases();
+  return { ok: true, lease: l };
+}
+function acquireRead(w, t, info) { newLease(w, t, info, 'read'); saveLeases(); }
+
+const cardLeases = (w, t) => S.leases.filter((l) => l.status !== 'RELEASED' && l.jobId === w.run?.id && l.cardId === t.id);
+function releaseCardLeases(w, t, reason) { for (const l of cardLeases(w, t)) retire(l, reason); saveLeases(); }
+function reserveCardLeases(w, t, reason) { for (const l of cardLeases(w, t)) if (l.mode === 'write' && l.status === 'ACTIVE') Object.assign(l, { status: 'RESERVED', reason, heartbeatAt: nowIso() }); saveLeases(); }
+function releaseJobLeases(w, reason) { for (const l of S.leases) if (l.status !== 'RELEASED' && l.jobId === w.run?.id && l.owner.kind === 'studio') retire(l, reason); saveLeases(); }
+function reserveJobLeases(w, reason) { for (const l of S.leases) if (l.status === 'ACTIVE' && l.mode === 'write' && l.jobId === w.run?.id && l.instance === INSTANCE) Object.assign(l, { status: 'RESERVED', reason, heartbeatAt: nowIso() }); saveLeases(); }
+function beatLeases() { let n = 0; for (const l of S.leases) if (l.status !== 'RELEASED' && l.instance === INSTANCE && l.owner.kind === 'studio') { l.heartbeatAt = nowIso(); n++; } if (n) saveLeases(); }
+
+// ----- file mirror in the git dir (so programs that know nothing about Studio can see a writer) -----
+async function lockFile(w, dir = w.project) {
+  w.lockPaths ||= {};
+  if (w.lockPaths[dir] === undefined) { const r = await git(dir, 'rev-parse', '--absolute-git-dir'); w.lockPaths[dir] = r.out ? path.join(r.out.trim(), 'studio-writer.lock') : null; }
+  return w.lockPaths[dir];
+}
+async function foreignLock(w, dir = w.project) {
+  const f = await lockFile(w, dir);
   if (!f) return null;
   let l;
   try { l = JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; }
@@ -791,55 +871,55 @@ async function foreignLock(w) {
   try { process.kill(l.pid, 0); } catch (e) { alive = e.code === 'EPERM'; }
   return alive && Date.now() - Date.parse(l.beat || 0) < LOCK_STALE_MS ? l : null;
 }
-
 async function acquireLock(w, t) {
-  const f = await lockFile(w);
+  const dir = t.workdir || w.project, f = await lockFile(w, dir);
   if (!f) return;
-  const write = () => { try { fs.writeFileSync(f, JSON.stringify({ owner: 'Multi-Agent Studio', instance: INSTANCE, pid: process.pid, project: w.project, card: t.title, since: (w.lockSince ||= new Date().toISOString()), beat: new Date().toISOString() })); } catch { /* the in-Studio lock still applies */ } };
+  const write = () => { try { fs.writeFileSync(f, JSON.stringify({ owner: 'Multi-Agent Studio', instance: INSTANCE, pid: process.pid, project: dir, card: t.title, since: (w.lockSince ||= nowIso()), beat: nowIso() })); } catch { /* the lease still applies */ } };
   write();
   clearInterval(w.lockTimer);
   w.lockTimer = setInterval(write, LOCK_BEAT_MS);
   w.lockTimer.unref?.();
 }
-
-async function releaseLock(w) {
-  if (w.tasks.some(holdsWriteLock)) return;
+async function releaseLock(w, t) {
+  if (w.tasks.some((x) => holdsWriteLock(x) && !x.workdir)) return;
   clearInterval(w.lockTimer);
   w.lockTimer = null;
   w.lockSince = null;
-  const f = await lockFile(w);
+  const f = await lockFile(w, t?.workdir || w.project);
   if (!f) return;
   try { if (JSON.parse(fs.readFileSync(f, 'utf8')).instance === INSTANCE) fs.rmSync(f); } catch { /* no lock of ours */ }
 }
 
-async function treeStamp(w) {
-  const st = await git(w.project, 'status', '--porcelain=v1');
+// ----- what the tree looks like (read-only git) -----
+async function treeStamp(w, dir = w.project) {
+  const st = await git(dir, 'status', '--porcelain=v1');
   if (st.err) return '';
-  const head = (await git(w.project, 'rev-parse', 'HEAD')).out?.trim() || '';
-  const branch = (await git(w.project, 'rev-parse', '--abbrev-ref', 'HEAD')).out?.trim() || '';
+  const head = (await git(dir, 'rev-parse', 'HEAD')).out?.trim() || '';
+  const branch = (await git(dir, 'rev-parse', '--abbrev-ref', 'HEAD')).out?.trim() || '';
   return crypto.createHash('sha1').update(head + '\n' + branch + '\n' + st.out).digest('hex');
 }
-
 // A file the working tree has changed after Studio last wrote, and only seconds ago: someone is editing now.
-async function recentEdit(w, sinceMs) {
-  const st = await git(w.project, '-c', 'core.quotepath=false', 'status', '--porcelain=v1');
+async function recentEdit(w, sinceMs, dir = w.project) {
+  const st = await git(dir, '-c', 'core.quotepath=false', 'status', '--porcelain=v1');
   if (st.err) return null;
   let newest = null;
   for (const line of st.out.split('\n').filter(Boolean).slice(0, 200)) {
     let p = line.slice(3);
     if (p.includes(' -> ')) p = p.split(' -> ').pop();
-    try { const m = fs.statSync(path.join(w.project, p.replace(/^"|"$/g, ''))).mtimeMs; if (!newest || m > newest.m) newest = { m, p }; } catch { /* deleted file */ }
+    try { const m = fs.statSync(path.join(dir, p.replace(/^"|"$/g, ''))).mtimeMs; if (!newest || m > newest.m) newest = { m, p }; } catch { /* deleted file */ }
   }
   const age = newest ? Date.now() - newest.m : Infinity;
   return newest && newest.m > sinceMs && age < RECENT_EDIT_MS ? { file: newest.p, secs: Math.round(age / 1000) } : null;
 }
 
-// null = free to write; busy = somebody else is working in it right now (wait); changed = it was changed while Studio was away (ask).
+// Extra checks before a writer starts, once the lease is ours.
+// null = go; busy = somebody is editing right now (wait); changed = the tree changed while Studio was away (ask).
 async function externalReason(w, t) {
+  if (t.workdir) return null; // our own fresh worktree: nobody else knows it
   if (!(await lockFile(w))) return null; // not a git project: nothing to compare with
   const lock = await foreignLock(w);
   if (lock) return { kind: 'busy', text: `${lock.owner || '另一個程式'} 正在修改這個專案（鎖定檔：${lock.card || '進行中'}）` };
-  if (w.tasks.some((x) => x !== t && holdsWriteLock(x))) return null; // our own writer is active
+  if (w.tasks.some((x) => x !== t && !x.workdir && holdsWriteLock(x))) return null; // our own writer is active
   const run = w.run;
   const recent = await recentEdit(w, Date.parse(run.leftAt || run.startedAt) || 0);
   if (recent) return { kind: 'busy', text: `${recent.secs} 秒前有檔案被改過（${recent.file}），可能有別的 AI 或程式正在修改這個專案` };
@@ -847,30 +927,56 @@ async function externalReason(w, t) {
   return null;
 }
 
-// Returns true when the card may write now (lock taken); otherwise the card is parked with the reason.
+function holderText(l) {
+  const v = leaseView(l);
+  return `此工作區目前由 ${v.owner} ${v.state === 'ACTIVE' ? '使用中' : '保留中'}${v.card ? `（工作卡「${v.card}」）` : ''}${v.branch ? `，branch ${v.branch}` : ''}，${new Date(v.since).toLocaleTimeString('zh-TW', { hour12: false })} 開始`;
+}
+function retryLater(w) {
+  clearTimeout(w.retryTimer);
+  w.retryTimer = setTimeout(() => pump(w), 30e3);
+  w.retryTimer.unref?.();
+}
+
+// Returns true when the card may start now (lease taken); otherwise the card is parked with the reason and nothing is written.
 async function takeWriteSlot(w, t) {
-  if (!isWriter(t)) return true;
-  const why = await externalReason(w, t);
-  if (!why) { Object.assign(t, { trust: false, blockReason: '', blockLogged: '' }); await acquireLock(w, t); return true; }
-  if (why.kind === 'busy') {
-    Object.assign(t, { status: 'WAITING', blockReason: why.text });
-    if (t.blockLogged !== why.text) { t.blockLogged = why.text; log(w, 'studio', 'system', `「${t.title}」先不動：${why.text}。等對方做完，Studio 每 30 秒再看一次。`); }
-    clearTimeout(w.retryTimer);
-    w.retryTimer = setTimeout(() => pump(w), 30e3);
-    w.retryTimer.unref?.();
+  const dir = t.workdir || w.project;
+  const info = await workspaceOf(dir);
+  if (!t.workdir) w.wsKey = info.key; // the project's own tree: lets the page find its leases
+  if (!isWriter(t)) { acquireRead(w, t, info); return true; } // reading never needs the lease
+  const got = await acquireWrite(w, t, info);
+  if (!got.ok) { // never steal a live lease: say who has it and offer the ways out
+    const text = holderText(got.holder);
+    Object.assign(t, { status: 'WAITING', blockReason: text, blocked: leaseView(got.holder) });
+    if (t.blockLogged !== text) { t.blockLogged = text; log(w, 'studio', 'system', `「${t.title}」先不動：${text}。可以等它做完、改成唯讀 Review、或使用獨立 worktree。`); }
+    retryLater(w);
     return false;
   }
+  const why = await externalReason(w, t);
+  if (!why) { Object.assign(t, { trust: false, blockReason: '', blockLogged: '', blocked: null }); await acquireLock(w, t); return true; }
+  if (why.kind === 'busy') {
+    retire(got.lease, 'not started: ' + why.text); saveLeases();
+    Object.assign(t, { status: 'WAITING', blockReason: why.text, blocked: null });
+    if (t.blockLogged !== why.text) { t.blockLogged = why.text; log(w, 'studio', 'system', `「${t.title}」先不動：${why.text}。等對方做完，Studio 每 30 秒再看一次。`); }
+    retryLater(w);
+    return false;
+  }
+  reserveCardLeases(w, t, 'asking the user'); // the lease stays ours while the user decides
   Object.assign(t, { status: 'NEEDS_USER', takeover: true, ask: { question: why.text + '。要讓 Studio 接手繼續寫嗎？', options: ['確認接手，繼續', '先不要（暫停）'] } });
   log(w, 'studio', 'system', `「${t.title}」先不動：${why.text}。需要你決定要不要讓 Studio 接手。`);
   notify(`${label(w)}：${AGENTS[t.agent].name} 需要你處理`, why.text, 'ask', w.project);
   return false;
 }
 
-// What Studio leaves behind after a writing step: the fingerprint later checks compare against.
+// After a writing step: remember what the tree looks like, and keep or give back the lease.
 async function endWriteStep(w, t) {
-  if (!isWriter(t)) return;
-  if (w.run) { w.run.treeStamp = await treeStamp(w); w.run.leftAt = new Date().toISOString(); }
-  await releaseLock(w);
+  const dir = t.workdir || w.project;
+  if (!isWriter(t)) { releaseCardLeases(w, t, 'read finished'); return; }
+  if (w.run && !t.workdir) { w.run.treeStamp = await treeStamp(w); w.run.leftAt = nowIso(); }
+  if (w.run?.stopped) releaseCardLeases(w, t, 'stopped');
+  else if (w.run?.paused) reserveCardLeases(w, t, 'paused');
+  else if (holdsWriteLock(t)) reserveCardLeases(w, t, 'waiting');
+  else releaseCardLeases(w, t, 'card finished');
+  if (!w.tasks.some((x) => holdsWriteLock(x) && sameTree(x, t))) await releaseLock(w, t);
 }
 
 async function runTask(w, t) {
@@ -878,11 +984,173 @@ async function runTask(w, t) {
   if (!(await takeWriteSlot(w, t))) return;
   if (!w.run?.active || t.status !== 'WORKING') { // paused or stopped while the check ran
     if (t.status === 'WORKING') Object.assign(t, w.run?.stopped ? { status: 'FAILED', result: '已停止' } : { status: 'PAUSED', result: '已暫停', resumed: true });
-    await releaseLock(w);
+    await endWriteStep(w, t);
     return;
   }
   try { await runCard(w, t); } finally { await endWriteStep(w, t); }
+  if (t.status === 'DONE' && t.worktree) await cleanupWorktree(w, t);
   pump(w);
+  for (const x of S.workspaces) if (x !== w && x.run?.active) pump(x); // a lease was just given back: jobs that were refused can go now
+}
+
+// ----- resume safety: a job may only continue writing if the tree is still its own -----
+async function leaseBlocker(w) {
+  for (const t of w.tasks) {
+    if (!isWriter(t) || ['DONE', 'FAILED'].includes(t.status)) continue; // every unfinished writing card will write again
+    const cur = writerOf((await workspaceOf(t.workdir || w.project)).key);
+    if (cur && !sameCard(cur, w, t)) return cur;
+  }
+  return null;
+}
+
+// ----- external takeover: another AI session / the user takes the tree -----
+// Studio stops its own writers on that tree (and waits until they really stopped), gives up its leases and records the
+// external owner. The paused Studio jobs stay paused: a restart never brings them back, and 繼續 is refused while the claim lasts.
+async function claimWorkspace(dir, who = {}) {
+  const info = await workspaceOf(dir);
+  const labelText = String(who.label || 'external').slice(0, 60);
+  const jobs = new Set();
+  for (const w of S.workspaces) {
+    if (!w.run) continue;
+    for (const t of w.tasks) if (isWriter(t) && (await workspaceOf(t.workdir || w.project)).key === info.key) jobs.add(w);
+  }
+  for (const w of jobs) {
+    if (w.run.active) pause(w);
+    await Promise.all(busyConvs(w.run).map((c) => stopTurn(c))); // wait until the writing really stopped
+    w.run.claimedBy = labelText;
+  }
+  for (const l of S.leases) if (l.key === info.key && l.mode === 'write' && l.status !== 'RELEASED' && l.owner.kind === 'studio') retire(l, `外部接手：${labelText}`);
+  let ext = S.leases.find((l) => l.key === info.key && l.owner.kind === 'external' && l.status !== 'RELEASED');
+  if (!ext) { ext = { id: crypto.randomUUID().slice(0, 8), key: info.key, path: info.path, repo: info.repo, mode: 'write', owner: { kind: 'external' }, acquiredAt: nowIso() }; S.leases.push(ext); }
+  Object.assign(ext, { owner: { kind: 'external', label: labelText }, branch: info.branch, pid: who.pid || null, status: 'ACTIVE', heartbeatAt: nowIso(), reason: who.note || '' });
+  saveLeases();
+  for (const w of jobs) log(w, 'studio', 'system', `工作區已由外部（${labelText}）接手：Studio 的寫入已停止，這件工作保持暫停。外部歸還後，由你按「繼續」。`);
+  return leaseView(ext);
+}
+async function releaseClaim(dir) {
+  const info = await workspaceOf(dir);
+  let n = 0;
+  for (const l of S.leases) if (l.key === info.key && l.owner.kind === 'external' && l.status !== 'RELEASED') { retire(l, '外部已歸還'); n++; }
+  saveLeases();
+  return { released: n };
+}
+
+// ----- formal handoff: the writer role of a card moves from one agent to another -----
+function writerHandoffNote(from, to, prior) {
+  return `HANDOFF: ${AGENTS[from].name} was working on this card and has been stopped by the user's handoff; you (${AGENTS[to].name}) take over the SAME working tree and branch. First check git status / log and the files, continue from where it stopped, do not redo finished work and do not open a duplicate PR. ${AGENTS[from].name} no longer writes here.${prior ? `\nIts last report: ${prior}` : ''}`;
+}
+async function lastAgentText(cid) {
+  if (!cid) return '';
+  try { const items = (await api('GET', `/api/conversations/${cid}/messages`)).items || []; const m = items.filter((x) => x.type === 'text' && x.position === 'left').at(-1); return clip(m?.content?.content || '', 700); } catch { return ''; }
+}
+async function handoffWriter(w, toAgent, taskId) {
+  if (!AGENTS[toAgent]) throw new Error('未知的 Agent');
+  if (!available(toAgent)) throw new Error(`${AGENTS[toAgent].name} 目前不可用`);
+  const run = w.run;
+  if (!run) throw new Error('這個專案目前沒有工作可以交接');
+  const held = S.leases.find((l) => l.mode === 'write' && l.jobId === run.id && ['ACTIVE', 'RESERVED'].includes(leaseState(l)));
+  const t = taskId ? w.tasks.find((x) => x.id === taskId) : held && w.tasks.find((x) => x.id === held.cardId);
+  if (!t) throw new Error('目前沒有人在這個工作區寫入，不需要交接（直接把工作卡改派即可）');
+  const from = t.agent;
+  if (from === toAgent) throw new Error(`${AGENTS[toAgent].name} 已經是這張卡的寫入者`);
+  // 1-3. stop the old agent's execution and wait until it has really stopped
+  if (t.status === 'WORKING') {
+    Object.assign(t, { hold: true, interrupted: true });
+    const cid = run.convs[workKey(t)];
+    const fail = () => { Object.assign(t, { hold: false, interrupted: false }); return new Error(`${AGENTS[from].name} 還沒有真的停下來，沒有交接`); };
+    if (cid && active.has(cid) && !(await stopTurn(cid))) throw fail();
+    for (let i = 0; i < 150 && t.status === 'WORKING'; i++) await sleep(100); // the card body parks itself once the turn ended
+    if (t.status === 'WORKING') throw fail();
+  }
+  // 4-5. the old agent gives up the lease; the card (with its conversation, history) goes to the new agent
+  const prior = await lastAgentText(run.convs[workKey(t)]);
+  const wasReserved = cardLeases(w, t).some((l) => l.mode === 'write');
+  releaseCardLeases(w, t, `交接給 ${AGENTS[toAgent].name}`);
+  (t.handoffs ||= []).push({ from, to: toAgent, at: nowIso() });
+  Object.assign(t, { agent: toAgent, hold: false, interrupted: false, resumed: true, trust: true, convReset: false, detail: '',
+    status: ['PAUSED', 'INTERRUPTED'].includes(t.status) ? t.status : 'WAITING', wakeNote: writerHandoffNote(from, toAgent, prior) });
+  log(w, 'studio', 'system', `工作區交接：${AGENTS[from].name} 已停止並放下寫入權，改由 ${AGENTS[toAgent].name} 從目前的資料夾和 branch 接續「${t.title}」。${AGENTS[from].name} 的對話和紀錄都保留，但不再是寫入者。`);
+  if (run.paused || wasReserved && !run.active) { // a paused job: the reservation moves with the card, nobody else can slip in
+    const info = await workspaceOf(t.workdir || w.project);
+    const l = newLease(w, t, info, 'write');
+    Object.assign(l, { status: 'RESERVED', reason: `交接自 ${AGENTS[from].name}` });
+    saveLeases();
+  } else pump(w);
+  saveRun(w, run.paused ? 'paused' : 'running'); // the record now says who owns the card
+  return { ok: true, card: t.title, from, to: toAgent };
+}
+
+// ----- parallel work the right way: an own worktree (own branch, own lease) -----
+const slugOf = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'card';
+async function useWorktree(w, taskId) {
+  const t = w.tasks.find((x) => x.id === taskId);
+  if (!t || !isWriter(t)) throw new Error('只有會修改檔案的工作卡才需要獨立 worktree');
+  if (t.workdir) throw new Error('這張卡已經在獨立 worktree 裡');
+  if (['WORKING', 'DONE'].includes(t.status)) throw new Error('這張卡已經開始或已完成');
+  const info = await workspaceOf(w.project);
+  if (!info.isGit) throw new Error('這個資料夾不是 git 專案，不能建立獨立 worktree');
+  const dir = path.join(RT, 'studio', 'worktrees', `${path.basename(info.path)}-${t.id}`);
+  const branch = `studio/${t.id}-${slugOf(t.title)}`;
+  const base = (await git(info.path, 'symbolic-ref', '-q', '--short', 'refs/remotes/origin/HEAD')).out?.trim() || 'HEAD';
+  fs.mkdirSync(path.dirname(dir), { recursive: true });
+  const r = await git(info.path, 'worktree', 'add', '-b', branch, dir, base);
+  if (r.err) throw new Error('建立 worktree 失敗：' + r.err);
+  Object.assign(t, { workdir: dir, worktree: { path: dir, branch, base, repoPath: info.path }, blocked: null, blockReason: '', blockLogged: '' });
+  log(w, 'studio', 'system', `「${t.title}」改在獨立 worktree 做（branch ${branch}）：不會碰到主資料夾的寫入者。`);
+  pump(w);
+  return { path: dir, branch };
+}
+function useReadOnly(w, taskId) {
+  const t = w.tasks.find((x) => x.id === taskId);
+  if (!t) throw new Error('找不到這張工作卡');
+  if (['WORKING', 'DONE'].includes(t.status)) throw new Error('這張卡已經開始或已完成');
+  Object.assign(t, { writes: false, forcedReadOnly: true, blocked: null, blockReason: '', blockLogged: '',
+    instructions: t.instructions + '\n\nNOTE: the working tree is being edited by someone else right now, so do this card READ-ONLY: review / analysis / report only. Do not modify files.' });
+  log(w, 'studio', 'system', `「${t.title}」改成唯讀 Review：只讀、不修改，可以和寫入者同時進行。`);
+  pump(w);
+}
+// The PR is merged (or, without a remote, the branch is part of the base): the worktree and its branch can go.
+async function cleanupWorktree(w, t) {
+  const wt = t.worktree;
+  if (!wt || wt.cleaned) return;
+  let merged = false;
+  const pr = await sh('gh', ['pr', 'list', '--head', wt.branch, '--state', 'merged', '--json', 'number'], wt.repoPath);
+  try { merged = JSON.parse(pr.out || '[]').length > 0; } catch { /* no gh answer */ }
+  if (!merged && !(await originRepo(wt.repoPath))) merged = !(await git(wt.repoPath, 'merge-base', '--is-ancestor', wt.branch, 'HEAD')).err;
+  if (!merged) { log(w, 'studio', 'system', `worktree「${wt.branch}」先保留：它的 PR 還沒 merge。`); return; }
+  if ((await git(wt.path, 'status', '--porcelain')).out?.trim()) { log(w, 'studio', 'system', `worktree「${wt.branch}」先保留：裡面還有沒提交的檔案。`); return; }
+  await git(wt.repoPath, 'worktree', 'remove', '--force', wt.path);
+  await git(wt.repoPath, 'branch', '-D', wt.branch);
+  wt.cleaned = true;
+  log(w, 'studio', 'system', `已 merge：清掉本次建立的 worktree 和 branch「${wt.branch}」。`);
+}
+
+// ----- unknown changes: never reset / stash / overwrite; stop writing and ask -----
+function flagExternalModification(w, why) {
+  const run = w.run;
+  if (!run || run.extMod) return;
+  run.extMod = { at: nowIso(), why };
+  for (const l of S.leases) if (l.jobId === run.id && l.status !== 'RELEASED') l.flag = 'EXTERNAL_MODIFICATION_DETECTED';
+  if (run.active) pause(w); // stops the writers and keeps the leases RESERVED; nothing in the tree is touched
+  log(w, 'studio', 'system', `偵測到來源不明的修改（EXTERNAL_MODIFICATION_DETECTED）：${why}。Studio 已停止寫入，什麼都沒有改動（沒有 reset、沒有 stash）。確認後按「確認接手並繼續」。`);
+  notify(`${label(w)}：偵測到來源不明的修改`, why, 'ask', w.project);
+  saveRun(w, 'paused');
+}
+// Runs every few seconds. While none of Studio's agents is executing, any change to a tree Studio holds is somebody else's;
+// while one is executing, only cooperating signals (a fresh outside lock file) can be told apart from the agent's own edits.
+async function checkWorkspaces() {
+  for (const w of S.workspaces) {
+    const run = w.run;
+    if (!run || run.extMod || run.stopped) continue;
+    const holding = w.tasks.filter((t) => isWriter(t) && !t.workdir && cardLeases(w, t).some((l) => l.mode === 'write'));
+    if (!holding.length) continue;
+    if (holding.some((t) => t.status === 'WORKING')) {
+      const lock = await foreignLock(w);
+      if (lock) flagExternalModification(w, `${lock.owner || '另一個程式'} 在 Studio 寫入期間也開始修改這個工作區（鎖定檔）`);
+      continue;
+    }
+    if (run.treeStamp && (await treeStamp(w)) !== run.treeStamp) flagExternalModification(w, '持有寫入權的 Agent 沒有在執行，工作區卻被改動了');
+  }
 }
 
 async function runCard(w, t) {
@@ -893,13 +1161,14 @@ async function runCard(w, t) {
   log(w, t.agent, 'worker', (note ? '收到等待的結果，繼續：' : t.resumed ? '繼續工作：' : '開始工作：') + t.title);
   try {
     const deps = (t.after || []).map((id) => w.tasks.find((x) => x.id === id)).filter(Boolean);
-    const prompt = note ? `Update from Multi-Agent Studio for your task "${t.title}":
+    const knowsTask = !!run.convs[workKey(t)]; // a new conversation (e.g. after a handoff) has not seen the task yet
+    const prompt = note && knowsTask ? `Update from Multi-Agent Studio for your task "${t.title}":
 ${note}
 
 Continue the task. End your reply with a short summary (1-3 sentences).
 ${STATUS_RULES}` : `You are a WORKER in "Multi-Agent Studio". Your leader (${AGENTS[run.leader].name}) assigned you this task.
-Work only inside the project folder: ${run.project}
-${t.resumed ? '\nYou were interrupted while doing this task earlier. First check the current state of the project folder, then finish the task without redoing work that is already done.\n' : ''}
+Work only inside this folder: ${t.workdir || run.project}
+${note ? `\nNOTE FROM STUDIO:\n${note}\n` : ''}${t.resumed ? '\nYou were interrupted while doing this task earlier. First check the current state of the project folder, then finish the task without redoing work that is already done.\n' : ''}
 Task: ${t.title}
 Instructions:
 ${t.instructions}
@@ -908,7 +1177,7 @@ ${accessRules(t)}
 ${deliveryRules(w.delivery, 'worker')}
 When you end your turn, reply with a short summary of what you did (1-3 sentences).
 ${STATUS_RULES}`;
-    const cid = await conv(w, t.agent, false, t.hard);
+    const cid = await conv(w, t.agent, false, t.hard, t.workdir);
     // A step stopped by 立刻打斷 ends early (maybe with an error): park the card until the Leader has read the note.
     const step = async (text) => { try { return await turn(t.agent, cid, text, { w }); } catch (e) { if (t.interrupted && !(e instanceof Halt)) return ''; throw e; } };
     const park = () => {
@@ -1248,6 +1517,8 @@ function refreshState(w) {
   const p = (async () => {
     const job = latestJob(w);
     const nums = job ? [...new Set(knownRefs(job).map((x) => +(String(x).match(/(?:pull\/|#)(\d+)/)?.[1] || 0)).filter(Boolean))] : [];
+    const info = await workspaceOf(w.project);
+    Object.assign(w, { wsKey: info.key, wsInfo: { path: info.path, branch: info.branch, repo: info.repo } });
     w.pstate = deriveState(job, await readGitState(w.project, nums));
     saveSettings();
   })().catch((e) => console.error('Project State 讀取失敗：' + e.message)).finally(() => refreshing.delete(w.project));
@@ -1382,6 +1653,7 @@ function stop(w) {
   run.stopped = true;
   busyConvs(run).forEach(cancelTurn);
   for (const t of w.tasks) if (['WAITING', 'PAUSED', 'INTERRUPTED', ...PARKED].includes(t.status)) { t.status = 'FAILED'; t.result = '已停止'; }
+  releaseJobLeases(w, 'stopped'); // STOP: the tree is free again; records stay
   log(w, 'studio', 'system', '已停止：這件工作到此為止，未完成的卡標成失敗，不能再「繼續」。要接著做，按「▶ 接著處理」開新的一輪。');
   finish(w, 'stopped');
 }
@@ -1393,6 +1665,7 @@ function pause(w) {
   run.active = false;
   busyConvs(run).forEach(cancelTurn);
   for (const t of w.tasks) if (t.status === 'WORKING') { t.status = 'PAUSED'; t.result = '已暫停'; t.resumed = true; }
+  reserveJobLeases(w, 'paused'); // PAUSE: the work still belongs to its owner
   log(w, 'studio', 'system', '已暫停：成員已停下（手上那一步可能做到一半），工作卡和進度都保留，不會自己恢復；關掉 Studio 也沒關係，要你按「繼續」才會接著做。');
   saveRun(w, 'paused');
 }
@@ -1408,12 +1681,12 @@ function loadRun(w, r) {
   w.tasks = r.tasks;
   w.activity = r.activity;
   w.run = { id: r.id, startedAt: r.startedAt, project: r.project, leader: r.leader, request: r.request, convs: r.convs || {}, phase: r.phase || 'working', leaderGen: 0, rounds: r.rounds || 0, ask: r.ask || null, notes: r.notes || [], goal: r.goal, refs: r.refs, context: r.context, continues: r.continues, active: false, paused: true, stopped: false, summarizing: false };
-  Object.assign(w.run, { treeStamp: r.treeStamp, leftAt: r.leftAt });
+  Object.assign(w.run, { treeStamp: r.treeStamp, leftAt: r.leftAt, extMod: r.extMod, claimedBy: r.claimedBy });
   for (const [k, cid] of Object.entries(w.run.convs)) convAgent.set(cid, k.split(':')[0]);
 }
 
 // w is null when continuing from history: the record's project picks (or opens) the workspace.
-function resume(w, id) {
+async function resume(w, id, opts = {}) {
   if (id && w?.run?.id !== id) {
     const r = readHistory(id);
     if (!resumable(r)) throw new Error('這筆紀錄不是暫停或中斷的工作');
@@ -1429,6 +1702,15 @@ function resume(w, id) {
   if (busyConvs(run).length) throw new Error('Agent 還在停下中，請幾秒後再按繼續');
   if (!isDir(run.project)) throw new Error('專案資料夾不存在：' + run.project);
   if (!available(w.leader)) throw new Error(`Leader ${AGENTS[w.leader].name} 目前不可用`);
+  // Is the tree still this job's? (Somebody else may hold it now: another agent after a handoff, an external session.)
+  const holder = await leaseBlocker(w);
+  if (holder) throw new Error(`工作區已由${holder.owner.kind === 'external' ? '外部 Agent 接手' : '另一個 Agent 接手'}，本工作保持暫停。（${holderText(holder)}）`);
+  if (run.extMod) {
+    if (!opts.confirmExternal) throw new Error(`偵測到來源不明的修改（EXTERNAL_MODIFICATION_DETECTED）：${run.extMod.why}。確認要讓 Studio 接手並繼續，請用「確認接手並繼續」。`);
+    Object.assign(run, { extMod: null, treeStamp: await treeStamp(w), leftAt: nowIso() });
+    for (const l of S.leases) if (l.jobId === run.id) l.flag = '';
+    for (const t of w.tasks) t.trust = true;
+  }
   if (run.leader !== w.leader) { run.handoffFrom = run.leader; run.leader = w.leader; }
   run.paused = false;
   run.active = true;
@@ -1445,6 +1727,11 @@ function reassign(w, taskId, agent) {
   if (!t) throw new Error('找不到這項工作');
   if (t.status === 'WORKING') throw new Error('工作進行中，請先暫停或 Stop');
   if (!available(agent)) throw new Error(`${AGENTS[agent]?.name ?? agent} 目前不可用`);
+  for (const l of cardLeases(w, t)) if (l.owner.agent !== agent) { // the lease follows the card to its new agent
+    retire(l, `改派給 ${AGENTS[agent].name}`);
+    if (l.mode === 'write' && l.status === 'RELEASED' && run.paused) S.leases.push({ ...l, id: crypto.randomUUID().slice(0, 8), owner: { kind: 'studio', agent }, status: 'RESERVED', acquiredAt: nowIso(), heartbeatAt: nowIso(), releasedAt: undefined, reason: '改派' });
+  }
+  saveLeases();
   Object.assign(t, { agent, result: '', wakeNote: '', wait: null, ask: null });
   log(w, 'user', 'user', `重新指派「${t.title}」給 ${AGENTS[agent].name}`);
   if (run.paused) { t.status = 'PAUSED'; saveRun(w, 'paused'); return; } // runs when the user continues
@@ -1552,14 +1839,23 @@ const routes = {
   'GET /api/state': () => {
     const workspaces = S.workspaces.map((w) => {
       const r = w.run;
-      return { project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, delivery: w.delivery, tiers: tiersOf(w), tasks: w.tasks, activity: w.activity, progress: readProjectProgress(w),
-        run: r && { id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
+      const key = w.wsKey || treeKey(w.project), live = S.leases.filter((l) => l.key === key && l.status !== 'RELEASED' && leaseState(l) !== 'RELEASED');
+      return { wsInfo: w.wsInfo, lease: { writer: live.filter((l) => l.mode === 'write').map(leaseView)[0] || null, readers: live.filter((l) => l.mode === 'read').map(leaseView) }, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, delivery: w.delivery, tiers: tiersOf(w), tasks: w.tasks, activity: w.activity, progress: readProjectProgress(w),
+        run: r && { extMod: r.extMod, claimedBy: r.claimedBy, id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
     });
     return { ...S, ...teamStats(), agents: Object.values(S.agents), workspaces };
   },
   // Project-scoped calls name their project in `ws` (its folder path).
   'POST /api/pause': (b) => pause(wsOf(b.ws)),
-  'POST /api/resume': (b) => resume(b.ws ? wsOf(b.ws) : null, b.id),
+  'POST /api/resume': (b) => resume(b.ws ? wsOf(b.ws) : null, b.id, { confirmExternal: !!b.confirmExternal }),
+  // Workspace leases. External programs / other AI sessions use claim / release-claim to say "I am editing this folder now".
+  'GET /api/leases': () => S.leases.filter((l) => l.status !== 'RELEASED').map(leaseView),
+  'POST /api/workspace/claim': (b) => claimWorkspace(b.path || wsOf(b.ws).project, { label: b.label, pid: b.pid, note: b.note }),
+  'POST /api/workspace/release-claim': (b) => releaseClaim(b.path || wsOf(b.ws).project),
+  'POST /api/handoff': (b) => handoffWriter(wsOf(b.ws), b.agent, b.taskId),
+  'POST /api/card/readonly': (b) => useReadOnly(wsOf(b.ws), b.taskId),
+  'POST /api/card/worktree': (b) => useWorktree(wsOf(b.ws), b.taskId),
+  'POST /api/lease/release': (b) => { const l = S.leases.find((x) => x.id === b.id); if (!l) throw new Error('找不到這個租約'); if (['ACTIVE'].includes(leaseState(l))) throw new Error('這個租約的持有者還活著，不能強制釋放；請先暫停或交接'); retire(l, '使用者手動釋放'); saveLeases(); },
   'POST /api/paseo/open': (b) => openInPaseo(wsOf(b.ws)),
   'POST /api/workspace/open': (b) => openWorkspace(b.path),
   'POST /api/workspace/close': (b) => closeWorkspace(wsOf(b.ws)),
@@ -1616,6 +1912,9 @@ watchCatalogs();
 pollPaseo();
 setInterval(pollPaseo, 10000);
 setInterval(watchExternal, 60000); // GitHub PR / CI waits
+loadLeases(); // who held which working tree before this start
+setInterval(beatLeases, LEASE_BEAT_MS); // heartbeat of the leases this Studio holds
+setInterval(() => checkWorkspaces().catch(() => {}), 15000); // unknown changes to a tree Studio holds
 // Port taken (e.g. another Studio copy is open): use the next free one, unless STUDIO_PORT asked for an exact port.
 server.on('error', (e) => {
   if (e.code !== 'EADDRINUSE' || process.env.STUDIO_PORT || PORT >= 4858) throw e;
