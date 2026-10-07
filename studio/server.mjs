@@ -24,13 +24,26 @@ const AGENTS = {
   antigravity: { name: 'Antigravity', create: (ws, lead) => ({ type: 'antigravity', extra: { backend: 'antigravity', workspace: ws, session_mode: lead ? 'plan' : 'yolo' } }) },
 };
 
+// ---------- External LLM providers ----------
+// A provider (name, API format, base URL, API key, model) lives in AionCore, which stores the key encrypted and runs
+// the model with its own agent loop (tools, file edits). Studio keeps only { id, name, platform, baseUrl, model, providerId }:
+// never the key, so settings.json, /api/state and the logs cannot leak it.
+const EXT_PLATFORMS = ['openai', 'anthropic', 'gemini'];
+function registerExternal(e) {
+  AGENTS[e.id] = { name: e.name, external: true, create: (ws, lead) => ({ type: 'aionrs', model: { provider_id: e.providerId, model: e.model, use_model: e.model }, extra: { workspace: ws, session_mode: lead ? 'plan' : 'yolo' } }) };
+  const a = (S.agents[e.id] ??= { id: e.id, status: 'checking', note: '', working: 0, models: [], efforts: [] });
+  Object.assign(a, { name: e.name, external: true, models: [{ value: e.model, name: e.model, description: '' }] });
+  S.agentCfg[e.id] ??= { model: '', effort: '' };
+  for (const w of S.workspaces) w.agentCfg[e.id] ??= { model: '', effort: '' };
+}
+
 // What a project does when a job is done: stop (default) | suggest next steps | auto-continue (user opts in).
 const AFTER_DONE = ['stop', 'suggest', 'auto'];
 const STRATEGY_IDS = ['save', 'balanced', 'quality', 'custom']; // model strategies (see STRATEGIES)
 const DELIVERY_IDS = ['auto', 'pr']; // delivery: auto = all the way to merge (default), pr = stop at the pull request
 const AUTO_MAX = 5; // auto-started jobs in a row before Studio stops and waits for the user
 // S.leader is the default Leader for newly opened projects.
-const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [], leases: [],
+const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [], leases: [], external: [],
   limits: {}, notify: true, notices: [], noticeSeq: 0 };
 // One workspace per project folder: its own Leader, board, team chat and run, so projects work side by side.
 // name = optional display name (tabs, cards, notifications); the folder name is used when empty.
@@ -61,6 +74,7 @@ const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { retu
 
 try {
   const saved = JSON.parse(fs.readFileSync(SETTINGS, 'utf8'));
+  for (const e of saved.external || []) if (e?.id && e.providerId && e.model) { S.external.push({ id: String(e.id), name: String(e.name || e.model), platform: e.platform, baseUrl: String(e.baseUrl || ''), isFullUrl: !!e.isFullUrl, model: String(e.model), providerId: String(e.providerId) }); registerExternal(S.external.at(-1)); }
   if (AGENTS[saved.leader]) S.leader = saved.leader;
   for (const id in S.agentCfg) Object.assign(S.agentCfg[id], saved.agentCfg?.[id]);
   // Older settings had one `project` and global models; it becomes the first open workspace with those models.
@@ -79,7 +93,7 @@ try {
 function saveSettings() {
   fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
   const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, strategy: w.strategy, delivery: w.delivery }));
-  fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify }, null, 2));
+  fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external }, null, 2));
 }
 
 function saveRun(w, status) {
@@ -187,7 +201,7 @@ const convAgent = new Map(); // conversationId -> agent id (to route catalog eve
 // cfg = the project's { model, effort } for this agent; none = agent defaults.
 async function createConv(agent, ws, lead, cfg) {
   const body = AGENTS[agent].create(ws, lead);
-  if (cfg?.model) body.extra.current_model_id = cfg.model;
+  if (cfg?.model && !AGENTS[agent].external) body.extra.current_model_id = cfg.model;
   if (cfg?.effort) body.extra.thought_level = cfg.effort;
   // Right after READY, create can briefly 400 (assistant catalog race seen in P0).
   for (let i = 0; ; i++) {
@@ -349,6 +363,69 @@ async function turn(agent, convId, text, { w, lead = false, check = false, timeo
   return String(last?.content?.content ?? '').trim();
 }
 
+// ---------- External provider operations ----------
+const extOf = (id) => S.external.find((x) => x.id === id);
+async function extProvider(id) {
+  const e = extOf(id);
+  const p = ((await api('GET', '/api/providers')) || []).find((x) => x.id === e?.providerId);
+  if (!p) throw new Error('這個外部模型的供應商設定不見了（AionCore 資料被清掉？），請按「編輯」重新輸入 API key');
+  return p;
+}
+// Error text never carries a key, even when AionCore or the provider echoes it.
+const hideKey = (e, key) => { if (key && key.length > 3) e.message = e.message.split(key).join('***'); return e; };
+const isLocalUrl = (u) => /^(localhost|127\.0\.0\.1|\[::1\])$/i.test(new URL(u).hostname);
+
+function extFields(b) {
+  const f = { name: String(b.name || '').trim(), platform: String(b.platform || 'openai'), baseUrl: String(b.baseUrl || '').trim().replace(/\/+$/, ''), model: String(b.model || '').trim(), isFullUrl: !!b.isFullUrl };
+  if (!f.name) throw new Error('請填顯示名稱');
+  if (!f.model) throw new Error('請填模型名稱');
+  if (!EXT_PLATFORMS.includes(f.platform)) throw new Error('不支援的 API 格式：' + f.platform);
+  let u; try { u = new URL(f.baseUrl); } catch { throw new Error('Base URL 不是有效的網址（例如 https://api.example.com/v1）'); }
+  if (!/^https?:$/.test(u.protocol)) throw new Error('Base URL 必須是 http:// 或 https://');
+  return f;
+}
+
+// Add (no id) or change (id) an external model. A blank key on edit keeps the saved key.
+async function saveExternal(b) {
+  const f = extFields(b), key = String(b.apiKey || '').trim(), old = b.id ? extOf(b.id) : null;
+  if (b.id && !old) throw new Error('找不到這個外部模型');
+  if (!old && !key && !isLocalUrl(f.baseUrl)) throw new Error('請填 API key（只有本機位址如 Ollama 可以留空）');
+  const body = { platform: f.platform, name: f.name, base_url: f.baseUrl, models: [f.model], enabled: true, is_full_url: f.isFullUrl };
+  if (key) body.api_key = key; else if (!old) body.api_key = 'local';
+  try {
+    let providerId = old?.providerId;
+    if (old) await api('PUT', '/api/providers/' + providerId, body);
+    else providerId = (await api('POST', '/api/providers', body)).id;
+    const e = Object.assign(old || { id: 'ext_' + crypto.randomBytes(4).toString('hex') }, f, { providerId });
+    if (!old) { S.external.push(e); for (const w of S.workspaces) w.workers = [...new Set([...w.workers, e.id])]; }
+    registerExternal(e);
+    saveSettings();
+    checkAgent(e.id); // runs in the background: the card shows "checking" and then available / the reason
+    return { id: e.id };
+  } catch (err) { throw hideKey(err, key); }
+}
+
+async function deleteExternal(id) {
+  const e = extOf(id);
+  if (!e) throw new Error('找不到這個外部模型');
+  const w = S.workspaces.find((x) => x.leader === id || x.run?.convs && x.tasks.some((t) => t.agent === id && !['DONE', 'FAILED'].includes(t.status)));
+  if (w) throw new Error(`「${label(w)}」正在用 ${e.name}（工頭或未完成的工作卡）；先換掉或等它做完再刪除`);
+  await api('DELETE', '/api/providers/' + e.providerId, {}).catch((err) => { if (!/404|not found/i.test(err.message)) throw err; });
+  S.external = S.external.filter((x) => x !== e);
+  delete AGENTS[id]; delete S.agents[id]; delete S.agentCfg[id];
+  for (const x of S.workspaces) { delete x.agentCfg[id]; x.workers = x.workers.filter((a) => a !== id); }
+  saveSettings();
+}
+
+// Ask the provider which models it offers (the key comes from the form, or from the saved provider when editing).
+async function extModels(b) {
+  const f = { platform: String(b.platform || 'openai'), baseUrl: String(b.baseUrl || '').trim().replace(/\/+$/, '') };
+  let key = String(b.apiKey || '').trim();
+  if (!key && b.id) key = (await extProvider(b.id)).api_key || '';
+  try { return (await api('POST', '/api/providers/fetch-models', { platform: f.platform, base_url: f.baseUrl, api_key: key || 'local' })).models || []; }
+  catch (err) { throw hideKey(err, key); }
+}
+
 // ---------- Team ----------
 async function checkAgent(id) {
   const a = S.agents[id];
@@ -358,6 +435,7 @@ async function checkAgent(id) {
     const ws = path.join(RT, 'studio', 'check');
     fs.mkdirSync(ws, { recursive: true });
     // The check uses agent defaults so a bad saved model can't make the agent look unavailable.
+    if (AGENTS[id].external) await extProvider(id);
     const reply = await turn(id, await createConv(id, ws, true), 'Reply with exactly: OK', { lead: true, check: true, timeout: 120e3 });
     if (!/OK/i.test(reply)) throw new Error('沒有正常回覆：' + (reply || '(空白)'));
     a.status = 'available';
@@ -1906,6 +1984,10 @@ const routes = {
   'POST /api/recent/remove': (b) => removeRecent(b.path),
   'POST /api/agent-config': (b) => setAgentCfg(wsOf(b.ws), b.agent, b.model, b.effort, b.hardModel, b.hardEffort),
   'POST /api/workers': (b) => setWorker(wsOf(b.ws), b.agent, !!b.on),
+  'POST /api/external/save': (b) => saveExternal(b),
+  'POST /api/external/delete': (b) => deleteExternal(b.id),
+  'POST /api/external/models': (b) => extModels(b),
+  'POST /api/external/check': (b) => { if (!extOf(b.id)) throw new Error('找不到這個外部模型'); checkAgent(b.id); },
   // One-time login for Studio's separate Codex home, in a visible console window.
   'POST /api/codex-login': () => { spawn('cmd', ['/c', 'start', 'Codex login (Studio)', 'cmd', '/k', 'codex', 'login'], { env: { ...process.env, CODEX_HOME }, detached: true, stdio: 'ignore' }); },
   'GET /api/history': () => listHistory(),

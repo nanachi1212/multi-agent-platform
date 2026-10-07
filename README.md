@@ -60,6 +60,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 - 工頭不讀檔、不查 repo、不跑指令，只規劃與確認；調查和動手都交給成員。Claude Code 只在 Codex 和 Antigravity 做不了時才拿到工作卡。
 - 模型策略（每個專案）：💰 省額度（預設，普通卡 Sonnet／Luna，困難卡自動升級 Opus／Sol）、⚖️ 均衡、🚀 品質優先、🛠️ 自訂。工頭自己判斷普通或困難；普通卡失敗會自動改用強模型重試一次。
 - 員工卡顯示 Claude（5 小時＋每週）與 Codex（每週）的額度條。Claude 額度只在 Studio 啟動和按「更新」時讀取一次。
+- **外部模型（API）**：總覽頁「外部模型（API）」按「＋ 新增外部模型」，填顯示名稱、API 格式（OpenAI 相容／Anthropic／Gemini）、Base URL、API Key、模型名稱（可按「取得模型清單」挑選；網址已是完整請求位址時勾選對應選項），按「儲存並測試」。它會成為和 Codex、Claude 一樣的團隊成員（可當工頭或成員，會讀寫專案檔案，同樣受工作區租約管理）。API key 只交給 AionCore 加密保存，Studio 的設定檔、畫面、紀錄都不含 key；編輯時 key 留空 = 不變；本機位址（如 Ollama）可不填 key。每個外部模型固定一個模型名稱，要換模型就新增一個。
 
 ### 已知限制（v0.1.0）
 
@@ -137,6 +138,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 - The Leader does not read files, search the repo or run commands; it only plans and checks, and sends investigation and work to workers. Claude Code gets a card only when Codex and Antigravity cannot do it.
 - Model strategy per project: 💰 save (default; normal cards Sonnet / Luna, hard cards auto-upgrade to Opus / Sol), ⚖️ balanced, 🚀 quality, 🛠️ custom. The Leader marks cards normal or hard by itself; a failed normal card is retried once on the strong model.
 - Seat cards show Claude (5-hour + weekly) and Codex (weekly) usage bars. Claude usage is read only at Studio start and on refresh.
+- **External models (API)**: on the overview page press "＋ 新增外部模型" under "外部模型（API）" and fill in display name, API format (OpenAI-compatible / Anthropic / Gemini), base URL, API key and model name ("取得模型清單" lists what the service offers; tick the full-URL option if the URL already is the complete request address), then "儲存並測試". It becomes a team member like Codex or Claude (Leader or Worker, reads and edits project files, governed by the same workspace lease). The API key is handed to AionCore, which stores it encrypted; Studio settings, UI and logs never contain it; leave the key blank when editing to keep it; local addresses (e.g. Ollama) need no key. One external model = one fixed model name; add another entry to use a different model.
 
 ### Known limits (v0.1.0)
 

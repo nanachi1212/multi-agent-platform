@@ -54,8 +54,8 @@
   h2.zone { margin:4px 0 -8px; font-size:15px; font-weight:700; }
   .sub { color:var(--muted); font-size:12px; margin:14px 0 6px; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  input[type=text], textarea, select { width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:10px; background:var(--panel2); outline:none; }
-  input[type=text]:focus, textarea:focus, select:focus { border-color:var(--accent); }
+  input[type=text], input[type=password], textarea, select { width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:10px; background:var(--panel2); outline:none; }
+  input[type=text]:focus, input[type=password]:focus, textarea:focus, select:focus { border-color:var(--accent); }
   .sidebar { display:flex; flex-direction:column; gap:16px; }
   .sidebar .row { margin-top:8px; }
   .empty { color:var(--muted); font-size:13px; padding:6px 0; }
@@ -246,6 +246,8 @@
     <section class="panel mx-wrap" id="matrix"></section>
     <h2 class="zone">AI 員工（全部專案）</h2>
     <section class="seats" id="ovSeats"></section>
+    <h2 class="zone">外部模型（API）</h2>
+    <section class="panel" id="extList"></section>
   </main>
 
   <main class="stage" id="projectView" hidden>
@@ -282,6 +284,23 @@
     </div>
   </main>
 </div>
+
+<dialog id="extDlg" style="width:min(560px,94vw)">
+  <div class="dlg-h"><b id="extTitle">新增外部模型</b><span class="spacer"></span><button class="btn small" id="extClose">關閉</button></div>
+  <div class="dlg-b">
+    <label>顯示名稱<input type="text" id="extName" placeholder="例如：DeepSeek、公司內部模型" autocomplete="off"></label>
+    <label>API 格式<select id="extPlatform"><option value="openai">OpenAI 相容（大多數服務、Ollama、vLLM、OpenRouter…）</option><option value="anthropic">Anthropic</option><option value="gemini">Gemini</option></select></label>
+    <label>Base URL<input type="text" id="extUrl" placeholder="https://api.example.com/v1" autocomplete="off"></label>
+    <label class="hint"><input type="checkbox" id="extFull"> 這個網址已經是完整的請求位址（不要再自動加上 /chat/completions 之類的路徑）</label>
+    <label>API Key<input type="password" id="extKey" autocomplete="new-password" placeholder="sk-…"></label>
+    <div class="hint" id="extKeyNote">API key 只交給 AionCore 加密保存，Studio 不存、也不會在畫面或紀錄顯示。本機位址（如 Ollama）可以留空。</div>
+    <label>模型名稱<input type="text" id="extModel" list="extModels" placeholder="例如：deepseek-chat" autocomplete="off"></label>
+    <datalist id="extModels"></datalist>
+    <div class="row"><button class="btn small ghost" id="extFetch" title="用上面的網址和 key 向服務詢問有哪些模型">取得模型清單</button><span class="hint" id="extFetchNote"></span></div>
+    <div class="hint" style="color:var(--bad)" id="extErr"></div>
+    <div class="row"><button class="btn pz" id="extSave">儲存並測試</button></div>
+  </div>
+</dialog>
 
 <dialog id="histDlg">
   <div class="dlg-h"><b id="histTitle">歷史紀錄</b><span class="spacer"></span><button class="btn pz small" id="histResume" hidden>繼續這個工作</button><button class="btn small" id="histClose">關閉</button></div>
@@ -414,6 +433,39 @@ function statusHtml(a, w) {
   const busy = S.workspaces.filter((x) => duty(a, x).kind === 'work').length;
   return busy ? `<span class="dot work"></span>忙碌中：${busy} 個專案` : '<span class="dot"></span>待命';
 }
+
+// External models (added by the user with name, URL, key, model). The key is never shown: it lives in AionCore.
+function extHtml() {
+  const rows = (S.external || []).map((e) => {
+    const a = S.agents.find((x) => x.id === e.id) || {};
+    const st = a.status === 'available' ? '<span class="tag ok">可用</span>' : a.status === 'unavailable' ? '<span class="tag bad">不可用</span>' : '<span class="tag">檢查中…</span>';
+    return `<div class="row" style="align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0;border-top:1px solid var(--line)">
+      <b>${esc(e.name)}</b> ${st}<span class="hint">${esc(e.model)} · ${esc(e.platform)} · ${esc(e.baseUrl)}</span>
+      ${a.status === 'unavailable' ? `<span class="hint" style="color:var(--bad)">${esc(a.note)}</span>` : ''}
+      <span class="spacer"></span><button class="btn small ghost" data-ext-check="${e.id}">重新測試</button><button class="btn small" data-ext-edit="${e.id}">編輯</button><button class="btn small ghost" data-ext-del="${e.id}">刪除</button></div>`;
+  }).join('');
+  return `<div class="hint">把 OpenAI 相容（或 Anthropic／Gemini）的外部模型接進來，它會像 Codex、Claude 一樣成為團隊成員：可以當工頭或成員，會讀寫專案檔案。</div>${rows}<div class="row" style="margin-top:8px"><button class="btn small" data-ext-add>＋ 新增外部模型</button></div>`;
+}
+let extEditId = '';
+function extOpen(id) {
+  const e = id ? S.external.find((x) => x.id === id) : null;
+  extEditId = e?.id || '';
+  $('extTitle').textContent = e ? '編輯外部模型' : '新增外部模型';
+  $('extName').value = e?.name || ''; $('extPlatform').value = e?.platform || 'openai'; $('extUrl').value = e?.baseUrl || '';
+  $('extFull').checked = !!e?.isFullUrl; $('extKey').value = ''; $('extModel').value = e?.model || '';
+  $('extKey').placeholder = e ? '（已儲存；留空 = 不變）' : 'sk-…';
+  $('extErr').textContent = ''; $('extFetchNote').textContent = ''; $('extModels').innerHTML = '';
+  $('extDlg').showModal();
+}
+// Calls from the dialog show their errors inside the dialog.
+async function extCall(url, body) {
+  $('extErr').textContent = '';
+  const r = await fetch(url, { method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify(body) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { $('extErr').textContent = j.error || ('錯誤 ' + r.status); throw new Error(j.error); }
+  return j;
+}
+const extForm = () => ({ id:extEditId, name:$('extName').value, platform:$('extPlatform').value, baseUrl:$('extUrl').value, apiKey:$('extKey').value, model:$('extModel').value, isFullUrl:$('extFull').checked });
 
 function seatHtml(a, w) {
   const l = look(a.id), lead = w && a.id === w.leader, out = w && !lead && !w.workers.includes(a.id), off = a.status !== 'available' || out;
@@ -731,6 +783,7 @@ function renderOverview() {
     : '<div class="panel empty">還沒有開啟專案。用左邊「開啟專案」或上方 ＋ 開啟一個或多個資料夾，每個專案會有自己的分頁，可以同時工作。</div>';
   $('matrix').innerHTML = matrixHtml();
   if (!$('ovSeats').contains(document.activeElement)) $('ovSeats').innerHTML = S.agents.map((a) => seatHtml(a, null)).join('');
+  if (!$('extList').contains(document.activeElement)) $('extList').innerHTML = extHtml();
 }
 
 function renderProject(w, force) {
@@ -884,6 +937,19 @@ $('pauseResume').onclick = () => {
 $('renameWs').onclick = () => { const n = prompt('這個專案的顯示名稱（留空 = 用資料夾名稱）', W()?.name || ''); if (n !== null) post('/api/workspace/rename', { ws: ws(), name: n }); };
 $('closeWs').onclick = () => post('/api/workspace/close', { ws: ws() }).then(() => go(''));
 $('histClose').onclick = () => $('histDlg').close();
+$('extClose').onclick = () => $('extDlg').close();
+$('extFetch').onclick = async () => {
+  $('extFetchNote').textContent = '查詢中…';
+  try {
+    const m = await extCall('/api/external/models', extForm());
+    $('extModels').innerHTML = m.map((x) => `<option value="${esc(x)}">`).join('');
+    $('extFetchNote').textContent = m.length ? `找到 ${m.length} 個模型：點「模型名稱」欄選擇` : '服務沒有回報模型清單，請自己輸入模型名稱';
+  } catch { $('extFetchNote').textContent = ''; }
+};
+$('extSave').onclick = async () => {
+  const b = $('extSave'); b.disabled = true;
+  try { await extCall('/api/external/save', extForm()); $('extDlg').close(); refresh(); } catch { /* shown in the dialog */ } finally { b.disabled = false; }
+};
 $('histResume').onclick = () => post('/api/resume', { id: histOpenId }).then(() => { $('histDlg').close(); go(histOpenProject); });
 $('paseoOpen').onclick = async () => {
   const b = $('paseoOpen');
@@ -978,6 +1044,10 @@ document.addEventListener('click', (e) => {
     return post('/api/start', { ws: p, request: $('request').value }).then(() => { drafts[p] = ''; $('request').value = ''; b.blur(); }).catch(() => {});
   }
   if (b.hasAttribute('data-recheck')) return post('/api/check');
+  if (b.hasAttribute('data-ext-add')) return extOpen('');
+  if (b.dataset.extEdit) return extOpen(b.dataset.extEdit);
+  if (b.dataset.extCheck) return post('/api/external/check', { id: b.dataset.extCheck }).catch(() => {});
+  if (b.dataset.extDel) { const e = S.external.find((x) => x.id === b.dataset.extDel); return confirm('刪除外部模型「' + (e?.name || '') + '」？\n\nAPI key 也會一併從 AionCore 刪除。已經完成的工作卡和紀錄不受影響。') && post('/api/external/delete', { id: b.dataset.extDel }).catch(() => {}); }
   b.blur();
   if (b.hasAttribute('data-codex-login')) post('/api/codex-login');
   if (b.dataset.leader) {
