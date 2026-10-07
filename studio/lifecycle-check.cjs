@@ -13,7 +13,8 @@ function makeEnv(script) {
     S: { workspaces: [] }, crypto: nodeCrypto, logs, notices, prompts,
     log: (w, who, role, text, detail) => logs.push({ who, role, text, detail }),
     notify: (title, body, kind) => notices.push({ title, body, kind }),
-    label: () => 'TestProj', refreshClaudeLimits() {}, saveRun() {}, saveSettings() {}, latestJob: () => null,
+    label: () => 'TestProj', refreshClaudeLimits() {}, saveRun() {}, saveSettings() {}, latestJob: () => null, clip: (x, n) => String(x ?? '').slice(0, n), AUTO_MAX: 5, AFTER_DONE: ['stop', 'suggest', 'auto'],
+    started: [], start: async (w, request, cont) => { env.started.push({ request, cont }); }, setTimeout: (fn) => queueMicrotask(fn),
     Halt: class extends Error {}, active: new Map(), busyConvs: () => [], cancelTurn() {}, convAgent: new Map(),
     available: () => true, workersFor: (w, lead) => w.workers.filter((x) => x !== lead),
     conv: async (w, agent, lead) => agent + (lead ? ':lead' : ':work'),
@@ -21,7 +22,7 @@ function makeEnv(script) {
     execFile: (cmd, args, opts, cb) => cb(new Error('no git / gh in test'), '', ''), isDir: () => true, readHistory() {}, openWorkspace() {}, wsOf() {},
   };
   const names = Object.keys(env);
-  const api = new Function(...names, code + '\nreturn { planPhase, pump, summarize, answer, continueCard, wake, parseStatus, finish };')(...names.map((k) => env[k])); // test harness: our own code
+  const api = new Function(...names, code + '\nreturn { planPhase, pump, summarize, answer, continueCard, wake, parseStatus, finish, autoNext };')(...names.map((k) => env[k])); // test harness: our own code
   return { env, api };
 }
 const newW = () => ({ project: 'P', leader: 'claude', workers: ['claude', 'codex', 'antigravity'], tasks: [], activity: [],
@@ -116,6 +117,29 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
   assert.ok(env.prompts.some((p) => p.text.startsWith('Your last reply had no STATUS line')));
   assert.ok(env.prompts.some((p) => p.text.includes('has no open card in this job')));
   console.log('5 missing status re-asked + no-deadlock wake: PASS');
+  // 7) after-done modes: stop asks for nothing, suggest keeps 1-3 next steps, auto starts the first (max 5 in a row)
+  const modeScript = (agent, text) => {
+    if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"t","agent":"codex","instructions":"x"}]}';
+    if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok","next":[{"title":"加測試","why":"保護剛做的功能","request":"add tests"},{"title":"更新文件","request":"update docs"}]}';
+    return 'ok\nSTATUS: DONE';
+  };
+  for (const mode of ['stop', 'suggest', 'auto']) {
+    ({ env, api } = makeEnv(modeScript));
+    w = Object.assign(newW(), { afterDone: mode, autoRounds: 0 }); env.S.workspaces.push(w);
+    await api.planPhase(w); await settle();
+    const check = env.prompts.find((p) => p.text.includes('Every current card has ended')).text;
+    assert.strictEqual(check.includes('"next"'), mode !== 'stop', mode + ': next steps asked only when wanted');
+    assert.strictEqual(w.run.suggestions.length, mode === 'stop' ? 0 : 2, mode + ': suggestions kept');
+    assert.deepStrictEqual(env.started.map((x) => x.request), mode === 'auto' ? ['add tests'] : [], mode + ': auto start only in auto mode');
+    if (mode === 'auto') {
+      assert.strictEqual(env.started[0].cont, true); assert.strictEqual(w.autoRounds, 1);
+      w.autoRounds = 5; api.autoNext(w, w.run);
+      assert.strictEqual(env.started.length, 1, 'stops after 5 in a row');
+      assert.ok(env.notices.some((n) => n.title.includes('自動持續開發先停下')));
+    }
+  }
+  console.log('7 after-done modes (stop / suggest / auto + limit): PASS');
+
   // status-line parser
   const { parseStatus } = api;
   assert.deepStrictEqual([parseStatus('Built.\nSTATUS: DONE').kind, parseStatus('Built.\nSTATUS: DONE').text], ['DONE', 'Built.']);

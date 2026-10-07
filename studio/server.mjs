@@ -24,6 +24,9 @@ const AGENTS = {
   antigravity: { name: 'Antigravity', create: (ws, lead) => ({ type: 'antigravity', extra: { backend: 'antigravity', workspace: ws, session_mode: lead ? 'plan' : 'yolo' } }) },
 };
 
+// What a project does when a job is done: stop (default) | suggest next steps | auto-continue (user opts in).
+const AFTER_DONE = ['stop', 'suggest', 'auto'];
+const AUTO_MAX = 5; // auto-started jobs in a row before Studio stops and waits for the user
 // S.leader is the default Leader for newly opened projects.
 const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [],
   limits: {}, notify: true, notices: [], noticeSeq: 0 };
@@ -32,7 +35,7 @@ const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}
 // agentCfg = this project's model / effort per agent; workers = agents allowed to work here.
 // New projects start from S.agentCfg (the last choices).
 const newWs = (project, leader = S.leader, name = '', agentCfg = S.agentCfg, workers = Object.keys(AGENTS)) => ({
-  project, leader, name, run: null, tasks: [], activity: [], pstate: null,
+  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0,
   agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...agentCfg?.[id] }])),
   workers: workers.filter((id) => AGENTS[id]),
 });
@@ -61,14 +64,14 @@ try {
   // Older settings had one `project` and global models; it becomes the first open workspace with those models.
   S.workspaces = (saved.workspaces || (saved.project ? [{ project: saved.project }] : []))
     .filter((x) => isDir(x.project))
-    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null }));
+    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop' }));
   S.recent = (saved.recent || []).filter(isDir);
   if (saved.notify === false) S.notify = false;
 } catch { /* first start: defaults */ }
 
 function saveSettings() {
   fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
-  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate }));
+  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone }));
   fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify }, null, 2));
 }
 
@@ -77,7 +80,7 @@ function saveRun(w, status) {
   if (!run) return;
   fs.mkdirSync(HISTORY, { recursive: true });
   // phase + convs let a paused run continue in the same agent conversations after a Studio restart.
-  const rec = { id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, convs: run.convs, tasks: w.tasks, activity: w.activity };
+  const rec = { id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, suggestions: run.suggestions, convs: run.convs, tasks: w.tasks, activity: w.activity };
   fs.writeFileSync(path.join(HISTORY, run.id + '.json'), JSON.stringify(rec, null, 2));
   S.historyRev++;
 }
@@ -435,6 +438,28 @@ function finish(w, status) {
   }
   refreshClaudeLimits();
   refreshState(w); // save the project state at job end
+  if (status === 'done' && w.afterDone === 'auto') setTimeout(() => autoNext(w, run), 5000);
+}
+
+// 自動持續開發: only when the user switched it on for this project, only after a done job, at most AUTO_MAX in a row.
+function autoNext(w, run) {
+  const next = run.suggestions?.[0];
+  if (w.afterDone !== 'auto' || w.run !== run || !next) return;
+  if (w.autoRounds >= AUTO_MAX) {
+    log(w, 'studio', 'system', `已自動連續做了 ${AUTO_MAX} 件，先停下來等你。`);
+    return notify(`${label(w)}：自動持續開發先停下`, `已連續自動做了 ${AUTO_MAX} 件，等你看過再繼續`, 'ask', w.project);
+  }
+  w.autoRounds++;
+  notify(`${label(w)}：自動開始下一步`, next.title, 'done', w.project);
+  start(w, next.request, true).then(() => log(w, 'studio', 'system', `自動持續開發（第 ${w.autoRounds}/${AUTO_MAX} 件）：工頭選了「${next.title}」`))
+    .catch((e) => log(w, 'studio', 'system', '自動開始下一步失敗：' + e.message));
+}
+
+function setAfterDone(w, mode) {
+  if (!AFTER_DONE.includes(mode)) throw new Error('未知的完成後模式');
+  w.afterDone = mode;
+  w.autoRounds = 0;
+  saveSettings();
 }
 
 // ---------- Plan limits (5-hour / weekly) ----------
@@ -833,7 +858,8 @@ function deriveState(job, g) {
     s.next = (s.level === 'done' ? '' : s.next + '；') + `把 ${loose.join('、')} 的 review 意見標成已解決`;
     if (s.level === 'done') Object.assign(s, { level: 'open', headline: `${loose.join('、')} 有 review 意見沒標成已解決`, you: '按「▶ 接著處理」讓團隊收尾' });
   }
-  return { ...s, goal: run ? clip(String(run.goal || run.request).split('\n').find((x) => x.trim()) || '', 160) : '', leader: run?.leader || '',
+  if (s.level === 'done' && run?.suggestions?.length) s.you = '可以開始新的工作，或選一個工頭建議的下一步';
+  return { ...s, suggestions: run?.suggestions || [], goal: run ? clip(String(run.goal || run.request).split('\n').find((x) => x.trim()) || '', 160) : '', leader: run?.leader || '',
     done: done.slice(-8), current, git: g || null, updatedAt: new Date().toISOString() };
 }
 
@@ -900,10 +926,13 @@ Decide whether the user's WHOLE request is complete: built, reviewed, verified, 
 Workers you can assign: ${workers.map((x) => `${x} (${AGENTS[x].name})`).join(', ') || '(none available)'}
 
 Reply with ONLY one JSON object, no markdown fences, one of:
-{"done":true,"report":"<final report to the user, 2-4 sentences, in the user's language>"}
+${w.afterDone === 'stop' ? '{"done":true,"report":"<final report to the user, 2-4 sentences, in the user\'s language>"}'
+    : '{"done":true,"report":"<final report to the user, 2-4 sentences, in the user\'s language>","next":[{"title":"<short title, user\'s language>","why":"<one sentence why it is worth doing>","request":"<the full request to give the team>"}]}'}
 {"done":false,"message":"<one sentence to the user>","subtasks":[${SUBTASK_SHAPE}]}
 {"needs_user":"<question to the user, in the user's language>","options":["<choice>","<choice>"]}
-Use needs_user only for a real decision the team cannot make. Rules for new subtasks:
+Use needs_user only for a real decision the team cannot make.${w.afterDone === 'stop' ? '' : `
+When done, also give 1 to 3 small, valuable next steps for this project in "next", best first, based on what you just saw (empty list if nothing is worth doing).${w.afterDone === 'auto' ? ' The first one may start automatically without the user: it must not need a decision from the user and must not be destructive (no deleting data, no force push, no release or deploy).' : ''}`}
+Rules for new subtasks:
 ${SUBTASK_RULES}`, { w, lead: true });
     if (run.leaderGen !== gen) return;
     let d = null;
@@ -926,6 +955,9 @@ ${SUBTASK_RULES}`, { w, lead: true });
       return pump(w);
     }
     log(w, lead, 'leader', String(d.report || d.message || '工頭確認整體工作已完成。'));
+    run.suggestions = w.afterDone === 'stop' ? [] : (Array.isArray(d.next) ? d.next : []).filter((x) => x && (x.request || x.title)).slice(0, 3)
+      .map((x) => ({ title: clip(x.title || x.request, 80), why: clip(x.why || '', 200), request: String(x.request || x.title) }));
+    if (run.suggestions.length) log(w, lead, 'leader', '建議的下一步：\n' + run.suggestions.map((x, i) => `${i + 1}. ${x.title}${x.why ? '：' + x.why : ''}`).join('\n'));
     finish(w, 'done');
   } catch (e) {
     if (run.leaderGen !== gen || e instanceof Halt) return;
@@ -1143,7 +1175,7 @@ const routes = {
   'GET /api/state': () => {
     const workspaces = S.workspaces.map((w) => {
       const r = w.run;
-      return { project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, tasks: w.tasks, activity: w.activity, progress: readProjectProgress(w),
+      return { project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, tasks: w.tasks, activity: w.activity, progress: readProjectProgress(w),
         run: r && { id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing } };
     });
     return { ...S, ...teamStats(), agents: Object.values(S.agents), workspaces };
@@ -1158,10 +1190,11 @@ const routes = {
   'POST /api/notify/test': () => windowsToast('測試通知：Studio 通知正常', '專案完成或需要你處理時會這樣通知你', `http://127.0.0.1:${PORT}/`),
   'POST /api/browse': async () => { const p = await browseFolder(); return p ? openWorkspace(p) : {}; },
   'POST /api/leader': (b) => setLeader(wsOf(b.ws), b.agent),
-  'POST /api/start': (b) => start(wsOf(b.ws), String(b.request || ''), !!b.continue),
+  'POST /api/start': (b) => { const w = wsOf(b.ws); w.autoRounds = 0; return start(w, String(b.request || ''), !!b.continue); },
+  'POST /api/after-done': (b) => setAfterDone(wsOf(b.ws), b.mode),
   'POST /api/stop': (b) => stop(wsOf(b.ws)),
   'POST /api/reassign': (b) => reassign(wsOf(b.ws), b.taskId, b.agent),
-  'POST /api/continue': (b) => continueProject(wsOf(b.ws)),
+  'POST /api/continue': (b) => { const w = wsOf(b.ws); w.autoRounds = 0; return continueProject(w); },
   'POST /api/project-state/refresh': (b) => refreshState(wsOf(b.ws)),
   'POST /api/answer': (b) => answer(wsOf(b.ws), b.taskId, b.text),
   'POST /api/continue-card': (b) => continueCard(wsOf(b.ws), b.taskId),
