@@ -15,7 +15,7 @@ function makeEnv(script, overrides = {}) {
   const env = {
     createWorkspaceLeaseStore,
     AGENTS: { claude: { name: 'Claude Code' }, codex: { name: 'Codex' }, antigravity: { name: 'Antigravity' } },
-    S: { workspaces: [], leases: [] }, RT: mkTmp('studio-rt-'), api: async () => ({ items: [] }), stopTurn: async () => true, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 20))), crypto: nodeCrypto, logs, notices, prompts,
+    S: { workspaces: [], leases: [] }, RT: mkTmp('studio-rt-'), PORT: 4848, api: async () => ({ items: [] }), stopTurn: async () => true, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 20))), crypto: nodeCrypto, logs, notices, prompts,
     log: (w, who, role, text, detail) => logs.push({ who, role, text, detail }),
     notify: (title, body, kind) => notices.push({ title, body, kind }),
     label: () => 'TestProj', refreshClaudeLimits() {}, saveRun() {}, saveSettings() {}, latestJob: () => null, clip: (x, n) => String(x ?? '').slice(0, n), AUTO_MAX: 5, AFTER_DONE: ['stop', 'suggest', 'auto'],

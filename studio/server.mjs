@@ -6,6 +6,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, execFile } from 'node:child_process';
+import { cleanupJobRuntimes, cleanupStaleRuntimes, checkPortOwnership, getProcessInfo, isPidAlive, killProcessTree, listRuntimes, registerRuntime, updateRuntime } from './runtime-registry.mjs';
+import { checkBackendReadiness, recoverOwnedRuntime } from './runtime-readiness.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const RT = path.join(ROOT, 'runtime');
@@ -45,7 +47,7 @@ const DELIVERY_IDS = ['auto', 'pr']; // delivery: auto = all the way to merge (d
 const AUTO_MAX = 5; // auto-started jobs in a row before Studio stops and waits for the user
 // S.leader is the default Leader for newly opened projects.
 const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [], leases: [], external: [],
-  limits: {}, notify: true, notices: [], noticeSeq: 0 };
+  limits: {}, notify: true, notices: [], noticeSeq: 0, runtimes: [] };
 // One workspace per project folder: its own Leader, board, team chat and run, so projects work side by side.
 // name = optional display name (tabs, cards, notifications); the folder name is used when empty.
 // agentCfg = this project's model / effort per agent; workers = agents allowed to work here.
@@ -178,6 +180,19 @@ async function startAion() {
   const logFile = fs.createWriteStream(path.join(RT, 'studio', 'aioncore.out.txt'));
   const p = spawn(AION, ['--local', '--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)],
     { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, CODEX_HOME } });
+  if (p.pid) {
+    const args = ['--local', '--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)];
+    registerRuntime({
+      job_id: 'studio_core',
+      purpose: 'helper',
+      root_pid: p.pid,
+      executable: AION,
+      command: `${AION} ${args.join(' ')}`,
+      args,
+      cwd: ROOT,
+      rtDir: RT
+    });
+  }
   process.on('exit', () => p.kill());
   await new Promise((res, rej) => {
     let buf = '';
@@ -618,6 +633,7 @@ function finish(w, status) {
   run.paused = false;
   run.phase = 'finished';
   releaseJobLeases(w, 'job ended');
+  if (w.run?.id && typeof cleanupJobRuntimes === 'function') cleanupJobRuntimes(w.run.id, { rtDir: RT }).catch(() => {});
   run.result = status;
   run.ask = null;
   saveRun(w, status);
@@ -1310,6 +1326,7 @@ ${note}
 Continue the task. End your reply with a short summary (1-3 sentences).
 ${STATUS_RULES}` : `You are a WORKER in "Multi-Agent Studio". Your leader (${agentName(run.leader)}) assigned you this task.
 Work only inside this folder: ${t.workdir || run.project}
+If you must run this project's backend on port 3018 for validation, let Studio own the process so it can verify and recover it: POST JSON to http://127.0.0.1:${PORT}/api/runtime/start with ws (project path), cardId (${t.id}), executable (absolute path), args (string array), cwd (inside this workspace), dataDir (an existing directory inside this workspace), port (3018), smokePath, and noCredentialsConfirmed:true only when restart needs no account credentials. Never register or stop an unknown process. A listener is not ready until Studio confirms process alive + reachable port + GET /health HTTP 200 + application ready.
 ${note ? `\nNOTE FROM STUDIO:\n${note}\n` : ''}${t.resumed ? '\nYou were interrupted while doing this task earlier. First check the current state of the project folder, then finish the task without redoing work that is already done.\n' : ''}
 Task: ${t.title}
 Instructions:
@@ -1387,11 +1404,15 @@ function applyStatus(w, t, st, reply) {
   }
   if (st.kind === 'WAITING_EXTERNAL') {
     const pr = findPr(st.detail + '\n' + reply);
+    const backendPort = /MiningProcessLockError|(?:backend|後端).{0,30}3018|3018.{0,60}(?:恢復|ready|health|啟動)|(?:恢復|等待).{0,30}3018/i.test(st.detail + '\n' + reply) ? 3018 : 0;
     t.status = 'WAITING_EXTERNAL';
-    t.wait = { what: st.detail || '外部結果', pr, manual: !pr };
+    t.wait = { what: st.detail || '外部結果', pr, manual: !pr && !backendPort, ...(backendPort ? { backendPort, manual: false } : {}) };
     if (pr) {
       log(w, 'studio', 'system', `「${t.title}」在等 PR ${pr} 的 CI：Studio 每分鐘檢查一次，跑完會自動交回 ${who}。`);
       checkExternal(w, t);
+    } else if (backendPort) {
+      log(w, 'studio', 'system', `「${t.title}」正在檢查 backend 3018 是否能安全自動恢復；listener 必須通過 health 與 application ready 才會繼續。`);
+      recoverBackendWait(w, t);
     } else {
       log(w, 'studio', 'system', `「${t.title}」在等「${t.wait.what}」：Studio 無法自動確認，結果好了請按「繼續」。`);
       notify(`${label(w)}：需要你按「繼續」`, `${who} 在等「${t.wait.what}」，Studio 無法自動確認`, 'ask', w.project);
@@ -2000,6 +2021,121 @@ async function openInPaseo(w) {
 }
 
 // ---------- HTTP ----------
+async function refreshRuntimeReadiness() {
+  const runtimes = listRuntimes({ rtDir: RT });
+  S.runtimes = await Promise.all(runtimes.map(async (runtime) => {
+    if (!runtime.port) return { ...runtime, readiness: null };
+    const readiness = await checkBackendReadiness(runtime, { isPidAlive });
+    return { ...runtime, readiness };
+  }));
+  return S.runtimes;
+}
+
+const recoveringRuntimes = new Set();
+const recoveryEnv = () => Object.fromEntries(['PATH', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP'].filter((key) => process.env[key]).map((key) => [key, process.env[key]]));
+async function recoverBackendWait(w, t) {
+  if (t.status !== 'WAITING_EXTERNAL' || !t.wait?.backendPort || t.wait.manual || recoveringRuntimes.has(t.id)) return;
+  recoveringRuntimes.add(t.id);
+  try {
+    const runtime = listRuntimes({ rtDir: RT }).find((x) => x.job_id === w.run?.id && x.card_id === t.id && x.port === t.wait.backendPort);
+    if (!runtime) {
+      Object.assign(t.wait, { manual: true, recoveryReason: 'Blocked: 找不到 Studio 建立的 backend runtime；PID 與 data owner 未知。' });
+      return;
+    }
+    const workspace = canonPath(t.workdir || w.project), dataDir = runtime.data_dir;
+    const occupant = await checkPortOwnership(runtime.port, { desiredJobId: runtime.job_id, desiredDataDir: dataDir, rtDir: RT });
+    if (occupant.owner === 'unknown' || (occupant.owner === 'studio' && occupant.runtime?.runtime_id !== runtime.runtime_id)) {
+      Object.assign(t.wait, { manual: true, recoveryReason: occupant.reason || `Blocked: port ${runtime.port} 有其他 runtime 使用。` });
+      return;
+    }
+    const proc = await getProcessInfo(runtime.root_pid);
+    const expectedExe = path.basename(runtime.executable || '').toLowerCase();
+    const expectedArgs = (runtime.args || []).join(' ').toLowerCase();
+    if (proc.exists && (!expectedExe || !String(proc.executable).toLowerCase().includes(expectedExe)
+        || !expectedArgs || !String(proc.command).toLowerCase().includes(expectedArgs))) {
+      Object.assign(t.wait, { manual: true, recoveryReason: `Blocked: PID ${runtime.root_pid} 的程序與已登記的 Studio runtime 不符，未終止程序。` });
+      return;
+    }
+    const result = await recoverOwnedRuntime(runtime, {
+      workspace, dataDir,
+      cleanup: async (old) => {
+        if (isPidAlive(old.root_pid)) {
+          await killProcessTree(old.root_pid);
+          for (let i = 0; i < 20 && isPidAlive(old.root_pid); i++) await sleep(100);
+          if (isPidAlive(old.root_pid)) throw new Error(`Blocked: Studio PID ${old.root_pid} 尚未停止，保留人工處理。`);
+        }
+        updateRuntime(old.runtime_id, { status: 'cleaned' }, { rtDir: RT });
+      },
+      restart: async (old) => {
+        const child = spawn(old.executable, old.args, { cwd: old.cwd, env: { ...recoveryEnv(), ...old.env }, windowsHide: true, stdio: 'ignore' });
+        if (!child.pid) throw new Error('Studio backend restart did not create a process');
+        const replacement = registerRuntime({ ...old, root_pid: child.pid, child_pids: [], status: 'running', rtDir: RT });
+        child.once('exit', () => updateRuntime(replacement.runtime_id, { status: 'exited' }, { rtDir: RT }));
+        return replacement;
+      },
+      readiness: async (replacement) => {
+        for (let i = 0; i < 60; i++) {
+          const value = await checkBackendReadiness(replacement, { isPidAlive });
+          if (value.status === 'BACKEND_READY' || !isPidAlive(replacement.root_pid)) return value;
+          await sleep(500);
+        }
+        return checkBackendReadiness(replacement, { isPidAlive });
+      },
+      smoke: async (replacement) => {
+        const response = await fetch(`http://127.0.0.1:${replacement.port}${replacement.smoke_path || '/health'}`, { signal: AbortSignal.timeout(3000) });
+        return response.ok ? { ok: true, status: response.status } : { ok: false, reason: `Smoke HTTP ${response.status}` };
+      },
+      continueJob: async () => wake(w, t, 'Studio 已清理並重啟已確認的 backend runtime；/health 與 smoke check 均通過，現在自動繼續。')
+    });
+    if (result.status === 'blocked') {
+      Object.assign(t.wait, { manual: true, recoveryReason: `Blocked: ${result.reason}` });
+      log(w, 'studio', 'system', `「${t.title}」backend 自動恢復停止：${result.reason}`);
+    } else {
+      log(w, 'studio', 'system', `「${t.title}」backend 已 ready，smoke 通過，工作卡自動繼續。`);
+    }
+  } catch (error) {
+    Object.assign(t.wait, { manual: true, recoveryReason: `Blocked: ${error.message}` });
+    log(w, 'studio', 'system', `「${t.title}」backend 自動恢復停止：${error.message}`);
+  } finally { recoveringRuntimes.delete(t.id); }
+}
+
+function watchBackendWaits() {
+  for (const w of S.workspaces) if (w.run?.active) for (const t of w.tasks) recoverBackendWait(w, t);
+}
+
+function within(parent, child) {
+  const relative = path.relative(path.resolve(parent), path.resolve(child));
+  return relative === '' || (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+async function startManagedRuntime(body) {
+  const w = wsOf(body.ws), task = w.tasks.find((x) => x.id === body.cardId);
+  if (!task || !w.run?.active) throw new Error('runtime 必須綁定進行中的工作卡');
+  const workspace = canonPath(task.workdir || w.project);
+  const cwd = canonPath(body.cwd || workspace);
+  if (!body.dataDir) throw new Error('runtime dataDir 必須明確指定');
+  const dataDir = path.resolve(String(body.dataDir));
+  const executable = path.resolve(String(body.executable || ''));
+  const args = body.args;
+  const port = Number(body.port);
+  if (!path.isAbsolute(String(body.executable || '')) || !Array.isArray(args) || args.some((x) => typeof x !== 'string')) throw new Error('runtime executable 必須為絕對路徑，args 必須是字串陣列');
+  if (!within(workspace, cwd) || !fs.existsSync(dataDir) || !within(workspace, canonPath(dataDir))) throw new Error('runtime cwd 與既有 data_dir 必須位於該卡的工作區內');
+  if (!Number.isInteger(port) || port < 1 || port > 65535 || !fs.existsSync(executable)) throw new Error('runtime executable 或 port 不合法');
+  const occupied = await checkPortOwnership(port, { desiredJobId: w.run.id, desiredDataDir: dataDir, rtDir: RT });
+  if (!occupied.available) throw new Error(occupied.reason || `port ${port} 已被佔用`);
+  const appEnv = { DATA_DIR: dataDir, PORT: String(port), ...(body.isolated ? { STUDIO_ISOLATED: '1', STUDIO_RUN_ID: w.run.id } : {}) };
+  const proc = spawn(executable, args, { cwd, env: { ...recoveryEnv(), ...appEnv }, windowsHide: true, stdio: 'ignore' });
+  if (!proc.pid) throw new Error('runtime process could not be started');
+  const restartSafe = body.noCredentialsConfirmed === true && !args.some((arg) => /--?(?:token|password|secret|api[-_]?key)(?:\s|=|$)/i.test(arg));
+  const runtime = registerRuntime({
+    job_id: w.run.id, card_id: task.id, workspace, purpose: body.purpose || 'dev_backend', root_pid: proc.pid,
+    executable, command: restartSafe ? [executable, ...args].join(' ') : path.basename(executable), args: restartSafe ? args : [], cwd, env: appEnv, port, data_dir: dataDir,
+    smoke_path: body.smokePath || '/health', restart_safe: restartSafe, rtDir: RT
+  });
+  proc.once('exit', () => updateRuntime(runtime.runtime_id, { status: 'exited' }, { rtDir: RT }));
+  return { runtime, readiness: await checkBackendReadiness(runtime, { isPidAlive }) };
+}
+
 const routes = {
   'POST /api/limits/refresh': async () => { refreshCodexLimits(); await refreshClaudeLimits(); },
   'POST /api/notify': (b) => { S.notify = !!b.on; saveSettings(); },
@@ -2010,7 +2146,7 @@ const routes = {
       return { wsInfo: w.wsInfo, lease: { writer: live.filter((l) => l.mode === 'write').map(leaseView)[0] || null, readers: live.filter((l) => l.mode === 'read').map(leaseView) }, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, delivery: w.delivery, tiers: tiersOf(w), tasks: w.tasks, activity: w.activity, progress: readProjectProgress(w),
         run: r && { extMod: r.extMod, claimedBy: r.claimedBy, id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
     });
-    return { ...S, ...teamStats(), agents: Object.values(S.agents), workspaces };
+    return { ...S, runtimes: S.runtimes, ...teamStats(), agents: Object.values(S.agents), workspaces };
   },
   // Project-scoped calls name their project in `ws` (its folder path).
   'POST /api/pause': (b) => pauseAndDrain(wsOf(b.ws)),
@@ -2052,6 +2188,15 @@ const routes = {
   // One-time login for Studio's separate Codex home, in a visible console window.
   'POST /api/codex-login': () => { spawn('cmd', ['/c', 'start', 'Codex login (Studio)', 'cmd', '/k', 'codex', 'login'], { env: { ...process.env, CODEX_HOME }, detached: true, stdio: 'ignore' }); },
   'GET /api/history': () => listHistory(),
+  'GET /api/runtimes': () => refreshRuntimeReadiness(),
+  'POST /api/runtime/start': (b) => startManagedRuntime(b),
+  'POST /api/runtime/readiness': async (b) => {
+    const runtime = listRuntimes({ rtDir: RT }).find((x) => x.runtime_id === b.runtimeId);
+    if (!runtime) throw new Error('找不到這個 Studio runtime');
+    return checkBackendReadiness(runtime, { isPidAlive });
+  },
+  'POST /api/runtime/check-port': (b) => checkPortOwnership(Number(b.port), { desiredJobId: b.jobId, desiredDataDir: b.dataDir, rtDir: RT }),
+  'POST /api/runtime/cleanup-stale': () => cleanupStaleRuntimes({ rtDir: RT }),
 };
 
 const server = http.createServer(async (req, res) => {
@@ -2072,6 +2217,9 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+loadLeases(); // restore ownership before any worker can start
+await cleanupStaleRuntimes({ rtDir: RT }).catch(() => {});
+
 // Show each open project's latest paused job again after a restart, ready to continue.
 for (const w of S.workspaces) {
   const r = historyItems().find((x) => same(x.project, w.project));
@@ -2083,7 +2231,9 @@ watchCatalogs();
 pollPaseo();
 setInterval(pollPaseo, 10000);
 setInterval(watchExternal, 60000); // GitHub PR / CI waits
-loadLeases(); // who held which working tree before this start
+await refreshRuntimeReadiness();
+setInterval(() => refreshRuntimeReadiness().catch(() => {}), 10000);
+setInterval(watchBackendWaits, 5000); // owned backend recovery is readiness-gated
 setInterval(beatLeases, LEASE_BEAT_MS); // heartbeat of the leases this Studio holds
 setInterval(() => checkWorkspaces().catch(() => {}), 15000); // unknown changes to a tree Studio holds
 // Port taken (e.g. another Studio copy is open): use the next free one, unless STUDIO_PORT asked for an exact port.

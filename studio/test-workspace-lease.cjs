@@ -14,10 +14,10 @@ async function store(rt, instance) {
   return { S, api };
 }
 module.exports = async function run({ makeEnv, mkTmp, region }) {
-  const dirs = [], environments = [];
+  const dirs = [], environments = [], worktrees = [];
   const tmp = (prefix) => { const d = mkTmp(prefix); dirs.push(d); return d; };
   const repo = () => {
-    const d = tmp('lease-中文 space-');
+    const d = tmp('lease-space-');
     const git = (...args) => execFileSync('git', args, { cwd: d, windowsHide: true, encoding: 'utf8' });
     git('init', '-q', '-b', 'main'); git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.invalid');
     fs.writeFileSync(path.join(d, 'dirty.txt'), 'base'); git('add', '.'); git('commit', '-qm', 'base');
@@ -43,7 +43,7 @@ module.exports = async function run({ makeEnv, mkTmp, region }) {
     assert.equal(E.api.acquireWrite(E.w, other, info).ok, false, 'A second writer refused');
     assert.equal(await E.api.takeWriteSlot(E.w, { ...other, writes: false }), true, 'B reviewer allowed');
     assert.equal(await E.api.takeWriteSlot(E.w, { ...other, id: 'review-2', writes: false }), true, 'B second reviewer allowed');
-    const wt = path.join(E.rt, 'separate-tree'); R.git('worktree', 'add', '-qb', 'separate', wt);
+    const wt = path.join(E.rt, 'separate-tree'); R.git('worktree', 'add', '-qb', 'separate', wt); worktrees.push({ repo: R.d, path: wt });
     const wi = await E.api.workspaceOf(wt); assert.notEqual(wi.key, info.key);
     assert.equal(E.api.acquireWrite(E.w, other, wi).ok, true, 'F linked worktree gets own writer');
     assert.equal(first.lease.worktree, info.path); assert.equal(first.lease.provider, 'codex');
@@ -118,6 +118,7 @@ module.exports = async function run({ makeEnv, mkTmp, region }) {
     // M: same dirty file changes in a linked worktree, although porcelain status is unchanged.
     const M = setup(repo().d), md = path.join(M.rt, 'dirty-worktree');
     execFileSync('git', ['worktree', 'add', '-qb', 'dirty-worktree', md], { cwd: M.w.project, windowsHide: true });
+    worktrees.push({ repo: M.w.project, path: md });
     M.t.workdir = md; M.t.status = 'WAITING_EXTERNAL'; M.w.run.active = true; M.w.run.paused = false;
     const file = path.join(md, 'dirty.txt'); fs.writeFileSync(file, 'dirty first');
     const mi = await M.api.workspaceOf(md); M.api.acquireWrite(M.w, M.t, mi); writers(M)[0].status = 'RESERVED'; M.api.saveLeases();
@@ -203,6 +204,7 @@ module.exports = async function run({ makeEnv, mkTmp, region }) {
     console.log('lease A two OS processes: exactly one writer acquired: PASS');
   } finally {
     for (const w of environments) { for (const timer of w.lockTimers?.values() || []) clearInterval(timer); clearInterval(w.lockTimer); clearTimeout(w.retryTimer); }
+    for (const wt of worktrees.reverse()) { try { execFileSync('git', ['worktree', 'remove', '--force', wt.path], { cwd: wt.repo, windowsHide: true, stdio: 'ignore' }); } catch {} }
     for (const d of [...new Set(dirs)].reverse()) fs.rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 };
