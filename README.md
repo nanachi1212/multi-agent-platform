@@ -33,6 +33,12 @@ Windows 優先的多 AI 協作平台。**Multi-Agent Studio** 是一個本機網
 - 工作卡可以設定「等前一張完成才開始」。全部做完後，工頭會確認整體需求是否真的完成，沒完成會自己追加工作卡（最多 3 輪，之後問你）。
 - 「現在發生什麼」：進度、在等什麼、接下來誰做什麼、你現在要不要處理（🔴 需要 Nana，可直接按選項回覆）。
 
+**自動交付與寫入鎖**
+- 交付方式（每個專案，預設 🚚 自動做到 merge）：需求清楚、沒有高風險時，AI 一路做完：修改 → 針對性驗證 → commit → push → PR → CI → 一次 review → 修正 blocker／有效 finding → CI → squash merge → 同步 main → 清理分支 → 下一張卡，不會因為 commit、push、開 PR、CI 通過或正常 merge 停下來等你。只有以下情況才問你：需求有重大歧義、可能永久遺失你的重要資料、需要新的付費服務／憑證／外部發布、review 的 blocker 無法在原範圍安全修正、CI 持續失敗且最小修正無效、merge conflict 碰到你或其他 AI 還沒提交的修改、無法合理回滾的操作。一般 P1/P2 review 意見直接在原 PR 修正並補測試。可改成「✋ 做到 PR 就停（merge 等我）」。
+- **同一個資料夾同一時間只有一位寫入者**：同一個專案裡，會修改檔案的工作卡一次只有一張在做（其他排隊），審查、讀程式、調查的卡標成「唯讀」，可以同時進行。要同時修改，請用不同的 git worktree／分支（各有各的鎖）。
+- 對外部也有鎖：寫入時會在 git 目錄放 `studio-writer.lock`（程式、時間、卡片）；另一個 Studio 或其他程式放了新的鎖，Studio 就不寫入，等對方做完（每 30 秒再看一次）。Studio 每次停止寫入時會記下這個資料夾的樣子（HEAD、分支、未提交檔案）；之後**自動恢復**（CI 結果、其他 AI 的結果、自動持續開發）前會比對：如果檔案幾秒前才被改過，就等；如果離開期間被改過，會先問你「要讓 Studio 接手嗎」。你自己按「繼續」或回答問題時，視為你已知道，不再多問。
+- **暫停 vs 停止**：暫停＝成員馬上停下（手上那一步可能做到一半）、進度全部保留、Studio 不會自己恢復（重開 Studio 也不會），要你按「繼續」。停止＝這件工作到此為止、未完成的卡標成失敗、不能再「繼續」，要接著做用「▶ 接著處理」開新的一輪。暫停和停止時都會釋放寫入鎖。
+
 **專案記憶與接續**
 - 每個專案保存「專案狀態」：上次目標、已完成、目前、下一步，並用 `git`／`gh` 核對真實狀態（main SHA、開著與已合併的 PR、每項 CI、未解決的 review 意見）。Git／GitHub 的結果優先於 AI 以前留下的文字。
 - 重開 Studio、按「▶ 接著處理」或更換工頭，都會拿到同一份接力棒，不用重新解釋。
@@ -89,7 +95,13 @@ The first start downloads AionCore v0.2.2 (official release, SHA-256 checked) in
 - Overview tab: one card per project (status, progress, next step, what you must do), one-click pause / continue, and an agents × projects table.
 - A Windows notification when a project finishes or needs you; clicking it opens that project tab.
 
-**Work lifecycle (no babysitting)**
+**Autonomous delivery and the writer lock**
+- Delivery (per project, default 🚚 auto to merge): when the request is clear and nothing is high-risk, the AI goes all the way: change → targeted validation → commit → push → PR → CI → one review → fix blockers / valid findings → CI → squash merge → sync main → delete the branch → next card. It does not stop for a commit, a push, a PR, green CI or a normal merge. It asks only for: a materially ambiguous requirement, a destructive operation that could permanently lose your important data, a new paid service / credential / external publication, a review blocker that cannot be fixed safely inside the original scope, CI that keeps failing after a minimal fix, a merge conflict touching uncommitted changes of you or another agent, or anything that cannot reasonably be rolled back. Ordinary P1/P2 review findings are fixed inside the original PR with a regression test. Switchable to "✋ stop at the PR (you merge)".
+- **One writer per working tree**: inside a project only one card that modifies files runs at a time (the others queue); review, reading and investigation cards are marked read-only and run alongside. For parallel edits use separate git worktrees / branches (each has its own lock).
+- A lock against outsiders too: while writing, Studio keeps `studio-writer.lock` in the git dir (program, time, card). A fresh lock from another Studio or program stops Studio from writing until it is gone (rechecked every 30 s). Whenever Studio stops writing it records what the tree looks like (HEAD, branch, uncommitted files); before an **automatic** resume (CI result, another agent's result, auto-continue) it compares: files changed seconds ago → wait; changed while Studio was away → it asks "may Studio take over?". When you press "繼續" or answer a question yourself, it assumes you know.
+- **Pause vs stop**: pause = workers stop now (the current step may be half done), all progress is kept, Studio never resumes by itself (not even after a restart), you press "繼續". Stop = this job ends, unfinished cards fail, no "繼續"; use "▶ 接著處理" to start a new round. Both release the writer lock.
+
+**Project memory and handoff**
 - Every worker reply states a status: done / waiting for something external (e.g. CI) / waiting for another agent / needs your decision. A turn ending is not "done".
 - Waiting cards continue by themselves when the awaited agent finishes, when a GitHub PR's CI finishes (`gh`, checked every minute), or when you answer. Waits Studio cannot check are shown as "needs you to press continue", never as a fake background wait.
 - Cards can depend on earlier cards. When all cards end, the Leader checks the whole request and adds cards if it is not complete (max 3 extra rounds, then it asks you).

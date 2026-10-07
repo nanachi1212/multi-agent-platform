@@ -27,6 +27,7 @@ const AGENTS = {
 // What a project does when a job is done: stop (default) | suggest next steps | auto-continue (user opts in).
 const AFTER_DONE = ['stop', 'suggest', 'auto'];
 const STRATEGY_IDS = ['save', 'balanced', 'quality', 'custom']; // model strategies (see STRATEGIES)
+const DELIVERY_IDS = ['auto', 'pr']; // delivery: auto = all the way to merge (default), pr = stop at the pull request
 const AUTO_MAX = 5; // auto-started jobs in a row before Studio stops and waits for the user
 // S.leader is the default Leader for newly opened projects.
 const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [],
@@ -36,7 +37,7 @@ const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}
 // agentCfg = this project's model / effort per agent; workers = agents allowed to work here.
 // New projects start from S.agentCfg (the last choices).
 const newWs = (project, leader = S.leader, name = '', agentCfg = S.agentCfg, workers = Object.keys(AGENTS)) => ({
-  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, strategy: 'save',
+  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, strategy: 'save', delivery: 'auto',
   agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...agentCfg?.[id] }])),
   workers: workers.filter((id) => AGENTS[id]),
 });
@@ -65,7 +66,7 @@ try {
   // Older settings had one `project` and global models; it becomes the first open workspace with those models.
   S.workspaces = (saved.workspaces || (saved.project ? [{ project: saved.project }] : []))
     .filter((x) => isDir(x.project))
-    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save' }));
+    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto' }));
   S.recent = (saved.recent || []).filter(isDir);
   if (saved.notify === false) S.notify = false;
 } catch (e) {
@@ -77,7 +78,7 @@ try {
 
 function saveSettings() {
   fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
-  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, strategy: w.strategy }));
+  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, strategy: w.strategy, delivery: w.delivery }));
   fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify }, null, 2));
 }
 
@@ -86,7 +87,7 @@ function saveRun(w, status) {
   if (!run) return;
   fs.mkdirSync(HISTORY, { recursive: true });
   // phase + convs let a paused run continue in the same agent conversations after a Studio restart.
-  const rec = { id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, notes: run.notes, suggestions: run.suggestions, convs: run.convs, tasks: w.tasks, activity: w.activity };
+  const rec = { treeStamp: run.treeStamp, leftAt: run.leftAt, id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, notes: run.notes, suggestions: run.suggestions, convs: run.convs, tasks: w.tasks, activity: w.activity };
   fs.writeFileSync(path.join(HISTORY, run.id + '.json'), JSON.stringify(rec, null, 2));
   S.historyRev++;
 }
@@ -394,8 +395,24 @@ const SUBTASK_RULES = `- Each subtask goes to exactly one worker id from the lis
 - When the request needs it, include review, verification and delivery (PR / merge) steps as their own subtasks.
 - Never let two subtasks edit the same file at the same time. A trivial request may stay a single subtask.
 - "instructions" must be complete and self-contained; the worker only sees that text, the results of its "after" subtasks, and the project folder.
+- Mark "writes": true for a subtask that changes files, commits, pushes or switches branches; "writes": false for review, reading code, investigation and analysis. Only ONE writing card runs at a time in a project's working tree (Studio queues the others); read-only cards run alongside it. Put changes that touch the same files in sequence with "after".
 - Claude Code has the smallest quota: give it a subtask only when codex and antigravity cannot do it.
 - Set "hard": true only when a subtask needs deep reasoning (a tricky bug, a design across many files, a security-sensitive change). Most subtasks are not hard; hard ones run on a stronger, more expensive model.`;
+
+// Delivery policy: how far an agent carries the work without stopping for the user.
+const STOP_CONDITIONS = `a requirement so ambiguous that different readings give different product behavior; a destructive operation that could permanently lose the user's important data; a new paid service, credential, account permission or external publication; a review blocker that cannot be fixed safely inside the original scope; CI that keeps failing after a minimal fix; a merge conflict that touches uncommitted changes of the user or of another agent; anything that cannot reasonably be rolled back`;
+function deliveryRules(mode, role) {
+  const ask = role === 'worker' ? 'report STATUS: NEEDS_USER' : 'use needs_user';
+  const stops = `Stop and ask the user (${ask}) ONLY for: ${STOP_CONDITIONS}. Ordinary P1/P2 review findings are fixed inside the original PR scope without asking (add a regression test, validate, continue). Side problems that are not blockers: note them in one line and move on.`;
+  if (mode === 'pr') {
+    return `Delivery policy (stop at the pull request): when the request is clear and nothing high-risk is involved, carry the work through change -> targeted validation -> commit -> push -> pull request -> CI without stopping, then report. Do NOT merge: the user merges. ${role === 'leader' ? 'Give the whole chain to ONE worker card (it parks on CI with STATUS: WAITING_EXTERNAL and the PR URL, and continues when woken).' : ''} ${stops}`;
+  }
+  const chain = 'change -> targeted validation -> commit -> push -> pull request -> CI -> one review (the repository\'s own review bot if it has one, otherwise one independent review by a different worker) -> fix blockers and valid findings -> CI again -> squash merge -> sync main -> delete the branch -> next card';
+  const how = role === 'leader' ? `Plan the whole chain, not just the code: give it to ONE worker card (that worker parks the card on CI with STATUS: WAITING_EXTERNAL and the PR URL, and continues when woken); add a review card for a different worker only when the repository has no review bot.`
+    : role === 'check' ? 'A request that changes a repository is complete only when the work is delivered (merged, main synced, branch deleted); if it is not, add cards for the missing steps instead of reporting it done or asking the user.'
+    : 'Carry YOUR card through this chain; when CI is pending report STATUS: WAITING_EXTERNAL with the PR URL instead of waiting inside your turn.';
+  return `Delivery policy (autonomous): when the request is clear and nothing high-risk is involved, carry the work all the way to delivery: ${chain}. Do NOT stop because of a commit, a push, opening a PR, green CI or a normal merge. Never bypass required checks (no --admin); merge only when checks are green (a repository without checks: after validation and review). If the folder is not a Git repository or has no GitHub remote, skip the steps that need one and never create a remote. ${how} ${stops}`;
+}
 
 // The project's work memory inside a Leader prompt.
 function memoryNote(run) {
@@ -411,9 +428,9 @@ ${run.context}
 
 const FIX_JSON = 'Your last reply was not the JSON object Studio needs. Reply again with ONLY that JSON object: no markdown fences, no other text.';
 
-const SUBTASK_SHAPE = `{"title":"<short title>","agent":"<worker id>","instructions":"<full instructions>","after":[<indexes>],"hard":false}`;
+const SUBTASK_SHAPE = `{"title":"<short title>","agent":"<worker id>","instructions":"<full instructions>","after":[<indexes>],"hard":false,"writes":true}`;
 
-function planPrompt(run, workers) {
+function planPrompt(run, workers, delivery) {
   return `You are the LEADER (foreman) of a small AI team in "Multi-Agent Studio".
 Project folder: ${run.project}
 Workers you can assign: ${workers.map((w) => `${w} (${AGENTS[w].name})`).join(', ')}
@@ -428,6 +445,7 @@ Rules:
 - Do not read files, search the repository or run commands yourself (your quota is precious): plan from the request and the work context. When facts are missing, make a short investigation subtask for a worker.
 - Split the request into 1 to 6 small subtasks.
 - Never ask the user for facts that are in the work context, the project folder, or git / GitHub: make looking them up a subtask instead.
+${deliveryRules(delivery, 'leader')}
 ${SUBTASK_RULES}
 
 Reply with ONLY one JSON object, no markdown fences, in exactly this shape:
@@ -440,7 +458,7 @@ function parseSubtasks(list, workers) {
   return (list || []).filter((x) => x && (x.instructions || x.title)).slice(0, 6).map((x, i) => {
     const a = String(x.agent || '').toLowerCase();
     const after = (Array.isArray(x.after) ? x.after : []).map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n < i);
-    return { hard: x.hard === true, title: String(x.title || x.instructions).slice(0, 120), instructions: String(x.instructions || x.title), agent: workers.find((w) => a.includes(w)) || workers[0], after };
+    return { hard: x.hard === true, writes: x.writes !== false, title: String(x.title || x.instructions).slice(0, 120), instructions: String(x.instructions || x.title), agent: workers.find((w) => a.includes(w)) || workers[0], after };
   });
 }
 
@@ -453,7 +471,7 @@ function parsePlan(reply, workers) {
 function addCards(w, subtasks, lead) {
   const ids = subtasks.map(() => crypto.randomUUID().slice(0, 8));
   subtasks.forEach((st, i) => {
-    w.tasks.push({ id: ids[i], hard: st.hard, title: st.title, instructions: st.instructions, agent: st.agent, after: st.after.map((n) => ids[n]), status: 'WAITING', result: '' });
+    w.tasks.push({ id: ids[i], hard: st.hard, writes: st.writes, title: st.title, instructions: st.instructions, agent: st.agent, after: st.after.map((n) => ids[n]), status: 'WAITING', result: '' });
     log(w, lead, 'leader', `派工給 ${AGENTS[st.agent].name}：${st.title}${st.after.length ? `（等「${st.after.map((n) => subtasks[n].title).join('」「')}」完成後開始）` : ''}`);
   });
 }
@@ -533,8 +551,14 @@ function autoNext(w, run) {
   }
   w.autoRounds++;
   notify(`${label(w)}：自動開始下一步`, next.title, 'done', w.project);
-  start(w, next.request, true).then(() => log(w, 'studio', 'system', `自動持續開發（第 ${w.autoRounds}/${AUTO_MAX} 件）：工頭選了「${next.title}」`))
+  start(w, next.request, true, true).then(() => log(w, 'studio', 'system', `自動持續開發（第 ${w.autoRounds}/${AUTO_MAX} 件）：工頭選了「${next.title}」`))
     .catch((e) => log(w, 'studio', 'system', '自動開始下一步失敗：' + e.message));
+}
+
+function setDelivery(w, mode) {
+  if (!DELIVERY_IDS.includes(mode)) throw new Error('未知的交付方式');
+  w.delivery = mode;
+  saveSettings();
 }
 
 function setAfterDone(w, mode) {
@@ -652,7 +676,7 @@ function workContext(job) {
 
 const CONTINUE_RE = /^\s*(繼續|继续|接著|接着|接續|continue|resume|把剩下|剩下的)/i;
 
-async function start(w, request, cont = false) {
+async function start(w, request, cont = false, inherit = false) {
   // "繼續…" / the 接著上次的工作 button continue the latest job instead of starting from zero.
   cont = cont || CONTINUE_RE.test(request);
   if (cont && w.run?.paused) return resume(w); // the paused job itself picks up where it stopped
@@ -671,7 +695,8 @@ async function start(w, request, cont = false) {
   w.activity = [];
   const now = new Date();
   const id = now.toISOString().slice(0, 19).replace(/[-:T]/g, '') + '-' + crypto.randomUUID().slice(0, 4);
-  w.run = { id, startedAt: now.toISOString(), project: w.project, leader: lead, request, convs: {}, phase: 'planning', leaderGen: 0, rounds: 0, ask: null, continues, context, goal: continues ? prev.run.goal || prev.run.request : request, refs: continues ? knownRefs(prev) : [], active: true, paused: false, stopped: false, summarizing: false };
+  // Auto-continue inherits the fingerprint of the tree the last job left, so changes made in between are noticed.
+  w.run = { treeStamp: inherit ? prev?.run?.treeStamp : undefined, leftAt: inherit ? prev?.run?.leftAt : undefined, id, startedAt: now.toISOString(), project: w.project, leader: lead, request, convs: {}, phase: 'planning', leaderGen: 0, rounds: 0, ask: null, continues, context, goal: continues ? prev.run.goal || prev.run.request : request, refs: continues ? knownRefs(prev) : [], active: true, paused: false, stopped: false, summarizing: false };
   log(w, 'user', 'user', request);
   if (continues) log(w, 'studio', 'system', '接續上次的工作：工頭會拿到目前的進度摘要，不用重講。', context);
   log(w, 'studio', 'system', `Leader：${AGENTS[lead].name}；Workers：${workersFor(w, lead).map((x) => AGENTS[x].name).join('、')}`);
@@ -687,7 +712,7 @@ async function planPhase(w) {
     if (!workers.length) throw new Error('至少需要一位可用的 Worker');
     const cid = await conv(w, lead, true);
     const tryPlan = (x) => { try { const p = parsePlan(x, workers); return p.subtasks.length ? p : null; } catch { return null; } };
-    let reply = await turn(lead, cid, planPrompt(run, workers), { w, lead: true });
+    let reply = await turn(lead, cid, planPrompt(run, workers, w.delivery), { w, lead: true });
     if (run.leaderGen !== gen) return; // a new Leader took over and plans again
     let plan = tryPlan(reply);
     if (!plan) {
@@ -716,12 +741,13 @@ function pump(w) {
   const run = w.run;
   if (!run?.active || run.paused || run.phase !== 'working') return;
   const byId = (id) => w.tasks.find((x) => x.id === id);
-  for (const t of w.tasks) {
+  const order = [...w.tasks].sort((a, b) => (b.wakeNote ? 1 : 0) - (a.wakeNote ? 1 : 0));
+  for (const t of order) {
     if (t.status !== 'WAITING') continue;
     const deps = (t.after || []).map(byId).filter(Boolean);
     if (deps.some((d) => d.status === 'FAILED')) { Object.assign(t, { status: 'FAILED', result: '前一張工作卡失敗，這張沒有開始；交給工頭決定下一步。' }); continue; }
     if (deps.some((d) => d.status !== 'DONE')) continue;
-    if (!t.hold && !w.tasks.some((x) => x.status === 'WORKING' && x.agent === t.agent)) runTask(w, t);
+    if (!t.hold && !w.tasks.some((x) => x.status === 'WORKING' && x.agent === t.agent) && !(isWriter(t) && writerBusy(w, t))) runTask(w, t);
   }
   // Cards that only wait on each other would wait forever.
   const onAgents = w.tasks.filter((t) => t.status === 'WAITING_AGENT');
@@ -731,7 +757,134 @@ function pump(w) {
   if (!run.summarizing && w.tasks.length && w.tasks.every((t) => t.status === 'DONE' || t.status === 'FAILED')) summarize(w);
 }
 
+// ---------- Writer lock: one writer per working tree ----------
+// Inside Studio only one WRITING card runs per project; read-only cards (review, reading, investigation) run alongside.
+// Against outside agents (another AI session, another Studio, the user's editor): a lock file in the git dir, plus a
+// fingerprint of the tree (HEAD, branch, uncommitted files) taken whenever Studio stops writing. Studio never starts or
+// resumes writing on its own while someone else is editing, or when the tree changed while it was away.
+const INSTANCE = crypto.randomUUID().slice(0, 8);
+const LOCK_STALE_MS = 3 * 60e3, RECENT_EDIT_MS = 90e3, LOCK_BEAT_MS = 30e3;
+const isWriter = (t) => t.writes !== false;
+const holdsWriteLock = (t) => isWriter(t) && ['WORKING', 'WAITING_EXTERNAL', 'NEEDS_USER'].includes(t.status);
+const writerBusy = (w, t) => w.tasks.some((x) => x !== t && holdsWriteLock(x));
+
+function accessRules(t) {
+  return isWriter(t)
+    ? 'ACCESS: you are the only one allowed to modify this working tree right now; other cards only read. Do not leave it half changed when you finish or wait: commit, or say clearly what is uncommitted.'
+    : 'ACCESS: READ-ONLY card. Another card may be editing this working tree at the same time. Read files and run read-only commands (git log / diff / show, gh pr view / diff, searches). Do NOT modify, create or delete files in the working tree and do not run commands that change it (no commit, checkout, switch, stash, pull, merge, rebase, reset, formatters, installs). You may post review comments with gh. If something must change, say exactly what in your reply; do not change it yourself.';
+}
+
+async function lockFile(w) {
+  if (w.lockPath === undefined) { const r = await git(w.project, 'rev-parse', '--absolute-git-dir'); w.lockPath = r.out ? path.join(r.out.trim(), 'studio-writer.lock') : null; }
+  return w.lockPath;
+}
+
+// A fresh lock from another Studio / program (not ours, owner still alive).
+async function foreignLock(w) {
+  const f = await lockFile(w);
+  if (!f) return null;
+  let l;
+  try { l = JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; }
+  if (l.instance === INSTANCE) return null;
+  let alive = true;
+  try { process.kill(l.pid, 0); } catch (e) { alive = e.code === 'EPERM'; }
+  return alive && Date.now() - Date.parse(l.beat || 0) < LOCK_STALE_MS ? l : null;
+}
+
+async function acquireLock(w, t) {
+  const f = await lockFile(w);
+  if (!f) return;
+  const write = () => { try { fs.writeFileSync(f, JSON.stringify({ owner: 'Multi-Agent Studio', instance: INSTANCE, pid: process.pid, project: w.project, card: t.title, since: (w.lockSince ||= new Date().toISOString()), beat: new Date().toISOString() })); } catch { /* the in-Studio lock still applies */ } };
+  write();
+  clearInterval(w.lockTimer);
+  w.lockTimer = setInterval(write, LOCK_BEAT_MS);
+  w.lockTimer.unref?.();
+}
+
+async function releaseLock(w) {
+  if (w.tasks.some(holdsWriteLock)) return;
+  clearInterval(w.lockTimer);
+  w.lockTimer = null;
+  w.lockSince = null;
+  const f = await lockFile(w);
+  if (!f) return;
+  try { if (JSON.parse(fs.readFileSync(f, 'utf8')).instance === INSTANCE) fs.rmSync(f); } catch { /* no lock of ours */ }
+}
+
+async function treeStamp(w) {
+  const st = await git(w.project, 'status', '--porcelain=v1');
+  if (st.err) return '';
+  const head = (await git(w.project, 'rev-parse', 'HEAD')).out?.trim() || '';
+  const branch = (await git(w.project, 'rev-parse', '--abbrev-ref', 'HEAD')).out?.trim() || '';
+  return crypto.createHash('sha1').update(head + '\n' + branch + '\n' + st.out).digest('hex');
+}
+
+// A file the working tree has changed after Studio last wrote, and only seconds ago: someone is editing now.
+async function recentEdit(w, sinceMs) {
+  const st = await git(w.project, '-c', 'core.quotepath=false', 'status', '--porcelain=v1');
+  if (st.err) return null;
+  let newest = null;
+  for (const line of st.out.split('\n').filter(Boolean).slice(0, 200)) {
+    let p = line.slice(3);
+    if (p.includes(' -> ')) p = p.split(' -> ').pop();
+    try { const m = fs.statSync(path.join(w.project, p.replace(/^"|"$/g, ''))).mtimeMs; if (!newest || m > newest.m) newest = { m, p }; } catch { /* deleted file */ }
+  }
+  const age = newest ? Date.now() - newest.m : Infinity;
+  return newest && newest.m > sinceMs && age < RECENT_EDIT_MS ? { file: newest.p, secs: Math.round(age / 1000) } : null;
+}
+
+// null = free to write; busy = somebody else is working in it right now (wait); changed = it was changed while Studio was away (ask).
+async function externalReason(w, t) {
+  if (!(await lockFile(w))) return null; // not a git project: nothing to compare with
+  const lock = await foreignLock(w);
+  if (lock) return { kind: 'busy', text: `${lock.owner || '另一個程式'} 正在修改這個專案（鎖定檔：${lock.card || '進行中'}）` };
+  if (w.tasks.some((x) => x !== t && holdsWriteLock(x))) return null; // our own writer is active
+  const run = w.run;
+  const recent = await recentEdit(w, Date.parse(run.leftAt || run.startedAt) || 0);
+  if (recent) return { kind: 'busy', text: `${recent.secs} 秒前有檔案被改過（${recent.file}），可能有別的 AI 或程式正在修改這個專案` };
+  if (!t.trust && run.treeStamp && (await treeStamp(w)) !== run.treeStamp) return { kind: 'changed', text: 'Studio 離開期間，這個專案的檔案、分支或 commit 被改過（不是這一輪工作改的）' };
+  return null;
+}
+
+// Returns true when the card may write now (lock taken); otherwise the card is parked with the reason.
+async function takeWriteSlot(w, t) {
+  if (!isWriter(t)) return true;
+  const why = await externalReason(w, t);
+  if (!why) { Object.assign(t, { trust: false, blockReason: '', blockLogged: '' }); await acquireLock(w, t); return true; }
+  if (why.kind === 'busy') {
+    Object.assign(t, { status: 'WAITING', blockReason: why.text });
+    if (t.blockLogged !== why.text) { t.blockLogged = why.text; log(w, 'studio', 'system', `「${t.title}」先不動：${why.text}。等對方做完，Studio 每 30 秒再看一次。`); }
+    clearTimeout(w.retryTimer);
+    w.retryTimer = setTimeout(() => pump(w), 30e3);
+    w.retryTimer.unref?.();
+    return false;
+  }
+  Object.assign(t, { status: 'NEEDS_USER', takeover: true, ask: { question: why.text + '。要讓 Studio 接手繼續寫嗎？', options: ['確認接手，繼續', '先不要（暫停）'] } });
+  log(w, 'studio', 'system', `「${t.title}」先不動：${why.text}。需要你決定要不要讓 Studio 接手。`);
+  notify(`${label(w)}：${AGENTS[t.agent].name} 需要你處理`, why.text, 'ask', w.project);
+  return false;
+}
+
+// What Studio leaves behind after a writing step: the fingerprint later checks compare against.
+async function endWriteStep(w, t) {
+  if (!isWriter(t)) return;
+  if (w.run) { w.run.treeStamp = await treeStamp(w); w.run.leftAt = new Date().toISOString(); }
+  await releaseLock(w);
+}
+
 async function runTask(w, t) {
+  t.status = 'WORKING'; // reserve the slot at once: no second writer may start while the checks below run
+  if (!(await takeWriteSlot(w, t))) return;
+  if (!w.run?.active || t.status !== 'WORKING') { // paused or stopped while the check ran
+    if (t.status === 'WORKING') Object.assign(t, w.run?.stopped ? { status: 'FAILED', result: '已停止' } : { status: 'PAUSED', result: '已暫停', resumed: true });
+    await releaseLock(w);
+    return;
+  }
+  try { await runCard(w, t); } finally { await endWriteStep(w, t); }
+  pump(w);
+}
+
+async function runCard(w, t) {
   const run = w.run;
   const note = t.wakeNote;
   t.status = 'WORKING';
@@ -750,6 +903,8 @@ Task: ${t.title}
 Instructions:
 ${t.instructions}
 ${deps.length ? `\nResults of the earlier cards this task builds on:\n${deps.map((d) => `- ${d.title} (${AGENTS[d.agent].name}): ${d.result}`).join('\n')}\n` : ''}
+${accessRules(t)}
+${deliveryRules(w.delivery, 'worker')}
 When you end your turn, reply with a short summary of what you did (1-3 sentences).
 ${STATUS_RULES}`;
     const cid = await conv(w, t.agent, false, t.hard);
@@ -762,11 +917,11 @@ ${STATUS_RULES}`;
       log(w, t.agent, 'worker', '已停下，等工頭轉達你的新指示：' + t.title);
     };
     const reply = await step(prompt);
-    if (t.interrupted) { park(); return pump(w); }
+    if (t.interrupted) { park(); return; }
     let st = parseStatus(reply);
     if (!st) { // ask once instead of guessing
       const again = await step(`Your last reply had no STATUS line. Reply with only the status line now.\n${STATUS_RULES}`);
-      if (t.interrupted) { park(); return pump(w); }
+      if (t.interrupted) { park(); return; }
       st = parseStatus(again);
       if (st) st.text = reply.trim();
     }
@@ -776,22 +931,23 @@ ${STATUS_RULES}`;
       const note = t.notes.splice(0).join('\n');
       log(w, 'studio', 'system', `把你的指示交給 ${AGENTS[t.agent].name}，接著調整「${t.title}」。`);
       last = await step(`New instruction from the user (via the leader) for your task "${t.title}":\n${note}\n\nApply it to this task now. End your reply with a short summary (1-3 sentences).\n${STATUS_RULES}`);
-      if (t.interrupted) { park(); return pump(w); }
+      if (t.interrupted) { park(); return; }
       st = parseStatus(last) || { kind: 'DONE', detail: '', options: [], text: last.trim() };
     }
     applyStatus(w, t, st, last);
   } catch (e) {
     if (e instanceof Halt && run.paused) { t.status = 'PAUSED'; t.result = '已暫停'; t.resumed = true; t.wakeNote = note; return; }
+    if (e instanceof Halt && run.stopped) { t.status = 'FAILED'; t.result = '已停止'; return; }
     if (e.stuck && !t.convReset) { // the worker's conversation will not stop: start a fresh one (the card brief carries the task)
       delete run.convs[workKey(t)];
       Object.assign(t, { convReset: true, status: 'WAITING', resumed: true, detail: e.message });
       log(w, 'studio', 'system', `${AGENTS[t.agent].name} 的對話卡住停不下來，改開一個新的對話重做「${t.title}」。`, e.message);
-      return pump(w);
+      return;
     }
     if (!(e instanceof Halt) && !e.timeout && !e.stuck && !t.hard && JSON.stringify(tierCfg(w, t.agent, true)) !== JSON.stringify(tierCfg(w, t.agent, false))) {
       Object.assign(t, { hard: true, escalated: true, status: 'WAITING', resumed: true, detail: e.message });
       log(w, 'studio', 'system', `「${t.title}」用平常的模型沒做成，自動改用強模型重試一次。`, e.message);
-      return pump(w);
+      return;
     }
     t.status = 'FAILED';
     t.result = e.timeout ? '沒有完成：' + e.message.replace(/^逾時：/, '')
@@ -801,7 +957,6 @@ ${STATUS_RULES}`;
     log(w, t.agent, 'worker', t.result + '：' + t.title, e.message);
     wakeWaiters(w, t);
   }
-  pump(w);
 }
 
 function applyStatus(w, t, st, reply) {
@@ -1139,6 +1294,7 @@ ${w.afterDone === 'stop' ? '{"done":true,"report":"<final report to the user, 2-
 {"done":false,"message":"<one sentence to the user>","subtasks":[${SUBTASK_SHAPE}]}
 {"needs_user":"<question to the user, in the user's language>","options":["<choice>","<choice>"]}
 Use needs_user only for a real decision about the work itself that the team cannot make.
+${deliveryRules(w.delivery, 'check')}
 A FAILED card with a technical reason (timeout, conversation busy, provider error) is a tooling problem, not a problem with the task: never ask the user to read logs or restart Studio. Add a retry card instead (smaller, or for another worker), and give the retry the facts it needs.${w.afterDone === 'stop' ? '' : `
 When done, also give 1 to 3 small, valuable next steps for this project in "next", best first, based on what you just saw (empty list if nothing is worth doing).${w.afterDone === 'auto' ? ' The first one may start automatically without the user: it must not need a decision from the user and must not be destructive (no deleting data, no force push, no release or deploy).' : ''}`}
 Rules for new subtasks:
@@ -1195,6 +1351,13 @@ function answer(w, taskId, text) {
     const t = w.tasks.find((x) => x.id === taskId);
     if (t?.status !== 'NEEDS_USER') throw new Error('這張工作卡沒有在等你回覆');
     log(w, 'user', 'user', `回覆「${t.title}」：${text}`);
+    if (t.takeover) { // "may Studio write over what was changed meanwhile?"
+      Object.assign(t, { takeover: false, ask: null });
+      if (/^先不要|暫停/.test(text)) { t.status = 'WAITING'; log(w, 'studio', 'system', '不接手：先暫停，等你處理好再按「繼續」。'); return pause(w); }
+      Object.assign(t, { status: 'WAITING', trust: true });
+      return pump(w);
+    }
+    t.trust = true; // the user is here: continue even if files changed while the card waited
     return wake(w, t, `The user answered your question:\n"""\n${text}\n"""`);
   }
   if (!run.ask || run.summarizing) throw new Error('工頭沒有在等你回覆');
@@ -1218,7 +1381,7 @@ function stop(w) {
   run.stopped = true;
   busyConvs(run).forEach(cancelTurn);
   for (const t of w.tasks) if (['WAITING', 'PAUSED', 'INTERRUPTED', ...PARKED].includes(t.status)) { t.status = 'FAILED'; t.result = '已停止'; }
-  log(w, 'studio', 'system', '已按下 Stop：這個專案的 Agent 停止目前工作。');
+  log(w, 'studio', 'system', '已停止：這件工作到此為止，未完成的卡標成失敗，不能再「繼續」。要接著做，按「▶ 接著處理」開新的一輪。');
   finish(w, 'stopped');
 }
 
@@ -1229,7 +1392,7 @@ function pause(w) {
   run.active = false;
   busyConvs(run).forEach(cancelTurn);
   for (const t of w.tasks) if (t.status === 'WORKING') { t.status = 'PAUSED'; t.result = '已暫停'; t.resumed = true; }
-  log(w, 'studio', 'system', '已暫停：工作卡和對話都保留，關掉 Studio 也沒關係，之後按「繼續」接著做。');
+  log(w, 'studio', 'system', '已暫停：成員已停下（手上那一步可能做到一半），工作卡和進度都保留，不會自己恢復；關掉 Studio 也沒關係，要你按「繼續」才會接著做。');
   saveRun(w, 'paused');
 }
 
@@ -1244,6 +1407,7 @@ function loadRun(w, r) {
   w.tasks = r.tasks;
   w.activity = r.activity;
   w.run = { id: r.id, startedAt: r.startedAt, project: r.project, leader: r.leader, request: r.request, convs: r.convs || {}, phase: r.phase || 'working', leaderGen: 0, rounds: r.rounds || 0, ask: r.ask || null, notes: r.notes || [], goal: r.goal, refs: r.refs, context: r.context, continues: r.continues, active: false, paused: true, stopped: false, summarizing: false };
+  Object.assign(w.run, { treeStamp: r.treeStamp, leftAt: r.leftAt });
   for (const [k, cid] of Object.entries(w.run.convs)) convAgent.set(cid, k.split(':')[0]);
 }
 
@@ -1259,6 +1423,7 @@ function resume(w, id) {
     }
   }
   const run = w?.run;
+  if (run?.stopped && !run.paused) throw new Error('這件工作已經停止，不能繼續；按「▶ 接著處理」開新的一輪');
   if (!run?.paused) throw new Error('沒有暫停中的工作');
   if (busyConvs(run).length) throw new Error('Agent 還在停下中，請幾秒後再按繼續');
   if (!isDir(run.project)) throw new Error('專案資料夾不存在：' + run.project);
@@ -1266,7 +1431,7 @@ function resume(w, id) {
   if (run.leader !== w.leader) { run.handoffFrom = run.leader; run.leader = w.leader; }
   run.paused = false;
   run.active = true;
-  for (const t of w.tasks) if (t.status === 'PAUSED' || t.status === 'INTERRUPTED') t.status = 'WAITING';
+  for (const t of w.tasks) { if (t.status === 'PAUSED' || t.status === 'INTERRUPTED') t.status = 'WAITING'; if (t.status === 'WAITING') t.trust = true; } // you pressed 繼續: files changed while paused are expected
   log(w, 'studio', 'system', `繼續工作（Leader：${AGENTS[run.leader].name}）。`);
   if (run.phase === 'planning') planPhase(w);
   else if (run.phase === 'summarizing') { if (!run.ask) summarize(w); } // a pending question waits for the user's answer
@@ -1386,7 +1551,7 @@ const routes = {
   'GET /api/state': () => {
     const workspaces = S.workspaces.map((w) => {
       const r = w.run;
-      return { project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, tiers: tiersOf(w), tasks: w.tasks, activity: w.activity, progress: readProjectProgress(w),
+      return { project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, delivery: w.delivery, tiers: tiersOf(w), tasks: w.tasks, activity: w.activity, progress: readProjectProgress(w),
         run: r && { id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
     });
     return { ...S, ...teamStats(), agents: Object.values(S.agents), workspaces };
@@ -1403,6 +1568,7 @@ const routes = {
   'POST /api/leader': (b) => setLeader(wsOf(b.ws), b.agent),
   'POST /api/start': (b) => { const w = wsOf(b.ws); w.autoRounds = 0; return start(w, String(b.request || ''), !!b.continue); },
   'POST /api/after-done': (b) => setAfterDone(wsOf(b.ws), b.mode),
+  'POST /api/delivery': (b) => setDelivery(wsOf(b.ws), b.mode),
   'POST /api/stop': (b) => stop(wsOf(b.ws)),
   'POST /api/reassign': (b) => reassign(wsOf(b.ws), b.taskId, b.agent),
   'POST /api/continue': (b) => { const w = wsOf(b.ws); w.autoRounds = 0; return continueProject(w); },

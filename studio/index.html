@@ -254,8 +254,8 @@
       <span class="spacer"></span>
       <span class="pill" id="runPill">待命</span>
       <button class="btn small" id="paseoOpen">用 Paseo 開啟</button>
-      <button class="btn pz" id="pauseResume">暫停</button>
-      <button class="btn danger" id="stop">Stop</button>
+      <button class="btn pz" id="pauseResume" title="暫停：成員馬上停下，工作卡和進度都保留，Studio 不會自己恢復；要你按「繼續」才會接著做。">暫停</button>
+      <button class="btn danger" id="stop" title="停止：這件工作到此為止，未完成的卡標成失敗，不能再「繼續」；要接著做請用「▶ 接著處理」開新的一輪。">Stop</button>
       <button class="btn small ghost" id="closeWs" title="關閉這個分頁（暫停中的工作仍在歷史紀錄）">關閉分頁</button>
     </section>
     <section class="panel wf-panel" id="nowPanel"></section>
@@ -455,7 +455,7 @@ function boardHtml(tasks, agents, editable) {
     const list = tasks.filter((t) => st.includes(t.status));
     return `<div class="lane"><div class="lane-h">${label}<span class="n">${list.length}</span></div>${list.map((t) => `
       <div class="card" style="--c:${look(t.agent).c}">
-        <div class="t">${esc(t.title)} ${t.escalated ? '<span class="tag">已升級強模型</span>' : t.hard ? '<span class="tag">困難</span>' : ''}${t.status === 'PAUSED' || t.status === 'INTERRUPTED' || PARKED.includes(t.status) ? `<span class="tag ${t.status === 'NEEDS_USER' ? 'bad' : 'pz'}">${STEP_WORD[t.status]}</span>` : ''}</div>
+        <div class="t">${esc(t.title)} ${t.writes === false ? '<span class="tag" title="只讀程式、審查或調查，不會修改檔案">唯讀</span> ' : ''}${t.escalated ? '<span class="tag">已升級強模型</span>' : t.hard ? '<span class="tag">困難</span>' : ''}${t.status === 'PAUSED' || t.status === 'INTERRUPTED' || PARKED.includes(t.status) ? `<span class="tag ${t.status === 'NEEDS_USER' ? 'bad' : 'pz'}">${STEP_WORD[t.status]}</span>` : ''}</div>
         <span class="who"><i></i>${esc(agents.find((a) => a.id === t.agent)?.name || t.agent)}</span>
         ${t.result && t.status !== 'PAUSED' ? `<div class="res">${esc(t.result)}</div>` : ''}
         ${PARKED.includes(t.status) ? `<div class="res"><b>${esc(waitLine(t))}</b></div>` : ''}
@@ -547,7 +547,8 @@ function officeHtml(w) {
     <div class="row" style="gap:6px;font-size:13px"><span class="hint" style="font-size:13px">做完之後：</span>
       <select data-after-done style="width:auto;padding:4px 8px;font-size:13px" title="只影響這個專案">
         ${[['stop', '① 完成就停（報告後等我）'], ['suggest', '② 完成後建議下一步（等我按）'], ['auto', '③ 自動持續開發（自動做下一個小目標）']].map(([k, t]) => `<option value="${k}" ${(w.afterDone || 'stop') === k ? 'selected' : ''}>${t}</option>`).join('')}
-      </select><span class="hint" style="font-size:13px;margin-left:8px">模型策略：</span>
+      </select><span class="hint" style="font-size:13px;margin-left:8px">交付：</span>
+      <select data-delivery style="width:auto;padding:4px 8px;font-size:13px" title="需求清楚、沒有高風險時，AI 要做到哪裡才停">${[['auto', '🚚 自動做到 merge'], ['pr', '✋ 做到 PR 就停（merge 等我）']].map(([k, t]) => `<option value="${k}" ${(w.delivery || 'auto') === k ? 'selected' : ''}>${t}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">模型策略：</span>
       <select data-strategy style="width:auto;padding:4px 8px;font-size:13px" title="工頭自己判斷普通卡／困難卡；普通卡失敗會自動改用強模型重試一次">${STRATEGY.map(([k, t]) => `<option value="${k}" ${(w.strategy || 'save') === k ? 'selected' : ''}>${t}</option>`).join('')}</select>${w.afterDone === 'auto' ? `<span class="tag pz">🔁 自動中 ${w.autoRounds || 0}/5</span>` : ''}</div>
     <div class="team-line">${esc(lead.name)} 工頭 · ${crew.length ? esc(crew.join(' + ')) + ' 協作' : '目前沒有可用的成員'} · Product First · 自動派工</div>
     <details class="rules"><summary>查看 AI 工作規則 ▾</summary><div class="rules-b">${r && (running || paused) ? `<b>目前交辦的內容</b>${esc(r.request)}` : ''}<b>工頭的工作方式</b>${esc(RULES)}</div></details>
@@ -641,7 +642,7 @@ function nowHtml(w, att) {
       ${step('📝', r.continues ? '你要團隊接著上次的工作' : '你交辦了工作', firstLine.slice(0, 140))}
       ${step(planned ? '✅' : r.active ? '⏳' : '🕒', planned ? `工頭 ${esc(name(r.leader))} 拆成 ${ts.length} 張工作卡` : `工頭 ${esc(name(r.leader))} 拆工作中`, '', !planned && r.active)}
       ${ts.map((t) => step(ICON[t.status] || '•', `${esc(t.title)}${t.escalated ? '（已自動升級強模型）' : t.hard ? '（困難）' : ''} · ${esc(name(t.agent))} · ${STEP_WORD[t.status] || t.status}`,
-        PARKED.includes(t.status) ? waitLine(t) : t.status === 'WORKING' ? '正在做…' : t.status === 'WAITING' ? (blocked.includes(t) ? '等前一張卡完成' : '等成員有空就開始') : t.result, t.status === 'WORKING')).join('')}
+        PARKED.includes(t.status) ? waitLine(t) : t.status === 'WORKING' ? '正在做…' : t.status === 'WAITING' ? (t.blockReason ? '先不動：' + t.blockReason : blocked.includes(t) ? '等前一張卡完成' : t.writes !== false && ts.some((x) => x !== t && x.writes !== false && ['WORKING', 'WAITING_EXTERNAL', 'NEEDS_USER'].includes(x.status)) ? '另一張卡正在修改這個專案（同一時間只有一位能改檔案），輪到它才開始' : '等成員有空就開始') : t.result, t.status === 'WORKING')).join('')}
       ${planned ? step(report ? '✅' : r.summarizing ? '⏳' : '🕒', '工頭確認整體完成', report || '', r.summarizing) : ''}
     </div></details>`;
 }
@@ -839,7 +840,7 @@ const openProject = (p) => post('/api/workspace/open', { path: p }).then((j) => 
 const browse = () => post('/api/browse').then((j) => { if (j.project) go(j.project); });
 $('browse').onclick = browse;
 $('setProject').onclick = () => openProject($('project').value).then(() => { $('project').value = ''; });
-$('stop').onclick = () => confirm('確定要停止這個專案的工作嗎？停止後未完成的工作卡會標成失敗（想晚點再做請用「暫停」）。') && post('/api/stop', { ws: ws() });
+$('stop').onclick = () => confirm('停止這件工作？\n\n• 成員馬上停下，未完成的工作卡標成失敗\n• 這件工作不能再按「繼續」，之後要用「▶ 接著處理」開新的一輪\n\n只是想晚點再做、保留進度，請按「暫停」。') && post('/api/stop', { ws: ws() });
 $('pauseResume').onclick = () => post(W()?.run?.paused ? '/api/resume' : '/api/pause', { ws: ws() });
 $('renameWs').onclick = () => { const n = prompt('這個專案的顯示名稱（留空 = 用資料夾名稱）', W()?.name || ''); if (n !== null) post('/api/workspace/rename', { ws: ws(), name: n }); };
 $('closeWs').onclick = () => post('/api/workspace/close', { ws: ws() }).then(() => go(''));
@@ -861,6 +862,8 @@ document.addEventListener('input', (e) => {
 });
 document.addEventListener('toggle', (e) => { if (e.target.id === 'doneDrop') doneOpen = e.target.open; }, true);
 document.addEventListener('change', (e) => {
+  const dl = e.target.closest('select[data-delivery]');
+  if (dl) return post('/api/delivery', { ws: ws(), mode: dl.value }).catch(() => {});
   const sg = e.target.closest('select[data-strategy]');
   if (sg) return post('/api/strategy', { ws: ws(), strategy: sg.value }).catch(() => {});
   const ad = e.target.closest('select[data-after-done]');
