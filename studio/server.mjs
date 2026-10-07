@@ -2225,7 +2225,30 @@ const routes = {
     const workspaces = S.workspaces.map((w) => {
       const r = w.run;
       const key = w.wsKey || treeKey(w.project), live = S.leases.filter((l) => l.key === key && l.status !== 'RELEASED' && leaseState(l) !== 'RELEASED');
-      return { wsInfo: w.wsInfo, lease: { writer: live.filter((l) => l.mode === 'write').map(leaseView)[0] || null, readers: live.filter((l) => l.mode === 'read').map(leaseView) }, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, delivery: w.delivery, tiers: tiersOf(w), tasks: w.tasks, activity: w.activity, progress: readProjectProgress(w),
+      const lease = { writer: live.filter((l) => l.mode === 'write').map(leaseView)[0] || null, readers: live.filter((l) => l.mode === 'read').map(leaseView) };
+      const wr = lease.writer;
+      const readers = (lease.readers || []).map((x) => x.owner).join(', ') || '—';
+      const repo = w.wsInfo?.repo || wr?.repo || path.basename(w.project);
+      const branch = w.wsInfo?.branch || wr?.branch || '—';
+      const writerStr = wr ? `${wr.owner} / ${repo} / ${branch}` : '—';
+      const workspace_summary = `Writer: ${writerStr} · Readers: ${readers} · branch: ${branch} · worktree: ${w.wsInfo?.path || w.project} · lease: ${wr?.state || (wr ? 'ACTIVE' : 'FREE')}`;
+      const tasks = (w.tasks || []).map((t) => {
+        let blocked_reason = '';
+        if (t.wait?.recoveryReason) {
+          const raw = String(t.wait.recoveryReason).trim();
+          blocked_reason = raw.startsWith('Blocked') ? raw.replace(/^Blocked\s*[:：]\s*/i, 'Blocked：') : `Blocked：${raw}`;
+        } else if (t.blocked?.owner) {
+          blocked_reason = `Blocked：workspace currently owned by ${t.blocked.owner}`;
+        } else if (t.blockReason) {
+          const raw = String(t.blockReason).trim();
+          blocked_reason = raw.startsWith('Blocked') ? raw.replace(/^Blocked\s*[:：]\s*/i, 'Blocked：') : `Blocked：${raw}`;
+        } else if (t.wait?.error) {
+          const raw = String(t.wait.error).trim();
+          blocked_reason = raw.startsWith('Blocked') ? raw.replace(/^Blocked\s*[:：]\s*/i, 'Blocked：') : `Blocked：${raw}`;
+        }
+        return { ...t, blocked_reason: blocked_reason || null };
+      });
+      return { wsInfo: w.wsInfo, lease, workspace_summary, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, delivery: w.delivery, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
         run: r && { extMod: r.extMod, claimedBy: r.claimedBy, id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
     });
     return { ...S, runtimes: S.runtimes, ...teamStats(), agents: Object.values(S.agents), workspaces };

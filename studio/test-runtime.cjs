@@ -439,6 +439,7 @@ async function runRuntimeTests() {
   }
 
   await require('./test-runtime-server.cjs')();
+  await require('./test-ui-ownership.cjs')();
   } finally {
   // Teardown temp resources
   for (const p of SPAWNED_PROCS) safeKill(p);

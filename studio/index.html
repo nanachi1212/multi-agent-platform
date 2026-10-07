@@ -503,20 +503,30 @@ function seatHtml(a, w) {
 function boardHtml(tasks, agents, editable) {
   if (!tasks.length) return '<div class="empty">還沒有工作卡。在上面說你要什麼、按「交給團隊」，工頭會拆成工作卡派給成員。</div>';
   const avail = agents.filter((a) => a.status === 'available');
+  const w = S.workspaces.find((x) => x.project === curPath()) || {};
   return `<div class="board">${LANES.map(([st, label]) => {
     const list = tasks.filter((t) => st.includes(t.status));
-    return `<div class="lane"><div class="lane-h">${label}<span class="n">${list.length}</span></div>${list.map((t) => `
+    return `<div class="lane"><div class="lane-h">${label}<span class="n">${list.length}</span></div>${list.map((t) => {
+      const blk = cardBlockedReason(t);
+      const ws = formatWorkspace(w, t);
+      const rts = (S.runtimes || []).filter((r) => r.card_id === t.id || ((w.run?.id && r.job_id === w.run.id) && t.status === 'WORKING' && t.writes !== false) || (!r.card_id && (r.workspace || '').toLowerCase() === (t.workdir || w.project || '').toLowerCase()));
+      const tagHtml = blk ? '<span class="tag bad">Blocked</span>' : (t.status === 'PAUSED' || t.status === 'INTERRUPTED' || PARKED.includes(t.status) ? `<span class="tag ${t.status === 'NEEDS_USER' ? 'bad' : 'pz'}">${STEP_WORD[t.status]}</span>` : '');
+      return `
       <div class="card" style="--c:${look(t.agent).c}">
-        <div class="t">${esc(t.title)} ${t.writes === false ? '<span class="tag" title="只讀程式、審查或調查，不會修改檔案">唯讀</span> ' : ''}${t.escalated ? '<span class="tag">已升級強模型</span>' : t.hard ? '<span class="tag">困難</span>' : ''}${t.status === 'PAUSED' || t.status === 'INTERRUPTED' || PARKED.includes(t.status) ? `<span class="tag ${t.status === 'NEEDS_USER' ? 'bad' : 'pz'}">${STEP_WORD[t.status]}</span>` : ''}</div>
+        <div class="t">${esc(t.title)} ${t.writes === false ? '<span class="tag" title="只讀程式、審查或調查，不會修改檔案">唯讀</span> ' : ''}${t.escalated ? '<span class="tag">已升級強模型</span>' : t.hard ? '<span class="tag">困難</span>' : ''}${tagHtml}</div>
         <span class="who"><i></i>${esc(agents.find((a) => a.id === t.agent)?.name || t.agent)}</span>
+        ${blk ? `<div class="res" style="color:var(--bad);font-weight:700">🚫 ${esc(blk)}</div>` : ''}
         ${t.result && t.status !== 'PAUSED' ? `<div class="res">${esc(t.result)}</div>` : ''}
-        ${PARKED.includes(t.status) ? `<div class="res"><b>${esc(waitLine(t))}</b></div>` : ''}
-        ${t.blocked && editable ? blockedHtml(S.workspaces.find((x) => x.project === curPath()) || {}, t) : ''}
+        ${PARKED.includes(t.status) && !blk ? `<div class="res"><b>${esc(waitLine(t))}</b></div>` : ''}
+        <div class="res" style="font-size:12px;opacity:0.85">📁 <b>Workspace</b> ${esc(ws.fullLine)}</div>
+        <div class="res" style="font-size:12px;opacity:0.85">⚡ <b>Runtime</b> ${rts.length ? esc(rts.map(formatRuntimeItem).join(' · ')) : '—'}</div>
+        ${t.blocked && editable ? blockedHtml(w, t) : ''}
         ${t.worktree ? `<div class="res">🌿 獨立 worktree：${esc(t.worktree.branch)}${t.worktree.cleaned ? '（已清掉）' : ''}</div>` : ''}
         ${t.handoffs?.length ? `<div class="res">🤝 交接：${t.handoffs.map((h) => esc(name(h.from)) + ' → ' + esc(name(h.to))).join('、')}</div>` : ''}
         ${t.detail ? `<details class="tech"><summary>查看技術細節</summary><pre>${esc(t.detail)}</pre></details>` : ''}
         ${editable && st !== 'WORKING' && st !== 'DONE' ? `<div class="re"><select data-task="${t.id}">${avail.map((a) => `<option value="${a.id}" ${a.id === t.agent ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><button class="btn small" data-reassign="${t.id}">改派</button></div>` : ''}
-      </div>`).join('')}</div>`;
+      </div>`;
+    }).join('')}</div>`;
   }).join('')}</div>`;
 }
 
@@ -557,22 +567,83 @@ function leaseHtml(w) {
     <span title="${esc(info.path || w.project)}">📁 ${esc(info.repo || base(info.path || w.project))}${info.branch ? ' · branch ' + esc(info.branch) : ''}</span>
     ${readers ? `<span>👁 唯讀：${readers}</span>` : ''}${buttons}</div>`;
 }
+function formatWorkspace(w, task = null) {
+  const L = w?.lease || {}, wr = L.writer;
+  const readers = (L.readers || []).map((x) => x.owner).join(', ') || '—';
+  const repo = w?.wsInfo?.repo || (wr?.repo) || (w?.project ? base(w.project) : '—');
+  const branch = task?.worktree?.branch || w?.wsInfo?.branch || wr?.branch || '—';
+  const worktree = task?.workdir || (task?.worktree?.path) || w?.wsInfo?.path || w?.project || '—';
+  const leaseStatus = task ? (task.writes === false ? 'READ' : (wr && (wr.cardId === task.id || wr.card === task.title)) ? (wr.state || 'ACTIVE') : (wr ? wr.state : 'FREE')) : (wr?.state || (wr ? 'ACTIVE' : 'FREE'));
+  const writerStr = wr ? `${wr.owner} / ${repo} / ${branch}` : '—';
+  return {
+    writer: wr?.owner || '—',
+    writerSummary: wr ? `Writer: ${writerStr}` : 'Writer: —',
+    readers,
+    branch,
+    worktree,
+    leaseStatus,
+    fullLine: `Writer: ${writerStr} · Readers: ${readers} · branch: ${branch} · worktree: ${worktree} · lease: ${leaseStatus}`
+  };
+}
+
+function formatRuntimeItem(r) {
+  const p = String(r.purpose || '').toLowerCase();
+  const purpose = p.includes('smoke') ? 'Smoke' : p.includes('test') ? 'Test' : 'Backend';
+  const port = r.port || '—';
+  let state = 'STOPPED';
+  const st = String(r.status || '').toLowerCase();
+  if (r.readiness?.status === 'BACKEND_READY') {
+    state = 'READY';
+  } else if (r.readiness?.status === 'BLOCKED') {
+    state = 'BLOCKED';
+  } else if (st === 'running') {
+    state = (purpose === 'Backend' && r.readiness?.process_alive && r.readiness?.status !== 'BACKEND_READY') ? 'BLOCKED' : 'RUNNING';
+  } else if (st === 'stopped' || st === 'cleaned' || st === 'exited' || (r.readiness && !r.readiness.process_alive)) {
+    state = 'STOPPED';
+  }
+  const jobPart = r.job_id ? ` — Job #${r.job_id}` : '';
+  const reasonPart = (state === 'BLOCKED' && r.readiness?.reason) ? ` · ${r.readiness.reason}` : '';
+  return `${purpose} ${port} — ${state}${jobPart}${reasonPart}`;
+}
+
+function cardBlockedReason(t) {
+  if (!t) return '';
+  if (t.blocked_reason) return t.blocked_reason;
+  if (t.wait?.recoveryReason) {
+    const raw = String(t.wait.recoveryReason).trim();
+    return raw.startsWith('Blocked') ? raw.replace(/^Blocked\s*[:：]\s*/i, 'Blocked：') : `Blocked：${raw}`;
+  }
+  if (t.blocked) {
+    const owner = t.blocked.owner || '';
+    if (owner) return `Blocked：workspace currently owned by ${owner}`;
+    if (t.blockReason) {
+      const raw = String(t.blockReason).trim();
+      return raw.startsWith('Blocked') ? raw.replace(/^Blocked\s*[:：]\s*/i, 'Blocked：') : `Blocked：${raw}`;
+    }
+    return 'Blocked：workspace currently owned by another agent';
+  }
+  if (t.blockReason) {
+    const raw = String(t.blockReason).trim();
+    return raw.startsWith('Blocked') ? raw.replace(/^Blocked\s*[:：]\s*/i, 'Blocked：') : `Blocked：${raw}`;
+  }
+  if (t.wait?.error) {
+    const raw = String(t.wait.error).trim();
+    return raw.startsWith('Blocked') ? raw.replace(/^Blocked\s*[:：]\s*/i, 'Blocked：') : `Blocked：${raw}`;
+  }
+  return '';
+}
+
 function runtimeHtml(w, task = null) {
-  const items = (S.runtimes || []).filter((r) => (w.run?.id && r.job_id === w.run.id) ||
-    ((r.workspace || '').toLowerCase() === (task?.workdir || w.project || '').toLowerCase()));
-  if (!items.length) return '';
-  return items.map((r) => {
-    const readiness = r.readiness;
-    const state = readiness?.status === 'BACKEND_READY' ? 'READY' : readiness?.process_alive ? 'BLOCKED' : 'STOPPED';
-    const job = r.job_id ? ` · Job #${esc(r.job_id)}` : '';
-    return `<div class="lim-f"><b>Runtime</b> ${esc(r.purpose === 'smoke' ? 'Smoke' : 'Backend')} ${esc(r.port || '—')} — ${state}${job}${readiness?.reason ? ` · ${esc(readiness.reason)}` : ''}</div>`;
-  }).join('');
+  const all = S.runtimes || [];
+  const items = task
+    ? all.filter((r) => r.card_id === task.id || (w.run?.id && r.job_id === w.run.id && task.status === 'WORKING' && task.writes !== false))
+    : all.filter((r) => (w.run?.id && r.job_id === w.run.id) ||
+        ((r.workspace || '').toLowerCase() === (w.project || '').toLowerCase()));
+  if (!items.length) return '<div class="lim-f"><b>Runtime</b> —</div>';
+  return items.map((r) => `<div class="lim-f"><b>Runtime</b> ${esc(formatRuntimeItem(r))}</div>`).join('');
 }
 function workspaceLine(w, task = null) {
-  const L = w.lease || {}, writer = L.writer, readers = (L.readers || []).map((x) => x.owner).join(', ') || '—';
-  const branch = task?.worktree?.branch || w.wsInfo?.branch || '—';
-  const path = task?.workdir || w.wsInfo?.path || w.project;
-  return `<div class="lim-f"><b>Workspace</b> Writer: ${esc(writer?.owner || '—')} · Readers: ${esc(readers)} · branch: ${esc(branch)} · worktree: ${esc(path)} · lease: ${esc(writer?.state || 'FREE')}</div>`;
+  return `<div class="lim-f"><b>Workspace</b> ${esc(formatWorkspace(w, task).fullLine)}</div>`;
 }
 // A refused card: who has the tree, and the three ways out.
 function blockedHtml(w, t) {
@@ -603,15 +674,15 @@ function attention(w) {
   if (!r) return { ic:'⚪', cls:'', text:'待命：還沒有交辦工作' };
   const askCard = ts.find((t) => t.status === 'NEEDS_USER');
   if (r.active && (askCard || (r.ask && !r.summarizing))) return { ic:'🔴', cls:'bad', need:true, text:'需要 Nana：' + (askCard ? askCard.ask?.question : r.ask.question) };
-  const refused = ts.find((t) => t.blocked && t.status === 'WAITING');
-  if (r.active && refused && !ts.some((t) => t.status === 'WORKING')) return { ic:'🟠', cls:'on', text: refused.blockReason };
+  const refused = ts.find((t) => (t.blocked || cardBlockedReason(t)) && t.status === 'WAITING');
+  if (r.active && refused && !ts.some((t) => t.status === 'WORKING')) return { ic:'🟠', cls:'on', text: cardBlockedReason(refused) || refused.blockReason || 'Blocked' };
   if (r.paused && r.extMod) return { ic:'🔴', cls:'bad', need:true, text:'偵測到來源不明的修改（EXTERNAL_MODIFICATION_DETECTED）：' + r.extMod.why };
   const manual = ts.find((t) => t.status === 'WAITING_EXTERNAL' && t.wait?.manual);
   if (r.active && manual) return { ic:'🟠', cls:'bad', need:true, text:manual.wait.recoveryReason || `需要你按「繼續」：${name(manual.agent)} 在等「${manual.wait.what}」，Studio 無法自動確認` };
   if (r.paused) return { ic:'🔵', cls:'pz', text:ts.some((t) => t.status === 'INTERRUPTED') ? '已中斷：按「繼續」從中斷的地方接著做' : '已暫停：按「繼續」接著做' };
   if (r.active) {
     if (r.phase === 'planning' || r.summarizing || ts.some((t) => t.status === 'WORKING')) return { ic:'🟢', cls:'ok', text:'不需要操作，團隊正在工作' };
-    const waits = ts.filter((t) => PARKED.includes(t.status)).map((t) => (t.status === 'WAITING_AGENT' ? name(t.wait?.agent) : t.wait?.pr ? 'CI' : t.wait?.what || '外部結果'));
+    const waits = ts.filter((t) => PARKED.includes(t.status) || cardBlockedReason(t)).map((t) => (t.status === 'WAITING_AGENT' ? name(t.wait?.agent) : t.wait?.pr ? 'CI' : cardBlockedReason(t) || t.wait?.what || '外部結果'));
     return { ic:'🟡', cls:'on', text:`不需要操作，正在等待 ${[...new Set(waits)].join('、') || '下一步'}` };
   }
   if (r.stopped) return { ic:'⏹️', cls:'', text:'已停止' };
@@ -653,6 +724,7 @@ function officeHtml(w) {
       <select data-delivery style="width:auto;padding:4px 8px;font-size:13px" title="需求清楚、沒有高風險時，AI 要做到哪裡才停">${[['auto', '🚚 自動做到 merge'], ['pr', '✋ 做到 PR 就停（merge 等我）']].map(([k, t]) => `<option value="${k}" ${(w.delivery || 'auto') === k ? 'selected' : ''}>${t}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">模型策略：</span>
       <select data-strategy style="width:auto;padding:4px 8px;font-size:13px" title="工頭自己判斷普通卡／困難卡；普通卡失敗會自動改用強模型重試一次">${STRATEGY.map(([k, t]) => `<option value="${k}" ${(w.strategy || 'save') === k ? 'selected' : ''}>${t}</option>`).join('')}</select>${w.afterDone === 'auto' ? `<span class="tag pz">🔁 自動中 ${w.autoRounds || 0}/5</span>` : ''}</div>
     ${leaseHtml(w)}
+    ${workspaceLine(w)}
     ${runtimeHtml(w)}
     <div class="team-line">${esc(lead.name)} 工頭 · ${crew.length ? esc(crew.join(' + ')) + ' 協作' : '目前沒有可用的成員'} · Product First · 自動派工</div>
     <details class="rules"><summary>查看 AI 工作規則 ▾</summary><div class="rules-b">${r && (running || paused) ? `<b>目前交辦的內容</b>${esc(r.request)}` : ''}<b>工頭的工作方式</b>${esc(RULES)}</div></details>
@@ -740,6 +812,8 @@ function nowHtml(w, att) {
   return `<div class="wf-head"><span class="big">${att.ic}</span><div><div class="st-line">${esc(w.name)}</div><div class="att ${att.cls}" style="display:inline-block;margin-top:4px">${esc(att.text)}</div></div></div>
     <dl class="wf">
       <dt>目前進度</dt><dd>${esc(progress)}</dd>
+      <dt>Workspace</dt><dd>${esc(formatWorkspace(w).fullLine)}</dd>
+      <dt>Runtime</dt><dd>${(S.runtimes || []).filter((r) => (w.run?.id && r.job_id === w.run.id) || ((r.workspace || '').toLowerCase() === (w.project || '').toLowerCase())).map(formatRuntimeItem).join(' · ') || '—'}</dd>
       <dt>正在等待</dt><dd>${waits.length ? esc(waits.join('\n')) : '—'}</dd>
       <dt>接下來</dt><dd>${esc(next)}</dd>
       <dt>你現在</dt><dd>${you}</dd>
@@ -747,8 +821,18 @@ function nowHtml(w, att) {
     <details class="rules" ${r.active || r.paused ? 'open' : ''}><summary>每張工作卡的進度 ▾</summary><div class="steps" style="margin-top:6px">
       ${step('📝', r.continues ? '你要團隊接著上次的工作' : '你交辦了工作', firstLine.slice(0, 140))}
       ${step(planned ? '✅' : r.active ? '⏳' : '🕒', planned ? `工頭 ${esc(name(r.leader))} 拆成 ${ts.length} 張工作卡` : `工頭 ${esc(name(r.leader))} 拆工作中`, '', !planned && r.active)}
-      ${ts.map((t) => step(ICON[t.status] || '•', `${esc(t.title)}${t.escalated ? '（已自動升級強模型）' : t.hard ? '（困難）' : ''} · ${esc(name(t.agent))} · ${STEP_WORD[t.status] || t.status}`,
-        [PARKED.includes(t.status) ? waitLine(t) : t.status === 'WORKING' ? '正在做…' : t.status === 'WAITING' ? (t.blockReason ? 'Blocked：' + t.blockReason : blocked.includes(t) ? '等前一張卡完成' : t.writes !== false && ts.some((x) => x !== t && x.writes !== false && ['WORKING', 'WAITING_EXTERNAL', 'NEEDS_USER'].includes(x.status)) ? '另一張卡正在修改這個專案（同一時間只有一位能改檔案），輪到它才開始' : '等成員有空就開始') : t.result, `Workspace Writer: ${w.lease?.writer?.owner || '—'} · Readers: ${(w.lease?.readers || []).map((x) => x.owner).join(', ') || '—'} · branch: ${t.worktree?.branch || w.wsInfo?.branch || '—'} · worktree: ${t.workdir || w.wsInfo?.path || w.project} · lease: ${w.lease?.writer?.state || 'FREE'}`, t.blocked?.owner ? `Blocked：workspace currently owned by ${t.blocked.owner}` : '', (S.runtimes || []).filter((r) => r.job_id === w.run?.id && (!r.card_id || r.card_id === t.id)).map((r) => `${r.purpose === 'smoke' ? 'Smoke' : 'Backend'} ${r.port || ''} — ${r.readiness?.status === 'BACKEND_READY' ? 'READY' : r.readiness?.process_alive ? 'BLOCKED' : 'STOPPED'}${r.job_id ? ` — Job #${r.job_id}` : ''}${r.readiness?.reason ? ` · ${r.readiness.reason}` : ''}`).join(' ')].filter(Boolean).join(' · '), t.status === 'WORKING')).join('')}
+      ${ts.map((t) => {
+        const blk = cardBlockedReason(t);
+        const ws = formatWorkspace(w, t);
+        const crun = (S.runtimes || []).filter((r) => (w.run?.id && r.job_id === w.run.id) || r.card_id === t.id || (!r.card_id && (r.workspace || '').toLowerCase() === (t.workdir || w.project || '').toLowerCase()));
+        const statusLabel = blk ? 'Blocked' : (STEP_WORD[t.status] || t.status);
+        const details = [
+          blk ? `🚫 ${blk}` : (PARKED.includes(t.status) ? waitLine(t) : t.status === 'WORKING' ? '正在做…' : t.status === 'WAITING' ? (blocked.includes(t) ? '等前一張卡完成' : t.writes !== false && ts.some((x) => x !== t && x.writes !== false && ['WORKING', 'WAITING_EXTERNAL', 'NEEDS_USER'].includes(x.status)) ? '另一張卡正在修改這個專案（同一時間只有一位能改檔案），輪到它才開始' : '等成員有空就開始') : t.result),
+          `Workspace: ${ws.fullLine}`,
+          `Runtime: ${crun.length ? crun.map(formatRuntimeItem).join(' · ') : '—'}`
+        ].filter(Boolean).join(' · ');
+        return step(blk ? '🚫' : (ICON[t.status] || '•'), `${esc(t.title)}${t.escalated ? '（已自動升級強模型）' : t.hard ? '（困難）' : ''} · ${esc(name(t.agent))} · ${statusLabel}`, details, t.status === 'WORKING');
+      }).join('')}
       ${planned ? step(report ? '✅' : r.summarizing ? '⏳' : '🕒', '工頭確認整體完成', report || '', r.summarizing) : ''}
     </div></details>`;
 }
