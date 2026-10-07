@@ -186,6 +186,7 @@ async function startAion() {
       job_id: 'studio_core',
       purpose: 'helper',
       root_pid: p.pid,
+      process_identity: await getProcessInfo(p.pid),
       executable: AION,
       command: `${AION} ${args.join(' ')}`,
       args,
@@ -2069,7 +2070,7 @@ async function recoverBackendWait(w, t) {
       restart: async (old) => {
         const child = spawn(old.executable, old.args, { cwd: old.cwd, env: { ...recoveryEnv(), ...old.env }, windowsHide: true, stdio: 'ignore' });
         if (!child.pid) throw new Error('Studio backend restart did not create a process');
-        const replacement = registerRuntime({ ...old, root_pid: child.pid, child_pids: [], status: 'running', rtDir: RT });
+        const replacement = registerRuntime({ ...old, root_pid: child.pid, process_identity: await getProcessInfo(child.pid), studio_pid: process.pid, child_pids: [], status: 'running', rtDir: RT });
         child.once('exit', () => updateRuntime(replacement.runtime_id, { status: 'exited' }, { rtDir: RT }));
         return replacement;
       },
@@ -2128,7 +2129,7 @@ async function startManagedRuntime(body) {
   if (!proc.pid) throw new Error('runtime process could not be started');
   const restartSafe = body.noCredentialsConfirmed === true && !args.some((arg) => /--?(?:token|password|secret|api[-_]?key)(?:\s|=|$)/i.test(arg));
   const runtime = registerRuntime({
-    job_id: w.run.id, card_id: task.id, workspace, purpose: body.purpose || 'dev_backend', root_pid: proc.pid,
+    job_id: w.run.id, card_id: task.id, workspace, purpose: body.purpose || 'dev_backend', root_pid: proc.pid, process_identity: await getProcessInfo(proc.pid),
     executable, command: restartSafe ? [executable, ...args].join(' ') : path.basename(executable), args: restartSafe ? args : [], cwd, env: appEnv, port, data_dir: dataDir,
     smoke_path: body.smokePath || '/health', restart_safe: restartSafe, rtDir: RT
   });

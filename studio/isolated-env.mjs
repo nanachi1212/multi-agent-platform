@@ -2,16 +2,18 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import net from 'node:net';
-import { getPortOccupant } from './runtime-registry.mjs';
+import { getPortOccupant, isSafeTempDir } from './runtime-registry.mjs';
 
 /**
  * Returns isolated data directory under %TEMP%\MultiAgentStudio\<project>\<run-id>\data
  * Ensures all lock files, cache, and state are completely separated from production ./data.
  */
 export function getIsolatedDataDir(project, runId) {
-  const projectSlug = path.basename(project || 'default').replace(/[^\w.-]/g, '_');
-  const safeRunId = String(runId || Date.now()).replace(/[^\w.-]/g, '_');
-  const tempRoot = path.join(os.tmpdir(), 'MultiAgentStudio', projectSlug, safeRunId);
+  const projectSlug = path.basename(project || 'default').replace(/[^\w-]/g, '_') || 'default';
+  const safeRunId = String(runId || Date.now()).replace(/[^\w-]/g, '_') || 'run';
+  const projectRoot = path.join(os.tmpdir(), 'MultiAgentStudio', projectSlug);
+  fs.mkdirSync(projectRoot, { recursive: true });
+  const tempRoot = fs.mkdtempSync(path.join(projectRoot, safeRunId + '-'));
   const dataDir = path.join(tempRoot, 'data');
   fs.mkdirSync(dataDir, { recursive: true });
   return { dataDir, tempRoot };
@@ -76,8 +78,8 @@ export async function createSmokeEnvironment({
   baseEnv = process.env,
   preferredPort = 3020
 } = {}) {
-  const { dataDir, tempRoot } = getIsolatedDataDir(project, runId);
   const port = await allocateIsolatedPort(preferredPort);
+  const { dataDir, tempRoot } = getIsolatedDataDir(project, runId);
 
   const env = {
     ...baseEnv,
@@ -101,8 +103,7 @@ export async function createSmokeEnvironment({
 export function cleanupIsolatedDir(tempRoot) {
   if (!tempRoot || typeof tempRoot !== 'string') return;
   const resolved = path.resolve(tempRoot);
-  const tempBase = path.resolve(os.tmpdir());
-  if (resolved.toLowerCase().startsWith(tempBase.toLowerCase()) && resolved.includes('MultiAgentStudio')) {
+  if (isSafeTempDir(resolved)) {
     try {
       fs.rmSync(resolved, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     } catch (e) {}

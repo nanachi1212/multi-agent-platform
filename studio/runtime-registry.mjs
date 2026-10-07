@@ -38,7 +38,7 @@ export async function getProcessInfo(pid) {
   if (!isPidAlive(pid)) return { pid, exists: false, command: '', executable: '' };
   if (process.platform === 'win32') {
     try {
-      const psCmd = `Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" -ErrorAction SilentlyContinue | Select-Object -Property ProcessId, Name, CommandLine, CreationDate | ConvertTo-Json -Compress`;
+      const psCmd = `Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" -ErrorAction SilentlyContinue | Select-Object -Property ProcessId, Name, ExecutablePath, CommandLine, CreationDate | ConvertTo-Json -Compress`;
       const out = await execPowerShell(psCmd);
       if (out && out.trim()) {
         const data = JSON.parse(out.trim());
@@ -46,7 +46,7 @@ export async function getProcessInfo(pid) {
           pid,
           exists: true,
           name: data.Name || '',
-          executable: data.Name || '',
+          executable: data.ExecutablePath || '',
           command: data.CommandLine || data.Name || '',
           creationDate: data.CreationDate || ''
         };
@@ -97,18 +97,12 @@ export async function killProcessTree(rootPid) {
     try { process.kill(rootPid, 'SIGKILL'); } catch (e) {}
   }
 
-  for (const childPid of children) {
-    if (isPidAlive(childPid)) {
-      if (process.platform === 'win32') {
-        try { await execCmd('taskkill', ['/F', '/PID', String(childPid)]); } catch (e) {}
-      }
-      if (isPidAlive(childPid)) {
-        try { process.kill(childPid, 'SIGKILL'); } catch (e) {}
-      }
-    }
+  // Do not kill detached/reused child PIDs after the parent tree has exited.
+  for (let i = 0; i < 20 && [rootPid, ...children].some(isPidAlive); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
-
-  return { ok: true, killed: true, rootPid, children };
+  const remaining = [rootPid, ...children].filter(isPidAlive);
+  return { ok: remaining.length === 0, killed: true, rootPid, children, remaining };
 }
 
 export async function getPortOccupant(port) {
@@ -144,13 +138,51 @@ export async function getPortOccupant(port) {
 
 // ---------- Safety checks ----------
 
-function isSafeTempDir(dirPath) {
+export function isSafeTempDir(dirPath) {
   if (!dirPath || typeof dirPath !== 'string') return false;
-  const resolved = path.resolve(dirPath);
-  const tempRoot = path.resolve(os.tmpdir());
-  // Ensure the directory is inside the system temp directory and contains expected studio markers
-  if (!resolved.toLowerCase().startsWith(tempRoot.toLowerCase())) return false;
-  return /MultiAgentStudio|studio-rt-|smoke-|temp-/i.test(resolved);
+  const base = path.resolve(os.tmpdir(), 'MultiAgentStudio');
+  const target = path.resolve(dirPath);
+  const relative = path.relative(base, target);
+  // Only individual run directories; never the temp root or a project directory.
+  if (!relative || path.isAbsolute(relative) || relative === '..' || relative.startsWith('..' + path.sep)
+      || relative.split(path.sep).length < 2) return false;
+  let current = target;
+  while (current !== path.dirname(base)) {
+    if (fs.existsSync(current) && fs.lstatSync(current).isSymbolicLink()) return false;
+    if (current === base) break;
+    current = path.dirname(current);
+  }
+  return true;
+}
+
+/** A PID is owned only when its OS creation time and executable still match. */
+export async function verifyRuntimeProcess(runtime) {
+  const info = await getProcessInfo(runtime.root_pid);
+  if (!info.exists) {
+    const descendants = (runtime.child_pids || []).filter(isPidAlive);
+    return { ok: runtime.created_by === 'studio' && descendants.length === 0, alive: false,
+      reason: descendants.length ? `Unverified orphan PIDs: ${descendants.join(', ')}` : '', info };
+  }
+  const identity = runtime.process_identity;
+  const ok = runtime.created_by === 'studio' && identity?.creationDate && identity?.executable
+    && String(identity.creationDate) === String(info.creationDate)
+    && identity.executable.toLowerCase() === info.executable.toLowerCase();
+  return { ok: !!ok, alive: true, info,
+    reason: ok ? '' : `Unknown/reused PID ${runtime.root_pid} (${info.command || info.executable || 'command unavailable'}); process ownership is unverified` };
+}
+
+export async function cleanupRuntime(runtime, { rtDir = null, customRuntimes = null } = {}) {
+  const verified = await verifyRuntimeProcess(runtime);
+  if (!verified.ok) return { ok: false, reason: verified.reason || 'Runtime owner is unknown' };
+  if (verified.alive) {
+    const killed = await killProcessTree(runtime.root_pid);
+    if (!killed.ok) return { ok: false, reason: `Runtime processes have not stopped: ${killed.remaining.join(', ')}` };
+  }
+  if (runtime.temp_dir && isSafeTempDir(runtime.temp_dir)) {
+    fs.rmSync(runtime.temp_dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+  updateRuntime(runtime.runtime_id, { status: 'cleaned' }, { rtDir, customRuntimes });
+  return { ok: true };
 }
 
 // ---------- Runtime Registry Persistence & Operations ----------
@@ -161,23 +193,19 @@ export function runtimesFile(rtDir) {
 }
 
 export function loadRuntimes(filePath) {
-  try {
-    if (!fs.existsSync(filePath)) return [];
-    const content = fs.readFileSync(filePath, 'utf8');
-    const data = JSON.parse(content);
-    return Array.isArray(data) ? data : [];
-  } catch (e) {
-    return [];
-  }
+  if (!fs.existsSync(filePath)) return [];
+  const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  if (!Array.isArray(data)) throw new Error('Invalid runtime registry; preserve it for recovery');
+  return data;
 }
 
 export function saveRuntimes(filePath, runtimes) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const temp = filePath + '.' + crypto.randomUUID() + '.tmp';
   try {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, JSON.stringify(runtimes, null, 2), 'utf8');
-  } catch (e) {
-    console.error('Failed to save runtimes.json:', e.message);
-  }
+    fs.writeFileSync(temp, JSON.stringify(runtimes, null, 2), { encoding: 'utf8', flag: 'wx' });
+    fs.renameSync(temp, filePath);
+  } finally { if (fs.existsSync(temp)) fs.unlinkSync(temp); }
 }
 
 export function registerRuntime({
@@ -199,6 +227,8 @@ export function registerRuntime({
   status = 'running',
   created_by = 'studio',
   restart_safe = false,
+  process_identity = null,
+  studio_pid = process.pid,
   rtDir = null,
   customRuntimes = null
 }) {
@@ -229,7 +259,10 @@ export function registerRuntime({
     heartbeat_at: now,
     status,
     created_by: String(created_by || 'unknown'),
-    restart_safe: restart_safe === true
+    restart_safe: restart_safe === true,
+    studio_pid,
+    process_identity: process_identity?.creationDate && process_identity?.executable
+      ? { creationDate: process_identity.creationDate, executable: process_identity.executable } : null
   };
 
   runtimes.push(entry);
@@ -258,79 +291,33 @@ export function listRuntimes({ rtDir = null, customRuntimes = null, filter = nul
   return runtimes.filter(filter);
 }
 
-export async function cleanupJobRuntimes(jobId, { rtDir = null, customRuntimes = null } = {}) {
-  if (!jobId) return { cleaned: 0 };
-  const file = runtimesFile(rtDir);
-  const runtimes = customRuntimes || loadRuntimes(file);
+export async function cleanupJobRuntimes(jobId, { rtDir = null, customRuntimes = null, cardIds = null } = {}) {
+  const runtimes = listRuntimes({ rtDir, customRuntimes });
   let cleaned = 0;
-
-  for (const r of runtimes) {
-    if (r.job_id === jobId && r.status === 'running') {
-      if (r.root_pid) {
-        await killProcessTree(r.root_pid);
-      }
-      if (r.temp_dir && isSafeTempDir(r.temp_dir)) {
-        try { fs.rmSync(r.temp_dir, { recursive: true, force: true }); } catch (e) {}
-      }
-      r.status = 'cleaned';
-      r.heartbeat_at = new Date().toISOString();
-      cleaned++;
-    }
+  const blocked = [];
+  for (const runtime of runtimes) {
+    if (runtime.job_id !== jobId || !['running', 'exited', 'stale'].includes(runtime.status)
+        || cardIds && !cardIds.includes(runtime.card_id)) continue;
+    const result = await cleanupRuntime(runtime, { rtDir, customRuntimes });
+    if (result.ok) cleaned++;
+    else blocked.push({ runtime_id: runtime.runtime_id, pid: runtime.root_pid, reason: result.reason });
   }
-
-  if (!customRuntimes) {
-    saveRuntimes(file, runtimes);
-  }
-  return { cleaned };
+  return { cleaned, blocked };
 }
 
 export async function cleanupStaleRuntimes({ rtDir = null, customRuntimes = null } = {}) {
-  const file = runtimesFile(rtDir);
-  const runtimes = customRuntimes || loadRuntimes(file);
-  let cleanedCount = 0;
-  let staleCount = 0;
-
-  for (const r of runtimes) {
-    if (r.status !== 'running') continue;
-
-    const alive = isPidAlive(r.root_pid);
-    if (!alive) {
-      if (r.temp_dir && isSafeTempDir(r.temp_dir)) {
-        try { fs.rmSync(r.temp_dir, { recursive: true, force: true }); } catch (e) {}
-      }
-      r.status = 'cleaned';
-      r.heartbeat_at = new Date().toISOString();
-      cleanedCount++;
-    } else {
-      const info = await getProcessInfo(r.root_pid);
-      const matchesExecutable = r.executable && info.executable &&
-        info.executable.toLowerCase().includes(path.basename(r.executable).toLowerCase());
-      const matchesCommand = r.command && info.command &&
-        (info.command.includes(r.command) || r.command.includes(info.command));
-
-      if (!matchesExecutable && !matchesCommand) {
-        // PID reused by unrelated program! DO NOT kill that process!
-        if (r.temp_dir && isSafeTempDir(r.temp_dir)) {
-          try { fs.rmSync(r.temp_dir, { recursive: true, force: true }); } catch (e) {}
-        }
-        r.status = 'stale';
-        r.heartbeat_at = new Date().toISOString();
-        staleCount++;
-      } else {
-        // Confirmed leftover process from crashed Studio: safely clean up PID tree
-        await killProcessTree(r.root_pid);
-        if (r.temp_dir && isSafeTempDir(r.temp_dir)) {
-          try { fs.rmSync(r.temp_dir, { recursive: true, force: true }); } catch (e) {}
-        }
-        r.status = 'cleaned';
-        r.heartbeat_at = new Date().toISOString();
-        cleanedCount++;
-      }
+  const runtimes = listRuntimes({ rtDir, customRuntimes });
+  let cleanedCount = 0, staleCount = 0;
+  for (const runtime of runtimes) {
+    if (!['running', 'exited', 'stale'].includes(runtime.status)) continue;
+    // Another live Studio owns its running processes. Never steal its runtime.
+    if (isPidAlive(runtime.root_pid) && runtime.studio_pid && isPidAlive(runtime.studio_pid)) continue;
+    const result = await cleanupRuntime(runtime, { rtDir, customRuntimes });
+    if (result.ok) cleanedCount++;
+    else {
+      updateRuntime(runtime.runtime_id, { status: 'stale', blocked_reason: result.reason }, { rtDir, customRuntimes });
+      staleCount++;
     }
-  }
-
-  if (!customRuntimes) {
-    saveRuntimes(file, runtimes);
   }
   return { cleanedCount, staleCount, total: runtimes.length };
 }
@@ -342,7 +329,13 @@ export async function checkPortOwnership(port, { desiredJobId, desiredDataDir, r
   }
 
   const runtimes = customRuntimes || loadRuntimes(runtimesFile(rtDir));
-  const matched = runtimes.find((r) => r.root_pid === occupantPid || (r.child_pids && r.child_pids.includes(occupantPid)));
+  let matched = runtimes.find((r) => r.status === 'running' && r.created_by === 'studio'
+    && (r.root_pid === occupantPid || (r.child_pids && r.child_pids.includes(occupantPid))));
+  if (matched) {
+    const verified = await verifyRuntimeProcess(matched);
+    const descendants = matched.root_pid === occupantPid ? [] : await getChildPids(matched.root_pid);
+    if (!verified.ok || !verified.alive || matched.root_pid !== occupantPid && !descendants.includes(occupantPid)) matched = null;
+  }
 
   if (matched) {
     const alive = isPidAlive(occupantPid);
@@ -358,7 +351,8 @@ export async function checkPortOwnership(port, { desiredJobId, desiredDataDir, r
       };
     }
 
-    if (desiredJobId && matched.job_id === desiredJobId) {
+    if (desiredJobId && matched.job_id === desiredJobId
+        && (!desiredDataDir || path.resolve(desiredDataDir) === matched.data_dir)) {
       return {
         status: 'owned_by_current_job',
         available: true,
@@ -386,12 +380,7 @@ export async function checkPortOwnership(port, { desiredJobId, desiredDataDir, r
   const procInfo = await getProcessInfo(occupantPid);
   const cmd = procInfo.command || procInfo.executable || `PID ${occupantPid}`;
 
-  let blockedReason;
-  if (port === 3018) {
-    blockedReason = `Blocked: unknown process PID ${occupantPid} (${cmd}) owns production data lock on port ${port}`;
-  } else {
-    blockedReason = `Blocked: unknown process PID ${occupantPid} (${cmd}) occupies port ${port}`;
-  }
+  const blockedReason = `Blocked: unknown process PID ${occupantPid} (${cmd}) occupies port ${port}; DATA_DIR owner unknown`;
 
   return {
     status: 'blocked',

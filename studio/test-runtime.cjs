@@ -32,11 +32,26 @@ function safeKill(proc) {
   } catch (e) {}
 }
 
+function waitOutput(proc, pattern) {
+  return new Promise((resolve, reject) => {
+    let output = '';
+    const timer = setTimeout(() => finish(new Error('Process did not become ready: ' + output)), 10000);
+    const onData = (data) => { output += data; const match = output.match(pattern); if (match) finish(null, match); };
+    const onExit = (code) => finish(new Error('Process exited before ready: ' + code));
+    const finish = (error, value) => {
+      clearTimeout(timer); proc.stdout.off('data', onData); proc.off('exit', onExit); proc.off('error', onExit);
+      error ? reject(error) : resolve(value);
+    };
+    proc.stdout.on('data', onData); proc.once('exit', onExit); proc.once('error', onExit);
+  });
+}
+
 async function runRuntimeTests() {
   const registry = await import('./runtime-registry.mjs');
   const isolated = await import('./isolated-env.mjs');
   const readiness = await import('./runtime-readiness.mjs');
 
+  try {
   console.log('--- Running Workstream B+C Runtime & Isolation Tests ---');
 
   // =========================================================================
@@ -66,22 +81,27 @@ async function runRuntimeTests() {
     // We launch a dummy node process holding an exclusive lock on smokeEnv.dataDir/.mining_process.lock
     const lockScript = `
       const fs = require('fs');
-      const p = process.argv[2];
-      const fd = fs.openSync(p, 'a+');
+      const p = process.argv[1];
+      const fd = fs.openSync(p, 'wx');
       // Hold file descriptor open and write marker
       fs.writeSync(fd, 'locked by smoke');
+      console.log('LOCKED');
       setInterval(() => {}, 1000);
     `;
     const smokeLockFile = path.join(smokeEnv.dataDir, '.mining_process.lock');
-    const smokeProc = spawn(process.execPath, ['-e', lockScript, smokeLockFile], { stdio: 'ignore', windowsHide: true });
+    const smokeProc = spawn(process.execPath, ['-e', lockScript, smokeLockFile], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     SPAWNED_PROCS.push(smokeProc);
-    await new Promise((r) => setTimeout(r, 150));
+    await waitOutput(smokeProc, /LOCKED/);
 
+    assert.strictEqual(registry.isPidAlive(smokeProc.pid), true);
+    assert.strictEqual(fs.readFileSync(smokeLockFile, 'utf8'), 'locked by smoke');
+    assert.throws(() => fs.openSync(smokeLockFile, 'wx'), /EEXIST/);
     // Register smoke process into runtime registry on port 3028
     const rt = registry.registerRuntime({
       job_id: 'smoke-run-h-1234',
       purpose: 'smoke',
       root_pid: smokeProc.pid,
+      process_identity: await registry.getProcessInfo(smokeProc.pid),
       executable: process.execPath,
       command: `smoke backend on port ${smokeEnv.port}`,
       port: smokeEnv.port,
@@ -95,7 +115,7 @@ async function runRuntimeTests() {
     // 3. Verify: while smoke backend is alive holding its lock on 3028/smoke DATA_DIR,
     // the production backend (mockProdDir) can independently acquire its OWN lock on prodDataDir!
     const prodLockFile = path.join(prodDataDir, '.mining_process.lock');
-    const prodFd = fs.openSync(prodLockFile, 'a+');
+    const prodFd = fs.openSync(prodLockFile, 'wx');
     fs.writeSync(prodFd, 'locked by prod');
     fs.closeSync(prodFd);
     assert.ok(fs.existsSync(prodLockFile), 'production data lock successfully created and acquired');
@@ -155,26 +175,21 @@ async function runRuntimeTests() {
   // =========================================================================
   {
     const rtDir = mkTmp('studio-rt-unknown-');
-    const testPort = 39182; // Pick high unreserved test port
+    let testPort; // OS chooses a free port; never touch production listeners.
 
     // Spawn an unknown dummy HTTP server process
     const dummyServerScript = `
       const http = require('http');
       const s = http.createServer((req, res) => res.end('hello'));
-      s.listen(${testPort}, '127.0.0.1', () => {
-        console.log('READY');
+      s.listen(0, '127.0.0.1', () => {
+        console.log('READY:' + s.address().port);
       });
       setInterval(() => {}, 1000);
     `;
     const unknownProc = spawn(process.execPath, ['-e', dummyServerScript], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
     SPAWNED_PROCS.push(unknownProc);
 
-    await new Promise((resolve, reject) => {
-      unknownProc.stdout.once('data', (d) => {
-        if (d.toString().includes('READY')) resolve();
-      });
-      setTimeout(resolve, 1000); // fallback
-    });
+    testPort = Number((await waitOutput(unknownProc, /READY:(\d+)/))[1]);
 
     // Check port ownership without registering it in Studio
     const portReport = await registry.checkPortOwnership(testPort, {
@@ -216,17 +231,8 @@ async function runRuntimeTests() {
     const procA = spawn(process.execPath, ['-e', treeScript], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
     SPAWNED_PROCS.push(procA);
 
-    let childPid = 0;
-    await new Promise((resolve) => {
-      procA.stdout.on('data', (d) => {
-        const m = d.toString().match(/CHILD:(\d+)/);
-        if (m) {
-          childPid = parseInt(m[1], 10);
-          resolve();
-        }
-      });
-      setTimeout(resolve, 800);
-    });
+    const childPid = Number((await waitOutput(procA, /CHILD:(\d+)/))[1]);
+    SPAWNED_PROCS.push({ pid: childPid });
 
     // Process B: Independent process (representing another job or external worker)
     const procB = spawn(process.execPath, ['-e', 'setInterval(()=>{}, 1000)'], { stdio: 'ignore', windowsHide: true });
@@ -236,6 +242,7 @@ async function runRuntimeTests() {
 
     // Verify all processes are alive
     assert.strictEqual(registry.isPidAlive(procA.pid), true, 'procA must be alive');
+    assert.ok(childPid > 0, 'child PID must be captured');
     if (childPid) assert.strictEqual(registry.isPidAlive(childPid), true, 'childPid must be alive');
     assert.strictEqual(registry.isPidAlive(procB.pid), true, 'procB must be alive');
 
@@ -244,6 +251,7 @@ async function runRuntimeTests() {
       job_id: 'job-target-1',
       purpose: 'dev_backend',
       root_pid: procA.pid,
+      process_identity: await registry.getProcessInfo(procA.pid),
       child_pids: childPid ? [childPid] : [],
       executable: process.execPath,
       command: 'node backend tree',
@@ -255,10 +263,25 @@ async function runRuntimeTests() {
       job_id: 'job-unrelated',
       purpose: 'helper',
       root_pid: procB.pid,
+      process_identity: await registry.getProcessInfo(procB.pid),
       executable: process.execPath,
       command: 'node independent worker',
       rtDir
     });
+
+    const reused = registry.registerRuntime({ job_id: 'job-reused', root_pid: procB.pid,
+      executable: process.execPath, process_identity: { creationDate: 'wrong-creation-time', executable: process.execPath }, rtDir });
+    const refused = await registry.cleanupJobRuntimes('job-reused', { rtDir });
+    assert.strictEqual(refused.blocked.length, 1);
+    assert.strictEqual(registry.isPidAlive(procB.pid), true, 'PID reuse never kills unrelated process');
+    assert.strictEqual(registry.listRuntimes({ rtDir }).find(x => x.runtime_id === reused.runtime_id).status, 'running');
+    assert.strictEqual(registry.isSafeTempDir(os.tmpdir()), false);
+    assert.strictEqual(registry.isSafeTempDir(path.join(os.tmpdir(), 'MultiAgentStudio')), false);
+    assert.strictEqual(registry.isSafeTempDir(path.join(os.tmpdir() + '-sibling', 'MultiAgentStudio', 'p', 'r')), false);
+    const one = isolated.getIsolatedDataDir('..', '..'), two = isolated.getIsolatedDataDir('..', '..');
+    TMP_DIRS.push(one.tempRoot, two.tempRoot);
+    assert.notStrictEqual(one.dataDir, two.dataDir, 'each smoke environment gets its own data owner');
+    assert.strictEqual(registry.isSafeTempDir(one.tempRoot), true);
 
     // Cleanup ONLY 'job-target-1'
     await registry.cleanupJobRuntimes('job-target-1', { rtDir });
@@ -351,12 +374,14 @@ async function runRuntimeTests() {
     console.log('Runtime recovery: known Studio owner auto-continues in order; unknown owner blocks: PASS');
   }
 
+  } finally {
   // Teardown temp resources
   for (const p of SPAWNED_PROCS) safeKill(p);
   for (const d of TMP_DIRS) {
     try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch (e) {}
   }
 
+  }
   console.log('--- All Workstream B+C Runtime & Isolation Tests: PASS ---');
 }
 
