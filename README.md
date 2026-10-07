@@ -3,6 +3,8 @@
 [繁體中文](#繁體中文) · [English](#english)
 
 > **v0.1.0 預覽版 / preview** — 實驗性專案，只適合拋棄式或有版本控制的專案。 / Experimental. Use it only on disposable or version-controlled projects.
+>
+> 授權 / License: [GPL-3.0](LICENSE)
 
 ---
 
@@ -62,6 +64,10 @@ Windows 優先的多 AI 協作平台。**Multi-Agent Studio** 是一個本機網
 - [Codex 架構審查](docs/architecture/ARCHITECTURE_REVIEW_CODEX.md)
 - [P0 Spike 報告](docs/reports/P0_SPIKE_REPORT.md)（P0 在當時的閘門條件下，結論為 NO-GO；那份架構研究與 Studio 是分開的）
 
+### 授權
+
+以 [GNU GPL v3.0](LICENSE) 授權。你可以使用、修改、散布；散布修改後的版本時，必須同樣以 GPL-3.0 公開原始碼。AionCore 是另外下載的第三方程式，有它自己的授權，不包含在本授權內。
+
 ---
 
 ## English
@@ -119,3 +125,7 @@ The first start downloads AionCore v0.2.2 (official release, SHA-256 checked) in
 - [Architecture V1](docs/architecture/MULTI_AGENT_PLATFORM_ARCHITECTURE_V1.md)
 - [Codex Architecture Review](docs/architecture/ARCHITECTURE_REVIEW_CODEX.md)
 - [P0 Spike Report](docs/reports/P0_SPIKE_REPORT.md) (the P0 spike ended NO-GO for MVP-0 under the gates of the time; that architecture track is separate from Studio)
+
+### License
+
+Licensed under the [GNU GPL v3.0](LICENSE). You may use, modify and distribute it; if you distribute a modified version, you must release its source under GPL-3.0 as well. AionCore is a separately downloaded third-party program with its own license and is not covered here.
