@@ -39,7 +39,7 @@ Windows 優先的多 AI 協作平台。**Multi-Agent Studio** 是一個本機網
 - **被擋下時**，工作卡不是籠統的「等待」，而是寫出「此工作區目前由 Claude Code 使用中（工作卡「…」），branch …，幾點開始，狀態」，並給三個選項：① 等待（Studio 自動再試）、② 改成唯讀 Review、③ 使用獨立 worktree（建立自己的 branch 和資料夾，各自有租約；merge 後自動清掉）。專案頁固定顯示「寫入者／資料夾／branch／唯讀者」。
 - **交接（Handoff）**：專案頁「改由…接手」。流程：停下現在的寫入者 → 保存這張卡、對話、進度 → 等它真的停住（沒停住就不交接）→ 放下它的租約 → 新的 Agent 取得租約、從目前的資料夾和 branch 接續。舊 Agent 的對話和紀錄保留，但不再是寫入者，也不會因為恢復或重開而拿回來。
 - **重開安全**：重開後 Studio 不會因為看到暫停／中斷的工作就直接恢復寫入。要「繼續」前會重新檢查租約：資料夾已經由另一個 Agent 或外部接手時，顯示「工作區已由另一個 Agent 接手，本工作保持暫停」；租約還是自己的才允許。Studio 當掉留下的租約不會永遠鎖死：持有者行程不在（或很久沒有心跳）就判定 `STALE`，才能被安全接手；持有者明確還活著時，不會被搶。
-- **外部 Agent／非 Studio 的修改**：另一個 AI 視窗或你自己要改這個資料夾時，宣告接手（專案頁「外部 Agent／我要自己改」，或用 API）：Studio 會停下並暫停自己的寫入、等它真的停住、放下自己的租約，租約改成外部持有；原本的 Studio 工作保持暫停，重開也不會自己恢復。做完用「外部已歸還」或 release-claim。宣告時可帶 `pid`（該行程不在就視為失效，不會永遠鎖死）。
+- **外部 Agent／非 Studio 的修改**：另一個 AI 視窗或你自己要改這個資料夾時，宣告接手（專案頁「外部 Agent／我要自己改」，或用 API）：Studio 會停下並暫停自己的寫入、等它真的停住、放下自己的租約，租約改成外部持有；原本的 Studio 工作保持暫停，重開也不會自己恢復。做完用「外部已歸還」或 release-claim。宣告時可帶 `pid` 作為資訊；外部租約狀態為 `EXTERNAL`，即使行程退出或 Studio 重開也保留，必須明確 release-claim 才歸還。
 ```
 curl -X POST http://127.0.0.1:4848/api/workspace/claim -H "content-type: application/json" -d "{\"path\":\"E:\\\\CodexProject\\\\MyProject\",\"label\":\"Claude 視窗\",\"pid\":1234}"
 curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type: application/json" -d "{\"path\":\"E:\\\\CodexProject\\\\MyProject\"}"
@@ -65,7 +65,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 ### 已知限制（v0.1.0）
 
 - 「模型策略」搭配真的 Codex、以及困難卡實際自動升級，目前只用模擬回覆驗證過；其餘功能已在真實專案（PDF 編輯器、股票面板）上使用。
-- 沒有 CI；所有驗證都是手動的：`node studio/lifecycle-check.cjs`（模擬 AI 回覆的流程檢查）加上實際操作。
+- 本機 CI：`.\scripts\ci.ps1 -Mode Auto`（語法與模擬 AI lifecycle／租約測試）；真實 provider 操作另行驗證。
 - 成員正在進行的那一步不會被「告訴工頭」中途打斷，要用「立刻打斷」。
 - AionCore 在 Antigravity 工作時，會在專案裡寫一個 `.agents/` 資料夾。
 - 目前只支援 Windows。
@@ -76,6 +76,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 
 ### 文件
 
+- [Workspace lease API 與生命週期](docs/workspace-lease.md)
 - [架構 V1](docs/architecture/MULTI_AGENT_PLATFORM_ARCHITECTURE_V1.md)
 - [Codex 架構審查](docs/architecture/ARCHITECTURE_REVIEW_CODEX.md)
 - [P0 Spike 報告](docs/reports/P0_SPIKE_REPORT.md)（P0 在當時的閘門條件下，結論為 NO-GO；那份架構研究與 Studio 是分開的）
@@ -111,7 +112,7 @@ The first start downloads AionCore v0.2.2 (official release, SHA-256 checked) in
 - **When refused**, the card does not just say "waiting": it says "this workspace is currently used by Claude Code (card …), branch …, since …, status …" with three options: ① wait (Studio retries), ② switch to read-only review, ③ use an independent worktree (own branch and folder, own lease; cleaned up after merge). The project page always shows writer / folder / branch / readers.
 - **Handoff**: "改由…接手" on the project page. Flow: stop the current writer → save its card, conversation and progress → wait until it has really stopped (no handoff if it has not) → release its lease → the new agent takes the lease and continues from the current folder and branch. The old agent's conversation and history stay, but it is no longer the writer and cannot get the role back by resume or restart.
 - **Restart safety**: after a restart Studio never resumes writing just because it sees a paused / interrupted job. Before "continue" it re-checks the lease: if another agent or an external party now holds the tree it says "the workspace was taken over by another agent, this job stays paused"; only the lease's own owner may resume. A lease left by a crashed Studio never locks forever: when the holder process is gone (or silent for long) it is `STALE` and can be reclaimed; a holder that is clearly alive is never taken over.
-- **External agents / non-Studio edits**: when another AI window or you want to edit the folder, declare it (project page button, or the API): Studio stops and pauses its own writers, waits until they really stopped, gives up its lease and records the external owner; the paused Studio job stays paused and a restart does not revive it. Give it back with "外部已歸還" or release-claim. A claim can carry a `pid` (if that process is gone the claim is stale, so it never locks forever).
+- **External agents / non-Studio edits**: when another AI window or you want to edit the folder, declare it (project page button, or the API): Studio stops and pauses its own writers, waits until they really stopped, gives up its lease and records the external owner; the paused Studio job stays paused and a restart does not revive it. Give it back with "外部已歸還" or release-claim. A claim can carry a `pid` for reference. Its `EXTERNAL` ownership survives process exit and Studio restart and requires explicit release-claim.
 ```
 curl -X POST http://127.0.0.1:4848/api/workspace/claim -H "content-type: application/json" -d "{\"path\":\"E:\\\\CodexProject\\\\MyProject\",\"label\":\"Claude window\",\"pid\":1234}"
 curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type: application/json" -d "{\"path\":\"E:\\\\CodexProject\\\\MyProject\"}"
@@ -143,7 +144,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 ### Known limits (v0.1.0)
 
 - The model strategy with real Codex, and a hard card actually auto-upgrading, were verified with scripted replies only; everything else has been used on real projects (a PDF editor, a stock panel).
-- No CI. All checks are manual: `node studio/lifecycle-check.cjs` (scripted-agent lifecycle check) plus hands-on use.
+- Local CI: `.\scripts\ci.ps1 -Mode Auto` (syntax and scripted lifecycle/lease checks). Live providers are verified separately.
 - "告訴工頭" does not cut into a worker's current step; use "立刻打斷" for that.
 - AionCore writes an `.agents/` folder into the project when Antigravity works there.
 - Windows only.
@@ -154,6 +155,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 
 ### Documentation
 
+- [Workspace lease API and lifecycle](docs/workspace-lease.md)
 - [Architecture V1](docs/architecture/MULTI_AGENT_PLATFORM_ARCHITECTURE_V1.md)
 - [Codex Architecture Review](docs/architecture/ARCHITECTURE_REVIEW_CODEX.md)
 - [P0 Spike Report](docs/reports/P0_SPIKE_REPORT.md) (the P0 spike ended NO-GO for MVP-0 under the gates of the time; that architecture track is separate from Studio)

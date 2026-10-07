@@ -1,40 +1,5 @@
-// Self-check for Studio's card lifecycle: runs the real code from server.mjs with scripted agent replies.
-// Run: node studio/lifecycle-check.cjs   (no agents, no network)
-const assert = require('assert');
-const nodeCrypto = require('crypto');
-const src = require('fs').readFileSync(require('path').join(__dirname, 'server.mjs'), 'utf8').replace(/\r\n/g, '\n');
-const region = (a, b) => { const i = src.indexOf(a), j = src.indexOf(b, i); if (i < 0 || j < 0) throw new Error('region ' + a); return src.slice(i, j); };
-const code = region('function handoffNote(run)', '// ---------- Plan limits') + region('async function planPhase(w)', '// Changing the Leader mid-run');
-
-const TMP_DIRS = [];
-function mkTmp(prefix) { const d = require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), prefix)); TMP_DIRS.push(d); return d; }
-function makeEnv(script, overrides = {}) {
-  const logs = [], notices = [], prompts = [];
-  const env = {
-    AGENTS: { claude: { name: 'Claude Code' }, codex: { name: 'Codex' }, antigravity: { name: 'Antigravity' } },
-    S: { workspaces: [], leases: [] }, RT: mkTmp('studio-rt-'), api: async () => ({ items: [] }), stopTurn: async () => true, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 20))), crypto: nodeCrypto, logs, notices, prompts,
-    log: (w, who, role, text, detail) => logs.push({ who, role, text, detail }),
-    notify: (title, body, kind) => notices.push({ title, body, kind }),
-    label: () => 'TestProj', refreshClaudeLimits() {}, saveRun() {}, saveSettings() {}, latestJob: () => null, clip: (x, n) => String(x ?? '').slice(0, n), AUTO_MAX: 5, AFTER_DONE: ['stop', 'suggest', 'auto'],
-    started: [], start: async (w, request, cont) => { env.started.push({ request, cont }); }, setTimeout: (fn, ms) => (ms === 5000 ? queueMicrotask(fn) : globalThis.setTimeout(fn, ms)), // only the 5 s auto-continue delay is skipped
-    Halt: class extends Error {}, active: new Map(), busyConvs: () => [], cancelTurn() {}, convAgent: new Map(),
-    available: () => true, workersFor: (w, lead) => w.workers.filter((x) => x !== lead),
-    tierCfg: (w, agent, hard) => ({ model: hard ? 'strong' : 'cheap', effort: '' }),
-    fs: require('fs'), path: require('path'), refreshState() {},
-    workKey: (t) => t.agent + ':work' + (t.hard ? ':hard' : '') + (t.workdir ? '@wt' : ''),
-    conv: async (w, agent, lead, hard, workdir) => { const k = agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : '') + (workdir ? '@wt' : ''); return (w.run.convs[k] ??= k); },
-    turn: async (agent, cid, text) => { prompts.push({ agent, cid, text }); await new Promise((r) => setTimeout(r, 5)); return script(agent, text); },
-    execFile: (cmd, args, opts, cb) => cb(new Error('no git / gh in test'), '', ''), isDir: () => true, readHistory() {}, openWorkspace() {}, wsOf() {},
-  };
-  env.agentName = (id) => env.AGENTS[id]?.name || id;
-  Object.assign(env, overrides);
-  const names = Object.keys(env);
-  const api = new Function(...names, code + '\nreturn { planPhase, pump, summarize, answer, continueCard, wake, parseStatus, finish, autoNext, instruct, pause, resume, stop, handoffWriter, claimWorkspace, releaseClaim, useWorktree, useReadOnly, checkWorkspaces, acquireWrite, workspaceOf, loadLeases, saveLeases, leaseState, leaseView, writerOf, retire, beatLeases, cleanupWorktree, runTask, treeKey, newLease, flagExternalModification, INSTANCE };')(...names.map((k) => env[k])); // test harness: our own code
-  return { env, api };
-}
-const newW = () => ({ project: 'P', leader: 'claude', workers: ['claude', 'codex', 'antigravity'], tasks: [], activity: [],
-  run: { id: 'r', project: 'P', leader: 'claude', request: 'Build feature X and get it reviewed', convs: {}, phase: 'planning', leaderGen: 0, rounds: 0, ask: null, active: true, paused: false, stopped: false, summarizing: false } });
-const settle = () => new Promise((r) => setTimeout(r, 300));
+// All scripted lifecycle regressions; no agents or network.
+const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle } = require('./lifecycle-harness.cjs');
 
 (async () => {
   // 1) dependency chain + waiting on another agent + auto wake + Leader confirms
@@ -424,7 +389,7 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
   await api.planPhase(w);
   assert.ok(await waitFor(() => w.tasks[0]?.status === 'WORKING' && nfs.existsSync(repo.lock)));
   api.pause(w);
-  assert.ok(await waitFor(() => !nfs.existsSync(repo.lock) && w.tasks[0].status === 'PAUSED'), 'paused: writer stopped, lock released');
+  assert.ok(await waitFor(() => nfs.existsSync(repo.lock) && w.tasks[0].status === 'PAUSED' && !w.executingSteps?.size), 'paused: writer stopped, reservation mirror retained');
   api.wake(w, w.tasks[0], 'CI finished'); // not parked -> no effect; and a paused run never starts anything
   await new Promise((r) => setTimeout(r, 150)); assert.strictEqual(turns5, 1, 'nothing runs while paused');
   repo.g('commit', '-q', '--allow-empty', '-m', 'edited while paused');
@@ -535,6 +500,9 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
     await assert.rejects(ED2.api.resume(wD2), /工作區已由另一個 Agent 接手，本工作保持暫停/);
     assert.strictEqual(ran2.length, 0, 'nothing runs after the restart');
     assert.ok(writeLeases(ED2.env).every((l) => l.owner.agent === 'claude'), 'the writer is still Claude');
+    const staleCodex = await ED2.api.acquireWrite(wD2, wD2.tasks[0], await ED2.api.workspaceOf(repoD.d));
+    assert.strictEqual(staleCodex.ok, false, 'the restarted pre-handoff Codex snapshot cannot reacquire the workspace');
+    assert.ok(writeLeases(ED2.env).every((l) => l.owner.agent === 'claude'), 'the stale job did not replace Claude as writer');
   }
 
   // E) STOP: the job ends for good, the lease is released, a restart does not bring it back
@@ -590,7 +558,7 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
     x = run([mk({ status: 'RESERVED' })]); r = await x.E.api.acquireWrite(x.wk, x.c, info); assert.strictEqual(r.ok, false, 'RESERVED is kept');
     x = run([mk({ status: 'RESERVED', heartbeatAt: new Date(Date.now() - 20 * 3600e3).toISOString() })]); r = await x.E.api.acquireWrite(x.wk, x.c, info); assert.ok(r.ok, 'an ancient RESERVED lease of a gone Studio expires');
     // an external claim whose process is gone is stale too
-    x = run([mk({ owner: { kind: 'external', label: 'gone' }, pid: 2147483000, status: 'ACTIVE' })]); r = await x.E.api.acquireWrite(x.wk, x.c, info); assert.ok(r.ok, 'a dead external claim does not lock the tree forever');
+    x = run([mk({ owner: { kind: 'external', label: 'gone' }, pid: 2147483000, status: 'ACTIVE' })]); r = await x.E.api.acquireWrite(x.wk, x.c, info); assert.ok(!r.ok, 'external ownership requires explicit release even after its process exits');
   }
 
   // H) different worktrees of one repository: each has its own writer
@@ -747,6 +715,8 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
   }
   console.log('16 review findings (stop timing, pause wind-down, takeover question, kept reservation, two Studios): PASS');
 
+  await require('./test-workspace-lease.cjs')({ makeEnv, mkTmp, region });
+
   // status-line parser
   const { parseStatus } = api;
   assert.deepStrictEqual([parseStatus('Built.\nSTATUS: DONE').kind, parseStatus('Built.\nSTATUS: DONE').text], ['DONE', 'Built.']);
@@ -754,6 +724,7 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
   assert.deepStrictEqual(parseStatus('x\nSTATUS：NEEDS_USER：A 還是 B？\nOPTIONS: A | B').options, ['A', 'B']);
   assert.strictEqual(parseStatus('no status here'), null);
   console.log('6 status-line parser: PASS');
+  await require('./test-runtime.cjs').runRuntimeTests();
   await new Promise((r) => setTimeout(r, 300));
   for (const d of [...TMP_DIRS, ...tmpRepos]) { try { require('fs').rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 }); } catch { /* temp folder still in use */ } }
 })().catch((e) => { console.error('FAIL', e.message); process.exit(1); });

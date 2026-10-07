@@ -1,0 +1,116 @@
+# Runtime Ownership, Readiness & Test Isolation (Workstreams B+C+D)
+
+本文件說明 Multi-Agent Studio 的 **Runtime Ownership Registry**、**程序樹生命週期清理**、**連接埠所有權（Port Ownership）檢查** 與 **測試／煙霧測試環境隔離（Test/Smoke Isolation）** 架構。
+
+---
+
+## 1. 架構概述與職責解耦
+
+Multi-Agent Studio 管理多個 Agent、背景進程與測試執行。為確保背景程序不相互干擾、系統當機後可安全清理殘留資源，並防止測試程序搶佔正式環境資料庫或鎖，由以下模組統一負責：
+
+- **`studio/runtime-registry.mjs`**：
+  - 持久化記錄 Studio 啟動的所有長時間程序（`runtimes.json`）。
+  - 提供作業系統層級（Windows PID Tree）的進程管理與清理（嚴格使用 `taskkill /F /T /PID` 或 PID 樹遞迴，**禁止依名稱 `Stop-Process -Name python/node` 殺程序**）。
+  - 啟動與掃描時自動清理確認 stale 的程序與殘留暫存目錄（具備 PID 重複使用安全防護）。
+  - 連接埠所有權檢查：**未知 process 絕不 kill**，精確回報 PID、指令、連接埠與鎖狀態。
+
+- **`studio/isolated-env.mjs`**：
+  - 專門為 Smoke／整合測試分配隔離的暫存環境 `%TEMP%\MultiAgentStudio\<project>\<run-id>\data`。
+  - 將隔離目錄注入為環境變數 `DATA_DIR`，使檔案鎖（如 `mining_process_lock`）、快取與狀態與正式目錄完全分離。
+  - 動態配置測試用連接埠（避開正式環境的 3018 與 3011），執行完畢後自動清理暫存目錄。
+- **`studio/runtime-readiness.mjs`**：
+  - `BACKEND_READY` 必須同時滿足已登記 PID 存活、連接埠可連線、`GET /health` 回 HTTP 200，以及 response `ready: true`、`status: "ready"` 或既有 TWstock `/health` 的 `status: "ok"`；明確 `ready: false` 或 startup error 一律拒絕。程序身分與 listener owner 也必須相符。
+  - 健康端點回報的 `error`、`reason` 或 `detail` 會保留在 blocked 原因中，例如 `MiningProcessLockError`。
+  - 自動恢復只處理明確標記為 Studio 建立、restart command／data owner 已確認且不需帳密的 runtime；依序 cleanup、restart、readiness、smoke，再喚醒原卡。未知 owner、PID、data owner、命令或需要憑證時停止並回報具體原因。
+
+---
+
+## 2. 資料模型（`runtimes.json`）
+
+持久化於 `runtime/studio/runtimes.json`，格式如下：
+
+```json
+[
+  {
+    "runtime_id": "rt_1762500000_abc123",
+    "job_id": "20261007183000-abcd",
+    "card_id": "card-1",
+    "workspace": "E:\\CodexProject\\MyProject",
+    "purpose": "dev_backend",
+    "root_pid": 12345,
+    "child_pids": [12346, 12347],
+    "executable": "python.exe",
+    "command": "python -m uvicorn app.main:app --port 3028",
+    "args": ["-m", "uvicorn", "app.main:app", "--port", "3028"],
+    "cwd": "E:\\CodexProject\\MyProject",
+    "created_by": "studio",
+    "restart_safe": true,
+    "port": 3028,
+    "data_dir": "C:\\Users\\User\\AppData\\Local\\Temp\\MultiAgentStudio\\MyProject\\run-1\\data",
+    "temp_dir": "C:\\Users\\User\\AppData\\Local\\Temp\\MultiAgentStudio\\MyProject\\run-1",
+    "started_at": "2026-10-07T10:30:00.000Z",
+    "heartbeat_at": "2026-10-07T10:30:20.000Z",
+    "status": "running"
+  }
+]
+```
+
+- `purpose` 包含：`dev_backend`、`frontend`、`smoke`、`test`、`preview`、`helper`。
+- `status` 包含：`running`、`stopped`、`stale`、`cleaned`。
+- `restart_safe` 只有在啟動參數已保存、`DATA_DIR`／`PORT` 可安全重建且不需要帳號憑證時才可為 `true`。任意環境變數及 credentials 不會持久化。
+
+---
+
+## 3. Readiness 與恢復 API
+
+- `POST /api/runtime/start` 只接受進行中工作卡、絕對 executable、字串 args、工作區內的 cwd 與既有 data directory；Studio 直接啟動並登記 PID。
+- `POST /api/runtime/readiness` 以 `runtimeId` 查詢 readiness；`GET /api/runtimes` 與 `/api/state` 也提供 runtime readiness。
+- 一般 `WAITING_EXTERNAL` 若明確提到 backend 3018／`MiningProcessLockError`，Studio 會尋找該卡建立的 runtime。已確認可安全重啟時會自動清理、重啟、檢查 `/health`、執行 smoke path 並繼續原卡；否則 UI 顯示 `Blocked` 原因，要求人工處理。
+- listener 存在但 FastAPI startup 失敗時仍是 `BLOCKED`，health response 的啟動錯誤會顯示給使用者。
+
+---
+
+## 4. 程序清理原則（Windows Process Tree）
+
+1. **嚴格針對目標 Job PID 樹**：
+   - 終止程序時使用 `taskkill /F /T /PID <root_pid>`。
+   - 只有登記於該 Job 下的進程才會被終止，絕不會影響其他 Job 或系統中執行的其他 python/node 程序。
+2. **PID 重複利用（Recycling）防護**：
+   - 當判定過期的 Runtime 紀錄時，若該 PID 存在但啟動指令或執行檔不相符，代表該 PID 已被作業系統指派給無關的程式；**絕對不殺此程序**，僅將紀錄標記為 `stale` 並保留其暫存目錄，等待 ownership 確認。
+
+---
+
+## 5. 連接埠所有權（Port Ownership）
+
+在啟動需要監聽連接埠的服務前，呼叫 `checkPortOwnership(port, options)`：
+1. 若連接埠未被佔用：回傳 `{ status: 'free', available: true }`。
+2. 若被佔用且為本 Studio 已知且相符的進程：回傳相應所有權狀態。
+3. 若被佔用但 **Owner 不明**（外部程序或非 Studio 紀錄）：
+   - **絕不強制 kill**。
+   - 查詢其行程資訊（PID、CommandLine、Executable）。
+   - 回傳 `{ status: 'blocked', available: false, owner: 'unknown', pid, command, port, reason }`。
+   - `reason` 明確指出阻擋原因，如：
+     `Blocked: unknown process PID 21996 ("python.exe" -m uvicorn ...) occupies port 3018`。
+
+---
+
+## 6. 測試／煙霧測試環境隔離（Smoke Isolation）
+
+- 煙霧測試後端啟動時，自動建立 `%TEMP%\MultiAgentStudio\<project>\<run-id>\data`，並設定 `DATA_DIR` 環境變數。
+- 測試連接埠自動在 3020–3099 間配置，保證不佔用正式環境 3018（後端）與 3011（前端）。
+- 由於檔案鎖（`.mining_process.lock`）位於各自的 `DATA_DIR` 內，即便煙霧測試（例如 3028 埠）正在執行並持鎖，正式環境 3018 仍可順利取得正式環境的資料庫與進程鎖，兩者互不干擾。
+- 測試結束後由 `cleanupIsolatedDir` 清理；若發生異常崩潰，則在下次 Studio 啟動時由 `cleanupStaleRuntimes` 自動掃描清除。
+
+## 整合補強：程序身分與清理邊界
+
+`process_identity` 保存 OS 程序建立時間與完整 executable 路徑；PID 相同或程序名稱相同並不足以允許清理。舊紀錄若仍活著卻缺少此身分，會保留程序並回報 PID／command。`studio_pid` 用來避免啟動掃描清理另一個仍存活的 Studio 所持有的 runtime。Job 清理回傳 `blocked` 清單，只有程序樹全部停止才標記 cleaned。暫存資料只刪除實際位於系統 temp 的 `MultiAgentStudio/<project>/<run>` 子目錄，拒絕根目錄、相鄰路徑與 symlink／junction；每個 smoke 呼叫建立獨立 run 目錄。Registry 損毀會明確失敗並保留原檔，更新採用同目錄暫存檔原子取代。
+
+## 恢復與 workspace 生命週期銜接
+
+恢復採用該 job／card／port 最新的 runtime 紀錄，先檢查 write lease、OS 程序身分與 DATA_DIR owner。健康 runtime 直接通過 health／smoke 後續卡；stale runtime 才 cleanup → restart → health → smoke → continue。每個非同步階段重新確認原 job、card 與 lease generation；PAUSE、STOP、handoff 或 external claim 會阻止重啟／續卡，並等待在途的恢復與 managed start 結束後清理程序樹，再釋放租約。已知 ownership 的 startup failure 保持自動 health 輪詢並顯示 blocked 原因，不會每五秒重啟同一 replacement。未知 PID／data owner 或無法安全重建命令才要求人工。
+
+## 驗證範圍
+
+`test-runtime.cjs` 除 H/I/J/L、readiness predicate 與恢復階段的取消外，亦啟動 OS 配置埠的真實 HTTP fixture：程序存活且 listener 可連線時，`MiningProcessLockError` 的 503 仍須 BLOCKED；同一程序改回既有 `status: "ok"` 契約後才 BACKEND_READY。`test-runtime-server.cjs` 執行 production server hooks，涵蓋最新 replacement、未知 PID／command、已知 startup failure 自動輪詢、不重複 restart、STOP 在 cleanup 期間的租約保留、handoff 前 OS drain，以及 write lease admission。延遲清理會固定原 job／card 範圍；前一輪 runtime 未停妥時禁止啟動新一輪。Auto CI 與 lifecycle-check 會執行上述回歸及 A–M 情境。
+
+本次測試使用隔離資料與子程序 fixture，未啟動真實 AionCore 或使用正式 TWstock DATA_DIR。Agent 直接在 shell 啟動的服務必須改由 `/api/runtime/start` 管理，才能使用此 registry 的 ownership 與自動恢復；本卡沒有新增 AionCore 內部程序追蹤 API。
