@@ -80,7 +80,7 @@ function saveRun(w, status) {
   if (!run) return;
   fs.mkdirSync(HISTORY, { recursive: true });
   // phase + convs let a paused run continue in the same agent conversations after a Studio restart.
-  const rec = { id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, suggestions: run.suggestions, convs: run.convs, tasks: w.tasks, activity: w.activity };
+  const rec = { id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, notes: run.notes, suggestions: run.suggestions, convs: run.convs, tasks: w.tasks, activity: w.activity };
   fs.writeFileSync(path.join(HISTORY, run.id + '.json'), JSON.stringify(rec, null, 2));
   S.historyRev++;
 }
@@ -619,6 +619,7 @@ async function planPhase(w) {
     addCards(w, plan.subtasks, lead);
     run.phase = 'working';
     pump(w);
+    processNotes(w);
   } catch (e) {
     if (run.leaderGen !== gen || e instanceof Halt) return; // pause: resume() plans again; stop: stop() already saved
     log(w, 'studio', 'system', e.detail ? e.message : '工頭這次沒有完成派工。Studio 保留了目前進度，可以再試一次。', e.detail || e.message);
@@ -677,7 +678,15 @@ ${STATUS_RULES}`;
       st = parseStatus(again);
       if (st) st.text = reply.trim();
     }
-    applyStatus(w, t, st || { kind: 'DONE', detail: '', options: [], text: reply.trim() + '\n（沒有回報狀態，先當作完成，由工頭確認整體結果）' }, reply);
+    st ||= { kind: 'DONE', detail: '', options: [], text: reply.trim() + '\n（沒有回報狀態，先當作完成，由工頭確認整體結果）' };
+    let last = reply;
+    while (t.notes?.length) {
+      const note = t.notes.splice(0).join('\n');
+      log(w, 'studio', 'system', `把你的指示交給 ${AGENTS[t.agent].name}，接著調整「${t.title}」。`);
+      last = await turn(t.agent, cid, `New instruction from the user (via the leader) for your task "${t.title}":\n${note}\n\nApply it to this task now. End your reply with a short summary (1-3 sentences).\n${STATUS_RULES}`, { w });
+      st = parseStatus(last) || { kind: 'DONE', detail: '', options: [], text: last.trim() };
+    }
+    applyStatus(w, t, st, last);
   } catch (e) {
     if (e instanceof Halt && run.paused) { t.status = 'PAUSED'; t.result = '已暫停'; t.resumed = true; t.wakeNote = note; return; }
     t.status = 'FAILED';
@@ -725,6 +734,87 @@ function applyStatus(w, t, st, reply) {
   t.status = 'NEEDS_USER';
   t.ask = { question: st.detail || t.result.slice(-300), options: st.options };
   notify(`${label(w)}：${who} 需要你處理`, t.ask.question.slice(0, 160), 'ask', w.project);
+}
+
+// ---------- Instructions from the user while a job runs ----------
+// The user's note goes to the Leader, who decides: tell a worker (on its card), cancel cards that
+// have not started, or add cards. A busy Leader (planning / final check) gets the notes right after.
+function instruct(w, text) {
+  text = String(text || '').trim();
+  if (!text) throw new Error('請輸入指示');
+  const run = w.run;
+  if (!run?.active && !run?.paused) throw new Error('目前沒有進行中的工作；新的工作請用「交給團隊」');
+  if (run.active && run.ask && !run.summarizing) return answer(w, '', text); // the Leader is waiting for an answer: this is it
+  log(w, 'user', 'user', '你的指示：' + text);
+  (run.notes ??= []).push(text);
+  if (run.paused) return log(w, 'studio', 'system', '工作暫停中：指示先保留，按「繼續」後交給工頭。');
+  processNotes(w);
+}
+
+const NOTE_SHAPE = `{"message":"<one sentence to the user, in the user's language>","tell":[{"card":"<card id>","note":"<what that worker must change>"}],"cancel":["<card id>"],"add":[${SUBTASK_SHAPE}]}`;
+
+async function processNotes(w) {
+  const run = w.run;
+  // Planning and the final check read the notes themselves when they end (see planPhase / summarize).
+  if (!run?.active || run.noting || run.phase !== 'working' || run.summarizing || !run.notes?.length) return;
+  run.noting = true;
+  const notes = run.notes.splice(0);
+  const gen = run.leaderGen, lead = run.leader;
+  const workers = workersFor(w, lead);
+  try {
+    const cid = await conv(w, lead, true);
+    const prompt = `You are the LEADER. While the team is working, the user sent new instructions:
+"""
+${notes.join('\n')}
+"""
+Current cards:
+${w.tasks.map((t) => `- id ${t.id} [${t.status}] ${t.title} (${t.agent})`).join('\n')}
+Workers you can assign: ${workers.map((x) => `${x} (${AGENTS[x].name})`).join(', ')}
+
+Decide how to apply the instructions. Do not modify files.
+- "tell" reaches that card's worker right away (a working worker gets it as soon as its current step ends; a card that has not started gets it before it starts).
+- "cancel" only cards that are WAITING or waiting on something; never DONE or WORKING cards.
+- "add" new cards; their "after" may only use indexes inside "add".
+Reply with ONLY one JSON object, no markdown fences, in exactly this shape (empty lists are fine):
+${NOTE_SHAPE}
+Rules for new cards:
+${SUBTASK_RULES}`;
+    let d = null;
+    for (const text of [prompt, FIX_JSON]) {
+      const reply = await turn(lead, cid, text, { w, lead: true });
+      if (run.leaderGen !== gen) return;
+      try { d = parseJson(reply); break; } catch { log(w, 'studio', 'system', '工頭的回覆格式不對，正在請它重新整理…', reply); }
+    }
+    if (!d) {
+      log(w, 'studio', 'system', '工頭這次沒能處理你的指示，已直接轉給正在工作的成員。');
+      d = { tell: w.tasks.filter((t) => OPEN.includes(t.status)).map((t) => ({ card: t.id, note: notes.join('\n') })) };
+    }
+    log(w, lead, 'leader', String(d.message || '收到你的指示，已調整工作。'));
+    for (const x of Array.isArray(d.tell) ? d.tell : []) {
+      const t = w.tasks.find((y) => y.id === String(x?.card)), note = String(x?.note || '').trim();
+      if (!t || !note) continue;
+      if (t.status === 'WORKING') (t.notes ??= []).push(note);
+      else if (PARKED.includes(t.status)) wake(w, t, 'New instruction from the user (via the leader): ' + note);
+      else if (['WAITING', 'PAUSED', 'INTERRUPTED'].includes(t.status)) t.instructions += '\n\nInstruction added by the user during the job: ' + note;
+      else continue;
+      log(w, 'studio', 'system', `已把指示轉給 ${AGENTS[t.agent].name}（「${t.title}」）。`);
+    }
+    for (const id of Array.isArray(d.cancel) ? d.cancel : []) {
+      const t = w.tasks.find((y) => y.id === String(id));
+      if (!t || !['WAITING', 'PAUSED', 'INTERRUPTED', ...PARKED].includes(t.status)) continue;
+      Object.assign(t, { status: 'FAILED', result: '依你的指示取消', wait: null, ask: null });
+      log(w, 'studio', 'system', `已取消「${t.title}」。`);
+    }
+    const subs = workers.length ? parseSubtasks(d.add, workers) : [];
+    if (subs.length) addCards(w, subs, lead);
+  } catch (e) {
+    if (run.leaderGen !== gen || e instanceof Halt) return;
+    log(w, 'studio', 'system', '工頭這次沒能處理你的指示，請再送一次。', e.message);
+  } finally {
+    run.noting = false;
+  }
+  pump(w);
+  processNotes(w); // more notes may have arrived meanwhile
 }
 
 // ---------- External waits: GitHub PR / CI (the only kind Studio can check by itself) ----------
@@ -943,6 +1033,7 @@ ${SUBTASK_RULES}`, { w, lead: true });
       try { d = parseJson(again); } catch { log(w, 'studio', 'system', '工頭這次沒有成功確認整體結果。', again); }
     }
     run.summarizing = false;
+    if (run.notes?.length) { run.phase = 'working'; return processNotes(w); } // new instructions beat "done"
     if (!d) return askUser(w, '工頭這次沒有成功確認整體結果，Studio 保留了目前進度。要讓工頭再確認一次嗎？', ['再確認一次']);
     if (d.needs_user) return askUser(w, String(d.needs_user), d.options);
     if (d.done === false) {
@@ -1032,7 +1123,7 @@ function loadRun(w, r) {
   for (const t of r.tasks) if (t.status === 'WORKING') Object.assign(t, { status: 'INTERRUPTED', result: '已中斷', resumed: true });
   w.tasks = r.tasks;
   w.activity = r.activity;
-  w.run = { id: r.id, startedAt: r.startedAt, project: r.project, leader: r.leader, request: r.request, convs: r.convs || {}, phase: r.phase || 'working', leaderGen: 0, rounds: r.rounds || 0, ask: r.ask || null, goal: r.goal, refs: r.refs, context: r.context, continues: r.continues, active: false, paused: true, stopped: false, summarizing: false };
+  w.run = { id: r.id, startedAt: r.startedAt, project: r.project, leader: r.leader, request: r.request, convs: r.convs || {}, phase: r.phase || 'working', leaderGen: 0, rounds: r.rounds || 0, ask: r.ask || null, notes: r.notes || [], goal: r.goal, refs: r.refs, context: r.context, continues: r.continues, active: false, paused: true, stopped: false, summarizing: false };
   for (const [k, cid] of Object.entries(w.run.convs)) convAgent.set(cid, k.split(':')[0]);
 }
 
@@ -1059,7 +1150,7 @@ function resume(w, id) {
   log(w, 'studio', 'system', `繼續工作（Leader：${AGENTS[run.leader].name}）。`);
   if (run.phase === 'planning') planPhase(w);
   else if (run.phase === 'summarizing') { if (!run.ask) summarize(w); } // a pending question waits for the user's answer
-  else { run.phase = 'working'; pump(w); watchExternal(); }
+  else { run.phase = 'working'; pump(w); watchExternal(); processNotes(w); }
 }
 
 function reassign(w, taskId, agent) {
@@ -1176,7 +1267,7 @@ const routes = {
     const workspaces = S.workspaces.map((w) => {
       const r = w.run;
       return { project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, tasks: w.tasks, activity: w.activity, progress: readProjectProgress(w),
-        run: r && { id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing } };
+        run: r && { id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
     });
     return { ...S, ...teamStats(), agents: Object.values(S.agents), workspaces };
   },
@@ -1196,6 +1287,7 @@ const routes = {
   'POST /api/reassign': (b) => reassign(wsOf(b.ws), b.taskId, b.agent),
   'POST /api/continue': (b) => { const w = wsOf(b.ws); w.autoRounds = 0; return continueProject(w); },
   'POST /api/project-state/refresh': (b) => refreshState(wsOf(b.ws)),
+  'POST /api/instruct': (b) => instruct(wsOf(b.ws), b.text),
   'POST /api/answer': (b) => answer(wsOf(b.ws), b.taskId, b.text),
   'POST /api/continue-card': (b) => continueCard(wsOf(b.ws), b.taskId),
   'POST /api/check': () => { checkAll().then(refreshClaudeLimits); },
