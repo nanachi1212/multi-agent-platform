@@ -61,6 +61,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 - 模型策略（每個專案）：💰 省額度（預設，普通卡 Sonnet／Luna，困難卡自動升級 Opus／Sol）、⚖️ 均衡、🚀 品質優先、🛠️ 自訂。工頭自己判斷普通或困難；普通卡失敗會自動改用強模型重試一次。
 - 員工卡顯示 Claude（5 小時＋每週）與 Codex（每週）的額度條。Claude 額度只在 Studio 啟動和按「更新」時讀取一次。
 - **外部模型（API）**：總覽頁「外部模型（API）」按「＋ 新增外部模型」，填顯示名稱、API 格式（OpenAI 相容／Anthropic／Gemini）、Base URL、API Key、模型名稱（可按「取得模型清單」挑選；網址已是完整請求位址時勾選對應選項），按「儲存並測試」。它會成為和 Codex、Claude 一樣的團隊成員（可當工頭或成員，會讀寫專案檔案，同樣受工作區租約管理）。API key 只交給 AionCore 加密保存，Studio 的設定檔、畫面、紀錄都不含 key；編輯時 key 留空 = 不變；本機位址（如 Ollama）可不填 key。每個外部模型固定一個模型名稱，要換模型就新增一個。
+- **工作詳情／詢問進度**：工作中的卡、員工卡、總覽「誰在做什麼」都顯示「🟠 工作中 · 14 分鐘 · 最近活動 1 分鐘前」；超過 8 分鐘沒有新活動顯示「🟡 可能卡住」（只是提醒，不會停掉它，工作很久本身不算卡住）；等工具確認、等 CI 會直接寫出來。按「查看工作詳情」看開始時間、已執行多久、最近活動（白話）、最近一句 AI 訊息，完整執行紀錄預設收合。「💬 詢問進度」或在詳情裡自己打問題：不會中斷工作、不會新增工作卡、不拿寫入租約。能在工作中途插話的 AI 會馬上收到；若它做完目前這一步才回答（實測 Claude Code、Antigravity 都是這樣），Studio 會在那時補問並顯示回答，畫面會照實寫「已詢問，等待 AI 回覆」。工頭看到的工作卡也帶有工作時間、最近活動和「可能卡住」提示。
 
 ### 已知限制（v0.1.0）
 
@@ -139,6 +140,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 - Model strategy per project: 💰 save (default; normal cards Sonnet / Luna, hard cards auto-upgrade to Opus / Sol), ⚖️ balanced, 🚀 quality, 🛠️ custom. The Leader marks cards normal or hard by itself; a failed normal card is retried once on the strong model.
 - Seat cards show Claude (5-hour + weekly) and Codex (weekly) usage bars. Claude usage is read only at Studio start and on refresh.
 - **External models (API)**: on the overview page press "＋ 新增外部模型" under "外部模型（API）" and fill in display name, API format (OpenAI-compatible / Anthropic / Gemini), base URL, API key and model name ("取得模型清單" lists what the service offers; tick the full-URL option if the URL already is the complete request address), then "儲存並測試". It becomes a team member like Codex or Claude (Leader or Worker, reads and edits project files, governed by the same workspace lease). The API key is handed to AionCore, which stores it encrypted; Studio settings, UI and logs never contain it; leave the key blank when editing to keep it; local addresses (e.g. Ollama) need no key. One external model = one fixed model name; add another entry to use a different model.
+- **Work details / ask for progress**: working cards, seat cards and the overview show "🟠 working · 14 min · last activity 1 min ago"; after 8 minutes without new activity it says "🟡 possibly stuck" (a hint only: nothing is stopped, long work alone is not stuck); waiting for a tool permission or CI is shown as such. "查看工作詳情" shows start time, elapsed time, recent activity in plain words and the latest AI message; the full log is collapsed. "💬 詢問進度" or your own question in the details: it never interrupts the work, never creates a card and never takes the write lease. Agents that accept a message mid-turn get it at once; if the agent only answers after its current step (observed for Claude Code and Antigravity), Studio asks again at that point and shows the answer; the page honestly says "asked, waiting for the AI". The Leader also sees each working card's time, last activity and the possibly-stuck hint.
 
 ### Known limits (v0.1.0)
 

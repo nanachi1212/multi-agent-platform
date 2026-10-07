@@ -302,6 +302,15 @@
   </div>
 </dialog>
 
+<dialog id="workDlg" style="width:min(760px,94vw)">
+  <div class="dlg-h"><b id="workTitle">工作詳情</b><span class="spacer"></span><button class="btn small" id="workAsk" title="不會中斷它的工作">💬 詢問進度</button><button class="btn small" id="workClose">關閉</button></div>
+  <div class="dlg-b">
+    <div id="workBody"><div class="empty">讀取中…</div></div>
+    <div class="row" style="gap:8px"><input type="text" id="workQ" placeholder="問這位 AI……（例如：為什麼這麼久？你卡在哪？還要做哪些事情？）" autocomplete="off"><button class="btn small" id="workSend">問</button></div>
+    <div class="hint">這只是詢問：不會中斷它的工作、不會新增工作卡，也不是給工頭的新指示。</div>
+  </div>
+</dialog>
+
 <dialog id="histDlg">
   <div class="dlg-h"><b id="histTitle">歷史紀錄</b><span class="spacer"></span><button class="btn pz small" id="histResume" hidden>繼續這個工作</button><button class="btn small" id="histClose">關閉</button></div>
   <div class="dlg-b">
@@ -410,7 +419,7 @@ function limitsHtml(a) {
 // What one agent does in one project: { kind: work|lead|wait|pz|'', text }.
 function duty(a, w) {
   const r = w.run, t = (st) => w.tasks.filter((x) => x.status === st && x.agent === a.id);
-  if (t('WORKING').length) return { kind:'work', text:t('WORKING')[0].title };
+  if (t('WORKING').length) return { kind:'work', text:t('WORKING')[0].title, task:t('WORKING')[0] };
   if (r?.active && t('NEEDS_USER').length) return { kind:'bad', text:'需要 Nana：' + t('NEEDS_USER')[0].title };
   if (r?.active && t('WAITING_EXTERNAL').length) return { kind:'wait', text:'等待外部結果：' + t('WAITING_EXTERNAL')[0].title };
   if (r?.active && t('WAITING_AGENT').length) return { kind:'wait', text:'等待其他 AI：' + t('WAITING_AGENT')[0].title };
@@ -427,6 +436,7 @@ function statusHtml(a, w) {
   if (w) {
     const d = duty(a, w);
     if (d.kind === 'bad' || d.kind === 'wait') return `<span class="dot ${d.kind === 'bad' ? 'bad' : 'pz'}"></span>${esc(d.text)}`;
+    if (d.task) { const ws = workState(d.task); return `<span class="dot ${ws.stuck ? 'pz' : 'work'}"></span>目前工作：${esc(d.text)}<div class="hint">${ws.ic} ${esc(ws.text)}</div>${workButtons(d.task, w.project)}`; }
     if (d.kind === 'work' || d.kind === 'pz') return `<span class="dot ${d.kind}"></span>${d.kind === 'work' && !d.text.startsWith('工頭') ? '工作中：' : ''}${esc(d.text)}`;
     return '<span class="dot"></span>待命';
   }
@@ -500,6 +510,43 @@ function seatHtml(a, w) {
   </div>`;
 }
 
+let workOpen = null; // { ws, id } of the open work details
+const ASK_STATE = { queued:'已詢問，等待 AI 回覆：這位 AI 不能在工作中途插話，問題會在它目前這一步做完後送達。', sent:'已送達，等待 AI 回覆…（有些 AI 會等目前這一步做完才回答）', failed:'' };
+function workHtml(d) {
+  const ws = workState(d), a = S.agents.find((x) => x.id === d.agent);
+  const now = d.status === 'WORKING' ? `${ws.ic} ${ws.text}` : PARKED.includes(d.status) ? waitLine(d) : (STEP_WORD[d.status] || d.status);
+  const acts = d.acts.length ? d.acts.map((x) => `<li>${hhmm(x.at)} · ${x.kind === 'tool' ? '執行' : '說'}：${esc(x.text)}${x.running ? ' <span class="tag pz">執行中</span>' : ''}</li>`).join('') : '<li class="hint">還沒有活動紀錄</li>';
+  const asks = d.asks.slice().reverse().map((q) => `<div class="askbox"><div class="q">你問（${hhmm(q.at)}）：${esc(q.text)}</div>${q.state === 'answered' ? `<div><b>${esc(a?.name || d.agent)}</b>（${hhmm(q.answeredAt)}）：${esc(q.answer)}</div>` : `<div class="hint">${esc(ASK_STATE[q.state] || '')}${q.state === 'failed' ? esc(q.answer) : ''}</div>`}</div>`).join('');
+  return `<dl class="facts">
+      <dt>AI 員工</dt><dd>${esc(a?.name || d.agent)}</dd>
+      <dt>目前工作</dt><dd>${esc(d.title)}</dd>
+      <dt>開始時間</dt><dd>${hhmm(d.workingSince || d.firstStartedAt)}</dd>
+      ${d.status === 'WORKING' && d.workingSince ? `<dt>已執行</dt><dd>${dur(Date.now() - Date.parse(d.workingSince))}</dd>` : ''}
+      <dt>目前狀態</dt><dd>${esc(now)}</dd>
+    </dl>
+    <h3>最近活動</h3><ul style="margin:0;padding-left:18px">${acts}</ul>
+    ${d.lastSay ? `<h3>最近一句 AI 訊息</h3><div class="res" style="white-space:pre-wrap">${esc(d.lastSay)}</div>` : ''}
+    ${asks ? '<h3>詢問進度</h3>' + asks : ''}
+    <details class="tech" id="workLog" ${workLogOpen ? 'open' : ''}><summary>查看完整執行紀錄（最近 ${d.log.length} 筆）</summary><pre>${esc(d.log.map((m) => `${hhmm(m.at)} ${m.who} ${m.kind}: ${m.text}`).join('\n'))}</pre></details>`;
+}
+let workLogOpen = false;
+async function loadWork() {
+  if (!workOpen || !$('workDlg').open) return;
+  const r = await fetch('/api/card/detail', { method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify({ ws:workOpen.ws, taskId:workOpen.id }) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { $('workBody').innerHTML = `<div class="empty">${esc(d.error || '讀取失敗')}</div>`; return; }
+  workLogOpen = !!$('workLog')?.open;
+  $('workTitle').textContent = `${name(d.agent)} · ${d.title}`;
+  $('workAsk').hidden = !ASKABLE.includes(d.status);
+  $('workBody').innerHTML = workHtml(d);
+}
+function openWork(ws, id) { workOpen = { ws, id }; workLogOpen = false; $('workBody').innerHTML = '<div class="empty">讀取中…</div>'; $('workDlg').showModal(); loadWork(); }
+async function askWork(text) {
+  if (!workOpen) return;
+  await post('/api/card/ask', { ws:workOpen.ws, taskId:workOpen.id, text }).catch(() => {});
+  loadWork();
+}
+
 function boardHtml(tasks, agents, editable) {
   if (!tasks.length) return '<div class="empty">還沒有工作卡。在上面說你要什麼、按「交給團隊」，工頭會拆成工作卡派給成員。</div>';
   const avail = agents.filter((a) => a.status === 'available');
@@ -511,6 +558,8 @@ function boardHtml(tasks, agents, editable) {
         <span class="who"><i></i>${esc(agents.find((a) => a.id === t.agent)?.name || t.agent)}</span>
         ${t.result && t.status !== 'PAUSED' ? `<div class="res">${esc(t.result)}</div>` : ''}
         ${PARKED.includes(t.status) ? `<div class="res"><b>${esc(waitLine(t))}</b></div>` : ''}
+        ${workState(t) ? `<div class="res"><b>${workState(t).ic} ${esc(workState(t).text)}</b></div>` : ''}
+        ${editable && (t.status === 'WORKING' || ASKABLE.includes(t.status)) ? workButtons(t, curPath()) : ''}
         ${t.blocked && editable ? blockedHtml(S.workspaces.find((x) => x.project === curPath()) || {}, t) : ''}
         ${t.worktree ? `<div class="res">🌿 獨立 worktree：${esc(t.worktree.branch)}${t.worktree.cleaned ? '（已清掉）' : ''}</div>` : ''}
         ${t.handoffs?.length ? `<div class="res">🤝 交接：${t.handoffs.map((h) => esc(name(h.from)) + ' → ' + esc(name(h.to))).join('、')}</div>` : ''}
@@ -564,6 +613,21 @@ function blockedHtml(w, t) {
     <div class="hint">${esc(b?.owner || '')}${b?.card ? ' · 卡「' + esc(b.card) + '」' : ''}${b?.branch ? ' · branch ' + esc(b.branch) : ''} · 狀態 ${esc(b?.state || '')}</div>
     <div class="row"><span class="hint">① 等待（Studio 會自動再試）</span><button class="btn small" data-readonly="${t.id}" title="這張卡只讀程式、做審查或報告，不修改檔案，可以和寫入者同時進行">② 唯讀 Review</button><button class="btn small" data-worktree="${t.id}" title="建立自己的 worktree 和 branch，各自有寫入權，互不干擾">③ 使用獨立 worktree</button></div></div>`;
 }
+
+// How a working card is doing: time, last activity, waiting for a permission, or possibly stuck (a hint only).
+const STUCK_MS = 8 * 60e3;
+const dur = (ms) => { const m = Math.floor(ms / 60e3); return m < 1 ? '不到 1 分鐘' : m < 60 ? m + ' 分鐘' : Math.floor(m / 60) + ' 小時 ' + (m % 60) + ' 分'; };
+const hhmm = (x) => (x ? new Date(x).toLocaleTimeString('zh-TW', { hour:'2-digit', minute:'2-digit', hour12:false }) : '—');
+function workState(t) {
+  if (t.status !== 'WORKING') return null;
+  const a = t.activity, now = Date.now(), ran = t.workingSince ? dur(now - Date.parse(t.workingSince)) : '';
+  if (a?.confirm) return { ic:'🟡', text:'等待工具確認' + (ran ? ' · 已工作 ' + ran : '') };
+  const idle = a ? now - a.at : 0;
+  if (idle >= STUCK_MS) return { ic:'🟡', stuck:true, text:`可能卡住 · ${dur(idle)}沒有新進度${a.tool ? '（正在執行：' + a.tool + '）' : ''}` };
+  return { ic:'🟠', text:'工作中' + (ran ? ' · ' + ran : '') + (a ? ' · 最近活動 ' + (idle < 60e3 ? '剛剛' : dur(idle) + '前') : '') };
+}
+const ASKABLE = ['WORKING', 'WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'];
+const workButtons = (t, project) => `<div class="row" style="gap:6px;margin-top:6px"><button class="btn small ghost" data-detail="${t.id}" data-ws="${esc(project)}">查看工作詳情</button>${ASKABLE.includes(t.status) ? `<button class="btn small" data-ask="${t.id}" data-ws="${esc(project)}" title="不會中斷它的工作，也不會新增工作卡">💬 詢問進度</button>` : ''}</div>`;
 
 function waitLine(t) {
   const wt = t.wait || {};
@@ -762,6 +826,7 @@ function matrixHtml() {
   const head = `<tr><th>員工</th>${S.workspaces.map((w) => `<th><a href="#p=${encodeURIComponent(w.project)}" style="color:inherit">${esc(w.name)}</a></th>`).join('')}</tr>`;
   const rows = S.agents.map((a) => `<tr><td><span class="who" style="--c:${look(a.id).c}"><i></i>${esc(a.name)}</span></td>${S.workspaces.map((w) => {
     const d = duty(a, w);
+    if (d.task) { const ws = workState(d.task); return `<td><a href="#" data-detail="${d.task.id}" data-ws="${esc(w.project)}" style="color:inherit" title="查看工作詳情">${esc(d.text)}</a><div class="hint">${ws.ic} ${esc(ws.text)}</div></td>`; }
     return d.kind || d.text ? `<td class="${d.kind ? '' : 'idle'}">${d.kind ? dotOf(d.kind === 'wait' ? '' : d.kind) + ' ' : ''}${esc(d.text)}</td>` : '<td class="idle">—</td>';
   }).join('')}</tr>`).join('');
   return `<table class="matrix">${head}${rows}</table>`;
@@ -937,6 +1002,11 @@ $('pauseResume').onclick = () => {
 $('renameWs').onclick = () => { const n = prompt('這個專案的顯示名稱（留空 = 用資料夾名稱）', W()?.name || ''); if (n !== null) post('/api/workspace/rename', { ws: ws(), name: n }); };
 $('closeWs').onclick = () => post('/api/workspace/close', { ws: ws() }).then(() => go(''));
 $('histClose').onclick = () => $('histDlg').close();
+$('workClose').onclick = () => $('workDlg').close();
+$('workAsk').onclick = () => askWork('');
+$('workSend').onclick = () => { const q = $('workQ').value.trim(); if (!q) return; $('workQ').value = ''; askWork(q); };
+$('workQ').onkeydown = (e) => { if (e.key === 'Enter') $('workSend').click(); };
+setInterval(loadWork, 4000);
 $('extClose').onclick = () => $('extDlg').close();
 $('extFetch').onclick = async () => {
   $('extFetchNote').textContent = '查詢中…';
@@ -1012,6 +1082,10 @@ document.addEventListener('click', (e) => {
   const h = e.target.closest('[data-hist]');
   if (h) return openHistory(h.dataset.hist);
   if (e.target.closest('[data-limits-refresh]')) { e.preventDefault(); return post('/api/limits/refresh'); }
+  const wd = e.target.closest('[data-detail]');
+  if (wd) { e.preventDefault(); return openWork(wd.dataset.ws || ws(), wd.dataset.detail); }
+  const wa = e.target.closest('[data-ask]');
+  if (wa) { openWork(wa.dataset.ws || ws(), wa.dataset.ask); return askWork(''); }
   const b = e.target.closest('button');
   if (!b) return;
   if (b.id === 'tabAdd') return browse();
