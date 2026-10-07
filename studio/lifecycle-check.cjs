@@ -301,7 +301,13 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
     for (const [name, text] of [['plan', plan], ['worker', work], ['check', check]]) {
       assert.ok(text.includes(mode === 'auto' ? 'Delivery policy (autonomous)' : 'Delivery policy (stop at the pull request)'), mode + ' ' + name + ': policy present');
       assert.ok(text.includes('a destructive operation that could permanently lose the user'), mode + ' ' + name + ': stop conditions present');
-      assert.ok(text.includes('Ordinary P1/P2 review findings are fixed inside the original PR scope'), mode + ' ' + name + ': P1/P2 rule present');
+      if (mode === 'auto') {
+        assert.ok(text.includes('Review triage') && text.includes('Blocker or P1 finding is always fixed') && text.includes('P2 that is directly caused by or inside what this PR changes is fixed'), name + ': triage tiers present');
+        assert.ok(text.includes('every other P2 and every P3 is NOT fixed') || text.includes('Every other P2 and every P3 is NOT fixed'), name + ': other P2 / P3 are recorded, not fixed');
+        assert.ok(text.includes('Review ONCE') && text.includes('At most two fix rounds'), name + ': the review loop is bounded');
+      } else assert.ok(!text.includes('Review triage'), name + ': no review chain in pr mode');
+      if (mode === 'auto' && name !== 'plan') assert.ok(text.includes('Recorded, not fixed'), name + ': recorded findings are reported');
+      assert.ok(!text.includes('Ordinary P1/P2 review findings are fixed'), name + ': the old blanket P1/P2 rule is gone');
       assert.strictEqual(text.includes('squash merge'), mode === 'auto', mode + ' ' + name + ': merge only in auto');
     }
     assert.ok(plan.includes('ONE worker card') && work.includes('STATUS: NEEDS_USER') && !plan.includes('STATUS: NEEDS_USER'), mode + ': role-specific wording');
@@ -433,7 +439,8 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
   assert.ok(await waitFor(() => w.tasks[0].status === 'FAILED' && !nfs.existsSync(repo.lock)), 'stopped: the card ends and the lock is released');
   assert.strictEqual(w.tasks[0].status, 'FAILED'); assert.strictEqual(w.tasks[0].result, '已停止');
   assert.throws(() => api.resume(w), /已經停止，不能繼續/);
-  for (const d of tmpRepos) nfs.rmSync(d, { recursive: true, force: true }); // the temporary repos made above
+  await new Promise((r) => setTimeout(r, 400)); // let background git calls finish before the temporary repos go (Windows keeps a folder busy while git runs in it)
+  for (const d of tmpRepos) nfs.rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   console.log('14 one writer per tree + lock file + outside writer + changed-while-away + pause / stop meaning: PASS');
 
   // status-line parser
