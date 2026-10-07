@@ -17,9 +17,10 @@ function makeEnv(script) {
     started: [], start: async (w, request, cont) => { env.started.push({ request, cont }); }, setTimeout: (fn) => queueMicrotask(fn),
     Halt: class extends Error {}, active: new Map(), busyConvs: () => [], cancelTurn() {}, convAgent: new Map(),
     available: () => true, workersFor: (w, lead) => w.workers.filter((x) => x !== lead),
+    tierCfg: (w, agent, hard) => ({ model: hard ? 'strong' : 'cheap', effort: '' }),
     workKey: (t) => t.agent + ':work' + (t.hard ? ':hard' : ''),
     conv: async (w, agent, lead, hard) => agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : ''),
-    turn: async (agent, cid, text) => { prompts.push({ agent, text }); await new Promise((r) => setTimeout(r, 5)); return script(agent, text); },
+    turn: async (agent, cid, text) => { prompts.push({ agent, cid, text }); await new Promise((r) => setTimeout(r, 5)); return script(agent, text); },
     execFile: (cmd, args, opts, cb) => cb(new Error('no git / gh in test'), '', ''), isDir: () => true, readHistory() {}, openWorkspace() {}, wsOf() {},
   };
   const names = Object.keys(env);
@@ -192,6 +193,32 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
   assert.ok(!w.tasks.some((t) => t.hold), 'holds cleared');
   assert.strictEqual(w.run.result, 'done');
   console.log('9 hard card + interrupt now (stop, Leader note, continue): PASS');
+
+  // 10) model strategies pick real catalog models; a failed normal card is retried once on the strong model
+  const tierSrc = region('const STRATEGIES = {', 'function setStrategy(');
+  const catalogs = { claude: { models: ['default', 'opus', 'fable', 'sonnet', 'haiku', 'claude-sonnet-5'].map((value) => ({ value })), efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    codex: { models: ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-luna'].map((value) => ({ value })), efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+    antigravity: { models: [], efforts: [] } };
+  const tiers = new Function('S', 'AGENTS', tierSrc + '\nreturn tiersOf;')({ agents: catalogs }, { claude: {}, codex: {}, antigravity: {} }); // test harness: our own code
+  const pick = (strategy) => { const t = tiers({ strategy, agentCfg: { claude: { model: 'haiku' } } }); return [t.claude.normal.model, t.claude.hard.model, t.codex.normal.model, t.codex.hard.model, t.codex.hard.effort]; };
+  assert.deepStrictEqual(pick('save'), ['sonnet', 'opus', 'gpt-6-luna', 'gpt-6.1-sol', 'high']);
+  assert.deepStrictEqual(pick('balanced'), ['sonnet', 'opus', 'gpt-6-luna', 'gpt-6.1-sol', 'xhigh']);
+  assert.deepStrictEqual(pick('quality'), ['opus', 'fable', 'gpt-6.1-sol', 'gpt-6.1-sol', 'max']);
+  assert.deepStrictEqual(pick('custom').slice(0, 2), ['haiku', 'haiku'], 'custom uses the seat settings');
+  let workerTries = 0;
+  ({ env, api } = makeEnv((agent, text) => {
+    if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"tricky","agent":"codex","instructions":"x"}]}';
+    if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+    if (++workerTries === 1) throw new Error('model gave up');
+    return 'done on the strong model\nSTATUS: DONE';
+  }));
+  w = newW(); env.S.workspaces.push(w);
+  await api.planPhase(w); await settle(); await settle();
+  const workerCids = env.prompts.filter((p) => p.agent === 'codex').map((p) => p.cid);
+  assert.deepStrictEqual(workerCids, ['codex:work', 'codex:work:hard'], 'retry runs on the hard conversation');
+  assert.deepStrictEqual([w.tasks[0].status, w.tasks[0].escalated, w.run.result], ['DONE', true, 'done']);
+  assert.ok(env.logs.some((l) => l.text.includes('自動改用強模型重試')));
+  console.log('10 model strategies resolve to real models + failed normal card retried on the strong model: PASS');
 
   // status-line parser
   const { parseStatus } = api;
