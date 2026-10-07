@@ -113,6 +113,32 @@ module.exports = async function () {
     assert.ok(moved.events.includes('drain'), 'OS runtimes drained before acquiring replacement lease');
     assert.equal(moved.runtimes[0].status, 'cleaned');
 
+    // A completed card must stop only its own backend before its workspace lease is released.
+    let releaseCardCleanup, cardCleanupStarted;
+    const cardCleanupGate = new Promise(resolve => { releaseCardCleanup = resolve; });
+    const cardCleanupSignal = new Promise(resolve => { cardCleanupStarted = resolve; });
+    const cardDone = setup({ cleanupJobRuntimes: async (jobId, { cardIds }) => {
+      assert.deepEqual(cardIds, ['card']);
+      assert.equal(jobId, cardDone.w.run.id);
+      cardCleanupStarted(); await cardCleanupGate;
+      return { cleaned: 1, blocked: [] };
+    } });
+    await acquire(cardDone); addRuntime(cardDone); cardDone.t.status = 'DONE';
+    const ending = cardDone.api.endWriteStep(cardDone.w, cardDone.t, 'codex');
+    await cardCleanupSignal;
+    assert.ok(cardDone.api.writerOf(cardDone.api.treeKey(cardDone.w.project)), 'the card lease remains held while its runtime is stopping');
+    releaseCardCleanup(); await ending;
+    assert.equal(cardDone.api.writerOf(cardDone.api.treeKey(cardDone.w.project)), null, 'lease is released only after runtime cleanup succeeds');
+    assert.equal(cardDone.t.runtimeStopPending, false);
+
+    const blockedCardDone = setup({ cleanupJobRuntimes: async () => ({ cleaned: 0,
+      blocked: [{ runtime_id: 'original', pid: 70001, reason: 'process tree still alive' }] }) });
+    await acquire(blockedCardDone); addRuntime(blockedCardDone); blockedCardDone.t.status = 'DONE';
+    await blockedCardDone.api.endWriteStep(blockedCardDone.w, blockedCardDone.t, 'codex');
+    assert.equal(blockedCardDone.t.runtimeStopPending, true);
+    assert.equal(blockedCardDone.api.writerOf(blockedCardDone.api.treeKey(blockedCardDone.w.project))?.status, 'RESERVED',
+      'failed card-runtime cleanup retains workspace ownership');
+
     const cleanedJobs = []; let finishStart;
     const finished = setup({ cleanupJobRuntimes: async (id) => { cleanedJobs.push(id); return { cleaned: 1, blocked: [] }; } });
     await acquire(finished); addRuntime(finished);
@@ -128,7 +154,7 @@ module.exports = async function () {
     const noLease = setup(); noLease.t.status = 'WORKING';
     await assert.rejects(noLease.api.startManagedRuntime({ ws: noLease.w.project, cardId: noLease.t.id }), /lease/);
     assert.ok(!noLease.events.includes('restart'));
-    console.log('Server runtime integration: latest owner, unknown PID, startup failure polling, STOP race, handoff drain, lease admission: PASS');
+    console.log('Server runtime integration: latest owner, unknown PID, startup failure polling, STOP race, handoff drain, card cleanup before lease release, lease admission: PASS');
   } finally {
     for (const w of environments) for (const timer of w.lockTimers?.values() || []) clearInterval(timer);
     for (const root of [...roots, ...TMP_DIRS.splice(baseline)]) fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
