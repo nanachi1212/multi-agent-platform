@@ -75,11 +75,34 @@
   .tag.pz { background:var(--pause-soft); color:var(--pause); }
 
   .stage { display:flex; flex-direction:column; gap:20px; min-width:0; }
-  .office { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.15fr); gap:16px; padding:0; overflow:hidden; border-top:4px solid var(--c); }
-  @media (max-width:1100px) { .office { grid-template-columns:1fr; } }
-  .office .seat { border:none; box-shadow:none; border-radius:0; border-right:1px solid var(--line); }
-  .office .desk { padding:16px; display:flex; flex-direction:column; gap:10px; }
-  .office .desk textarea { min-height:120px; resize:vertical; border-radius:12px; font-size:15px; flex:1; }
+  .office { display:flex; flex-direction:column; gap:12px; border-top:4px solid var(--c); padding:18px 20px; }
+  .boss { display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:15px; }
+  .boss .crown { font-weight:700; color:var(--muted); }
+  .boss .meta { color:var(--muted); }
+  .boss .seat-status { min-height:0; font-size:13px; }
+  .boss select { width:auto; padding:5px 8px; font-size:13px; border-radius:8px; }
+  .team-line { color:var(--muted); font-size:13px; }
+  details.rules summary { cursor:pointer; color:var(--accent); font-size:13px; font-weight:600; width:max-content; }
+  details.rules .rules-b { margin-top:8px; background:var(--panel2); border-radius:10px; padding:10px 12px; font-size:13px; max-height:320px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
+  details.rules .rules-b b { display:block; color:var(--muted); font-size:12px; margin:6px 0 2px; }
+  .ask { margin:4px 0 0; font-size:18px; font-weight:700; }
+  .office textarea { min-height:110px; resize:vertical; border-radius:12px; font-size:15px; }
+  .hint { color:var(--muted); font-size:12px; }
+  .kpi-drop { position:relative; cursor:pointer; }
+  .kpi-drop > summary { list-style:none; } .kpi-drop > summary::-webkit-details-marker { display:none; }
+  .kpi-drop[open] { border-color:var(--accent); }
+  .drop { position:absolute; left:0; top:calc(100% + 6px); z-index:6; width:min(560px,80vw); max-height:420px; overflow:auto; background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:0 12px 32px rgba(0,0,0,.18); padding:8px; cursor:default; }
+  .drow { padding:8px 10px; border-radius:8px; border-bottom:1px solid var(--line); }
+  .drow:last-child { border-bottom:none; }
+  .drow .t { font-weight:600; } .drow .who { margin-left:6px; }
+  .drow .res { color:var(--muted); font-size:12.5px; white-space:pre-wrap; word-break:break-word; margin-top:4px; }
+  .steps { display:flex; flex-direction:column; gap:0; }
+  .now-line { font-size:15px; font-weight:700; margin-bottom:10px; }
+  .step { display:grid; grid-template-columns:28px 1fr; gap:10px; padding:8px 0; border-bottom:1px dashed var(--line); }
+  .step:last-child { border-bottom:none; }
+  .step .ic { font-size:16px; text-align:center; }
+  .step .st { font-weight:600; } .step .sd { color:var(--muted); font-size:12.5px; white-space:pre-wrap; word-break:break-word; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
+  .step.cur .st { color:var(--work); }
   .err { color:var(--bad); font-weight:600; }
   .now { background:var(--panel2); border-radius:10px; padding:8px 12px; font-size:13px; }
   .now b { color:var(--muted); font-size:12px; }
@@ -201,7 +224,7 @@
     <section class="projects" id="projects"></section>
     <h2 class="zone">誰在做什麼</h2>
     <section class="panel mx-wrap" id="matrix"></section>
-    <h2 class="zone">員工（全部專案）</h2>
+    <h2 class="zone">AI 員工（全部專案）</h2>
     <section class="seats" id="ovSeats"></section>
   </main>
 
@@ -217,18 +240,21 @@
     </section>
     <section class="kpis" id="kpis"></section>
 
-    <h2 class="zone">Leader 辦公室</h2>
+    <h2 class="zone">交辦工作</h2>
     <section class="panel office" id="office"></section>
 
-    <h2 class="zone">員工席位</h2>
+    <h2 class="zone">現在做到哪裡</h2>
+    <section class="panel" id="nowPanel"></section>
+
+    <h2 class="zone">AI 員工</h2>
     <section class="seats" id="seats"></section>
 
-    <h2 class="zone">進行中的任務</h2>
+    <h2 class="zone">工作卡</h2>
     <section class="panel"><div id="board"></div></section>
 
     <div class="cols">
       <section class="panel">
-        <h3>團隊對話</h3>
+        <h3>完整對話紀錄（細節）</h3>
         <div class="chat" id="chat"></div>
       </section>
       <section class="panel">
@@ -303,12 +329,12 @@ function modelLabel(a, w) {
 const effortLabel = (a, w) => !w ? '依專案設定' : (w.agentCfg[a.id] || {}).effort || (a.efforts.length ? '預設' : '—');
 
 function cfgHtml(a, w) {
-  if (!w) return '<div class="cfg-note">模型／推理強度在各專案頁分開設定。</div>';
-  if (!a.models.length && !a.efforts.length) return `<div class="cfg-note">${a.status === 'checking' ? '讀取模型清單中…' : '此 Agent 使用預設模型（不支援切換）'}</div>`;
+  if (!w) return '<div class="cfg-note">模型／思考強度在各專案頁分開設定。</div>';
+  if (!a.models.length && !a.efforts.length) return `<div class="cfg-note">${a.status === 'checking' ? '讀取模型清單中…' : '這位 AI 員工使用預設模型（不支援切換）'}</div>`;
   const cfg = w.agentCfg[a.id] || {}, busy = w.run?.active;
-  return `<details class="cfg-box"><summary>這個專案的模型／推理強度${busy ? '（下一次開始工作生效）' : ''}</summary><div class="cfg">
+  return `<details class="cfg-box"><summary>這個專案的模型／思考強度${busy ? '（下一次開始工作生效）' : ''}</summary><div class="cfg">
     <label>模型<select data-cfg="${a.id}" data-k="model"><option value="">預設</option>${a.models.map((m) => `<option value="${esc(m.value)}" title="${esc(m.description)}" ${m.value === cfg.model ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select></label>
-    <label>推理強度<select data-cfg="${a.id}" data-k="effort" ${a.efforts.length ? '' : 'disabled'}><option value="">預設</option>${a.efforts.map((v) => `<option value="${esc(v)}" ${v === cfg.effort ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></label>
+    <label>思考強度<select data-cfg="${a.id}" data-k="effort" ${a.efforts.length ? '' : 'disabled'}><option value="">預設</option>${a.efforts.map((v) => `<option value="${esc(v)}" ${v === cfg.effort ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></label>
   </div></details>`;
 }
 
@@ -338,10 +364,10 @@ function limitsHtml(a) {
 function duty(a, w) {
   const r = w.run, t = (st) => w.tasks.filter((x) => x.status === st && x.agent === a.id);
   if (t('WORKING').length) return { kind:'work', text:t('WORKING')[0].title };
-  if (w.leader === a.id && r?.active) return { kind:'work', text:{ planning:'Leader：規劃與派工中', summarizing:'Leader：整理總結中' }[r.phase] || 'Leader：監督進度中' };
+  if (w.leader === a.id && r?.active) return { kind:'work', text:{ planning:'工頭：規劃與派工中', summarizing:'工頭：整理總結中' }[r.phase] || '工頭：監督進度中' };
   if (r?.paused && (t('PAUSED').length || w.leader === a.id)) return { kind:'pz', text:'已暫停' + (t('PAUSED')[0] ? '：' + t('PAUSED')[0].title : '') };
   if (r?.active && t('WAITING').length) return { kind:'wait', text:`排隊中 ${t('WAITING').length} 張` };
-  return { kind:'', text:w.leader === a.id ? 'Leader' : w.workers.includes(a.id) ? '' : '不參與' };
+  return { kind:'', text:w.leader === a.id ? '工頭' : w.workers.includes(a.id) ? '' : '不參與' };
 }
 
 // w = one project's seat view; no w = overview across all open projects.
@@ -350,7 +376,7 @@ function statusHtml(a, w) {
   if (a.status === 'unavailable') return '<span class="dot bad"></span>無法使用';
   if (w) {
     const d = duty(a, w);
-    if (d.kind === 'work' || d.kind === 'pz') return `<span class="dot ${d.kind}"></span>${d.kind === 'work' && !d.text.startsWith('Leader') ? '工作中：' : ''}${esc(d.text)}`;
+    if (d.kind === 'work' || d.kind === 'pz') return `<span class="dot ${d.kind}"></span>${d.kind === 'work' && !d.text.startsWith('工頭') ? '工作中：' : ''}${esc(d.text)}`;
     return '<span class="dot"></span>待命';
   }
   const busy = S.workspaces.filter((x) => duty(a, x).kind === 'work').length;
@@ -363,11 +389,11 @@ function seatHtml(a, w) {
   const done = S.lastDone[a.id];
   let lastTxt;
   if (a.status === 'unavailable') lastTxt = a.note;
-  else if (w) lastTxt = [...w.activity].reverse().find((m) => m.who === a.id)?.text || (lead ? '把需求交給我，我會拆成工作卡分給大家。' : '等待 Leader 派工。');
+  else if (w) lastTxt = [...w.activity].reverse().find((m) => m.who === a.id)?.text || (lead ? '把需求交給我，我會拆成工作卡分給大家。' : '等待工頭派工。');
   else lastTxt = S.workspaces.map((x) => [x, duty(a, x)]).filter(([, d]) => d.kind).map(([x, d]) => `${x.name}：${d.text}`).join('\n') || '目前沒有工作。';
   const busy = w && (w.run?.active || w.run?.paused);
-  const roleTag = w ? (lead ? '<span class="tag lead">LEADER</span>' : '<span class="tag">WORKER</span>')
-    : leads.length ? `<span class="tag lead" title="${esc(leads.map((x) => x.name).join('、'))}">LEADER × ${leads.length}</span>` : '<span class="tag">WORKER</span>';
+  const roleTag = w ? (lead ? '<span class="tag lead">工頭</span>' : '<span class="tag">成員</span>')
+    : leads.length ? `<span class="tag lead" title="${esc(leads.map((x) => x.name).join('、'))}">工頭 × ${leads.length}</span>` : '<span class="tag">成員</span>';
   return `<div class="seat ${off ? 'off' : ''}" style="--c:${l.c}">
     <div class="seat-top"><div class="avatar">${l.ab}</div><div>
       <div class="seat-name">${esc(a.name)}</div>
@@ -376,20 +402,21 @@ function seatHtml(a, w) {
     <div class="seat-status">${statusHtml(a, w)}</div>
     <dl class="facts">
       <dt>模型</dt><dd title="${esc(modelLabel(a, w))}">${esc(modelLabel(a, w))}</dd>
-      <dt>推理強度</dt><dd>${esc(effortLabel(a, w))}</dd>
+      <dt>思考強度</dt><dd>${esc(effortLabel(a, w))}</dd>
       <dt>最近完成</dt><dd title="${esc(done?.title || '')}">${done ? `${esc(done.title)} · ${when(done.at)}` : '—'}</dd>
     </dl>
     <div class="seat-last">${esc(lastTxt)}</div>
     ${limitsHtml(a)}
     ${cfgHtml(a, w)}
-    ${a.id === 'codex' && a.status === 'unavailable' ? `<div class="cfg-note">Studio 的 Codex 使用獨立資料夾，不會出現在你平常的 Codex 紀錄。登入一次後按「重新檢查 Agent」。</div><button class="btn small" data-codex-login>登入 Codex（Studio 專用）</button>` : ''}
-    ${!w || lead ? '' : `<div class="row"><button class="btn small" data-leader="${a.id}" ${a.status !== 'available' ? 'disabled' : ''}>${busy ? '接手當 Leader' : '設為 Leader'}</button>
+    ${a.status === 'unavailable' ? '<button class="btn small" data-recheck title="重新連線並檢查所有 AI 員工">重新連線／重新檢查</button>' : ''}
+    ${a.id === 'codex' && a.status === 'unavailable' ? `<div class="cfg-note">Studio 的 Codex 使用獨立資料夾，不會出現在你平常的 Codex 紀錄。登入一次後按「重新檢查」。</div><button class="btn small" data-codex-login>登入 Codex（Studio 專用）</button>` : ''}
+    ${!w || lead ? '' : `<div class="row"><button class="btn small" data-leader="${a.id}" ${a.status !== 'available' ? 'disabled' : ''}>${busy ? '接手當工頭' : '設為工頭'}</button>
       <button class="btn small ghost" data-worker="${a.id}" data-on="${out ? 1 : 0}" title="只影響這個專案；下一次派工生效">${out ? '讓它參與這個專案' : '這個專案不用它'}</button></div>`}
   </div>`;
 }
 
 function boardHtml(tasks, agents, editable) {
-  if (!tasks.length) return '<div class="empty">還沒有工作。把需求交給 Leader，它會拆成工作卡派給員工。</div>';
+  if (!tasks.length) return '<div class="empty">還沒有工作卡。在上面說你要什麼、按「交給團隊」，工頭會拆成工作卡派給成員。</div>';
   const avail = agents.filter((a) => a.status === 'available');
   return `<div class="board">${LANES.map(([st, label]) => {
     const list = tasks.filter((t) => t.status === st || (st === 'WAITING' && t.status === 'PAUSED'));
@@ -409,8 +436,75 @@ function chatHtml(activity) {
     if (m.role === 'system') return `<div class="sys">${esc(m.time)} · ${esc(m.text)}</div>`;
     if (m.role === 'user') return `<div class="msg me"><div class="bubble"><div class="hd"><b>你</b> · ${esc(m.time)}</div>${esc(m.text)}</div></div>`;
     const l = look(m.who);
-    return `<div class="msg" style="--c:${l.c}"><div class="av">${l.ab}</div><div class="bubble"><div class="hd"><b>${esc(name(m.who))}</b> · ${m.role === 'leader' ? 'Leader' : 'Worker'} · ${esc(m.time)}</div>${esc(m.text)}</div></div>`;
+    return `<div class="msg" style="--c:${l.c}"><div class="av">${l.ab}</div><div class="bubble"><div class="hd"><b>${esc(name(m.who))}</b> · ${m.role === 'leader' ? '工頭' : '成員'} · ${esc(m.time)}</div>${esc(m.text)}</div></div>`;
   }).join('');
+}
+
+// Re-render only when the markup changed, so open drop-downs keep their scroll position.
+const setHtml = (el, html) => { if (el._html !== html) { el._html = html; el.innerHTML = html; } };
+let doneOpen = false; // 這次完成的工作卡 drop-down
+const ICON = { DONE:'✅', WORKING:'⏳', WAITING:'🕒', PAUSED:'⏸️', FAILED:'❌' };
+const STEP_WORD = { DONE:'完成', WORKING:'進行中', WAITING:'排隊中', PAUSED:'已暫停', FAILED:'失敗／停止' };
+
+// KPI "這次完成的工作卡" that opens a list of every card with its full result.
+function doneDropHtml(w) {
+  const n = w.tasks.filter((t) => t.status === 'DONE').length;
+  const rows = w.tasks.length ? w.tasks.map((t) => `<div class="drow">
+      <div><span title="${STEP_WORD[t.status] || t.status}">${ICON[t.status] || '•'}</span> <span class="t">${esc(t.title)}</span><span class="who" style="--c:${look(t.agent).c}"><i></i>${esc(name(t.agent))}</span></div>
+      <div class="res">${t.result ? esc(t.result) : t.status === 'WORKING' ? '正在做…' : '還沒開始'}</div></div>`).join('')
+    : '<div class="empty" style="padding:8px">這次還沒有工作卡。</div>';
+  return `<details class="kpi kpi-drop" id="doneDrop" ${doneOpen ? 'open' : ''}><summary><div class="v">${n}/${w.tasks.length}</div><div class="l">這次完成的工作卡 ▾</div></summary><div class="drop">${rows}</div></details>`;
+}
+
+// The Leader's fixed rules, in plain words (what planPrompt / summarize tell it).
+const RULES = `• 工頭不自己動手改檔案，只負責看懂需求、拆成 1～4 張工作卡、派給成員。
+• 互不相關的工作會同時派給不同成員；同一個檔案不會讓兩位成員同時改。
+• 每張工作卡的說明都要完整，成員只看那張卡就能做。
+• 成員只在這個專案資料夾裡工作，做完回報 1～3 句摘要。
+• 全部做完後，工頭寫 2～4 句總結給你。`;
+
+function officeHtml(w) {
+  const r = w.run, running = !!r?.active, paused = !!r?.paused;
+  const lead = S.agents.find((a) => a.id === w.leader);
+  const crew = w.workers.filter((id) => id !== w.leader && S.agents.find((a) => a.id === id)?.status === 'available').map(name);
+  const others = S.agents.filter((a) => a.id !== w.leader && a.status === 'available');
+  const effort = effortLabel(lead, w);
+  return `<div class="boss"><span class="crown">👑 工頭</span><b>${esc(lead.name)}</b>
+      <span class="meta">· ${esc(modelLabel(lead, w) === '預設' ? '預設模型' : modelLabel(lead, w))}${effort !== '—' && effort !== '預設' ? ' · ' + esc(effort) : ''}</span>
+      <span class="seat-status">${statusHtml(lead, w)}</span><span class="spacer"></span>
+      ${others.length ? `<select data-swap-leader title="換一位 AI 員工當工頭${running || paused ? '；新工頭會接手目前的工作' : ''}"><option value="">更換工頭…</option>${others.map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select>` : ''}</div>
+    <div class="team-line">${esc(lead.name)} 工頭 · ${crew.length ? esc(crew.join(' + ')) + ' 協作' : '目前沒有可用的成員'} · Product First · 自動派工</div>
+    <details class="rules"><summary>查看 AI 工作規則 ▾</summary><div class="rules-b">${r && (running || paused) ? `<b>目前交辦的內容</b>${esc(r.request)}` : ''}<b>工頭的工作方式</b>${esc(RULES)}</div></details>
+    <div class="ask">今天想讓「${esc(w.name)}」做什麼？</div>
+    <textarea id="request" placeholder="例如：幫我把「匯出 PDF」功能做好，做完告訴我怎麼試用。\n或：首頁載入太慢，幫我找出原因並修好。">${esc(drafts[w.project] || '')}</textarea>
+    <div class="row"><span class="hint">${running ? '團隊正在做上一件事，做完才能交下一件（可以先打好）。' : 'Ctrl + Enter 也可以送出'}</span><span class="err" id="err"></span><span class="spacer"></span>
+      <button class="btn primary" id="start" ${running ? 'disabled' : ''}>▶ 交給團隊</button></div>`;
+}
+
+// "Where are we now": request → 工頭 plans → each card → 工頭 summary, with a one-line headline.
+function nowHtml(w) {
+  const r = w.run;
+  if (!r) return '<div class="empty">還沒有交辦工作。在上面說你要什麼，按「交給團隊」就開始。</div>';
+  const ts = w.tasks, done = ts.filter((t) => t.status === 'DONE').length, working = ts.filter((t) => t.status === 'WORKING');
+  const leadName = name(r.leader);
+  const report = r.phase === 'finished' ? [...w.activity].reverse().find((m) => m.role === 'leader')?.text : '';
+  const headline = r.active
+    ? r.phase === 'planning' ? `工頭 ${leadName} 正在看需求、拆工作…`
+      : r.phase === 'summarizing' ? `成員都做完了，工頭 ${leadName} 正在寫總結…`
+      : `成員工作中：完成 ${done}/${ts.length} 張${working.length ? '，' + working.map((t) => `${name(t.agent)} 正在做「${t.title}」`).join('；') : ''}`
+    : r.paused ? `已暫停：完成 ${done}/${ts.length} 張，按「繼續」接著做`
+    : r.stopped ? `已停止：完成 ${done}/${ts.length} 張`
+    : ts.length && ts.every((t) => t.status === 'DONE') ? `全部完成（${done}/${ts.length} 張）` : `已結束，有 ${ts.filter((t) => t.status === 'FAILED').length} 張沒完成`;
+  const step = (ic, title, desc, cur) => `<div class="step ${cur ? 'cur' : ''}"><div class="ic">${ic}</div><div><div class="st">${title}</div>${desc ? `<div class="sd">${esc(desc)}</div>` : ''}</div></div>`;
+  const firstLine = String(r.request).split('\n').find((x) => x.trim()) || '';
+  const planned = ts.length > 0;
+  return `<div class="now-line">${esc(headline)}</div><div class="steps">
+    ${step('📝', '你交辦了工作', firstLine.slice(0, 140))}
+    ${step(planned ? '✅' : r.active ? '⏳' : '🕒', planned ? `工頭 ${esc(leadName)} 拆成 ${ts.length} 張工作卡` : `工頭 ${esc(leadName)} 拆工作中`, '', !planned && r.active)}
+    ${ts.map((t) => step(ICON[t.status] || '•', `${esc(t.title)} · ${esc(name(t.agent))} · ${STEP_WORD[t.status] || t.status}`,
+      t.status === 'WORKING' ? '正在做…' : t.status === 'WAITING' ? '等成員有空就開始' : t.result, t.status === 'WORKING')).join('')}
+    ${planned ? step(report ? '✅' : r.phase === 'summarizing' ? '⏳' : '🕒', '工頭總結', report || '', r.phase === 'summarizing') : ''}
+  </div>`;
 }
 
 const kpi = (v, l) => `<div class="kpi"><div class="v">${v}</div><div class="l">${l}</div></div>`;
@@ -424,10 +518,10 @@ function projCardHtml(w) {
     <div class="pc-top"><span class="nm">${esc(w.name)}</span><span class="pill ${pill}">${label}</span>
       ${r?.active || r?.paused ? `<button class="btn small ${r.paused ? 'pz' : ''}" data-pz="${esc(w.project)}">${r.paused ? '繼續' : '暫停'}</button>` : ''}</div>
     <div class="sub" style="margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(w.project)}">${esc(w.project)}</div>
-    <div class="pc-req">${r ? esc(r.request) : '<span class="empty">還沒有工作，點進來交辦給 Leader。</span>'}</div>
+    <div class="pc-req">${r ? esc(r.request) : '<span class="empty">還沒有工作，點進來交給團隊。</span>'}</div>
     ${total ? `<div class="sbar">${seg(done, 'ok')}${seg(working, 'work')}${seg(failed, 'bad')}</div>
       <div class="lim-f">完成 ${done}/${total}${working ? ` · 進行中 ${working}` : ''}${failed ? ` · 失敗 ${failed}` : ''}</div>` : ''}
-    <div class="lim-f">Leader <span class="who" style="--c:${look(w.leader).c}"><i></i>${esc(name(w.leader))}</span></div>
+    <div class="lim-f">工頭 <span class="who" style="--c:${look(w.leader).c}"><i></i>${esc(name(w.leader))}</span></div>
     ${w.tasks.filter((t) => t.status === 'WORKING').map((t) => `<div class="who" style="--c:${look(t.agent).c}"><i></i>${esc(name(t.agent))}：${esc(t.title)}</div>`).join('')}
   </a>`;
 }
@@ -454,7 +548,7 @@ function renderOverview() {
   const all = S.workspaces.flatMap((w) => w.tasks);
   const avail = S.agents.filter((a) => a.status === 'available').length;
   $('ovKpis').innerHTML = kpi(S.todayDone, '今日完成的工作卡') + kpi(`${S.workspaces.filter((w) => w.run?.active).length}/${S.workspaces.length}`, '工作中的專案') +
-    kpi(all.filter((t) => t.status === 'WORKING').length, '進行中的工作卡') + kpi(`${avail}/${S.agents.length}`, '可用的 Agent');
+    kpi(all.filter((t) => t.status === 'WORKING').length, '進行中的工作卡') + kpi(`${avail}/${S.agents.length}`, '可用的 AI 員工');
   $('projects').innerHTML = S.workspaces.length ? S.workspaces.map(projCardHtml).join('')
     : '<div class="panel empty">還沒有開啟專案。用左邊「開啟專案」或上方 ＋ 開啟一個或多個資料夾，每個專案會有自己的分頁，可以同時工作。</div>';
   $('matrix').innerHTML = matrixHtml();
@@ -468,7 +562,7 @@ function renderProject(w, force) {
   $('pvPath').textContent = $('pvPath').title = w.project;
   $('paseoOpen').hidden = S.paseo === 'missing';
   if (!$('paseoOpen').dataset.busy) $('paseoOpen').disabled = false;
-  $('runPill').textContent = running ? `團隊工作中 · Leader ${name(r.leader)}` : paused ? '已暫停 · 可稍後繼續' : (r?.stopped ? '已停止' : '待命');
+  $('runPill').textContent = running ? `團隊工作中 · 工頭 ${name(r.leader)}` : paused ? '已暫停 · 可稍後繼續' : (r?.stopped ? '已停止' : '待命');
   $('runPill').className = 'pill ' + (running ? 'on' : paused ? 'pz' : '');
   $('pauseResume').textContent = paused ? '繼續' : '暫停';
   $('pauseResume').disabled = !running && !paused;
@@ -477,22 +571,16 @@ function renderProject(w, force) {
 
   const avail = S.agents.filter((a) => a.status === 'available').length;
   const n = (st) => w.tasks.filter((t) => t.status === st).length;
-  $('kpis').innerHTML = kpi(`${n('DONE')}/${w.tasks.length}`, '這次完成的工作卡') + kpi(n('WORKING'), '進行中') +
-    kpi(n('WAITING') + n('PAUSED'), paused ? '等待／已暫停' : '等待中') + kpi(`${avail}/${S.agents.length}`, '可用的 Agent');
+  setHtml($('kpis'), doneDropHtml(w) + kpi(n('WORKING'), '進行中') +
+    kpi(n('WAITING') + n('PAUSED'), paused ? '等待／已暫停' : '等待中') + kpi(`${avail}/${S.agents.length}`, '可用的 AI 員工'));
 
-  const leader = S.agents.find((a) => a.id === w.leader);
   if (force || !$('office').contains(document.activeElement)) {
     $('office').style.setProperty('--c', look(w.leader).c);
-    $('office').innerHTML = seatHtml(leader, w) + `<div class="desk">
-      <h3 style="margin:0">交辦給 Leader</h3>
-      ${r && (running || paused) ? `<div class="now"><b>目前的工作</b><br>${esc(r.request)}</div>` : ''}
-      <textarea id="request" placeholder="你想讓團隊在「${esc(w.name)}」做什麼？（Ctrl + Enter 開始）">${esc(drafts[w.project] || '')}</textarea>
-      <div class="row"><span class="err" id="err"></span><span class="spacer"></span>
-        <button class="btn ghost" id="recheck">重新檢查 Agent</button>
-        <button class="btn primary" id="start" ${running ? 'disabled' : ''}>開始工作</button></div>
-    </div>`;
+    setHtml($('office'), officeHtml(w));
   }
-  if (force || !$('seats').contains(document.activeElement)) $('seats').innerHTML = S.agents.filter((a) => a.id !== w.leader).map((a) => seatHtml(a, w)).join('');
+  setHtml($('nowPanel'), nowHtml(w));
+  // The 工頭 card comes first so its model, limits and settings stay one click away.
+  if (force || !$('seats').contains(document.activeElement)) setHtml($('seats'), [w.leader, ...S.agents.map((a) => a.id).filter((id) => id !== w.leader)].map((id) => seatHtml(S.agents.find((a) => a.id === id), w)).join(''));
   if (force || !$('board').contains(document.activeElement)) $('board').innerHTML = boardHtml(w.tasks, S.agents, true);
 
   const box = $('chat');
@@ -543,7 +631,7 @@ async function openHistory(id) {
   histOpenProject = r.project;
   $('histTitle').textContent = fmt(r.startedAt) + ' 的工作紀錄';
   $('histMeta').innerHTML = `<div><b>需求：</b>${esc(r.request)}</div>
-    <div class="sub" style="margin:6px 0 0">專案 ${esc(r.project)} · Leader ${esc(name(r.leader))} · ${STATUS[r.status] || r.status}</div>`;
+    <div class="sub" style="margin:6px 0 0">專案 ${esc(r.project)} · 工頭 ${esc(name(r.leader))} · ${STATUS[r.status] || r.status}</div>`;
   $('histBoard').innerHTML = boardHtml(r.tasks, S.agents, false);
   $('histChat').innerHTML = chatHtml(r.activity);
   const ow = S.workspaces.find((x) => sameP(x.project, r.project));
@@ -615,7 +703,15 @@ $('paseoOpen').onclick = async () => {
 };
 document.addEventListener('keydown', (e) => { if (e.target.id === 'request' && e.key === 'Enter' && e.ctrlKey && !$('start').disabled) $('start').click(); });
 document.addEventListener('input', (e) => { if (e.target.id === 'request' && ws()) drafts[ws()] = e.target.value; });
+document.addEventListener('toggle', (e) => { if (e.target.id === 'doneDrop') doneOpen = e.target.open; }, true);
 document.addEventListener('change', (e) => {
+  const sw = e.target.closest('select[data-swap-leader]');
+  if (sw) {
+    const id = sw.value, busy = W()?.run?.active || W()?.run?.paused;
+    sw.value = '';
+    if (id && (!busy || confirm(`把工頭交接給 ${name(id)}？\n新工頭會接手原本的需求和目前的工作卡，不用重新輸入；正在工作的成員會繼續做。`))) post('/api/leader', { ws: ws(), agent: id }).catch(() => {});
+    return;
+  }
   const s = e.target.closest('select[data-cfg]');
   if (!s) return;
   const id = s.dataset.cfg, p = ws(), pick = (k) => s.closest('.cfg').querySelector(`select[data-k="${k}"]`).value;
@@ -623,6 +719,7 @@ document.addEventListener('change', (e) => {
   post('/api/agent-config', { ws: p, agent: id, model: pick('model'), effort: pick('effort') }).catch(() => {});
 });
 document.addEventListener('click', (e) => {
+  if (doneOpen && !e.target.closest('#doneDrop')) { doneOpen = false; $('doneDrop')?.removeAttribute('open'); }
   const pzb = e.target.closest('[data-pz]');
   if (pzb) { // inside a project card link: act, don't open the tab
     e.preventDefault();
@@ -643,12 +740,12 @@ document.addEventListener('click', (e) => {
     const p = ws();
     return post('/api/start', { ws: p, request: $('request').value }).then(() => { drafts[p] = ''; $('request').value = ''; b.blur(); }).catch(() => {});
   }
-  if (b.id === 'recheck') return post('/api/check');
+  if (b.hasAttribute('data-recheck')) return post('/api/check');
   b.blur();
   if (b.hasAttribute('data-codex-login')) post('/api/codex-login');
   if (b.dataset.leader) {
     const busy = W()?.run?.active || W()?.run?.paused;
-    if (!busy || confirm(`把 Leader 交接給 ${name(b.dataset.leader)}？\n新 Leader 會接手原始需求和目前的工作卡，不用重新輸入；正在工作的員工會繼續做。`)) post('/api/leader', { ws: ws(), agent: b.dataset.leader });
+    if (!busy || confirm(`把工頭交接給 ${name(b.dataset.leader)}？\n新工頭會接手原本的需求和目前的工作卡，不用重新輸入；正在工作的成員會繼續做。`)) post('/api/leader', { ws: ws(), agent: b.dataset.leader });
   }
   if (b.dataset.worker) post('/api/workers', { ws: ws(), agent: b.dataset.worker, on: b.dataset.on === '1' });
   if (b.dataset.reassign) post('/api/reassign', { ws: ws(), taskId: b.dataset.reassign, agent: document.querySelector(`select[data-task="${b.dataset.reassign}"]`).value });
