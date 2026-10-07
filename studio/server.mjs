@@ -2432,6 +2432,8 @@ const routes = {
   'POST /api/external/models': (b) => extModels(b),
   'POST /api/external/check': (b) => { if (!extOf(b.id)) throw new Error('找不到這個外部模型'); checkAgent(b.id); },
   // One-time login for Studio's separate Codex home, in a visible console window.
+  // Claude uses the machine's normal Claude Code login (no separate home).
+  'POST /api/claude-login': () => { spawn('cmd', ['/c', 'start', 'Claude login (Studio)', 'cmd', '/k', 'claude', 'auth', 'login'], { detached: true, stdio: 'ignore' }); },
   'POST /api/codex-login': () => { spawn('cmd', ['/c', 'start', 'Codex login (Studio)', 'cmd', '/k', 'codex', 'login'], { env: { ...process.env, CODEX_HOME }, detached: true, stdio: 'ignore' }); },
   'GET /api/history': () => listHistory(),
   'GET /api/runtimes': () => refreshRuntimeReadiness(),
