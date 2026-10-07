@@ -505,6 +505,7 @@ function seatHtml(a, w) {
     ${cfgHtml(a, w)}
     ${a.status === 'unavailable' ? '<button class="btn small" data-recheck title="重新連線並檢查所有 AI 員工">重新連線／重新檢查</button>' : ''}
     ${a.id === 'codex' && a.status === 'unavailable' ? `<div class="cfg-note">Studio 的 Codex 使用獨立資料夾，不會出現在你平常的 Codex 紀錄。登入一次後按「重新檢查」。</div><button class="btn small" data-codex-login>登入 Codex（Studio 專用）</button>` : ''}
+    ${a.id === 'claude' && a.status === 'unavailable' ? `<div class="cfg-note">Studio 的 Claude 使用你電腦上 Claude Code 的登入。在跳出的視窗登入完成後按「重新檢查」。</div><button class="btn small" data-claude-login>登入 Claude</button>` : ''}
     ${!w || lead ? '' : `<div class="row"><button class="btn small" data-leader="${a.id}" ${a.status !== 'available' ? 'disabled' : ''}>${busy ? '接手當工頭' : '設為工頭'}</button>
       <button class="btn small ghost" data-worker="${a.id}" data-on="${out ? 1 : 0}" title="只影響這個專案；下一次派工生效">${out ? '讓它參與這個專案' : '這個專案不用它'}</button></div>`}
   </div>`;
@@ -1230,6 +1231,7 @@ document.addEventListener('click', (e) => {
   if (b.dataset.extDel) { const e = S.external.find((x) => x.id === b.dataset.extDel); return confirm('刪除外部模型「' + (e?.name || '') + '」？\n\nAPI key 也會一併從 AionCore 刪除。已經完成的工作卡和紀錄不受影響。') && post('/api/external/delete', { id: b.dataset.extDel }).catch(() => {}); }
   b.blur();
   if (b.hasAttribute('data-codex-login')) post('/api/codex-login');
+  if (b.hasAttribute('data-claude-login')) post('/api/claude-login');
   if (b.dataset.leader) {
     const busy = W()?.run?.active || W()?.run?.paused;
     if (!busy || confirm(`把工頭交接給 ${name(b.dataset.leader)}？\n新工頭會接手原本的需求和目前的工作卡，不用重新輸入；正在工作的成員會繼續做。`)) post('/api/leader', { ws: ws(), agent: b.dataset.leader });
