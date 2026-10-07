@@ -306,6 +306,7 @@ async function runRuntimeTests() {
   {
     const runtime = { root_pid: 42, port: 3018 };
     const healthy = await readiness.checkBackendReadiness(runtime, {
+      verifyOwnership: async () => ({ ok: true }),
       isPidAlive: () => true,
       portReachable: async () => true,
       getHealth: async () => ({ httpStatus: 200, body: { ready: true } })
@@ -314,6 +315,7 @@ async function runRuntimeTests() {
     assert.strictEqual(healthy.process_alive && healthy.port_reachable && healthy.application_ready, true);
 
     const startupFailure = await readiness.checkBackendReadiness(runtime, {
+      verifyOwnership: async () => ({ ok: true }),
       isPidAlive: () => true,
       portReachable: async () => true,
       getHealth: async () => ({ httpStatus: 503, body: { ready: false, error: 'MiningProcessLockError: data directory is locked' } })
@@ -322,11 +324,22 @@ async function runRuntimeTests() {
     assert.match(startupFailure.reason, /MiningProcessLockError/);
 
     const deadProcess = await readiness.checkBackendReadiness(runtime, {
+      verifyOwnership: async () => ({ ok: true }),
       isPidAlive: () => false,
       portReachable: async () => true,
       getHealth: async () => ({ httpStatus: 200, body: { ready: true } })
     });
     assert.strictEqual(deadProcess.status, 'BLOCKED', 'health alone does not replace process identity');
+    assert.strictEqual(readiness.isApplicationReady({ status: 'ok' }), true, 'existing TWstock /health contract');
+    assert.strictEqual(readiness.isApplicationReady({ status: 'ok', ready: false }), false);
+    assert.strictEqual(readiness.isApplicationReady({ ready: true, error: 'MiningProcessLockError' }), false);
+    const falseReady = await readiness.checkBackendReadiness(runtime, {
+      isPidAlive: () => true, portReachable: async () => true,
+      verifyOwnership: async () => ({ ok: false, reason: 'Unknown PID 42: external listener' }),
+      getHealth: async () => ({ httpStatus: 200, body: { status: 'ok' } })
+    });
+    assert.strictEqual(falseReady.status, 'BLOCKED', 'unrelated listener cannot satisfy readiness');
+    assert.match(falseReady.reason, /Unknown PID/);
     console.log('Case K: process + port + HTTP 200 + application ready; startup failure reason: PASS');
   }
 
@@ -371,6 +384,28 @@ async function runRuntimeTests() {
     });
     assert.strictEqual(failedHealth.status, 'blocked');
     assert.deepStrictEqual(failedHealthEvents, ['cleanup', 'restart', 'health'], 'failed readiness must not run smoke or continue the card');
+    for (const phase of ['cleanup', 'restart', 'health', 'smoke']) {
+      let active = true;
+      const stoppedEvents = [];
+      const stopped = await readiness.recoverOwnedRuntime(runtime, {
+        workspace: runtime.workspace, dataDir: runtime.data_dir, canProceed: () => active,
+        cleanup: async () => { stoppedEvents.push('cleanup'); if (phase === 'cleanup') active = false; return { ok: true }; },
+        restart: async () => { stoppedEvents.push('restart'); if (phase === 'restart') active = false; return runtime; },
+        readiness: async () => { stoppedEvents.push('health'); if (phase === 'health') active = false; return { status: 'BACKEND_READY' }; },
+        smoke: async () => { stoppedEvents.push('smoke'); if (phase === 'smoke') active = false; return { ok: true }; },
+        continueJob: async () => stoppedEvents.push('continue')
+      });
+      assert.strictEqual(stopped.status, 'cancelled');
+      assert.ok(!stoppedEvents.includes('continue'), 'STOP/PAUSE/handoff during ' + phase + ' must fence continuation');
+      if (phase === 'cleanup') assert.ok(!stoppedEvents.includes('restart'), 'STOP during cleanup must prevent restart');
+    }
+    const unconfirmed = await readiness.recoverOwnedRuntime(runtime, {
+      cleanup: async () => ({ ok: false, reason: 'process tree still alive' }),
+      restart: async () => { throw new Error('must not restart'); }, readiness: async () => ({}),
+      smoke: async () => ({ ok: true }), continueJob: async () => {}
+    });
+    assert.strictEqual(unconfirmed.status, 'blocked');
+    assert.strictEqual(failedHealth.manual, false, 'known owner startup failure stays automatically monitored');
     console.log('Runtime recovery: known Studio owner auto-continues in order; unknown owner blocks: PASS');
   }
 

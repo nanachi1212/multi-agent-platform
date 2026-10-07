@@ -19,7 +19,7 @@ Multi-Agent Studio 管理多個 Agent、背景進程與測試執行。為確保�
   - 將隔離目錄注入為環境變數 `DATA_DIR`，使檔案鎖（如 `mining_process_lock`）、快取與狀態與正式目錄完全分離。
   - 動態配置測試用連接埠（避開正式環境的 3018 與 3011），執行完畢後自動清理暫存目錄。
 - **`studio/runtime-readiness.mjs`**：
-  - `BACKEND_READY` 必須同時滿足已登記 PID 存活、連接埠可連線、`GET /health` 回 HTTP 200，以及 response `ready: true` 或 `status: "ready"`。
+  - `BACKEND_READY` 必須同時滿足已登記 PID 存活、連接埠可連線、`GET /health` 回 HTTP 200，以及 response `ready: true`、`status: "ready"` 或既有 TWstock `/health` 的 `status: "ok"`；明確 `ready: false` 或 startup error 一律拒絕。程序身分與 listener owner 也必須相符。
   - 健康端點回報的 `error`、`reason` 或 `detail` 會保留在 blocked 原因中，例如 `MiningProcessLockError`。
   - 自動恢復只處理明確標記為 Studio 建立、restart command／data owner 已確認且不需帳密的 runtime；依序 cleanup、restart、readiness、smoke，再喚醒原卡。未知 owner、PID、data owner、命令或需要憑證時停止並回報具體原因。
 
@@ -104,3 +104,7 @@ Multi-Agent Studio 管理多個 Agent、背景進程與測試執行。為確保�
 ## 整合補強：程序身分與清理邊界
 
 `process_identity` 保存 OS 程序建立時間與完整 executable 路徑；PID 相同或程序名稱相同並不足以允許清理。舊紀錄若仍活著卻缺少此身分，會保留程序並回報 PID／command。`studio_pid` 用來避免啟動掃描清理另一個仍存活的 Studio 所持有的 runtime。Job 清理回傳 `blocked` 清單，只有程序樹全部停止才標記 cleaned。暫存資料只刪除實際位於系統 temp 的 `MultiAgentStudio/<project>/<run>` 子目錄，拒絕根目錄、相鄰路徑與 symlink／junction；每個 smoke 呼叫建立獨立 run 目錄。Registry 損毀會明確失敗並保留原檔，更新採用同目錄暫存檔原子取代。
+
+## 恢復與 workspace 生命週期銜接
+
+恢復採用該 job／card／port 最新的 runtime 紀錄，先檢查 write lease、OS 程序身分與 DATA_DIR owner。健康 runtime 直接通過 health／smoke 後續卡；stale runtime 才 cleanup → restart → health → smoke → continue。每個非同步階段重新確認原 job、card 與 lease generation；PAUSE、STOP、handoff 或 external claim 會阻止重啟／續卡，並等待在途的恢復與 managed start 結束後清理程序樹，再釋放租約。已知 ownership 的 startup failure 保持自動 health 輪詢並顯示 blocked 原因，不會每五秒重啟同一 replacement。未知 PID／data owner 或無法安全重建命令才要求人工。

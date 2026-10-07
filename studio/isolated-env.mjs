@@ -13,6 +13,7 @@ export function getIsolatedDataDir(project, runId) {
   const safeRunId = String(runId || Date.now()).replace(/[^\w-]/g, '_') || 'run';
   const projectRoot = path.join(os.tmpdir(), 'MultiAgentStudio', projectSlug);
   fs.mkdirSync(projectRoot, { recursive: true });
+  if (!isSafeTempDir(path.join(projectRoot, safeRunId + '-pending'))) throw new Error('Unsafe smoke temp directory');
   const tempRoot = fs.mkdtempSync(path.join(projectRoot, safeRunId + '-'));
   const dataDir = path.join(tempRoot, 'data');
   fs.mkdirSync(dataDir, { recursive: true });

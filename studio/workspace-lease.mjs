@@ -111,7 +111,7 @@ export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, A
       if (l.jobId !== w.run?.id || l.owner.kind !== 'studio') continue;
       if (w.run?.stopped) l.jobStopped = true;
       if (l.status === 'RELEASED') continue;
-      if (l.mode === 'write' && (w.executingSteps?.has(l.cardId) || w.tasks.some((t) => t.id === l.cardId && (t.status === 'WORKING' || t.stopUnconfirmed)))) continue;
+      if (l.mode === 'write' && (w.executingSteps?.has(l.cardId) || w.tasks.some((t) => t.id === l.cardId && (t.status === 'WORKING' || t.stopUnconfirmed || t.runtimeStopPending)))) continue;
       retire(l, reason);
     }
     saveLeases();
