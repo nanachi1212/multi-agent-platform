@@ -22,7 +22,7 @@ function makeEnv(script) {
     execFile: (cmd, args, opts, cb) => cb(new Error('no git / gh in test'), '', ''), isDir: () => true, readHistory() {}, openWorkspace() {}, wsOf() {},
   };
   const names = Object.keys(env);
-  const api = new Function(...names, code + '\nreturn { planPhase, pump, summarize, answer, continueCard, wake, parseStatus, finish, autoNext };')(...names.map((k) => env[k])); // test harness: our own code
+  const api = new Function(...names, code + '\nreturn { planPhase, pump, summarize, answer, continueCard, wake, parseStatus, finish, autoNext, instruct };')(...names.map((k) => env[k])); // test harness: our own code
   return { env, api };
 }
 const newW = () => ({ project: 'P', leader: 'claude', workers: ['claude', 'codex', 'antigravity'], tasks: [], activity: [],
@@ -139,6 +139,32 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
     }
   }
   console.log('7 after-done modes (stop / suggest / auto + limit): PASS');
+
+  // 8) instructions mid-job: the Leader tells the working card, cancels a waiting card and adds one
+  let implTurn = 0;
+  ({ env, api } = makeEnv(async (agent, text) => {
+    if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"impl","agent":"codex","instructions":"build it red"},{"title":"docs","agent":"antigravity","instructions":"write docs","after":[0]}]}';
+    if (text.includes('the user sent new instructions')) {
+      const id = (n) => text.match(new RegExp('id (\\w+) \\[\\w+\\] ' + n))[1];
+      return JSON.stringify({ message: '改成藍色，文件先不寫', tell: [{ card: id('impl'), note: 'use blue instead of red' }], cancel: [id('docs')], add: [{ title: 'check colors', agent: 'antigravity', instructions: 'check' }] });
+    }
+    if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+    if (text.includes('Task: impl')) { implTurn++; await new Promise((r) => setTimeout(r, 120)); return 'Built it red.\nSTATUS: DONE'; }
+    if (text.startsWith('New instruction from the user')) return 'Switched to blue.\nSTATUS: DONE';
+    return 'ok\nSTATUS: DONE';
+  }));
+  w = newW(); env.S.workspaces.push(w);
+  await api.planPhase(w);
+  api.instruct(w, '改用藍色，不要寫文件');
+  await settle(); await settle();
+  const byTitle = (x) => w.tasks.find((t) => t.title === x);
+  assert.ok(env.prompts.some((p) => p.agent === 'codex' && p.text.includes('use blue instead of red')), 'working worker got the note in the same task');
+  assert.deepStrictEqual([byTitle('impl').status, byTitle('impl').result], ['DONE', 'Switched to blue.']);
+  assert.deepStrictEqual([byTitle('docs').status, byTitle('docs').result], ['FAILED', '依你的指示取消']);
+  assert.strictEqual(byTitle('check colors').status, 'DONE');
+  assert.ok(env.logs.some((l) => l.text === '你的指示：改用藍色，不要寫文件'));
+  assert.strictEqual(w.run.result, 'done');
+  console.log('8 instructions mid-job (tell working card / cancel / add): PASS');
 
   // status-line parser
   const { parseStatus } = api;

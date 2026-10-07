@@ -538,6 +538,11 @@ function officeHtml(w) {
     <div class="team-line">${esc(lead.name)} 工頭 · ${crew.length ? esc(crew.join(' + ')) + ' 協作' : '目前沒有可用的成員'} · Product First · 自動派工</div>
     <details class="rules"><summary>查看 AI 工作規則 ▾</summary><div class="rules-b">${r && (running || paused) ? `<b>目前交辦的內容</b>${esc(r.request)}` : ''}<b>工頭的工作方式</b>${esc(RULES)}</div></details>
     ${!running && !paused && ['open', 'wait', 'need'].includes(w.pstate?.level) ? '<div class="hint" style="border-top:1px dashed var(--line);padding-top:10px;font-weight:700">或者，開始新的工作</div>' : ''}
+    ${running || paused ? `<div class="ask">工作進行中，想補充或修改指示？</div>
+    <textarea id="instruction" placeholder="例如：按鈕改成藍色。或：先不要 merge，等我看過。\n工頭會決定要轉告哪位成員、取消或追加哪些工作卡。">${esc(drafts['i:' + w.project] || '')}</textarea>
+    <div class="row"><span class="hint">${paused ? '工作暫停中：指示會先保留，按「繼續」後交給工頭' : r?.notes || r?.noting ? '⏳ 工頭正在看你的指示…' : '正在工作的成員做完手上這一步就會收到'}</span><span class="err" id="err"></span><span class="spacer"></span>
+      <button class="btn primary" id="instructBtn">📣 告訴工頭</button></div>
+    <div class="hint" style="border-top:1px dashed var(--line);padding-top:10px;font-weight:700">新的工作要等這件做完才能交辦</div>` : ''}
     <div class="ask">今天想讓「${esc(w.name)}」做什麼？</div>
     <textarea id="request" placeholder="例如：幫我把「匯出 PDF」功能做好，做完告訴我怎麼試用。\n或：首頁載入太慢，幫我找出原因並修好。">${esc(drafts[w.project] || '')}</textarea>
     <div class="row"><span class="hint">${running ? '團隊正在做上一件事，做完才能交下一件（可以先打好）。' : 'Ctrl + Enter 也可以送出'}</span><span class="err" id="err"></span><span class="spacer"></span>
@@ -581,6 +586,7 @@ function nowHtml(w, att) {
   const waits = [...ts.filter((t) => PARKED.includes(t.status)).map((t) => '• ' + waitLine(t)),
     ...blocked.map((t) => `• 「${t.title}」等「${(t.after || []).map((id) => byId(id)?.title).filter(Boolean).join('」「')}」完成`)];
   if (r.ask && !r.summarizing) waits.unshift('• Nana 的決定：' + r.ask.question);
+  if (r.notes || r.noting) waits.unshift('• 工頭正在看你的新指示');
   const working = ts.filter((t) => t.status === 'WORKING');
   const ready = ts.find((t) => t.status === 'WAITING' && !blocked.includes(t));
   const next = r.paused ? '按「繼續」後，從停下的地方接著做'
@@ -829,8 +835,15 @@ $('paseoOpen').onclick = async () => {
   b.dataset.busy = '1'; b.disabled = true; b.textContent = '開啟中…';
   try { await post('/api/paseo/open', { ws: ws() }); } catch {} finally { delete b.dataset.busy; b.disabled = false; b.textContent = '用 Paseo 開啟'; }
 };
-document.addEventListener('keydown', (e) => { if (e.target.id === 'request' && e.key === 'Enter' && e.ctrlKey && !$('start').disabled) $('start').click(); });
-document.addEventListener('input', (e) => { if (e.target.id === 'request' && ws()) drafts[ws()] = e.target.value; });
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' || !e.ctrlKey) return;
+  if (e.target.id === 'request' && !$('start').disabled) $('start').click();
+  if (e.target.id === 'instruction') $('instructBtn').click();
+});
+document.addEventListener('input', (e) => {
+  if (e.target.id === 'request' && ws()) drafts[ws()] = e.target.value;
+  if (e.target.id === 'instruction' && ws()) drafts['i:' + ws()] = e.target.value;
+});
 document.addEventListener('toggle', (e) => { if (e.target.id === 'doneDrop') doneOpen = e.target.open; }, true);
 document.addEventListener('change', (e) => {
   const ad = e.target.closest('select[data-after-done]');
@@ -873,6 +886,10 @@ document.addEventListener('click', (e) => {
   if (b.dataset.suggest !== undefined) {
     const x = W()?.pstate?.suggestions?.[+b.dataset.suggest];
     if (x) { b.disabled = true; return post('/api/start', { ws: ws(), request: x.request, continue: true }).catch(() => {}); }
+  }
+  if (b.id === 'instructBtn') {
+    const p = ws();
+    return post('/api/instruct', { ws: p, text: $('instruction').value }).then(() => { drafts['i:' + p] = ''; $('office')._html = ''; render(); }).catch(() => {});
   }
   if (b.hasAttribute('data-continue-state') || b.hasAttribute('data-refresh-state')) {
     b.disabled = true; b.textContent = b.hasAttribute('data-refresh-state') ? '讀取中…' : '核對狀態中…';
