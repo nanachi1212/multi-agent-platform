@@ -103,6 +103,23 @@
   .step .ic { font-size:16px; text-align:center; }
   .step .st { font-weight:600; } .step .sd { color:var(--muted); font-size:12.5px; white-space:pre-wrap; word-break:break-word; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
   .step.cur .st { color:var(--work); }
+  .wf-head { display:flex; align-items:center; gap:14px; margin-bottom:12px; }
+  .wf-head .big { font-size:30px; line-height:1; }
+  .wf-head .st-line { font-size:17px; font-weight:700; }
+  .wf { display:grid; grid-template-columns:88px 1fr; gap:8px 14px; margin:0 0 6px; font-size:14px; }
+  .wf dt { color:var(--muted); font-weight:700; font-size:13px; padding-top:1px; }
+  .wf dd { margin:0; white-space:pre-wrap; word-break:break-word; }
+  .wf-panel { border-top:4px solid var(--c, var(--line)); }
+  .wf-panel.need { border-top-color:var(--bad); background:linear-gradient(var(--bad-soft), var(--panel) 120px); }
+  .askbox { margin-top:8px; display:flex; flex-direction:column; gap:8px; background:var(--panel2); border:1px solid var(--bad); border-radius:12px; padding:12px; }
+  .askbox .q { font-weight:700; white-space:pre-wrap; }
+  .askbox textarea { min-height:60px; }
+  .att { font-size:13px; font-weight:700; padding:6px 10px; border-radius:10px; background:var(--panel2); }
+  .att.bad { background:var(--bad-soft); color:var(--bad); } .att.ok { background:var(--ok-soft); color:var(--ok); }
+  .att.on { background:var(--work-soft); color:var(--work); } .att.pz { background:var(--pause-soft); color:var(--pause); }
+  details.tech { margin-top:4px; font-size:12px; } details.tech summary { cursor:pointer; color:var(--muted); }
+  details.tech pre { white-space:pre-wrap; word-break:break-word; max-height:220px; overflow:auto; background:var(--panel2); border-radius:8px; padding:8px; margin:4px 0 0; font:11.5px/1.5 Consolas,monospace; }
+  .sys-wrap { align-self:center; max-width:90%; display:flex; flex-direction:column; align-items:center; }
   .err { color:var(--bad); font-weight:600; }
   .now { background:var(--panel2); border-radius:10px; padding:8px 12px; font-size:13px; }
   .now b { color:var(--muted); font-size:12px; }
@@ -137,7 +154,7 @@
   .tbar i { display:block; height:100%; background:var(--muted); opacity:.45; }
   .lim-f { display:flex; align-items:center; gap:8px; font-size:11.5px; color:var(--muted); }
 
-  .board { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
+  .board { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; }
   @media (max-width:1100px) { .board { grid-template-columns:repeat(2,minmax(0,1fr)); } }
   .lane { background:var(--panel2); border-radius:12px; padding:10px; min-height:110px; }
   .lane-h { display:flex; align-items:center; gap:6px; font-size:12px; font-weight:700; color:var(--muted); margin-bottom:8px; }
@@ -238,13 +255,11 @@
       <button class="btn danger" id="stop">Stop</button>
       <button class="btn small ghost" id="closeWs" title="關閉這個分頁（暫停中的工作仍在歷史紀錄）">關閉分頁</button>
     </section>
+    <section class="panel wf-panel" id="nowPanel"></section>
     <section class="kpis" id="kpis"></section>
 
     <h2 class="zone">交辦工作</h2>
     <section class="panel office" id="office"></section>
-
-    <h2 class="zone">現在做到哪裡</h2>
-    <section class="panel" id="nowPanel"></section>
 
     <h2 class="zone">AI 員工</h2>
     <section class="seats" id="seats"></section>
@@ -280,7 +295,9 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
 const LOOK = { claude: { c:'#d97757', ab:'CC' }, codex: { c:'#10a37f', ab:'CX' }, antigravity: { c:'#4285f4', ab:'AG' } };
 const look = (id) => LOOK[id] || { c:'#8d8678', ab:String(id).slice(0, 2).toUpperCase() };
-const LANES = [['WAITING','等待中'], ['WORKING','進行中'], ['DONE','完成'], ['FAILED','失敗 / 停止']];
+// Board lanes; a lane can hold several card states.
+const LANES = [[['WAITING','PAUSED','INTERRUPTED'],'待做'], [['WORKING'],'工作中'], [['WAITING_EXTERNAL','WAITING_AGENT','NEEDS_USER'],'在等'], [['DONE'],'已完成'], [['FAILED'],'失敗 / 停止']];
+const PARKED = ['WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'];
 const STATUS = { done:'完成', failed:'有失敗', stopped:'已停止', paused:'暫停中', running:'進行中', interrupted:'中斷（可繼續）' };
 let S = null, last = '', histKey = '', histOpenId = null, histOpenProject = '', shownView = null;
 const drafts = {}; // unsent request text per project
@@ -297,7 +314,7 @@ window.addEventListener('hashchange', () => S && render());
 function wsStatus(w) {
   const r = w.run;
   if (!r) return ['', '待命', ''];
-  if (r.active) return ['work', { planning:'規劃中', summarizing:'總結中' }[r.phase] || '工作中', 'on'];
+  if (r.active) return ['work', { planning:'規劃中', summarizing:'工頭確認中' }[r.phase] || (w.tasks.some((t) => t.status === 'WORKING') ? '工作中' : '等待中'), 'on'];
   if (r.paused) return ['pz', '已暫停', 'pz'];
   if (r.stopped) return ['', '已停止', ''];
   return w.tasks.length && w.tasks.every((t) => t.status === 'DONE') ? ['ok', '已完成', 'ok'] : ['bad', '有失敗', 'bad'];
@@ -364,6 +381,9 @@ function limitsHtml(a) {
 function duty(a, w) {
   const r = w.run, t = (st) => w.tasks.filter((x) => x.status === st && x.agent === a.id);
   if (t('WORKING').length) return { kind:'work', text:t('WORKING')[0].title };
+  if (r?.active && t('NEEDS_USER').length) return { kind:'bad', text:'需要 Nana：' + t('NEEDS_USER')[0].title };
+  if (r?.active && t('WAITING_EXTERNAL').length) return { kind:'wait', text:'等待外部結果：' + t('WAITING_EXTERNAL')[0].title };
+  if (r?.active && t('WAITING_AGENT').length) return { kind:'wait', text:'等待其他 AI：' + t('WAITING_AGENT')[0].title };
   if (w.leader === a.id && r?.active) return { kind:'work', text:{ planning:'工頭：規劃與派工中', summarizing:'工頭：整理總結中' }[r.phase] || '工頭：監督進度中' };
   if (r?.paused && (t('PAUSED').length || w.leader === a.id)) return { kind:'pz', text:'已暫停' + (t('PAUSED')[0] ? '：' + t('PAUSED')[0].title : '') };
   if (r?.active && t('WAITING').length) return { kind:'wait', text:`排隊中 ${t('WAITING').length} 張` };
@@ -376,6 +396,7 @@ function statusHtml(a, w) {
   if (a.status === 'unavailable') return '<span class="dot bad"></span>無法使用';
   if (w) {
     const d = duty(a, w);
+    if (d.kind === 'bad' || d.kind === 'wait') return `<span class="dot ${d.kind === 'bad' ? 'bad' : 'pz'}"></span>${esc(d.text)}`;
     if (d.kind === 'work' || d.kind === 'pz') return `<span class="dot ${d.kind}"></span>${d.kind === 'work' && !d.text.startsWith('工頭') ? '工作中：' : ''}${esc(d.text)}`;
     return '<span class="dot"></span>待命';
   }
@@ -419,12 +440,14 @@ function boardHtml(tasks, agents, editable) {
   if (!tasks.length) return '<div class="empty">還沒有工作卡。在上面說你要什麼、按「交給團隊」，工頭會拆成工作卡派給成員。</div>';
   const avail = agents.filter((a) => a.status === 'available');
   return `<div class="board">${LANES.map(([st, label]) => {
-    const list = tasks.filter((t) => t.status === st || (st === 'WAITING' && t.status === 'PAUSED'));
+    const list = tasks.filter((t) => st.includes(t.status));
     return `<div class="lane"><div class="lane-h">${label}<span class="n">${list.length}</span></div>${list.map((t) => `
       <div class="card" style="--c:${look(t.agent).c}">
-        <div class="t">${esc(t.title)} ${t.status === 'PAUSED' ? '<span class="tag pz">已暫停</span>' : ''}</div>
+        <div class="t">${esc(t.title)} ${t.status === 'PAUSED' || t.status === 'INTERRUPTED' || PARKED.includes(t.status) ? `<span class="tag ${t.status === 'NEEDS_USER' ? 'bad' : 'pz'}">${STEP_WORD[t.status]}</span>` : ''}</div>
         <span class="who"><i></i>${esc(agents.find((a) => a.id === t.agent)?.name || t.agent)}</span>
         ${t.result && t.status !== 'PAUSED' ? `<div class="res">${esc(t.result)}</div>` : ''}
+        ${PARKED.includes(t.status) ? `<div class="res"><b>${esc(waitLine(t))}</b></div>` : ''}
+        ${t.detail ? `<details class="tech"><summary>查看技術細節</summary><pre>${esc(t.detail)}</pre></details>` : ''}
         ${editable && st !== 'WORKING' && st !== 'DONE' ? `<div class="re"><select data-task="${t.id}">${avail.map((a) => `<option value="${a.id}" ${a.id === t.agent ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><button class="btn small" data-reassign="${t.id}">改派</button></div>` : ''}
       </div>`).join('')}</div>`;
   }).join('')}</div>`;
@@ -432,19 +455,50 @@ function boardHtml(tasks, agents, editable) {
 
 function chatHtml(activity) {
   if (!activity.length) return '<div class="empty">尚無對話。</div>';
+  const tech = (m) => (m.detail ? `<details class="tech"><summary>查看技術細節</summary><pre>${esc(m.detail)}</pre></details>` : '');
   return activity.map((m) => {
-    if (m.role === 'system') return `<div class="sys">${esc(m.time)} · ${esc(m.text)}</div>`;
+    if (m.role === 'system') return `<div class="sys-wrap"><div class="sys">${esc(m.time)} · ${esc(m.text)}</div>${tech(m)}</div>`;
     if (m.role === 'user') return `<div class="msg me"><div class="bubble"><div class="hd"><b>你</b> · ${esc(m.time)}</div>${esc(m.text)}</div></div>`;
     const l = look(m.who);
-    return `<div class="msg" style="--c:${l.c}"><div class="av">${l.ab}</div><div class="bubble"><div class="hd"><b>${esc(name(m.who))}</b> · ${m.role === 'leader' ? '工頭' : '成員'} · ${esc(m.time)}</div>${esc(m.text)}</div></div>`;
+    return `<div class="msg" style="--c:${l.c}"><div class="av">${l.ab}</div><div class="bubble"><div class="hd"><b>${esc(name(m.who))}</b> · ${m.role === 'leader' ? '工頭' : '成員'} · ${esc(m.time)}</div>${esc(m.text)}${tech(m)}</div></div>`;
   }).join('');
 }
 
 // Re-render only when the markup changed, so open drop-downs keep their scroll position.
 const setHtml = (el, html) => { if (el._html !== html) { el._html = html; el.innerHTML = html; } };
-let doneOpen = false; // 這次完成的工作卡 drop-down
-const ICON = { DONE:'✅', WORKING:'⏳', WAITING:'🕒', PAUSED:'⏸️', FAILED:'❌' };
-const STEP_WORD = { DONE:'完成', WORKING:'進行中', WAITING:'排隊中', PAUSED:'已暫停', FAILED:'失敗／停止' };
+let doneOpen = false;
+let histCount = 0; // saved jobs of the open project (for 接著上次的工作) // 這次完成的工作卡 drop-down
+const ICON = { DONE:'✅', WORKING:'⏳', WAITING:'🕒', PAUSED:'⏸️', INTERRUPTED:'⏸️', FAILED:'❌', WAITING_EXTERNAL:'🟡', WAITING_AGENT:'🤝', NEEDS_USER:'🔴' };
+const STEP_WORD = { DONE:'已完成', WORKING:'工作中', WAITING:'待做', PAUSED:'已暫停', INTERRUPTED:'已中斷', FAILED:'失敗', WAITING_EXTERNAL:'等待外部結果', WAITING_AGENT:'等待其他 AI', NEEDS_USER:'需要 Nana' };
+const prShort = (pr) => (/^\d+$/.test(String(pr)) ? '#' + pr : '#' + String(pr).split('/').pop());
+
+// One honest line about what a parked card waits for and what happens next.
+function waitLine(t) {
+  const wt = t.wait || {};
+  if (t.status === 'NEEDS_USER') return `需要 Nana：${t.ask?.question || ''}`;
+  if (t.status === 'WAITING_AGENT') return `在等 ${name(wt.agent)}：${wt.what || ''}（它做完會自動交回 ${name(t.agent)}）`;
+  if (wt.pr && !wt.manual) return `在等 GitHub CI（PR ${prShort(wt.pr)}）：${wt.ci || '檢查中'}（Studio 每分鐘檢查，跑完自動交回 ${name(t.agent)}）`;
+  return `在等「${wt.what || '外部結果'}」：Studio 無法自動確認${wt.error ? '（' + wt.error + '）' : ''}，好了請按「繼續」`;
+}
+
+// "你現在需要做什麼" for one project: { ic, cls, text, need }.
+function attention(w) {
+  const r = w.run, ts = w.tasks;
+  if (!r) return { ic:'⚪', cls:'', text:'待命：還沒有交辦工作' };
+  const askCard = ts.find((t) => t.status === 'NEEDS_USER');
+  if (r.active && (askCard || (r.ask && !r.summarizing))) return { ic:'🔴', cls:'bad', need:true, text:'需要 Nana：' + (askCard ? askCard.ask?.question : r.ask.question) };
+  const manual = ts.find((t) => t.status === 'WAITING_EXTERNAL' && t.wait?.manual);
+  if (r.active && manual) return { ic:'🟠', cls:'bad', need:true, text:`需要你按「繼續」：${name(manual.agent)} 在等「${manual.wait.what}」，Studio 無法自動確認` };
+  if (r.paused) return { ic:'🔵', cls:'pz', text:ts.some((t) => t.status === 'INTERRUPTED') ? '已中斷：按「繼續」從中斷的地方接著做' : '已暫停：按「繼續」接著做' };
+  if (r.active) {
+    if (r.phase === 'planning' || r.summarizing || ts.some((t) => t.status === 'WORKING')) return { ic:'🟢', cls:'ok', text:'不需要操作，團隊正在工作' };
+    const waits = ts.filter((t) => PARKED.includes(t.status)).map((t) => (t.status === 'WAITING_AGENT' ? name(t.wait?.agent) : t.wait?.pr ? 'CI' : t.wait?.what || '外部結果'));
+    return { ic:'🟡', cls:'on', text:`不需要操作，正在等待 ${[...new Set(waits)].join('、') || '下一步'}` };
+  }
+  if (r.stopped) return { ic:'⏹️', cls:'', text:'已停止' };
+  if (r.result === 'done') return { ic:'✅', cls:'ok', text:'已完成' };
+  return { ic:'❌', cls:'bad', need:true, text:'這次沒有完成：看一下結果，或按「↻ 接著上次的工作」' };
+}
 
 // KPI "這次完成的工作卡" that opens a list of every card with its full result.
 function doneDropHtml(w) {
@@ -478,33 +532,67 @@ function officeHtml(w) {
     <div class="ask">今天想讓「${esc(w.name)}」做什麼？</div>
     <textarea id="request" placeholder="例如：幫我把「匯出 PDF」功能做好，做完告訴我怎麼試用。\n或：首頁載入太慢，幫我找出原因並修好。">${esc(drafts[w.project] || '')}</textarea>
     <div class="row"><span class="hint">${running ? '團隊正在做上一件事，做完才能交下一件（可以先打好）。' : 'Ctrl + Enter 也可以送出'}</span><span class="err" id="err"></span><span class="spacer"></span>
-      <button class="btn primary" id="start" ${running ? 'disabled' : ''}>▶ 交給團隊</button></div>`;
+      ${!running && (r || histCount) ? `<button class="btn" id="continueJob" title="工頭會拿到上次的進度摘要（需求、完成的卡、PR、在等什麼），從那裡接著做；不用重講">↻ 接著上次的工作</button>` : ''}
+      <button class="btn primary" id="start" ${running ? 'disabled' : ''} title="交辦一件新的工作">▶ 交給團隊</button></div>`;
 }
 
-// "Where are we now": request → 工頭 plans → each card → 工頭 summary, with a one-line headline.
-function nowHtml(w) {
-  const r = w.run;
-  if (!r) return '<div class="empty">還沒有交辦工作。在上面說你要什麼，按「交給團隊」就開始。</div>';
-  const ts = w.tasks, done = ts.filter((t) => t.status === 'DONE').length, working = ts.filter((t) => t.status === 'WORKING');
-  const leadName = name(r.leader);
-  const report = r.phase === 'finished' ? [...w.activity].reverse().find((m) => m.role === 'leader')?.text : '';
-  const headline = r.active
-    ? r.phase === 'planning' ? `工頭 ${leadName} 正在看需求、拆工作…`
-      : r.phase === 'summarizing' ? `成員都做完了，工頭 ${leadName} 正在寫總結…`
-      : `成員工作中：完成 ${done}/${ts.length} 張${working.length ? '，' + working.map((t) => `${name(t.agent)} 正在做「${t.title}」`).join('；') : ''}`
-    : r.paused ? `已暫停：完成 ${done}/${ts.length} 張，按「繼續」接著做`
-    : r.stopped ? `已停止：完成 ${done}/${ts.length} 張`
-    : ts.length && ts.every((t) => t.status === 'DONE') ? `全部完成（${done}/${ts.length} 張）` : `已結束，有 ${ts.filter((t) => t.status === 'FAILED').length} 張沒完成`;
+// 現在發生什麼: status, progress, what we wait for, what happens next, and what the user must do (if anything).
+function nowHtml(w, att) {
+  const r = w.run, ts = w.tasks;
+  if (!r) return `<div class="wf-head"><span class="big">⚪</span><div><div class="st-line">待命</div><div class="sub" style="margin:0">在下面說你要什麼，按「交給團隊」就開始${histCount ? '；或按「↻ 接著上次的工作」接著上次做' : ''}。</div></div></div>`;
+  const done = ts.filter((t) => t.status === 'DONE');
+  const lastDone = done.at(-1);
+  const pr = ts.map((t) => String(t.result).match(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+|\bPR\s*#\d+/i)?.[0] || (t.wait?.pr ? 'PR ' + prShort(t.wait.pr) : '')).filter(Boolean).at(-1);
+  const progress = r.phase === 'planning' ? `工頭 ${name(r.leader)} 正在看需求、拆工作`
+    : !ts.length ? '工頭這次沒有建立工作卡（詳細原因在下面的完整對話紀錄）'
+    : `完成 ${done.length}/${ts.length} 張工作卡${lastDone ? `，最近完成「${lastDone.title}」` : ''}${pr ? `\n已知交付：${/^PR/i.test(pr) ? pr : 'PR ' + prShort(pr)}` : ''}`;
+  const byId = (id) => ts.find((x) => x.id === id);
+  const blocked = ts.filter((t) => t.status === 'WAITING' && (t.after || []).some((id) => byId(id)?.status !== 'DONE'));
+  const waits = [...ts.filter((t) => PARKED.includes(t.status)).map((t) => '• ' + waitLine(t)),
+    ...blocked.map((t) => `• 「${t.title}」等「${(t.after || []).map((id) => byId(id)?.title).filter(Boolean).join('」「')}」完成`)];
+  if (r.ask && !r.summarizing) waits.unshift('• Nana 的決定：' + r.ask.question);
+  const working = ts.filter((t) => t.status === 'WORKING');
+  const ready = ts.find((t) => t.status === 'WAITING' && !blocked.includes(t));
+  const next = r.paused ? '按「繼續」後，從停下的地方接著做'
+    : !r.active ? (r.result === 'done' ? '沒有了，這次的工作完成了' : '可以按「↻ 接著上次的工作」，工頭會從這裡接著做')
+    : r.phase === 'planning' ? '工頭拆完工作後，成員會自動開始'
+    : r.ask && !r.summarizing ? '你回覆後，工頭會接著安排'
+    : r.summarizing ? '工頭確認整體是否完成；還沒完成會自己追加工作卡'
+    : [...working.map((t) => `${name(t.agent)} 做完「${t.title}」${ready ? ` → ${name(ready.agent)} 接著做「${ready.title}」` : ''}`),
+      ...ts.filter((t) => PARKED.includes(t.status) && t.status !== 'NEEDS_USER' && !(t.status === 'WAITING_EXTERNAL' && t.wait?.manual))
+        .map((t) => `${t.status === 'WAITING_AGENT' ? name(t.wait?.agent) + ' 做完' : 'CI 跑完'} → ${name(t.agent)} 自動繼續「${t.title}」`)].join('\n')
+      || '全部工作卡結束後，工頭會確認整體是否完成';
+  const askCard = r.active && ts.find((t) => t.status === 'NEEDS_USER');
+  const leadAsk = r.active && !askCard && r.ask && !r.summarizing ? r.ask : null;
+  const ask = askCard ? { q: askCard.ask?.question, opts: askCard.ask?.options || [], id: askCard.id, who: name(askCard.agent) } : leadAsk ? { q: leadAsk.question, opts: leadAsk.options || [], id: '', who: '工頭 ' + name(r.leader) } : null;
+  const manual = r.active ? ts.filter((t) => t.status === 'WAITING_EXTERNAL' && t.wait?.manual) : [];
+  let you = '☕ 不需要操作';
+  if (ask) you = `<div class="askbox"><div class="q">${esc(ask.who)} 問你：${esc(ask.q)}</div>
+      ${ask.opts.length ? `<div class="row">${ask.opts.map((o) => `<button class="btn" data-answer="${esc(o)}" data-for="${ask.id}">${esc(o)}</button>`).join('')}</div>` : ''}
+      <textarea id="answerText" placeholder="${ask.opts.length ? '或直接打字回覆…' : '在這裡回覆…'}"></textarea>
+      <div class="row"><span class="spacer"></span><button class="btn primary" data-answer-send data-for="${ask.id}">送出回覆</button></div></div>`;
+  else if (manual.length) you = manual.map((t) => `<div class="row" style="margin-bottom:6px">「${esc(t.wait.what)}」好了嗎？<button class="btn small pz" data-continue-card="${t.id}">好了，繼續</button></div>`).join('');
+  else if (r.paused) you = '<button class="btn pz small" data-resume-job>▶ 繼續</button>';
+  else if (!r.active && r.result !== 'done' && !r.stopped) you = '看一下下面的結果，或按「↻ 接著上次的工作」';
+  else if (!r.active) you = '☕ 不需要操作';
   const step = (ic, title, desc, cur) => `<div class="step ${cur ? 'cur' : ''}"><div class="ic">${ic}</div><div><div class="st">${title}</div>${desc ? `<div class="sd">${esc(desc)}</div>` : ''}</div></div>`;
   const firstLine = String(r.request).split('\n').find((x) => x.trim()) || '';
   const planned = ts.length > 0;
-  return `<div class="now-line">${esc(headline)}</div><div class="steps">
-    ${step('📝', '你交辦了工作', firstLine.slice(0, 140))}
-    ${step(planned ? '✅' : r.active ? '⏳' : '🕒', planned ? `工頭 ${esc(leadName)} 拆成 ${ts.length} 張工作卡` : `工頭 ${esc(leadName)} 拆工作中`, '', !planned && r.active)}
-    ${ts.map((t) => step(ICON[t.status] || '•', `${esc(t.title)} · ${esc(name(t.agent))} · ${STEP_WORD[t.status] || t.status}`,
-      t.status === 'WORKING' ? '正在做…' : t.status === 'WAITING' ? '等成員有空就開始' : t.result, t.status === 'WORKING')).join('')}
-    ${planned ? step(report ? '✅' : r.phase === 'summarizing' ? '⏳' : '🕒', '工頭總結', report || '', r.phase === 'summarizing') : ''}
-  </div>`;
+  const report = r.phase === 'finished' ? [...w.activity].reverse().find((m) => m.role === 'leader')?.text : '';
+  return `<div class="wf-head"><span class="big">${att.ic}</span><div><div class="st-line">${esc(w.name)}</div><div class="att ${att.cls}" style="display:inline-block;margin-top:4px">${esc(att.text)}</div></div></div>
+    <dl class="wf">
+      <dt>目前進度</dt><dd>${esc(progress)}</dd>
+      <dt>正在等待</dt><dd>${waits.length ? esc(waits.join('\n')) : '—'}</dd>
+      <dt>接下來</dt><dd>${esc(next)}</dd>
+      <dt>你現在</dt><dd>${you}</dd>
+    </dl>
+    <details class="rules" ${r.active || r.paused ? 'open' : ''}><summary>每張工作卡的進度 ▾</summary><div class="steps" style="margin-top:6px">
+      ${step('📝', r.continues ? '你要團隊接著上次的工作' : '你交辦了工作', firstLine.slice(0, 140))}
+      ${step(planned ? '✅' : r.active ? '⏳' : '🕒', planned ? `工頭 ${esc(name(r.leader))} 拆成 ${ts.length} 張工作卡` : `工頭 ${esc(name(r.leader))} 拆工作中`, '', !planned && r.active)}
+      ${ts.map((t) => step(ICON[t.status] || '•', `${esc(t.title)} · ${esc(name(t.agent))} · ${STEP_WORD[t.status] || t.status}`,
+        PARKED.includes(t.status) ? waitLine(t) : t.status === 'WORKING' ? '正在做…' : t.status === 'WAITING' ? (blocked.includes(t) ? '等前一張卡完成' : '等成員有空就開始') : t.result, t.status === 'WORKING')).join('')}
+      ${planned ? step(report ? '✅' : r.summarizing ? '⏳' : '🕒', '工頭確認整體完成', report || '', r.summarizing) : ''}
+    </div></details>`;
 }
 
 const kpi = (v, l) => `<div class="kpi"><div class="v">${v}</div><div class="l">${l}</div></div>`;
@@ -518,6 +606,7 @@ function projCardHtml(w) {
     <div class="pc-top"><span class="nm">${esc(w.name)}</span><span class="pill ${pill}">${label}</span>
       ${r?.active || r?.paused ? `<button class="btn small ${r.paused ? 'pz' : ''}" data-pz="${esc(w.project)}">${r.paused ? '繼續' : '暫停'}</button>` : ''}</div>
     <div class="sub" style="margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(w.project)}">${esc(w.project)}</div>
+    <div class="att ${attention(w).cls}">${attention(w).ic} ${esc(attention(w).text)}</div>
     <div class="pc-req">${r ? esc(r.request) : '<span class="empty">還沒有工作，點進來交給團隊。</span>'}</div>
     ${total ? `<div class="sbar">${seg(done, 'ok')}${seg(working, 'work')}${seg(failed, 'bad')}</div>
       <div class="lim-f">完成 ${done}/${total}${working ? ` · 進行中 ${working}` : ''}${failed ? ` · 失敗 ${failed}` : ''}</div>` : ''}
@@ -539,8 +628,8 @@ function matrixHtml() {
 
 function renderTabs(w) {
   $('tabs').innerHTML = `<a class="tab ${w ? '' : 'on'}" href="#">總覽</a>` + S.workspaces.map((x) => {
-    const [k, label] = wsStatus(x), n = x.tasks.filter((t) => t.status === 'WORKING').length;
-    return `<a class="tab ${x === w ? 'on' : ''}" href="#p=${encodeURIComponent(x.project)}" title="${esc(x.project)} · ${label}">${dotOf(k)}<span class="nm">${esc(x.name)}</span>${n ? `<span class="n">${n}</span>` : ''}</a>`;
+    const [k] = wsStatus(x), att = attention(x), n = x.tasks.filter((t) => t.status === 'WORKING').length;
+    return `<a class="tab ${x === w ? 'on' : ''}" href="#p=${encodeURIComponent(x.project)}" title="${esc(x.project)} · ${esc(att.text)}">${dotOf(att.need ? 'bad' : k)}<span class="nm">${esc(x.name)}</span>${n ? `<span class="n">${n}</span>` : ''}</a>`;
   }).join('') + '<button class="tab add" id="tabAdd" title="開啟另一個專案（瀏覽資料夾）">＋</button>';
 }
 
@@ -556,6 +645,7 @@ function renderOverview() {
 }
 
 function renderProject(w, force) {
+  if (force) histCount = 0;
   const r = w.run, running = !!r?.active, paused = !!r?.paused;
   $('pvHead').style.setProperty('--c', look(w.leader).c);
   $('pvName').textContent = w.name;
@@ -578,7 +668,7 @@ function renderProject(w, force) {
     $('office').style.setProperty('--c', look(w.leader).c);
     setHtml($('office'), officeHtml(w));
   }
-  setHtml($('nowPanel'), nowHtml(w));
+  if (force || !$('nowPanel').contains(document.activeElement)) { const att = attention(w); $('nowPanel').classList.toggle('need', !!att.need); setHtml($('nowPanel'), nowHtml(w, att)); }
   // The 工頭 card comes first so its model, limits and settings stay one click away.
   if (force || !$('seats').contains(document.activeElement)) setHtml($('seats'), [w.leader, ...S.agents.map((a) => a.id).filter((id) => id !== w.leader)].map((id) => seatHtml(S.agents.find((a) => a.id === id), w)).join(''));
   if (force || !$('board').contains(document.activeElement)) $('board').innerHTML = boardHtml(w.tasks, S.agents, true);
@@ -617,6 +707,7 @@ function render() {
 // On a project page the list shows only that project's runs.
 async function loadHistory(view) {
   const list = (await (await fetch('/api/history')).json()).filter((h) => !view || sameP(h.project, view));
+  if (view && histCount !== list.length) { histCount = list.length; if ($('office')) $('office')._html = ''; render(); }
   $('histHead').textContent = view ? `歷史紀錄 · ${W()?.name || base(view)}` : '歷史紀錄（全部專案）';
   $('history').innerHTML = list.length ? list.map((h) => `
     <button class="hitem" data-hist="${h.id}">
@@ -736,6 +827,17 @@ document.addEventListener('click', (e) => {
   const b = e.target.closest('button');
   if (!b) return;
   if (b.id === 'tabAdd') return browse();
+  if (b.id === 'continueJob') {
+    const p = ws();
+    if (W()?.run?.paused) return post('/api/resume', { ws: p }).catch(() => {});
+    return post('/api/start', { ws: p, request: $('request').value.trim() || '繼續上次的工作', continue: true }).then(() => { drafts[p] = ''; }).catch(() => {});
+  }
+  if (b.hasAttribute('data-resume-job')) return post('/api/resume', { ws: ws() }).catch(() => {});
+  if (b.dataset.continueCard) return post('/api/continue-card', { ws: ws(), taskId: b.dataset.continueCard }).catch(() => {});
+  if (b.dataset.answer !== undefined || b.hasAttribute('data-answer-send')) {
+    const text = b.dataset.answer ?? $('answerText')?.value ?? '';
+    return post('/api/answer', { ws: ws(), taskId: b.dataset.for || '', text }).catch(() => {});
+  }
   if (b.id === 'start') {
     const p = ws();
     return post('/api/start', { ws: p, request: $('request').value }).then(() => { drafts[p] = ''; $('request').value = ''; b.blur(); }).catch(() => {});

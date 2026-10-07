@@ -77,7 +77,7 @@ function saveRun(w, status) {
   if (!run) return;
   fs.mkdirSync(HISTORY, { recursive: true });
   // phase + convs let a paused run continue in the same agent conversations after a Studio restart.
-  const rec = { id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, convs: run.convs, tasks: w.tasks, activity: w.activity };
+  const rec = { id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, convs: run.convs, tasks: w.tasks, activity: w.activity };
   fs.writeFileSync(path.join(HISTORY, run.id + '.json'), JSON.stringify(rec, null, 2));
   S.historyRev++;
 }
@@ -121,8 +121,9 @@ function readHistory(id) {
 
 // Every event of a working run is also saved (status "running"), so closing the Studio mid-job loses nothing:
 // after a restart the job shows as interrupted and can be continued like a paused one.
-function log(w, who, role, text) {
-  w?.activity.push({ time: new Date().toLocaleTimeString('zh-TW', { hour12: false }), who, role, text: String(text) });
+// detail = technical text (raw replies, parser errors); the page shows it only behind 查看技術細節.
+function log(w, who, role, text, detail) {
+  w?.activity.push({ time: new Date().toLocaleTimeString('zh-TW', { hour12: false }), who, role, text: String(text), ...(detail ? { detail: String(detail).slice(0, 4000) } : {}) });
   if (w?.run?.active) saveRun(w, 'running');
 }
 
@@ -304,6 +305,29 @@ function handoffNote(run) {
   return run.handoffFrom ? `\nYou are taking over as LEADER from ${AGENTS[run.handoffFrom].name}. Continue the same job; do not ask the user to repeat the request.\n` : '';
 }
 
+const SUBTASK_RULES = `- Each subtask goes to exactly one worker id from the list above.
+- Workers run in parallel, one task at a time each. Spread independent parts across different workers.
+- Use "after" (0-based indexes of EARLIER subtasks in this list) when a subtask needs their results first, e.g. a review after the implementation, a fix after the review, a merge after the fix. Independent subtasks have no "after".
+- When the request needs it, include review, verification and delivery (PR / merge) steps as their own subtasks.
+- Never let two subtasks edit the same file at the same time. A trivial request may stay a single subtask.
+- "instructions" must be complete and self-contained; the worker only sees that text, the results of its "after" subtasks, and the project folder.`;
+
+// The project's work memory inside a Leader prompt.
+function memoryNote(run) {
+  if (!run.context) return '';
+  return `\n${run.continues
+    ? 'This is a CONTINUATION of the earlier job below. Start where it stopped: do not redo DONE cards, do not open a duplicate PR, pick up the waiting and unfinished items.'
+    : 'Earlier Studio work in this project folder (background; reuse it, do not redo it):'}
+"""
+${run.context}
+"""
+`;
+}
+
+const FIX_JSON = 'Your last reply was not the JSON object Studio needs. Reply again with ONLY that JSON object: no markdown fences, no other text.';
+
+const SUBTASK_SHAPE = `{"title":"<short title>","agent":"<worker id>","instructions":"<full instructions>","after":[<indexes>]}`;
+
 function planPrompt(run, workers) {
   return `You are the LEADER (foreman) of a small AI team in "Multi-Agent Studio".
 Project folder: ${run.project}
@@ -313,25 +337,80 @@ User request:
 """
 ${run.request}
 """
-
+${memoryNote(run)}
 Rules:
 - Do NOT do the work yourself. Do NOT create or modify any files. Only plan and delegate.
-- Split the request into 1 to 4 small subtasks. Each subtask goes to exactly one worker id from the list above.
-- Workers run in parallel, one task at a time each. When the request has independent parts, spread them across different workers so they work at the same time.
-- Never let two subtasks edit the same file. A trivial request may stay a single subtask.
-- "instructions" must be complete and self-contained; the worker only sees that text and works in the project folder.
+- Split the request into 1 to 6 small subtasks.
+- Never ask the user for facts that are in the work context, the project folder, or git / GitHub: make looking them up a subtask instead.
+${SUBTASK_RULES}
 
 Reply with ONLY one JSON object, no markdown fences, in exactly this shape:
-{"message":"<one short sentence to the user, in the user's language>","subtasks":[{"title":"<short title>","agent":"<worker id>","instructions":"<full instructions>"}]}`;
+{"message":"<one short sentence to the user, in the user's language; for a continuation say where the job stands and where you pick up>","subtasks":[${SUBTASK_SHAPE}]}`;
+}
+
+const parseJson = (reply) => JSON.parse(reply.slice(reply.indexOf('{'), reply.lastIndexOf('}') + 1));
+
+function parseSubtasks(list, workers) {
+  return (list || []).filter((x) => x && (x.instructions || x.title)).slice(0, 6).map((x, i) => {
+    const a = String(x.agent || '').toLowerCase();
+    const after = (Array.isArray(x.after) ? x.after : []).map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n < i);
+    return { title: String(x.title || x.instructions).slice(0, 120), instructions: String(x.instructions || x.title), agent: workers.find((w) => a.includes(w)) || workers[0], after };
+  });
 }
 
 function parsePlan(reply, workers) {
-  const p = JSON.parse(reply.slice(reply.indexOf('{'), reply.lastIndexOf('}') + 1));
-  const subtasks = (p.subtasks || []).filter((x) => x && (x.instructions || x.title)).slice(0, 5).map((x) => {
-    const a = String(x.agent || '').toLowerCase();
-    return { title: String(x.title || x.instructions).slice(0, 120), instructions: String(x.instructions || x.title), agent: workers.find((w) => a.includes(w)) || workers[0] };
+  const p = parseJson(reply);
+  return { message: String(p.message || ''), subtasks: parseSubtasks(p.subtasks, workers) };
+}
+
+// Adds planned subtasks as cards; "after" indexes become card ids.
+function addCards(w, subtasks, lead) {
+  const ids = subtasks.map(() => crypto.randomUUID().slice(0, 8));
+  subtasks.forEach((st, i) => {
+    w.tasks.push({ id: ids[i], title: st.title, instructions: st.instructions, agent: st.agent, after: st.after.map((n) => ids[n]), status: 'WAITING', result: '' });
+    log(w, lead, 'leader', `派工給 ${AGENTS[st.agent].name}：${st.title}${st.after.length ? `（等「${st.after.map((n) => subtasks[n].title).join('」「')}」完成後開始）` : ''}`);
   });
-  return { message: String(p.message || ''), subtasks };
+}
+
+// ---------- Card lifecycle ----------
+// A worker's turn ending is not the card being done. Every reply ends with one STATUS line:
+//   DONE | WAITING_EXTERNAL (CI, build...) | WAITING_AGENT (another worker) | NEEDS_USER (a real decision).
+// Waiting cards are parked; Studio wakes them (same conversation) when the result arrives.
+const STATUS_RULES = `At the very end of your reply add exactly one status line:
+STATUS: DONE   (the goal of this task is fully reached; nothing more to do for it)
+STATUS: WAITING_EXTERNAL: <what you wait for; include the PR URL if there is one>   (GitHub CI, a build, a deploy...)
+STATUS: WAITING_AGENT: <agent id>: <what you need from them>   (ids: ${Object.keys(AGENTS).join(', ')})
+STATUS: NEEDS_USER: <question to the user, in the user's language>   (only for a real decision: choose between options, a destructive action, a login)
+With NEEDS_USER and choices, add one more line: OPTIONS: <choice 1> | <choice 2>
+Never say DONE while you still wait for something. Do not wait or poll inside your turn: report the status and end the turn; Studio wakes you with the result.`;
+
+function parseStatus(reply) {
+  const m = [...reply.matchAll(/^\s*[*_`]*STATUS[*_`]*\s*[:：]\s*[*_`]*\s*(DONE|WAITING_EXTERNAL|WAITING_AGENT|NEEDS_USER)\b[*_`]*\s*[:：]?\s*(.*)$/gim)].at(-1);
+  if (!m) return null;
+  const options = (reply.match(/^\s*[*_`]*OPTIONS[*_`]*\s*[:：]\s*[*_`]*\s*(.+)$/im)?.[1] || '').split('|').map((x) => x.trim()).filter(Boolean).slice(0, 4);
+  const text = reply.replace(m[0], '').replace(/^\s*[*_`]*OPTIONS[*_`]*\s*[:：].*$/im, '').trim();
+  return { kind: m[1].toUpperCase(), detail: m[2].trim(), options, text };
+}
+
+const PARKED = ['WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'];
+const OPEN = ['WAITING', 'WORKING', 'PAUSED', 'INTERRUPTED', ...PARKED];
+const findPr = (s) => s.match(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/)?.[0] || s.match(/\bPR\s*#(\d+)/i)?.[1] || '';
+
+// A parked card goes back to the queue with a note; the worker continues in the same conversation.
+function wake(w, t, note) {
+  if (!PARKED.includes(t.status)) return;
+  Object.assign(t, { status: 'WAITING', wakeNote: note, wait: null, ask: null });
+  log(w, 'studio', 'system', `「${t.title}」等待的結果到了，交回 ${AGENTS[t.agent].name} 繼續。`);
+  pump(w);
+}
+
+// When a card ends (done or failed), cards waiting on that agent get its result.
+function wakeWaiters(w, done) {
+  for (const t of w.tasks) {
+    if (t !== done && t.status === 'WAITING_AGENT' && t.wait?.agent === done.agent) {
+      wake(w, t, `${AGENTS[done.agent].name} finished "${done.title}" (${done.status}). Their result:\n${done.result}`);
+    }
+  }
 }
 
 function finish(w, status) {
@@ -339,6 +418,8 @@ function finish(w, status) {
   run.active = false;
   run.paused = false;
   run.phase = 'finished';
+  run.result = status;
+  run.ask = null;
   saveRun(w, status);
   if (status === 'done' || status === 'failed') {
     const done = w.tasks.filter((t) => t.status === 'DONE').length;
@@ -349,7 +430,7 @@ function finish(w, status) {
       ? `${label(w)}：${workers.length === 1 ? AGENTS[workers[0]].name : '團隊'} 已完成 ${done}/${w.tasks.length} 工作`
       : `${label(w)}：${AGENTS[failed?.agent ?? run.leader].name} 需要你處理`;
     const body = status === 'done' ? String(run.request).slice(0, 100)
-      : failed ? `「${failed.title}」失敗：${failed.result}`.slice(0, 160) : 'Leader 沒有完成派工，打開專案查看原因';
+      : failed ? `「${failed.title}」失敗：${failed.result}`.slice(0, 160) : '工頭沒有完成派工，打開專案查看';
     notify(title, body, status, w.project);
   }
   refreshClaudeLimits();
@@ -424,7 +505,49 @@ function renameWorkspace(w, name) {
   saveSettings();
 }
 
-async function start(w, request) {
+// ---------- Work memory ----------
+// Each project keeps a short, structured summary of its latest job (from the board, not the full chat).
+// A new job gets it as background; a continuation and a new Leader get it as the starting point.
+const clip = (x, n) => { x = String(x ?? ''); return x.length > n ? x.slice(0, n) + '…' : x; };
+const REF_RE = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+|\bPR\s*#\d+|\bcommit\s+[0-9a-f]{7,40}\b|\bbranch\s+[`'"]?[\w./-]+/gi;
+
+// The latest job of this project: the live one, or the newest saved record.
+function latestJob(w) {
+  if (w.run) return { run: w.run, tasks: w.tasks, activity: w.activity };
+  const r = historyItems().find((x) => same(x.project, w.project));
+  return r && { run: { ...r, result: r.status }, tasks: r.tasks, activity: r.activity };
+}
+
+function knownRefs(job) {
+  const found = job.tasks.flatMap((t) => [...String(t.result).matchAll(REF_RE)].map((m) => m[0]).concat(t.wait?.pr ? [/^\d+$/.test(t.wait.pr) ? 'PR #' + t.wait.pr : String(t.wait.pr)] : []));
+  return [...new Set([...(job.run.refs || []), ...found])].slice(-12);
+}
+
+function workContext(job) {
+  if (!job?.run) return '';
+  const { run, tasks } = job;
+  const state = run.active ? 'in progress' : run.paused ? 'paused' : run.result || 'ended';
+  const report = run.phase === 'finished' ? [...(job.activity || [])].reverse().find((m) => m.role === 'leader')?.text : '';
+  const card = (t) => `- [${t.status}] ${t.title} (${AGENTS[t.agent]?.name || t.agent}): ${clip(t.result, 400)}`
+    + (t.wait ? ` | waiting for: ${t.wait.what}${t.wait.pr ? ` (PR ${t.wait.pr}${t.wait.ci ? ', ' + t.wait.ci : ''})` : ''}${t.wait.agent ? ` (from ${AGENTS[t.wait.agent]?.name})` : ''}` : '')
+    + (t.ask ? ` | question to the user: ${t.ask.question}` : '');
+  return [
+    `Overall goal: ${clip(run.goal || run.request, 1500)}`,
+    run.goal && run.goal !== run.request ? `Latest request: ${clip(run.request, 600)}` : '',
+    `State: ${state}. Leader was ${AGENTS[run.leader]?.name || run.leader}.`,
+    tasks.length ? 'Cards:\n' + tasks.map(card).join('\n') : 'Cards: none yet.',
+    `Known deliveries (PR / branch / commit): ${knownRefs(job).join(', ') || 'none recorded'}`,
+    run.ask ? `Open question to the user: ${run.ask.question}` : '',
+    report ? `Leader's last report: ${clip(report, 800)}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+const CONTINUE_RE = /^\s*(繼續|继续|接著|接着|接續|continue|resume|把剩下|剩下的)/i;
+
+async function start(w, request, cont = false) {
+  // "繼續…" / the 接著上次的工作 button continue the latest job instead of starting from zero.
+  cont = cont || CONTINUE_RE.test(request);
+  if (cont && w.run?.paused) return resume(w); // the paused job itself picks up where it stopped
   if (w.run?.active) throw new Error('這個專案的團隊正在工作中，請先等待、暫停或按 Stop');
   if (!isDir(w.project)) throw new Error('專案資料夾不存在：' + w.project);
   if (!request.trim()) throw new Error('請輸入需求');
@@ -432,13 +555,17 @@ async function start(w, request) {
   if (!available(lead)) throw new Error(`Leader ${AGENTS[lead].name} 目前不可用`);
   if (!workersFor(w, lead).length) throw new Error('這個專案至少需要一位可用的 Worker');
 
+  const prev = latestJob(w);
+  const continues = cont && !!prev;
+  const context = workContext(prev);
   // A paused run stays in history (status "paused") and can be continued from there later.
   w.tasks = [];
   w.activity = [];
   const now = new Date();
   const id = now.toISOString().slice(0, 19).replace(/[-:T]/g, '') + '-' + crypto.randomUUID().slice(0, 4);
-  w.run = { id, startedAt: now.toISOString(), project: w.project, leader: lead, request, convs: {}, phase: 'planning', leaderGen: 0, active: true, paused: false, stopped: false, summarizing: false };
+  w.run = { id, startedAt: now.toISOString(), project: w.project, leader: lead, request, convs: {}, phase: 'planning', leaderGen: 0, rounds: 0, ask: null, continues, context, goal: continues ? prev.run.goal || prev.run.request : request, refs: continues ? knownRefs(prev) : [], active: true, paused: false, stopped: false, summarizing: false };
   log(w, 'user', 'user', request);
+  if (continues) log(w, 'studio', 'system', '接續上次的工作：工頭會拿到目前的進度摘要，不用重講。', context);
   log(w, 'studio', 'system', `Leader：${AGENTS[lead].name}；Workers：${workersFor(w, lead).map((x) => AGENTS[x].name).join('、')}`);
   planPhase(w);
 }
@@ -450,86 +577,260 @@ async function planPhase(w) {
   try {
     const workers = workersFor(w, lead);
     if (!workers.length) throw new Error('至少需要一位可用的 Worker');
-    const reply = await turn(lead, await conv(w, lead, true), planPrompt(run, workers), { w, lead: true });
+    const cid = await conv(w, lead, true);
+    const tryPlan = (x) => { try { const p = parsePlan(x, workers); return p.subtasks.length ? p : null; } catch { return null; } };
+    let reply = await turn(lead, cid, planPrompt(run, workers), { w, lead: true });
     if (run.leaderGen !== gen) return; // a new Leader took over and plans again
-    let plan;
-    try { plan = parsePlan(reply, workers); } catch { throw new Error('Leader 回覆無法解析為工作清單：' + reply.slice(0, 500)); }
-    if (!plan.subtasks.length) throw new Error('Leader 沒有產生任何工作：' + reply.slice(0, 500));
-    log(w, lead, 'leader', plan.message || `已拆成 ${plan.subtasks.length} 項工作`);
-    for (const st of plan.subtasks) {
-      w.tasks.push({ id: crypto.randomUUID().slice(0, 8), ...st, status: 'WAITING', result: '' });
-      log(w, lead, 'leader', `派工給 ${AGENTS[st.agent].name}：${st.title}`);
+    let plan = tryPlan(reply);
+    if (!plan) {
+      log(w, 'studio', 'system', '工頭的工作清單格式不對，正在請它重新整理…', reply);
+      reply = await turn(lead, cid, FIX_JSON, { w, lead: true });
+      if (run.leaderGen !== gen) return;
+      plan = tryPlan(reply);
     }
+    if (!plan) throw Object.assign(new Error('工頭這次沒有成功建立工作清單。Studio 保留了目前進度，按「↻ 接著上次的工作」可以再試一次。'), { detail: reply });
+    log(w, lead, 'leader', plan.message || `已拆成 ${plan.subtasks.length} 項工作`);
+    addCards(w, plan.subtasks, lead);
     run.phase = 'working';
     pump(w);
   } catch (e) {
     if (run.leaderGen !== gen || e instanceof Halt) return; // pause: resume() plans again; stop: stop() already saved
-    log(w, 'studio', 'system', 'Leader 失敗：' + e.message);
+    log(w, 'studio', 'system', e.detail ? e.message : '工頭這次沒有完成派工。Studio 保留了目前進度，可以再試一次。', e.detail || e.message);
     finish(w, 'failed');
   }
 }
 
-// Start every WAITING task whose agent is free in this project; when all are finished, the Leader writes the report.
+// Start every WAITING card whose earlier cards are DONE and whose agent is free in this project.
+// When every card has ended, the Leader checks the whole request (and may add cards).
 // ponytail: an agent can work for two projects at once (separate conversations); add a global per-agent slot if plan limits suffer.
 function pump(w) {
   const run = w.run;
   if (!run?.active || run.paused || run.phase !== 'working') return;
+  const byId = (id) => w.tasks.find((x) => x.id === id);
   for (const t of w.tasks) {
-    if (t.status === 'WAITING' && !w.tasks.some((x) => x.status === 'WORKING' && x.agent === t.agent)) runTask(w, t);
+    if (t.status !== 'WAITING') continue;
+    const deps = (t.after || []).map(byId).filter(Boolean);
+    if (deps.some((d) => d.status === 'FAILED')) { Object.assign(t, { status: 'FAILED', result: '前一張工作卡失敗，這張沒有開始；交給工頭決定下一步。' }); continue; }
+    if (deps.some((d) => d.status !== 'DONE')) continue;
+    if (!w.tasks.some((x) => x.status === 'WORKING' && x.agent === t.agent)) runTask(w, t);
+  }
+  // Cards that only wait on each other would wait forever.
+  const onAgents = w.tasks.filter((t) => t.status === 'WAITING_AGENT');
+  if (onAgents.length && !w.tasks.some((t) => ['WORKING', 'WAITING', 'WAITING_EXTERNAL', 'NEEDS_USER'].includes(t.status))) {
+    for (const t of onAgents) wake(w, t, 'Everyone you could wait for is waiting too or has finished, so nothing more will arrive. Continue with what you have, or report NEEDS_USER.');
   }
   if (!run.summarizing && w.tasks.length && w.tasks.every((t) => t.status === 'DONE' || t.status === 'FAILED')) summarize(w);
 }
 
 async function runTask(w, t) {
   const run = w.run;
+  const note = t.wakeNote;
   t.status = 'WORKING';
-  log(w, t.agent, 'worker', (t.resumed ? '繼續工作：' : '開始工作：') + t.title);
+  t.wakeNote = '';
+  log(w, t.agent, 'worker', (note ? '收到等待的結果，繼續：' : t.resumed ? '繼續工作：' : '開始工作：') + t.title);
   try {
-    const prompt = `You are a WORKER in "Multi-Agent Studio". Your leader (${AGENTS[run.leader].name}) assigned you this task.
+    const deps = (t.after || []).map((id) => w.tasks.find((x) => x.id === id)).filter(Boolean);
+    const prompt = note ? `Update from Multi-Agent Studio for your task "${t.title}":
+${note}
+
+Continue the task. End your reply with a short summary (1-3 sentences).
+${STATUS_RULES}` : `You are a WORKER in "Multi-Agent Studio". Your leader (${AGENTS[run.leader].name}) assigned you this task.
 Work only inside the project folder: ${run.project}
 ${t.resumed ? '\nYou were interrupted while doing this task earlier. First check the current state of the project folder, then finish the task without redoing work that is already done.\n' : ''}
 Task: ${t.title}
 Instructions:
 ${t.instructions}
-
-When finished, reply with a short summary of what you did (1-3 sentences).`;
-    t.result = (await turn(t.agent, await conv(w, t.agent, false), prompt, { w })) || '(完成，沒有文字回覆)';
-    t.status = 'DONE';
-    t.doneAt = new Date().toISOString();
-    log(w, t.agent, 'worker', t.result);
+${deps.length ? `\nResults of the earlier cards this task builds on:\n${deps.map((d) => `- ${d.title} (${AGENTS[d.agent].name}): ${d.result}`).join('\n')}\n` : ''}
+When you end your turn, reply with a short summary of what you did (1-3 sentences).
+${STATUS_RULES}`;
+    const cid = await conv(w, t.agent, false);
+    const reply = await turn(t.agent, cid, prompt, { w });
+    let st = parseStatus(reply);
+    if (!st) { // ask once instead of guessing
+      const again = await turn(t.agent, cid, `Your last reply had no STATUS line. Reply with only the status line now.\n${STATUS_RULES}`, { w });
+      st = parseStatus(again);
+      if (st) st.text = reply.trim();
+    }
+    applyStatus(w, t, st || { kind: 'DONE', detail: '', options: [], text: reply.trim() + '\n（沒有回報狀態，先當作完成，由工頭確認整體結果）' }, reply);
   } catch (e) {
-    if (e instanceof Halt && run.paused) { t.status = 'PAUSED'; t.result = '已暫停'; t.resumed = true; return; }
+    if (e instanceof Halt && run.paused) { t.status = 'PAUSED'; t.result = '已暫停'; t.resumed = true; t.wakeNote = note; return; }
     t.status = 'FAILED';
-    t.result = e.message;
-    log(w, t.agent, 'worker', '失敗：' + e.message);
+    t.result = '這張卡執行時出錯，沒有完成。';
+    t.detail = e.message;
+    log(w, t.agent, 'worker', '這張卡執行時出錯，沒有完成：' + t.title, e.message);
+    wakeWaiters(w, t);
   }
   pump(w);
 }
 
-async function summarize(w) {
+function applyStatus(w, t, st, reply) {
+  const who = AGENTS[t.agent].name;
+  t.result = st.text || '(沒有文字回覆)';
+  log(w, t.agent, 'worker', t.result);
+  if (st.kind === 'DONE') {
+    t.status = 'DONE';
+    t.doneAt = new Date().toISOString();
+    return wakeWaiters(w, t);
+  }
+  if (st.kind === 'WAITING_EXTERNAL') {
+    const pr = findPr(st.detail + '\n' + reply);
+    t.status = 'WAITING_EXTERNAL';
+    t.wait = { what: st.detail || '外部結果', pr, manual: !pr };
+    if (pr) {
+      log(w, 'studio', 'system', `「${t.title}」在等 PR ${pr} 的 CI：Studio 每分鐘檢查一次，跑完會自動交回 ${who}。`);
+      checkExternal(w, t);
+    } else {
+      log(w, 'studio', 'system', `「${t.title}」在等「${t.wait.what}」：Studio 無法自動確認，結果好了請按「繼續」。`);
+      notify(`${label(w)}：需要你按「繼續」`, `${who} 在等「${t.wait.what}」，Studio 無法自動確認`, 'ask', w.project);
+    }
+    return;
+  }
+  if (st.kind === 'WAITING_AGENT') {
+    const a = Object.keys(AGENTS).find((id) => st.detail.toLowerCase().includes(id) || st.detail.includes(AGENTS[id].name));
+    t.status = 'WAITING_AGENT';
+    t.wait = { agent: a || '', what: st.detail.replace(/^[\w-]+\s*[:：]\s*/, '') || '另一位成員的結果' };
+    if (!a || a === t.agent) return wake(w, t, `Studio could not tell which other team member you wait for (ids: ${Object.keys(AGENTS).join(', ')}). Continue without waiting, or report NEEDS_USER.`);
+    if (!w.tasks.some((x) => x !== t && x.agent === a && OPEN.includes(x.status))) {
+      return wake(w, t, `${AGENTS[a].name} has no open card in this job, so nothing will arrive from them. Do what you can without it, or report NEEDS_USER.`);
+    }
+    log(w, 'studio', 'system', `「${t.title}」在等 ${AGENTS[a].name}：它做完會自動交回 ${who}。`);
+    return;
+  }
+  t.status = 'NEEDS_USER';
+  t.ask = { question: st.detail || t.result.slice(-300), options: st.options };
+  notify(`${label(w)}：${who} 需要你處理`, t.ask.question.slice(0, 160), 'ask', w.project);
+}
+
+// ---------- External waits: GitHub PR / CI (the only kind Studio can check by itself) ----------
+const checking = new Set(); // card ids with a gh call in flight
+const ghJson = (args, cwd) => new Promise((res, rej) => execFile('gh', args, { cwd, windowsHide: true, timeout: 30000 },
+  (e, out, err) => { if (e) return rej(new Error(String(err || e.message).trim().slice(0, 200))); try { res(JSON.parse(out)); } catch (x) { rej(x); } }));
+
+// owner/name of the folder's GitHub origin, or '' (read-only git call).
+const originRepo = (cwd) => new Promise((res) => execFile('git', ['-c', 'safe.directory=*', 'remote', 'get-url', 'origin'], { cwd, windowsHide: true, timeout: 10000 },
+  (e, out) => res(String(out || '').match(/github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\s*$/)?.[1] || '')));
+
+async function checkExternal(w, t) {
+  if (t.status !== 'WAITING_EXTERNAL' || !t.wait?.pr || t.wait.manual || checking.has(t.id)) return;
+  checking.add(t.id);
+  try {
+    // A bare "#23" belongs to the project's own origin (gh's default repo can point elsewhere).
+    const repo = /^\d+$/.test(String(t.wait.pr)) ? await originRepo(w.project) : '';
+    const j = await ghJson(['pr', 'view', String(t.wait.pr), ...(repo ? ['--repo', repo] : []), '--json', 'url,state,reviewDecision,statusCheckRollup'], w.project);
+    if (t.status !== 'WAITING_EXTERNAL') return;
+    const checks = j.statusCheckRollup || [];
+    const pending = checks.filter((c) => (c.__typename === 'CheckRun' ? c.status !== 'COMPLETED' : ['PENDING', 'EXPECTED'].includes(c.state)));
+    t.wait.ci = checks.length ? `${checks.length - pending.length}/${checks.length} 個 CI 檢查完成` : '還沒看到 CI 檢查';
+    t.wait.checkedAt = new Date().toISOString();
+    if (!checks.length) t.wait.empty = (t.wait.empty || 0) + 1;
+    // A new PR can take a minute to register its checks: zero checks three times in a row means there are none.
+    if (j.state === 'OPEN' && (pending.length || (!checks.length && t.wait.empty < 3))) return;
+    const summary = checks.map((c) => `${c.name || c.context || 'check'}: ${c.conclusion || c.state || c.status}`).join(', ') || 'no CI checks found';
+    wake(w, t, `GitHub PR ${j.url}: state ${j.state}, review decision ${j.reviewDecision || 'none'}. CI: ${summary}.`);
+  } catch (e) {
+    if (t.status !== 'WAITING_EXTERNAL') return;
+    Object.assign(t.wait, { manual: true, error: e.message });
+    log(w, 'studio', 'system', `查不到 PR ${t.wait.pr} 的狀態（${e.message}）：結果好了請按「繼續」。`);
+    notify(`${label(w)}：需要你按「繼續」`, `Studio 查不到 PR ${t.wait.pr} 的 CI 狀態`, 'ask', w.project);
+  } finally { checking.delete(t.id); }
+}
+
+function watchExternal() {
+  for (const w of S.workspaces) if (w.run?.active) for (const t of w.tasks) if (t.status === 'WAITING_EXTERNAL') checkExternal(w, t);
+}
+
+// ---------- The Leader checks the whole request ----------
+const MAX_ROUNDS = 3; // extra card rounds before the Leader must ask the user
+
+async function summarize(w, userAnswer = '') {
   const run = w.run;
   run.summarizing = true;
   run.phase = 'summarizing';
+  run.ask = null;
   const gen = run.leaderGen, lead = run.leader;
+  const workers = workersFor(w, lead);
   const results = w.tasks.map((t) => `- [${t.status}] ${t.title} (${AGENTS[t.agent].name}): ${t.result}`).join('\n');
   try {
-    const txt = await turn(lead, await conv(w, lead, true), `You are the LEADER. The workers have finished.${handoffNote(run)}
+    const reply = await turn(lead, await conv(w, lead, true), `You are the LEADER. Every current card has ended.${handoffNote(run)}
 Original user request:
 """
 ${run.request}
 """
-Results:
+Cards so far:
 ${results}
+${memoryNote(run)}${userAnswer ? `\nThe user answered your question:\n"""\n${userAnswer}\n"""\n` : ''}
+Decide whether the user's WHOLE request is complete: built, reviewed, verified, and delivered or merged when the request asks for it. Do not modify files.
+Workers you can assign: ${workers.map((x) => `${x} (${AGENTS[x].name})`).join(', ') || '(none available)'}
 
-Do not modify files. Write a short final report to the user (2-4 sentences, in the user's language). Plain text only.`, { w, lead: true });
+Reply with ONLY one JSON object, no markdown fences, one of:
+{"done":true,"report":"<final report to the user, 2-4 sentences, in the user's language>"}
+{"done":false,"message":"<one sentence to the user>","subtasks":[${SUBTASK_SHAPE}]}
+{"needs_user":"<question to the user, in the user's language>","options":["<choice>","<choice>"]}
+Use needs_user only for a real decision the team cannot make. Rules for new subtasks:
+${SUBTASK_RULES}`, { w, lead: true });
     if (run.leaderGen !== gen) return;
-    log(w, lead, 'leader', txt || '(沒有文字回覆)');
+    let d = null;
+    try { d = parseJson(reply); } catch {
+      log(w, 'studio', 'system', '工頭的回覆格式不對，正在請它重新整理…', reply);
+      const again = await turn(lead, await conv(w, lead, true), FIX_JSON, { w, lead: true });
+      if (run.leaderGen !== gen) return;
+      try { d = parseJson(again); } catch { log(w, 'studio', 'system', '工頭這次沒有成功確認整體結果。', again); }
+    }
+    run.summarizing = false;
+    if (!d) return askUser(w, '工頭這次沒有成功確認整體結果，Studio 保留了目前進度。要讓工頭再確認一次嗎？', ['再確認一次']);
+    if (d.needs_user) return askUser(w, String(d.needs_user), d.options);
+    if (d.done === false) {
+      const subs = workers.length ? parseSubtasks(d.subtasks, workers) : [];
+      if (!subs.length) return askUser(w, String(d.message || '工頭認為還沒完成，但沒有安排下一步。要怎麼做？'), []);
+      if (++run.rounds > MAX_ROUNDS) return askUser(w, `工頭已經追加 ${MAX_ROUNDS} 輪工作，整體還沒完成（${d.message || ''}）。要讓團隊繼續追加嗎？`, ['繼續追加', '就這樣結束']);
+      log(w, lead, 'leader', d.message || `整體還沒完成，追加 ${subs.length} 張工作卡`);
+      addCards(w, subs, lead);
+      run.phase = 'working';
+      return pump(w);
+    }
+    log(w, lead, 'leader', String(d.report || d.message || '工頭確認整體工作已完成。'));
+    finish(w, 'done');
   } catch (e) {
     if (run.leaderGen !== gen || e instanceof Halt) return;
-    log(w, 'studio', 'system', 'Leader 總結失敗：' + e.message);
+    run.summarizing = false;
+    log(w, 'studio', 'system', '工頭這次沒有完成整體確認。Studio 保留了目前進度，可以按「↻ 接著上次的工作」再試。', e.message);
+    finish(w, 'failed');
   }
-  run.summarizing = false;
-  finish(w, w.tasks.every((t) => t.status === 'DONE') ? 'done' : 'failed');
+}
+
+function askUser(w, question, options) {
+  const run = w.run;
+  run.phase = 'summarizing';
+  run.ask = { question, options: (Array.isArray(options) ? options : []).map(String).filter(Boolean).slice(0, 4) };
+  log(w, run.leader, 'leader', '需要你決定：' + question);
+  notify(`${label(w)}：${AGENTS[run.leader].name} 需要你處理`, question.slice(0, 160), 'ask', w.project);
+}
+
+// The user's reply to a card (taskId) or to the Leader (no taskId).
+function answer(w, taskId, text) {
+  text = String(text || '').trim();
+  if (!text) throw new Error('請選一個選項或輸入回覆');
+  const run = w.run;
+  if (!run?.active) throw new Error('這個專案目前沒有在工作（暫停中請先按「繼續」）');
+  if (taskId) {
+    const t = w.tasks.find((x) => x.id === taskId);
+    if (t?.status !== 'NEEDS_USER') throw new Error('這張工作卡沒有在等你回覆');
+    log(w, 'user', 'user', `回覆「${t.title}」：${text}`);
+    return wake(w, t, `The user answered your question:\n"""\n${text}\n"""`);
+  }
+  if (!run.ask || run.summarizing) throw new Error('工頭沒有在等你回覆');
+  log(w, 'user', 'user', '回覆工頭：' + text);
+  run.rounds = 0;
+  summarize(w, text);
+}
+
+// Manual 「繼續」 for a wait Studio cannot check by itself.
+function continueCard(w, taskId) {
+  const t = w.tasks.find((x) => x.id === taskId);
+  if (!['WAITING_EXTERNAL', 'WAITING_AGENT'].includes(t?.status)) throw new Error('這張工作卡沒有在等待');
+  if (!w.run?.active) throw new Error('這個專案目前沒有在工作（暫停中請先按「繼續」）');
+  log(w, 'user', 'user', `「${t.title}」在等的東西好了，請繼續`);
+  wake(w, t, `The user says what you were waiting for ("${t.wait?.what || ''}") should be ready now. Check it yourself and continue.`);
 }
 
 function stop(w) {
@@ -537,7 +838,7 @@ function stop(w) {
   if (!run?.active && !run?.paused) return;
   run.stopped = true;
   busyConvs(run).forEach(cancelTurn);
-  for (const t of w.tasks) if (['WAITING', 'PAUSED'].includes(t.status)) { t.status = 'FAILED'; t.result = '已停止'; }
+  for (const t of w.tasks) if (['WAITING', 'PAUSED', 'INTERRUPTED', ...PARKED].includes(t.status)) { t.status = 'FAILED'; t.result = '已停止'; }
   log(w, 'studio', 'system', '已按下 Stop：這個專案的 Agent 停止目前工作。');
   finish(w, 'stopped');
 }
@@ -557,11 +858,12 @@ function pause(w) {
 const resumable = (r) => r.status === 'paused' || (r.status === 'running' && !S.workspaces.some((w) => w.run?.id === r.id && w.run.active));
 
 function loadRun(w, r) {
-  // Cards that were mid-work when the Studio closed continue like paused cards.
-  for (const t of r.tasks) if (t.status === 'WORKING') Object.assign(t, { status: 'PAUSED', result: '已中斷', resumed: true });
+  // (goal / refs / context / continues come back too: the work memory survives a restart)
+  // Cards that were mid-work when the Studio closed are interrupted; waiting cards keep waiting.
+  for (const t of r.tasks) if (t.status === 'WORKING') Object.assign(t, { status: 'INTERRUPTED', result: '已中斷', resumed: true });
   w.tasks = r.tasks;
   w.activity = r.activity;
-  w.run = { id: r.id, startedAt: r.startedAt, project: r.project, leader: r.leader, request: r.request, convs: r.convs || {}, phase: r.phase || 'working', leaderGen: 0, active: false, paused: true, stopped: false, summarizing: false };
+  w.run = { id: r.id, startedAt: r.startedAt, project: r.project, leader: r.leader, request: r.request, convs: r.convs || {}, phase: r.phase || 'working', leaderGen: 0, rounds: r.rounds || 0, ask: r.ask || null, goal: r.goal, refs: r.refs, context: r.context, continues: r.continues, active: false, paused: true, stopped: false, summarizing: false };
   for (const [k, cid] of Object.entries(w.run.convs)) convAgent.set(cid, k.split(':')[0]);
 }
 
@@ -584,11 +886,11 @@ function resume(w, id) {
   if (run.leader !== w.leader) { run.handoffFrom = run.leader; run.leader = w.leader; }
   run.paused = false;
   run.active = true;
-  for (const t of w.tasks) if (t.status === 'PAUSED') t.status = 'WAITING';
+  for (const t of w.tasks) if (t.status === 'PAUSED' || t.status === 'INTERRUPTED') t.status = 'WAITING';
   log(w, 'studio', 'system', `繼續工作（Leader：${AGENTS[run.leader].name}）。`);
   if (run.phase === 'planning') planPhase(w);
-  else if (run.phase === 'summarizing') summarize(w);
-  else { run.phase = 'working'; pump(w); }
+  else if (run.phase === 'summarizing') { if (!run.ask) summarize(w); } // a pending question waits for the user's answer
+  else { run.phase = 'working'; pump(w); watchExternal(); }
 }
 
 function reassign(w, taskId, agent) {
@@ -597,8 +899,7 @@ function reassign(w, taskId, agent) {
   if (!t) throw new Error('找不到這項工作');
   if (t.status === 'WORKING') throw new Error('工作進行中，請先暫停或 Stop');
   if (!available(agent)) throw new Error(`${AGENTS[agent]?.name ?? agent} 目前不可用`);
-  t.agent = agent;
-  t.result = '';
+  Object.assign(t, { agent, result: '', wakeNote: '', wait: null, ask: null });
   log(w, 'user', 'user', `重新指派「${t.title}」給 ${AGENTS[agent].name}`);
   if (run.paused) { t.status = 'PAUSED'; saveRun(w, 'paused'); return; } // runs when the user continues
   t.status = 'WAITING';
@@ -625,7 +926,7 @@ function setLeader(w, agent) {
   if (oldConv && active.has(oldConv)) cancelTurn(oldConv);
   if (run.paused) return saveRun(w, 'paused');
   if (run.phase === 'planning') planPhase(w);
-  else if (run.phase === 'summarizing') summarize(w);
+  else if (run.phase === 'summarizing' && !run.ask) summarize(w);
 }
 
 // Opens a project as its own tab (or returns the open one).
@@ -702,7 +1003,7 @@ const routes = {
     const workspaces = S.workspaces.map((w) => {
       const r = w.run;
       return { project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, tasks: w.tasks, activity: w.activity, progress: readProjectProgress(w),
-        run: r && { id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt } };
+        run: r && { id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing } };
     });
     return { ...S, ...teamStats(), agents: Object.values(S.agents), workspaces };
   },
@@ -716,9 +1017,11 @@ const routes = {
   'POST /api/notify/test': () => windowsToast('測試通知：Studio 通知正常', '專案完成或需要你處理時會這樣通知你', `http://127.0.0.1:${PORT}/`),
   'POST /api/browse': async () => { const p = await browseFolder(); return p ? openWorkspace(p) : {}; },
   'POST /api/leader': (b) => setLeader(wsOf(b.ws), b.agent),
-  'POST /api/start': (b) => start(wsOf(b.ws), String(b.request || '')),
+  'POST /api/start': (b) => start(wsOf(b.ws), String(b.request || ''), !!b.continue),
   'POST /api/stop': (b) => stop(wsOf(b.ws)),
   'POST /api/reassign': (b) => reassign(wsOf(b.ws), b.taskId, b.agent),
+  'POST /api/answer': (b) => answer(wsOf(b.ws), b.taskId, b.text),
+  'POST /api/continue-card': (b) => continueCard(wsOf(b.ws), b.taskId),
   'POST /api/check': () => { checkAll().then(refreshClaudeLimits); },
   'POST /api/recent/remove': (b) => removeRecent(b.path),
   'POST /api/agent-config': (b) => setAgentCfg(wsOf(b.ws), b.agent, b.model, b.effort),
@@ -756,6 +1059,7 @@ await startAion();
 watchCatalogs();
 pollPaseo();
 setInterval(pollPaseo, 10000);
+setInterval(watchExternal, 60000); // GitHub PR / CI waits
 // Port taken (e.g. another Studio copy is open): use the next free one, unless STUDIO_PORT asked for an exact port.
 server.on('error', (e) => {
   if (e.code !== 'EADDRINUSE' || process.env.STUDIO_PORT || PORT >= 4858) throw e;
