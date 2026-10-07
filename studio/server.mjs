@@ -26,6 +26,7 @@ const AGENTS = {
 
 // What a project does when a job is done: stop (default) | suggest next steps | auto-continue (user opts in).
 const AFTER_DONE = ['stop', 'suggest', 'auto'];
+const STRATEGY_IDS = ['save', 'balanced', 'quality', 'custom']; // model strategies (see STRATEGIES)
 const AUTO_MAX = 5; // auto-started jobs in a row before Studio stops and waits for the user
 // S.leader is the default Leader for newly opened projects.
 const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [],
@@ -67,7 +68,12 @@ try {
     .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save' }));
   S.recent = (saved.recent || []).filter(isDir);
   if (saved.notify === false) S.notify = false;
-} catch { /* first start: defaults */ }
+} catch (e) {
+  if (e.code !== 'ENOENT') { // not a first start: the file exists but could not be used
+    console.error('設定檔讀取失敗（專案分頁沒有載入）：' + e.message);
+    try { fs.copyFileSync(SETTINGS, SETTINGS.replace(/.json$/, '.broken.json')); console.error('已把原檔另存成 settings.broken.json，不會被覆蓋。'); } catch { /* nothing to keep */ }
+  }
+}
 
 function saveSettings() {
   fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
@@ -230,7 +236,6 @@ const STRATEGIES = {
   balanced: { claude: [['^sonnet$', 'high'], ['^opus$', 'xhigh']], codex: [['luna', 'high'], ['sol', 'xhigh']] },
   quality: { claude: [['^opus$', 'high'], ['^fable$', 'high']], codex: [['sol', 'high'], ['sol', 'max']] },
 };
-const STRATEGY_IDS = [...Object.keys(STRATEGIES), 'custom'];
 
 // The { model, effort } an agent uses in a project for one tier ('' = the agent's default).
 function tierCfg(w, agent, hard) {
