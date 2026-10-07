@@ -511,12 +511,12 @@ function seatHtml(a, w) {
 }
 
 let workOpen = null; // { ws, id } of the open work details
-const ASK_STATE = { queued:'已詢問，等待 AI 回覆：這位 AI 不能在工作中途插話，問題會在它目前這一步做完後送達。', sent:'已送達，等待 AI 回覆…（有些 AI 會等目前這一步做完才回答）', failed:'' };
+const ASK_STATE = { queued:'已詢問，等待 AI 回覆：這位 AI 不能在工作中途插話，問題會在它這段工作告一段落時送達。', sent:'已送達，等待 AI 回覆…（有些 AI 會等目前這一步做完才回答）', failed:'' };
 function workHtml(d) {
   const ws = workState(d), a = S.agents.find((x) => x.id === d.agent);
   const now = d.status === 'WORKING' ? `${ws.ic} ${ws.text}` : PARKED.includes(d.status) ? waitLine(d) : (STEP_WORD[d.status] || d.status);
   const acts = d.acts.length ? d.acts.map((x) => `<li>${hhmm(x.at)} · ${x.kind === 'tool' ? '執行' : '說'}：${esc(x.text)}${x.running ? ' <span class="tag pz">執行中</span>' : ''}</li>`).join('') : '<li class="hint">還沒有活動紀錄</li>';
-  const asks = d.asks.slice().reverse().map((q) => `<div class="askbox"><div class="q">你問（${hhmm(q.at)}）：${esc(q.text)}</div>${q.state === 'answered' ? `<div><b>${esc(a?.name || d.agent)}</b>（${hhmm(q.answeredAt)}）：${esc(q.answer)}</div>` : `<div class="hint">${esc(ASK_STATE[q.state] || '')}${q.state === 'failed' ? esc(q.answer) : ''}</div>`}</div>`).join('');
+  const asks = d.asks.slice().reverse().map((q) => `<div class="askbox"><div class="q">你問（${hhmm(q.at)}）：${esc(q.text)}</div>${q.state === 'answered' ? `<div><b>${esc(a?.name || d.agent)}</b>（${hhmm(q.answeredAt)}）：${esc(q.answer)}</div>` : `<div class="hint">${esc(ASK_STATE[q.state] || '')}${['failed', 'closed'].includes(q.state) ? esc(q.answer) : ''}</div>`}</div>`).join('');
   return `<dl class="facts">
       <dt>AI 員工</dt><dd>${esc(a?.name || d.agent)}</dd>
       <dt>目前工作</dt><dd>${esc(d.title)}</dd>
@@ -623,7 +623,8 @@ function workState(t) {
   const a = t.activity, now = Date.now(), ran = t.workingSince ? dur(now - Date.parse(t.workingSince)) : '';
   if (a?.confirm) return { ic:'🟡', text:'等待工具確認' + (ran ? ' · 已工作 ' + ran : '') };
   const idle = a ? now - a.at : 0;
-  if (idle >= STUCK_MS) return { ic:'🟡', stuck:true, text:`可能卡住 · ${dur(idle)}沒有新進度${a.tool ? '（正在執行：' + a.tool + '）' : ''}` };
+  if (idle >= STUCK_MS && a.tool) return { ic:'🟠', text:`指令執行中 · ${dur(idle)}沒有新訊息（正在執行：${a.tool}）` }; // a long build / test is not stuck
+  if (idle >= STUCK_MS) return { ic:'🟡', stuck:true, text:`可能卡住 · ${dur(idle)}沒有新進度` };
   return { ic:'🟠', text:'工作中' + (ran ? ' · ' + ran : '') + (a ? ' · 最近活動 ' + (idle < 60e3 ? '剛剛' : dur(idle) + '前') : '') };
 }
 const ASKABLE = ['WORKING', 'WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'];

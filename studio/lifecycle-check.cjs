@@ -29,7 +29,7 @@ function makeEnv(script, overrides = {}) {
   env.agentName = (id) => env.AGENTS[id]?.name || id;
   Object.assign(env, overrides);
   const names = Object.keys(env);
-  const api = new Function(...names, code + '\nreturn { planPhase, pump, summarize, answer, continueCard, wake, parseStatus, finish, autoNext, instruct, pause, resume, stop, handoffWriter, claimWorkspace, releaseClaim, useWorktree, useReadOnly, checkWorkspaces, acquireWrite, workspaceOf, loadLeases, saveLeases, leaseState, leaseView, writerOf, retire, beatLeases, cleanupWorktree, runTask, treeKey, newLease, flagExternalModification, INSTANCE, askAgent, cardDetail, workInfo, resolveAsks };')(...names.map((k) => env[k])); // test harness: our own code
+  const api = new Function(...names, code + '\nreturn { planPhase, pump, summarize, answer, continueCard, wake, parseStatus, finish, autoNext, instruct, pause, resume, stop, handoffWriter, claimWorkspace, releaseClaim, useWorktree, useReadOnly, checkWorkspaces, acquireWrite, workspaceOf, loadLeases, saveLeases, leaseState, leaseView, writerOf, retire, beatLeases, cleanupWorktree, runTask, treeKey, newLease, flagExternalModification, INSTANCE, askAgent, cardDetail, workInfo, resolveAsks, cardStep };')(...names.map((k) => env[k])); // test harness: our own code
   return { env, api };
 }
 const newW = () => ({ project: 'P', leader: 'claude', workers: ['claude', 'codex', 'antigravity'], tasks: [], activity: [],
@@ -236,7 +236,8 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
       return { runtime: { turn_id: 'turn_orphan', ...script.runtime(state) } };
     };
     const env = { api, sleep: () => new Promise((r) => setTimeout(r, 1)), active: new Map(), S: { agents: { codex: { working: 0 } } },
-      answerConfirmations: async () => {}, refreshCodexLimits() {}, Halt: class extends Error {} };
+      answerConfirmations: async () => {}, refreshCodexLimits() {}, Halt: class extends Error {},
+      isAskAnswer: (m) => String(m.content?.content || '').toUpperCase().includes('PROGRESS ANSWER:'), clip: (x) => String(x ?? ''), toolText: (c) => String(c?.name || '') };
     const fn = new Function(...Object.keys(env), turnCode + String.fromCharCode(10) + 'return { turn, sendMessage };')(...Object.values(env)); // test harness: our own code
     return { ...fn, state };
   };
@@ -767,19 +768,50 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
     await new Promise((r) => setTimeout(r, 60));
     assert.strictEqual(asked, 0, 'the working step is not interrupted by the question');
     g.open();
-    assert.ok(await waitFor(() => q.state === 'answered'), 'answered at the next safe point');
-    assert.strictEqual(q.answer, '做到一半，正在跑測試。', 'answer without the status line');
-    assert.ok(await waitFor(() => t.status === 'DONE'));
-    assert.deepStrictEqual([w.tasks.length, t.result, asked], [1, 'built', 1], 'no extra card, the card result is its own');
+    assert.ok(await waitFor(() => q.state === 'closed'), 'the card ended before the question could be asked');
+    assert.ok(q.answer.includes('built') && asked === 0, 'says so honestly with the card result, without an extra turn');
+    assert.deepStrictEqual([w.tasks.length, t.status, t.result], [1, 'DONE', 'built'], 'no extra card, the card result is its own');
     await assert.rejects(api.askAgent(w, t.id, 'x'), /沒有在工作/);
     // long work with recent activity is not "stuck"; a long silence is
     const cid = w.run.convs[env.workKey(t)];
     Object.assign(t, { status: 'WORKING', workingSince: new Date(Date.now() - 60 * 60e3).toISOString() });
     env.convActivity.set(cid, { at: Date.now() - 60e3, tool: 'Run pytest' });
     assert.ok(/working 60 min, last activity 1 min ago, running: Run pytest$/.test(api.workInfo(w, t)), api.workInfo(w, t));
+    env.convActivity.set(cid, { at: Date.now() - 9 * 60e3, tool: 'Run pytest' });
+    assert.ok(!/possibly stuck/.test(api.workInfo(w, t)), 'a long-running command is not stuck');
     env.convActivity.set(cid, { at: Date.now() - 9 * 60e3, tool: '' });
     assert.ok(/possibly stuck/.test(api.workInfo(w, t)));
     t.status = 'DONE';
+  }
+  // a parked card is asked right away; pausing while the question is answered keeps the card's next step from running
+  {
+    const ga = mkGate(); let updates = 0, qs = 0;
+    ({ env, api } = makeEnv(async (agent, text) => {
+      if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"impl","agent":"codex","instructions":"build","writes":false}]}';
+      if (text.startsWith('Question from the user')) { qs++; if (qs === 2) await ga.p; return 'Sure.\nPROGRESS ANSWER: 在等 CI，沒有卡住。\nSTATUS: DONE'; }
+      if (text.startsWith('Update from Multi-Agent Studio')) { updates++; return 'ok\nSTATUS: DONE'; }
+      if (text.includes('Task: impl')) return 'pushed\nSTATUS: WAITING_EXTERNAL: CI of the release';
+      return 'ok\nSTATUS: DONE';
+    }));
+    w = newW(); w.workers = ['codex']; env.S.workspaces.push(w);
+    api.planPhase(w);
+    assert.ok(await waitFor(() => w.tasks[0]?.status === 'WAITING_EXTERNAL'));
+    const t = w.tasks[0];
+    const q1 = await api.askAgent(w, t.id, '');
+    assert.ok(await waitFor(() => q1.state === 'answered'), 'a waiting card is asked at once');
+    assert.strictEqual(q1.answer, '在等 CI，沒有卡住。', 'only the marked answer, without the status line');
+    assert.strictEqual(t.status, 'WAITING_EXTERNAL', 'the question does not move the card');
+    const q2 = await api.askAgent(w, t.id, '還要多久？');
+    assert.ok(await waitFor(() => q2.state === 'sent'));
+    api.wake(w, t, 'CI finished');
+    await new Promise((r) => setTimeout(r, 60));
+    assert.strictEqual(updates, 0, 'the card step waits for the question');
+    api.pause(w);
+    ga.open();
+    assert.ok(await waitFor(() => t.status === 'PAUSED'), 'paused, not run');
+    await new Promise((r) => setTimeout(r, 60));
+    assert.strictEqual(updates, 0, 'the card step did not start after the pause');
+    assert.strictEqual(q2.state, 'failed', 'the question cancelled by the pause says so');
   }
   // a backend that takes messages mid-turn is asked at once; the answer is the first AI text after the question
   {
@@ -792,9 +824,12 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
     w = newW();
     const t = { id: 'c1', title: 'impl', agent: 'codex', status: 'WORKING' };
     w.tasks.push(t); w.run.convs['codex:work'] = 'cv1'; env.active.set('cv1', 'turn1');
+    t.status = 'WAITING_EXTERNAL'; api.cardStep.add('cv1');
+    assert.strictEqual((await api.askAgent(w, 'c1', '')).how, 'later', 'never mid-turn into a turn that is not this card working step');
+    w.run = { ...w.run }; t.asks = []; t.status = 'WORKING'; // a new run object ends the queued delivery of the old one
     const q = await api.askAgent(w, 'c1', '');
     assert.deepStrictEqual([q.state, q.how, q.msgId], ['sent', 'now', 'm1']);
-    assert.ok(posted.includes('continue your task') && posted.includes('目前做到哪裡'), 'default question, work continues');
+    assert.ok(posted.includes('目前做到哪裡') && posted.includes('"impl"') && !posted.includes('continue your task'), 'default question about this card');
     assert.ok(posted.includes('PROGRESS ANSWER:'), 'the answer is asked with a marker');
     const items = [{ id: 'm0' }, { id: 'm1' }, { id: 'm2', type: 'tool_call', position: 'left' }, { id: 'm3', type: 'text', position: 'left', content: { content: 'Run 1 done.' } }];
     api.resolveAsks(t, items);

@@ -329,10 +329,11 @@ const convActivity = new Map();
 
 const HARD_CAP_MS = 3 * 3600e3; // no single step may run longer than this
 // timeout = how long the agent may show NO progress (new messages); a long job that keeps working is never cut off.
-async function turn(agent, convId, text, { w, lead = false, check = false, timeout = 25 * 60e3, progressEvery = 30000 } = {}) {
+async function turn(agent, convId, text, { w, lead = false, check = false, ask = false, timeout = 25 * 60e3, progressEvery = 30000 } = {}) {
   const run = w?.run;
   const sent = await sendMessage(convId, text);
   active.set(convId, sent.turn_id);
+  convActivity.set(convId, { at: Date.now(), tool: '', confirm: false }); // a fresh turn starts with fresh activity
   if (!check) S.agents[agent].working++;
   try {
     let mark = '', markAt = Date.now(), checkedAt = 0, tool = '';
@@ -357,6 +358,7 @@ async function turn(agent, convId, text, { w, lead = false, check = false, timeo
     }
   } finally {
     active.delete(convId);
+    convActivity.delete(convId);
     if (!check) S.agents[agent].working--;
     if (agent === 'codex') refreshCodexLimits();
   }
@@ -364,7 +366,7 @@ async function turn(agent, convId, text, { w, lead = false, check = false, timeo
   const items = (await api('GET', `/api/conversations/${convId}/messages`)).items || [];
   const after = items.slice(items.findIndex((m) => m.id === sent.msg_id) + 1);
   // A failed tool call mid-turn is normal (agents retry); only a failed text reply means the turn failed.
-  const texts = after.filter((m) => m.type === 'text' && m.position === 'left');
+  const texts = after.filter((m) => m.type === 'text' && m.position === 'left' && (ask || !isAskAnswer(m))); // a progress answer is never a card's result
   const last = texts.at(-1);
   const err = last?.status === 'error' ? last : !last && after.find((m) => m.status === 'error');
   if (err) throw new Error(String(err.content?.content ?? JSON.stringify(err.content)).slice(0, 1000));
@@ -1160,7 +1162,7 @@ function writerHandoffNote(from, to, prior) {
 }
 async function lastAgentText(cid) {
   if (!cid) return '';
-  try { const items = (await api('GET', `/api/conversations/${cid}/messages`)).items || []; const m = items.filter((x) => x.type === 'text' && x.position === 'left').at(-1); return clip(m?.content?.content || '', 700); } catch { return ''; }
+  try { const items = (await api('GET', `/api/conversations/${cid}/messages`)).items || []; const m = items.filter((x) => x.type === 'text' && x.position === 'left' && !isAskAnswer(x)).at(-1); return clip(m?.content?.content || '', 700); } catch { return ''; }
 }
 async function handoffWriter(w, toAgent, taskId) {
   if (!AGENTS[toAgent]) throw new Error('未知的 Agent');
@@ -1303,7 +1305,14 @@ ${STATUS_RULES}`;
     // A step stopped by 立刻打斷 ends early (maybe with an error): park the card until the Leader has read the note.
     const step = async (text) => {
       cardStep.add(cid);
-      try { await askBusy.get(cid); return await turn(t.agent, cid, text, { w }); } catch (e) { if (t.interrupted && !(e instanceof Halt)) return ''; throw e; } finally { cardStep.delete(cid); }
+      try {
+        if (askBusy.has(cid)) { // a progress question is being answered: Stop / Pause / 打斷 / handoff meanwhile cancelled that turn, not this step
+          await askBusy.get(cid);
+          if (t.interrupted) return '';
+          if (run.stopped || run.paused) throw new Halt(run.stopped ? '已停止' : '已暫停');
+        }
+        return await turn(t.agent, cid, text, { w });
+      } catch (e) { if (t.interrupted && !(e instanceof Halt)) return ''; throw e; } finally { cardStep.delete(cid); t.stepEndAt = Date.now(); }
     };
     const park = () => {
       Object.assign(t, { status: 'WAITING', interrupted: false, resumed: true,
@@ -1397,13 +1406,15 @@ function applyStatus(w, t, st, reply) {
 const STUCK_MS = 8 * 60e3; // no new activity for this long = "可能卡住" (a hint only; nothing is stopped)
 const cardStep = new Set(); // conversations a card step is using right now
 const askBusy = new Map(); // conversationId -> a progress question being answered between steps
+const ASKABLE = ['WORKING', 'WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'];
 const ASK_DEFAULT = '目前做到哪裡？現在正在做什麼？有沒有卡住？預計下一步是什麼？';
-const askPrompt = (q, midTurn) => `Question from the user (Nana) about the task you are working on. This is only a question, not a new instruction:
+const askPrompt = (q, title) => `Question from the user (Nana) about your task "${title}". This is only a question, not a new instruction:
 "${q}"
 Reply now with ONE separate text message that starts with "${ASK_MARK}" and answers briefly in the user's language (2-5 short lines): how far you are, what you are doing right now, whether you are stuck (and why), and your next step. Write it as a visible reply, not only in your thoughts.
-Do not change your plan, do not edit files or run commands for this question, and do not add a STATUS line.${midTurn ? ' After answering, continue your task where you left off.' : ''}`;
+Do not change your plan, do not edit files or run commands for this question, and do not add a STATUS line.`;
 const convOf = (w, t) => w.run?.convs?.[workKey(t)];
 const ASK_MARK = 'PROGRESS ANSWER:';
+const isAskAnswer = (m) => String(m.content?.content || '').toUpperCase().includes(ASK_MARK);
 const answerText = (x) => String(x || '').replace(/^\s*STATUS:.*$/gim, '').replace(/^[\s*_]*PROGRESS ANSWER:[\s*_]*/i, '').trim();
 
 // Leader / work-memory view of a working card: time, last activity, possibly stuck.
@@ -1413,22 +1424,22 @@ function workInfo(w, t) {
   const idle = a ? Date.now() - a.at : 0;
   return ` | working ${mins(Date.now() - Date.parse(t.workingSince))} min, last activity ${mins(idle)} min ago`
     + (a?.confirm ? ', waiting for a tool permission' : a?.tool ? `, running: ${a.tool}` : '')
-    + (idle >= STUCK_MS ? ' (no progress for a while: possibly stuck; long work alone is fine)' : '');
+    + (idle >= STUCK_MS && !a?.tool ? ' (no progress for a while: possibly stuck; long work alone is fine)' : '');
 }
 
 async function askAgent(w, id, text) {
   const t = w.tasks.find((x) => x.id === id);
   if (!t) throw new Error('找不到這張工作卡');
-  if (!['WORKING', 'WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'].includes(t.status)) throw new Error('這張卡現在沒有在工作，沒有可以詢問的對象');
+  if (!ASKABLE.includes(t.status)) throw new Error('這張卡現在沒有在工作，沒有可以詢問的對象');
   const cid = convOf(w, t);
   if (!cid) throw new Error('這位 AI 員工還沒開始這張卡，等它開始後再問');
-  const q = { id: crypto.randomUUID().slice(0, 8), at: nowIso(), text: clip(String(text || '').trim(), 500) || ASK_DEFAULT, state: 'queued', answer: '' };
+  const q = { id: crypto.randomUUID().slice(0, 8), at: nowIso(), text: clip(String(text || '').trim(), 500) || ASK_DEFAULT, state: 'queued', answer: '', agent: t.agent };
   (t.asks ||= []).push(q);
   if (t.asks.length > 20) t.asks.shift();
   const rt = (await api('GET', `/api/conversations/${cid}`).catch(() => ({}))).runtime || {};
-  if (active.has(cid) && rt.is_processing && rt.supports_midturn_delivery) {
+  if (t.status === 'WORKING' && cardStep.has(cid) && !askBusy.has(cid) && active.has(cid) && rt.is_processing && rt.supports_midturn_delivery) { // only into this card's own working step
     // The backend takes a message in the middle of a turn: ask now, the work goes on.
-    try { Object.assign(q, { state: 'sent', how: 'now', msgId: (await api('POST', `/api/conversations/${cid}/messages`, { content: askPrompt(q.text, true) })).msg_id }); return q; }
+    try { Object.assign(q, { state: 'sent', how: 'now', msgId: (await api('POST', `/api/conversations/${cid}/messages`, { content: askPrompt(q.text, t.title) })).msg_id }); return q; }
     catch { /* not taken right now: ask at the next safe point */ }
   }
   q.how = 'later';
@@ -1444,11 +1455,17 @@ async function deliverAsk(w, t, cid, q) {
     if (Date.now() - t0 > HARD_CAP_MS) return Object.assign(q, { state: 'failed', answer: '一直等不到安全的時點，問題沒有送出。' });
     if (!run.paused && !active.has(cid) && !cardStep.has(cid) && !askBusy.has(cid)) break;
   }
+  if (!ASKABLE.includes(t.status)) return Object.assign(q, { state: 'closed', answer: '問題送達前這張卡已經結束，沒有再問。它最後的回報：' + clip(t.result, 600) });
+  const why = t.agent !== q.agent ? '這張卡已經交給別的 AI 員工，問題沒有送給原本的那位。'
+    : convOf(w, t) !== cid ? '這張卡換了新的對話，問題沒有送出，請再問一次。' : '';
+  if (why) return Object.assign(q, { state: 'failed', answer: why });
   let done;
   askBusy.set(cid, new Promise((r) => { done = r; }));
   try {
     q.state = 'sent';
-    Object.assign(q, { state: 'answered', answer: answerText(await turn(t.agent, cid, askPrompt(q.text, false), { w, check: true, timeout: 5 * 60e3 })) || '（沒有文字回覆）', answeredAt: nowIso() });
+    const reply = await turn(t.agent, cid, askPrompt(q.text, t.title), { w, check: true, ask: true, timeout: 5 * 60e3 });
+    if (run.stopped || run.paused) Object.assign(q, { state: 'failed', answer: '工作被' + (run.stopped ? '停止' : '暫停') + '，這個問題沒有得到回答。' });
+    else Object.assign(q, { state: 'answered', answer: answerText(reply.toUpperCase().includes(ASK_MARK) ? reply.slice(reply.toUpperCase().indexOf(ASK_MARK)) : reply) || '（沒有文字回覆）', answeredAt: nowIso() });
   } catch (e) { Object.assign(q, { state: 'failed', answer: '沒有得到回覆：' + clip(e.message, 200) }); }
   finally { askBusy.delete(cid); done(); }
 }
@@ -1492,7 +1509,8 @@ async function cardDetail(w, id) {
   const items = cid ? (await api('GET', `/api/conversations/${cid}/messages`).catch(() => ({}))).items || [] : [];
   resolveAsks(t, items);
   const since = Date.parse(t.firstStartedAt || 0) - 2000; // one conversation may hold several cards of this agent
-  const mine = items.filter((m) => (m.created_at || 0) >= since);
+  const until = t.status === 'WORKING' || !t.stepEndAt ? Infinity : t.stepEndAt + 2000; // the same agent may already work on another card in this conversation
+  const mine = items.filter((m) => (m.created_at || 0) >= since && (m.created_at || 0) <= until);
   const say = (m) => m.type === 'text' && m.position === 'left' && answerText(m.content?.content);
   const acts = mine.filter((m) => m.type === 'tool_call' || say(m)).slice(-12).reverse()
     .map((m) => ({ at: m.created_at, kind: m.type === 'tool_call' ? 'tool' : 'say', text: clip(m.type === 'tool_call' ? itemText(m) : answerText(itemText(m)).split('\n')[0], 160), running: m.type === 'tool_call' && m.status !== 'finish' }));
