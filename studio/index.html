@@ -17,6 +17,7 @@
       --work:#f0a948; --work-soft:#3a2e1a; --wait:#a39d92; --wait-soft:#2c2c2f; --pause:#7fb3e8; --pause-soft:#1d2c3b; --shadow:none; }
   }
   * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
   body { margin:0; background:var(--bg); color:var(--text); font:14px/1.55 "Segoe UI","Microsoft JhengHei UI","Microsoft JhengHei",sans-serif; }
   button, input, textarea, select { font:inherit; color:inherit; }
 
@@ -139,6 +140,31 @@
   .sys { align-self:center; color:var(--muted); font-size:12px; background:var(--panel2); border-radius:999px; padding:3px 12px; text-align:center; max-width:90%; }
   #progress { white-space:pre-wrap; margin:0; max-height:520px; overflow:auto; background:var(--panel2); border-radius:10px; padding:10px; font:12.5px/1.6 Consolas,"Microsoft JhengHei",monospace; }
 
+  .pill.bad { background:var(--bad-soft); color:var(--bad); }
+  .dot.ok { background:var(--ok); }
+  .tabs { display:flex; gap:4px; flex-wrap:wrap; align-items:center; min-width:0; }
+  .tab { display:inline-flex; align-items:center; gap:7px; padding:6px 14px; border-radius:10px; border:1px solid transparent; color:var(--muted); text-decoration:none; font-weight:600; background:none; cursor:pointer; max-width:220px; }
+  .tab:hover { border-color:var(--line); color:var(--text); }
+  .tab.on { background:var(--accent-soft); color:var(--accent); border-color:var(--accent); }
+  .tab .nm { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .tab .n { background:var(--work); color:#fff; border-radius:999px; padding:0 7px; font-size:11px; }
+  .tab.add { font-size:16px; padding:4px 12px; }
+  .pv-head { display:flex; align-items:center; gap:12px; flex-wrap:wrap; border-top:4px solid var(--c); }
+  .pv-head .nm { font-size:18px; font-weight:700; }
+  .pv-head .sub { margin:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:40vw; }
+  .projects { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:14px; }
+  .pcard { display:flex; flex-direction:column; gap:8px; background:var(--panel); border:1px solid var(--line); border-top:4px solid var(--c); border-radius:16px; padding:14px 16px; box-shadow:var(--shadow); color:inherit; text-decoration:none; min-width:0; }
+  .pcard:hover { border-color:var(--accent); border-top-color:var(--c); }
+  .pc-top { display:flex; align-items:center; gap:8px; } .pc-top .nm { font-weight:700; font-size:16px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pc-req { font-size:13px; background:var(--panel2); border-radius:10px; padding:7px 10px; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+  .sbar { display:flex; height:8px; border-radius:999px; background:var(--panel2); border:1px solid var(--line); overflow:hidden; }
+  .sbar i { display:block; height:100%; }
+  .matrix { width:100%; border-collapse:collapse; font-size:13px; }
+  .matrix th, .matrix td { border-bottom:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top; }
+  .matrix th { color:var(--muted); font-size:12px; font-weight:700; }
+  .matrix td.idle { color:var(--muted); }
+  .mx-wrap { overflow-x:auto; }
+
   dialog { width:min(1100px,94vw); max-height:88vh; border:1px solid var(--line); border-radius:16px; padding:0; background:var(--bg); color:var(--text); box-shadow:0 20px 60px rgba(0,0,0,.25); }
   dialog::backdrop { background:rgba(20,18,14,.45); }
   .dlg-h { position:sticky; top:0; display:flex; align-items:center; gap:12px; padding:14px 18px; background:var(--panel); border-bottom:1px solid var(--line); }
@@ -148,32 +174,47 @@
 <body>
 <header class="topbar">
   <div class="brand"><span class="logo"></span>Multi-Agent Studio</div>
-  <div class="proj-chip" id="projChip">尚未選擇專案</div>
+  <nav class="tabs" id="tabs"></nav>
   <span class="spacer"></span>
-  <button class="btn small" id="notifyBtn" title="工作完成或失敗時通知你（網頁開著時用網頁通知和提示音；網頁沒開時用 Windows 通知）">🔔 通知：開</button>
+  <button class="btn small" id="notifyBtn" title="每個專案完成或需要你處理時發 Windows 通知（點通知直接打開該專案分頁）；開著的網頁另外播提示音">🔔 通知：開</button>
   <span class="pill" id="paseoPill">Paseo</span>
-  <button class="btn small" id="paseoOpen">用 Paseo 開啟目前專案</button>
-  <span class="pill" id="runPill">待命</span>
-  <button class="btn pz" id="pauseResume">暫停</button>
-  <button class="btn danger" id="stop">Stop</button>
 </header>
 
 <div class="layout">
   <aside class="sidebar">
     <section class="panel">
-      <h3>專案</h3>
+      <h3>開啟專案</h3>
       <input type="text" id="project" placeholder="貼上資料夾路徑，例如 D:\my-project">
-      <div class="row"><button class="btn" id="browse">瀏覽…</button><button class="btn" id="setProject">使用這個資料夾</button></div>
-      <div class="sub">常用專案（點一下切換）</div>
+      <div class="row"><button class="btn" id="browse">瀏覽…</button><button class="btn" id="setProject">開啟</button></div>
+      <div class="sub">常用專案（點一下開啟成分頁；每個專案可同時工作）</div>
       <div class="recent" id="recent"></div>
     </section>
     <section class="panel">
-      <h3>歷史紀錄</h3>
+      <h3 id="histHead">歷史紀錄</h3>
       <div class="history" id="history"></div>
     </section>
   </aside>
 
-  <main class="stage">
+  <main class="stage" id="overview">
+    <section class="kpis" id="ovKpis"></section>
+    <h2 class="zone">專案</h2>
+    <section class="projects" id="projects"></section>
+    <h2 class="zone">誰在做什麼</h2>
+    <section class="panel mx-wrap" id="matrix"></section>
+    <h2 class="zone">員工（全部專案）</h2>
+    <section class="seats" id="ovSeats"></section>
+  </main>
+
+  <main class="stage" id="projectView" hidden>
+    <section class="panel pv-head" id="pvHead">
+      <div style="min-width:0"><div class="row" style="gap:6px"><span class="nm" id="pvName"></span><button class="btn small ghost" id="renameWs" title="改顯示名稱（分頁、總覽、Windows 通知都用這個名稱）">✎ 改名</button></div><div class="sub" id="pvPath"></div></div>
+      <span class="spacer"></span>
+      <span class="pill" id="runPill">待命</span>
+      <button class="btn small" id="paseoOpen">用 Paseo 開啟</button>
+      <button class="btn pz" id="pauseResume">暫停</button>
+      <button class="btn danger" id="stop">Stop</button>
+      <button class="btn small ghost" id="closeWs" title="關閉這個分頁（暫停中的工作仍在歷史紀錄）">關閉分頁</button>
+    </section>
     <section class="kpis" id="kpis"></section>
 
     <h2 class="zone">Leader 辦公室</h2>
@@ -191,7 +232,7 @@
         <div class="chat" id="chat"></div>
       </section>
       <section class="panel">
-        <h3>Product First · 共用專案進度</h3>
+        <h3>Product First · 專案進度</h3>
         <div class="sub" id="progressPath" style="margin-top:0"></div>
         <pre id="progress"></pre>
       </section>
@@ -214,8 +255,27 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<
 const LOOK = { claude: { c:'#d97757', ab:'CC' }, codex: { c:'#10a37f', ab:'CX' }, antigravity: { c:'#4285f4', ab:'AG' } };
 const look = (id) => LOOK[id] || { c:'#8d8678', ab:String(id).slice(0, 2).toUpperCase() };
 const LANES = [['WAITING','等待中'], ['WORKING','進行中'], ['DONE','完成'], ['FAILED','失敗 / 停止']];
-const STATUS = { done:'完成', failed:'有失敗', stopped:'已停止', paused:'暫停中' };
-let S = null, last = '', histRev = -1, shownProject = null, histOpenId = null;
+const STATUS = { done:'完成', failed:'有失敗', stopped:'已停止', paused:'暫停中', running:'進行中', interrupted:'中斷（可繼續）' };
+let S = null, last = '', histKey = '', histOpenId = null, histOpenProject = '', shownView = null;
+const drafts = {}; // unsent request text per project
+
+// The page shows the overview (#) or one project (#p=<folder>).
+const curPath = () => { const m = location.hash.match(/^#p=(.+)$/); return m ? decodeURIComponent(m[1]) : ''; };
+const W = () => S.workspaces.find((w) => w.project === curPath()) || null;
+const go = (p) => { location.hash = p ? 'p=' + encodeURIComponent(p) : ''; };
+const sameP = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
+const anyActive = () => S.workspaces.some((w) => w.run?.active);
+window.addEventListener('hashchange', () => S && render());
+
+// [dot class, label, pill class] for a project tab / card.
+function wsStatus(w) {
+  const r = w.run;
+  if (!r) return ['', '待命', ''];
+  if (r.active) return ['work', { planning:'規劃中', summarizing:'總結中' }[r.phase] || '工作中', 'on'];
+  if (r.paused) return ['pz', '已暫停', 'pz'];
+  if (r.stopped) return ['', '已停止', ''];
+  return w.tasks.length && w.tasks.every((t) => t.status === 'DONE') ? ['ok', '已完成', 'ok'] : ['bad', '有失敗', 'bad'];
+}
 
 async function post(url, body) {
   $('err') && ($('err').textContent = '');
@@ -231,19 +291,22 @@ const base = (p) => String(p).split(/[\\/]/).filter(Boolean).pop() || p;
 const fmt = (iso) => new Date(iso).toLocaleString('zh-TW', { month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit', hour12:false });
 const when = (iso) => new Date(iso).toDateString() === new Date().toDateString() ? new Date(iso).toLocaleTimeString('zh-TW', { hour:'2-digit', minute:'2-digit', hour12:false }) : fmt(iso);
 
-function modelLabel(a) {
-  const cfg = S.agentCfg[a.id] || {};
+// w = the project whose settings are shown; no w (overview) = settings live on each project page.
+function modelLabel(a, w) {
+  if (!w) return '依專案設定';
+  const cfg = w.agentCfg[a.id] || {};
   if (!a.models.length) return a.status === 'checking' ? '讀取中…' : '預設';
   if (cfg.model) return a.models.find((m) => m.value === cfg.model)?.name || cfg.model;
   const def = a.models.find((m) => m.value === 'default');
   return def ? `預設（${def.description.split(' · ')[0]}）` : '預設';
 }
-const effortLabel = (a) => (S.agentCfg[a.id] || {}).effort || (a.efforts.length ? '預設' : '—');
+const effortLabel = (a, w) => !w ? '依專案設定' : (w.agentCfg[a.id] || {}).effort || (a.efforts.length ? '預設' : '—');
 
-function cfgHtml(a) {
+function cfgHtml(a, w) {
+  if (!w) return '<div class="cfg-note">模型／推理強度在各專案頁分開設定。</div>';
   if (!a.models.length && !a.efforts.length) return `<div class="cfg-note">${a.status === 'checking' ? '讀取模型清單中…' : '此 Agent 使用預設模型（不支援切換）'}</div>`;
-  const cfg = S.agentCfg[a.id] || {}, busy = S.run?.active;
-  return `<details class="cfg-box"><summary>調整模型／推理強度${busy ? '（下一次開始工作生效）' : ''}</summary><div class="cfg">
+  const cfg = w.agentCfg[a.id] || {}, busy = w.run?.active;
+  return `<details class="cfg-box"><summary>這個專案的模型／推理強度${busy ? '（下一次開始工作生效）' : ''}</summary><div class="cfg">
     <label>模型<select data-cfg="${a.id}" data-k="model"><option value="">預設</option>${a.models.map((m) => `<option value="${esc(m.value)}" title="${esc(m.description)}" ${m.value === cfg.model ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select></label>
     <label>推理強度<select data-cfg="${a.id}" data-k="effort" ${a.efforts.length ? '' : 'disabled'}><option value="">預設</option>${a.efforts.map((v) => `<option value="${esc(v)}" ${v === cfg.effort ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></label>
   </div></details>`;
@@ -271,40 +334,57 @@ function limitsHtml(a) {
   return `<div class="limits">${rows}<div class="lim-f">${new Date(L.updatedAt).toLocaleTimeString('zh-TW', { hour:'2-digit', minute:'2-digit', hour12:false })} 更新${a.id === 'claude' ? ' · <a href="#" data-limits-refresh>更新</a>' : ''}</div></div>`;
 }
 
-function statusHtml(a) {
-  const r = S.run, lead = a.id === S.leader;
-  if (a.status === 'checking') return '<span class="dot"></span>檢查中…';
-  if (a.status === 'unavailable') return '<span class="dot bad"></span>無法使用';
-  const work = S.tasks.find((t) => t.status === 'WORKING' && t.agent === a.id);
-  if (work) return `<span class="dot work"></span>工作中：${esc(work.title)}`;
-  if (lead && r?.active) return `<span class="dot work"></span>${{ planning:'規劃與派工中', summarizing:'整理總結中' }[r.phase] || '監督進度中'}`;
-  const pz = S.tasks.find((t) => t.status === 'PAUSED' && t.agent === a.id);
-  if (r?.paused && (pz || lead)) return `<span class="dot pz"></span>已暫停${pz ? '：' + esc(pz.title) : ''}`;
-  return '<span class="dot"></span>待命';
+// What one agent does in one project: { kind: work|lead|wait|pz|'', text }.
+function duty(a, w) {
+  const r = w.run, t = (st) => w.tasks.filter((x) => x.status === st && x.agent === a.id);
+  if (t('WORKING').length) return { kind:'work', text:t('WORKING')[0].title };
+  if (w.leader === a.id && r?.active) return { kind:'work', text:{ planning:'Leader：規劃與派工中', summarizing:'Leader：整理總結中' }[r.phase] || 'Leader：監督進度中' };
+  if (r?.paused && (t('PAUSED').length || w.leader === a.id)) return { kind:'pz', text:'已暫停' + (t('PAUSED')[0] ? '：' + t('PAUSED')[0].title : '') };
+  if (r?.active && t('WAITING').length) return { kind:'wait', text:`排隊中 ${t('WAITING').length} 張` };
+  return { kind:'', text:w.leader === a.id ? 'Leader' : w.workers.includes(a.id) ? '' : '不參與' };
 }
 
-function seatHtml(a) {
-  const l = look(a.id), lead = a.id === S.leader, off = a.status !== 'available';
-  const lastMsg = [...S.activity].reverse().find((m) => m.who === a.id);
+// w = one project's seat view; no w = overview across all open projects.
+function statusHtml(a, w) {
+  if (a.status === 'checking') return '<span class="dot"></span>檢查中…';
+  if (a.status === 'unavailable') return '<span class="dot bad"></span>無法使用';
+  if (w) {
+    const d = duty(a, w);
+    if (d.kind === 'work' || d.kind === 'pz') return `<span class="dot ${d.kind}"></span>${d.kind === 'work' && !d.text.startsWith('Leader') ? '工作中：' : ''}${esc(d.text)}`;
+    return '<span class="dot"></span>待命';
+  }
+  const busy = S.workspaces.filter((x) => duty(a, x).kind === 'work').length;
+  return busy ? `<span class="dot work"></span>忙碌中：${busy} 個專案` : '<span class="dot"></span>待命';
+}
+
+function seatHtml(a, w) {
+  const l = look(a.id), lead = w && a.id === w.leader, out = w && !lead && !w.workers.includes(a.id), off = a.status !== 'available' || out;
+  const leads = S.workspaces.filter((x) => x.leader === a.id);
   const done = S.lastDone[a.id];
-  const lastTxt = a.status === 'unavailable' ? a.note : lastMsg?.text || (lead ? '把需求交給我，我會拆成工作卡分給大家。' : '等待 Leader 派工。');
-  const busy = S.run?.active || S.run?.paused;
+  let lastTxt;
+  if (a.status === 'unavailable') lastTxt = a.note;
+  else if (w) lastTxt = [...w.activity].reverse().find((m) => m.who === a.id)?.text || (lead ? '把需求交給我，我會拆成工作卡分給大家。' : '等待 Leader 派工。');
+  else lastTxt = S.workspaces.map((x) => [x, duty(a, x)]).filter(([, d]) => d.kind).map(([x, d]) => `${x.name}：${d.text}`).join('\n') || '目前沒有工作。';
+  const busy = w && (w.run?.active || w.run?.paused);
+  const roleTag = w ? (lead ? '<span class="tag lead">LEADER</span>' : '<span class="tag">WORKER</span>')
+    : leads.length ? `<span class="tag lead" title="${esc(leads.map((x) => x.name).join('、'))}">LEADER × ${leads.length}</span>` : '<span class="tag">WORKER</span>';
   return `<div class="seat ${off ? 'off' : ''}" style="--c:${l.c}">
     <div class="seat-top"><div class="avatar">${l.ab}</div><div>
       <div class="seat-name">${esc(a.name)}</div>
-      <div class="tags">${lead ? '<span class="tag lead">LEADER</span>' : '<span class="tag">WORKER</span>'}${a.status === 'available' ? '<span class="tag ok">可用</span>' : a.status === 'unavailable' ? '<span class="tag bad">不可用</span>' : ''}</div>
+      <div class="tags">${roleTag}${out ? '<span class="tag">這個專案不參與</span>' : ''}${a.status === 'available' ? '<span class="tag ok">可用</span>' : a.status === 'unavailable' ? '<span class="tag bad">不可用</span>' : ''}</div>
     </div></div>
-    <div class="seat-status">${statusHtml(a)}</div>
+    <div class="seat-status">${statusHtml(a, w)}</div>
     <dl class="facts">
-      <dt>模型</dt><dd title="${esc(modelLabel(a))}">${esc(modelLabel(a))}</dd>
-      <dt>推理強度</dt><dd>${esc(effortLabel(a))}</dd>
+      <dt>模型</dt><dd title="${esc(modelLabel(a, w))}">${esc(modelLabel(a, w))}</dd>
+      <dt>推理強度</dt><dd>${esc(effortLabel(a, w))}</dd>
       <dt>最近完成</dt><dd title="${esc(done?.title || '')}">${done ? `${esc(done.title)} · ${when(done.at)}` : '—'}</dd>
     </dl>
     <div class="seat-last">${esc(lastTxt)}</div>
     ${limitsHtml(a)}
-    ${cfgHtml(a)}
+    ${cfgHtml(a, w)}
     ${a.id === 'codex' && a.status === 'unavailable' ? `<div class="cfg-note">Studio 的 Codex 使用獨立資料夾，不會出現在你平常的 Codex 紀錄。登入一次後按「重新檢查 Agent」。</div><button class="btn small" data-codex-login>登入 Codex（Studio 專用）</button>` : ''}
-    ${lead ? '' : `<button class="btn small" data-leader="${a.id}" ${off ? 'disabled' : ''}>${busy ? '接手當 Leader' : '設為 Leader'}</button>`}
+    ${!w || lead ? '' : `<div class="row"><button class="btn small" data-leader="${a.id}" ${a.status !== 'available' ? 'disabled' : ''}>${busy ? '接手當 Leader' : '設為 Leader'}</button>
+      <button class="btn small ghost" data-worker="${a.id}" data-on="${out ? 1 : 0}" title="只影響這個專案；下一次派工生效">${out ? '讓它參與這個專案' : '這個專案不用它'}</button></div>`}
   </div>`;
 }
 
@@ -333,85 +413,143 @@ function chatHtml(activity) {
   }).join('');
 }
 
-function render() {
-  const r = S.run, running = !!r?.active, paused = !!r?.paused;
-  $('projChip').textContent = S.project ? '📁 ' + S.project : '尚未選擇專案';
-  $('projChip').title = S.project;
-  if (S.project !== shownProject) { shownProject = S.project; $('project').value = S.project || ''; }
+const kpi = (v, l) => `<div class="kpi"><div class="v">${v}</div><div class="l">${l}</div></div>`;
+const dotOf = (k) => (k ? `<span class="dot ${k}"></span>` : '<span class="dot"></span>');
 
-  const pz = { running:['Paseo 執行中','ok'], stopped:['Paseo 未開啟',''], missing:['Paseo 未安裝',''], checking:['Paseo 檢查中…',''] }[S.paseo] || ['Paseo',''];
-  $('paseoPill').textContent = pz[0];
-  $('paseoPill').className = 'pill ' + pz[1];
+function projCardHtml(w) {
+  const r = w.run, [, label, pill] = wsStatus(w), n = (st) => w.tasks.filter((t) => t.status === st).length;
+  const total = w.tasks.length, done = n('DONE'), working = n('WORKING'), failed = n('FAILED');
+  const seg = (v, c) => (total && v ? `<i style="width:${(v / total) * 100}%;background:var(--${c})"></i>` : '');
+  return `<a class="pcard" href="#p=${encodeURIComponent(w.project)}" style="--c:${look(w.leader).c}">
+    <div class="pc-top"><span class="nm">${esc(w.name)}</span><span class="pill ${pill}">${label}</span>
+      ${r?.active || r?.paused ? `<button class="btn small ${r.paused ? 'pz' : ''}" data-pz="${esc(w.project)}">${r.paused ? '繼續' : '暫停'}</button>` : ''}</div>
+    <div class="sub" style="margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(w.project)}">${esc(w.project)}</div>
+    <div class="pc-req">${r ? esc(r.request) : '<span class="empty">還沒有工作，點進來交辦給 Leader。</span>'}</div>
+    ${total ? `<div class="sbar">${seg(done, 'ok')}${seg(working, 'work')}${seg(failed, 'bad')}</div>
+      <div class="lim-f">完成 ${done}/${total}${working ? ` · 進行中 ${working}` : ''}${failed ? ` · 失敗 ${failed}` : ''}</div>` : ''}
+    <div class="lim-f">Leader <span class="who" style="--c:${look(w.leader).c}"><i></i>${esc(name(w.leader))}</span></div>
+    ${w.tasks.filter((t) => t.status === 'WORKING').map((t) => `<div class="who" style="--c:${look(t.agent).c}"><i></i>${esc(name(t.agent))}：${esc(t.title)}</div>`).join('')}
+  </a>`;
+}
+
+// Agents × projects: who is doing what right now.
+function matrixHtml() {
+  if (!S.workspaces.length) return '<div class="empty">開啟專案後，這裡會顯示每位員工在每個專案正在做什麼。</div>';
+  const head = `<tr><th>員工</th>${S.workspaces.map((w) => `<th><a href="#p=${encodeURIComponent(w.project)}" style="color:inherit">${esc(w.name)}</a></th>`).join('')}</tr>`;
+  const rows = S.agents.map((a) => `<tr><td><span class="who" style="--c:${look(a.id).c}"><i></i>${esc(a.name)}</span></td>${S.workspaces.map((w) => {
+    const d = duty(a, w);
+    return d.kind || d.text ? `<td class="${d.kind ? '' : 'idle'}">${d.kind ? dotOf(d.kind === 'wait' ? '' : d.kind) + ' ' : ''}${esc(d.text)}</td>` : '<td class="idle">—</td>';
+  }).join('')}</tr>`).join('');
+  return `<table class="matrix">${head}${rows}</table>`;
+}
+
+function renderTabs(w) {
+  $('tabs').innerHTML = `<a class="tab ${w ? '' : 'on'}" href="#">總覽</a>` + S.workspaces.map((x) => {
+    const [k, label] = wsStatus(x), n = x.tasks.filter((t) => t.status === 'WORKING').length;
+    return `<a class="tab ${x === w ? 'on' : ''}" href="#p=${encodeURIComponent(x.project)}" title="${esc(x.project)} · ${label}">${dotOf(k)}<span class="nm">${esc(x.name)}</span>${n ? `<span class="n">${n}</span>` : ''}</a>`;
+  }).join('') + '<button class="tab add" id="tabAdd" title="開啟另一個專案（瀏覽資料夾）">＋</button>';
+}
+
+function renderOverview() {
+  const all = S.workspaces.flatMap((w) => w.tasks);
+  const avail = S.agents.filter((a) => a.status === 'available').length;
+  $('ovKpis').innerHTML = kpi(S.todayDone, '今日完成的工作卡') + kpi(`${S.workspaces.filter((w) => w.run?.active).length}/${S.workspaces.length}`, '工作中的專案') +
+    kpi(all.filter((t) => t.status === 'WORKING').length, '進行中的工作卡') + kpi(`${avail}/${S.agents.length}`, '可用的 Agent');
+  $('projects').innerHTML = S.workspaces.length ? S.workspaces.map(projCardHtml).join('')
+    : '<div class="panel empty">還沒有開啟專案。用左邊「開啟專案」或上方 ＋ 開啟一個或多個資料夾，每個專案會有自己的分頁，可以同時工作。</div>';
+  $('matrix').innerHTML = matrixHtml();
+  if (!$('ovSeats').contains(document.activeElement)) $('ovSeats').innerHTML = S.agents.map((a) => seatHtml(a, null)).join('');
+}
+
+function renderProject(w, force) {
+  const r = w.run, running = !!r?.active, paused = !!r?.paused;
+  $('pvHead').style.setProperty('--c', look(w.leader).c);
+  $('pvName').textContent = w.name;
+  $('pvPath').textContent = $('pvPath').title = w.project;
   $('paseoOpen').hidden = S.paseo === 'missing';
-  if (!$('paseoOpen').dataset.busy) $('paseoOpen').disabled = !S.project;
-
+  if (!$('paseoOpen').dataset.busy) $('paseoOpen').disabled = false;
   $('runPill').textContent = running ? `團隊工作中 · Leader ${name(r.leader)}` : paused ? '已暫停 · 可稍後繼續' : (r?.stopped ? '已停止' : '待命');
   $('runPill').className = 'pill ' + (running ? 'on' : paused ? 'pz' : '');
   $('pauseResume').textContent = paused ? '繼續' : '暫停';
   $('pauseResume').disabled = !running && !paused;
   $('stop').disabled = !running && !paused;
-  $('setProject').disabled = $('browse').disabled = running;
+  $('closeWs').disabled = running;
 
   const avail = S.agents.filter((a) => a.status === 'available').length;
-  const kpi = (v, l) => `<div class="kpi"><div class="v">${v}</div><div class="l">${l}</div></div>`;
-  $('kpis').innerHTML = kpi(S.todayDone, '今日完成的工作卡') + kpi(S.tasks.filter((t) => t.status === 'WORKING').length, '進行中') +
-    kpi(S.tasks.filter((t) => t.status === 'WAITING' || t.status === 'PAUSED').length, paused ? '等待／已暫停' : '等待中') + kpi(`${avail}/${S.agents.length}`, '可用的 Agent');
+  const n = (st) => w.tasks.filter((t) => t.status === st).length;
+  $('kpis').innerHTML = kpi(`${n('DONE')}/${w.tasks.length}`, '這次完成的工作卡') + kpi(n('WORKING'), '進行中') +
+    kpi(n('WAITING') + n('PAUSED'), paused ? '等待／已暫停' : '等待中') + kpi(`${avail}/${S.agents.length}`, '可用的 Agent');
 
-  const leader = S.agents.find((a) => a.id === S.leader);
-  if (!$('office').contains(document.activeElement)) {
-    const keep = $('request')?.value || '';
-    $('office').style.setProperty('--c', look(S.leader).c);
-    $('office').innerHTML = seatHtml(leader) + `<div class="desk">
+  const leader = S.agents.find((a) => a.id === w.leader);
+  if (force || !$('office').contains(document.activeElement)) {
+    $('office').style.setProperty('--c', look(w.leader).c);
+    $('office').innerHTML = seatHtml(leader, w) + `<div class="desk">
       <h3 style="margin:0">交辦給 Leader</h3>
       ${r && (running || paused) ? `<div class="now"><b>目前的工作</b><br>${esc(r.request)}</div>` : ''}
-      <textarea id="request" placeholder="你想讓團隊做什麼？（Ctrl + Enter 開始）">${esc(keep)}</textarea>
+      <textarea id="request" placeholder="你想讓團隊在「${esc(w.name)}」做什麼？（Ctrl + Enter 開始）">${esc(drafts[w.project] || '')}</textarea>
       <div class="row"><span class="err" id="err"></span><span class="spacer"></span>
         <button class="btn ghost" id="recheck">重新檢查 Agent</button>
         <button class="btn primary" id="start" ${running ? 'disabled' : ''}>開始工作</button></div>
     </div>`;
   }
-
-  if (!$('seats').contains(document.activeElement)) $('seats').innerHTML = S.agents.filter((a) => a.id !== S.leader).map((a) => seatHtml(a)).join('');
-
-  $('recent').innerHTML = S.recent.length ? S.recent.map((p) => `
-    <div class="chip ${p === S.project ? 'on' : ''}" data-project="${esc(p)}" title="${esc(p)}"><span class="nm">${esc(base(p))}</span><span class="x" data-remove="${esc(p)}" title="從清單移除">✕</span></div>`).join('')
-    : '<div class="empty">用過的專案會出現在這裡。</div>';
-
-  if (!$('board').contains(document.activeElement)) $('board').innerHTML = boardHtml(S.tasks, S.agents, true);
+  if (force || !$('seats').contains(document.activeElement)) $('seats').innerHTML = S.agents.filter((a) => a.id !== w.leader).map((a) => seatHtml(a, w)).join('');
+  if (force || !$('board').contains(document.activeElement)) $('board').innerHTML = boardHtml(w.tasks, S.agents, true);
 
   const box = $('chat');
-  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
-  box.innerHTML = chatHtml(S.activity);
+  const atBottom = force || box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  box.innerHTML = chatHtml(w.activity);
   if (atBottom) box.scrollTop = box.scrollHeight;
 
-  $('progressPath').textContent = S.progress?.exists ? S.progress.file : '專案裡的 .ai-workspace/progress.md';
-  $('progress').textContent = S.progress?.exists ? S.progress.text : '尚未建立 .ai-workspace/progress.md';
+  $('progressPath').textContent = w.progress?.exists ? w.progress.file : '專案裡的 .ai-workspace/progress.md';
+  $('progress').textContent = w.progress?.exists ? w.progress.text : '尚未建立 .ai-workspace/progress.md';
+}
 
-  if (S.historyRev !== histRev) { histRev = S.historyRev; loadHistory(); }
+function render() {
+  const w = W(), view = w ? w.project : '', force = view !== shownView;
+  shownView = view;
+  renderTabs(w);
+  $('overview').hidden = !!w;
+  $('projectView').hidden = !w;
+  if (w) renderProject(w, force); else renderOverview();
+  document.title = (w ? w.name + ' · ' : '') + 'Multi-Agent Studio';
+
+  const pz = { running:['Paseo 執行中','ok'], stopped:['Paseo 未開啟',''], missing:['Paseo 未安裝',''], checking:['Paseo 檢查中…',''] }[S.paseo] || ['Paseo',''];
+  $('paseoPill').textContent = pz[0];
+  $('paseoPill').className = 'pill ' + pz[1];
+
+  const open = (p) => S.workspaces.some((x) => sameP(x.project, p));
+  $('recent').innerHTML = S.recent.length ? S.recent.map((p) => `
+    <div class="chip ${open(p) ? 'on' : ''}" data-project="${esc(p)}" title="${esc(p)}${open(p) ? '（已開啟）' : ''}"><span class="nm">${esc(base(p))}</span><span class="x" data-remove="${esc(p)}" title="從清單移除">✕</span></div>`).join('')
+    : '<div class="empty">用過的專案會出現在這裡。</div>';
+
+  if (S.historyRev + '|' + view !== histKey) { histKey = S.historyRev + '|' + view; loadHistory(view); }
   renderNotifyBtn();
 }
 
-async function loadHistory() {
-  const list = await (await fetch('/api/history')).json();
+// On a project page the list shows only that project's runs.
+async function loadHistory(view) {
+  const list = (await (await fetch('/api/history')).json()).filter((h) => !view || sameP(h.project, view));
+  $('histHead').textContent = view ? `歷史紀錄 · ${W()?.name || base(view)}` : '歷史紀錄（全部專案）';
   $('history').innerHTML = list.length ? list.map((h) => `
     <button class="hitem" data-hist="${h.id}">
       <div class="req">${esc(h.request)}</div>
-      <div class="meta"><span>${fmt(h.startedAt)}</span><span>${esc(base(h.project))}</span>${h.status === 'paused' ? '<span class="tag pz">暫停中</span>' : `<span>${STATUS[h.status] || h.status} ${h.done}/${h.total}</span>`}</div>
+      <div class="meta"><span>${fmt(h.startedAt)}</span><span>${esc(base(h.project))}</span>${h.status === 'paused' || h.status === 'interrupted' ? `<span class="tag pz">${STATUS[h.status]}</span>` : `<span>${STATUS[h.status] || h.status} ${h.done}/${h.total}</span>`}</div>
     </button>`).join('') : '<div class="empty">完成的工作會保存在這裡。</div>';
 }
 
 async function openHistory(id) {
   const r = await (await fetch('/api/history/' + id)).json();
   histOpenId = id;
+  histOpenProject = r.project;
   $('histTitle').textContent = fmt(r.startedAt) + ' 的工作紀錄';
   $('histMeta').innerHTML = `<div><b>需求：</b>${esc(r.request)}</div>
     <div class="sub" style="margin:6px 0 0">專案 ${esc(r.project)} · Leader ${esc(name(r.leader))} · ${STATUS[r.status] || r.status}</div>`;
   $('histBoard').innerHTML = boardHtml(r.tasks, S.agents, false);
   $('histChat').innerHTML = chatHtml(r.activity);
-  $('histResume').hidden = !(r.status === 'paused' && !S.run?.active);
+  const ow = S.workspaces.find((x) => sameP(x.project, r.project));
+  $('histResume').hidden = !((r.status === 'paused' || r.status === 'running') && !ow?.run?.active && !ow?.run?.paused);
   $('histDlg').showModal();
 }
-
 async function refresh() {
   try {
     const res = await fetch('/api/state');
@@ -419,10 +557,10 @@ async function refresh() {
     if (txt === last && Date.now() - lastRender < 30000) return; // re-render now and then so reset bars move
     last = txt; S = JSON.parse(txt); render(); lastRender = Date.now();
     handleNotices();
-  } catch { $('runPill').textContent = '無法連到 Studio（視窗是否已關閉？）'; }
+  } catch { $('paseoPill').textContent = '無法連到 Studio（視窗是否已關閉？）'; }
 }
 
-// ---------- Notifications: sound + browser notification (the server falls back to a Windows toast when no page is open) ----------
+// ---------- Notifications: the server sends the Windows toast; open pages add a sound ----------
 let seenNotice = null, lastRender = 0, audio = null;
 document.addEventListener('pointerdown', () => { audio ??= new AudioContext(); }); // browsers only allow sound after a click
 
@@ -432,13 +570,7 @@ function handleNotices() {
   seenNotice = S.noticeSeq;
 }
 
-function announce(n) {
-  chime(n.kind === 'done');
-  if ('Notification' in window && Notification.permission === 'granted') {
-    const x = new Notification('Multi-Agent Studio：' + n.title, { body: n.body, tag: 'studio-' + n.id });
-    x.onclick = () => { window.focus(); x.close(); };
-  }
-}
+const announce = (n) => chime(n.kind === 'done');
 
 function chime(ok) {
   try {
@@ -456,55 +588,70 @@ function chime(ok) {
 }
 
 function renderNotifyBtn() {
-  const denied = 'Notification' in window && Notification.permission === 'denied';
-  $('notifyBtn').textContent = S.notify ? (denied ? '🔔 通知：開（只有聲音）' : '🔔 通知：開') : '🔕 通知：關';
+  $('notifyBtn').textContent = S.notify ? '🔔 Windows 通知：開' : '🔕 Windows 通知：關';
 }
 
 $('notifyBtn').onclick = async () => {
   const on = !S.notify;
-  if (on && 'Notification' in window && Notification.permission === 'default') await Notification.requestPermission();
   await post('/api/notify', { on });
-  if (on) chime(true);
+  if (on) { chime(true); post('/api/notify/test'); } // shows a test toast right away
 };
 
-$('browse').onclick = () => post('/api/browse').then((j) => { if (j.path) $('project').value = j.path; });
-$('setProject').onclick = () => post('/api/project', { path: $('project').value });
-$('stop').onclick = () => confirm('確定要停止嗎？停止後未完成的工作卡會標成失敗（想晚點再做請用「暫停」）。') && post('/api/stop');
-$('pauseResume').onclick = () => post(S.run?.paused ? '/api/resume' : '/api/pause');
+const ws = () => W()?.project;
+const openProject = (p) => post('/api/workspace/open', { path: p }).then((j) => go(j.project));
+const browse = () => post('/api/browse').then((j) => { if (j.project) go(j.project); });
+$('browse').onclick = browse;
+$('setProject').onclick = () => openProject($('project').value).then(() => { $('project').value = ''; });
+$('stop').onclick = () => confirm('確定要停止這個專案的工作嗎？停止後未完成的工作卡會標成失敗（想晚點再做請用「暫停」）。') && post('/api/stop', { ws: ws() });
+$('pauseResume').onclick = () => post(W()?.run?.paused ? '/api/resume' : '/api/pause', { ws: ws() });
+$('renameWs').onclick = () => { const n = prompt('這個專案的顯示名稱（留空 = 用資料夾名稱）', W()?.name || ''); if (n !== null) post('/api/workspace/rename', { ws: ws(), name: n }); };
+$('closeWs').onclick = () => post('/api/workspace/close', { ws: ws() }).then(() => go(''));
 $('histClose').onclick = () => $('histDlg').close();
-$('histResume').onclick = () => post('/api/resume', { id: histOpenId }).then(() => $('histDlg').close());
+$('histResume').onclick = () => post('/api/resume', { id: histOpenId }).then(() => { $('histDlg').close(); go(histOpenProject); });
 $('paseoOpen').onclick = async () => {
   const b = $('paseoOpen');
   b.dataset.busy = '1'; b.disabled = true; b.textContent = '開啟中…';
-  try { await post('/api/paseo/open'); } catch {} finally { delete b.dataset.busy; b.disabled = false; b.textContent = '用 Paseo 開啟目前專案'; }
+  try { await post('/api/paseo/open', { ws: ws() }); } catch {} finally { delete b.dataset.busy; b.disabled = false; b.textContent = '用 Paseo 開啟'; }
 };
 document.addEventListener('keydown', (e) => { if (e.target.id === 'request' && e.key === 'Enter' && e.ctrlKey && !$('start').disabled) $('start').click(); });
+document.addEventListener('input', (e) => { if (e.target.id === 'request' && ws()) drafts[ws()] = e.target.value; });
 document.addEventListener('change', (e) => {
   const s = e.target.closest('select[data-cfg]');
   if (!s) return;
-  const id = s.dataset.cfg, pick = (k) => document.querySelector(`select[data-cfg="${id}"][data-k="${k}"]`).value;
+  const id = s.dataset.cfg, p = ws(), pick = (k) => s.closest('.cfg').querySelector(`select[data-k="${k}"]`).value;
   s.blur();
-  post('/api/agent-config', { agent: id, model: pick('model'), effort: pick('effort') }).catch(() => {});
+  post('/api/agent-config', { ws: p, agent: id, model: pick('model'), effort: pick('effort') }).catch(() => {});
 });
 document.addEventListener('click', (e) => {
+  const pzb = e.target.closest('[data-pz]');
+  if (pzb) { // inside a project card link: act, don't open the tab
+    e.preventDefault();
+    const x = S.workspaces.find((y) => y.project === pzb.dataset.pz);
+    return post(x?.run?.paused ? '/api/resume' : '/api/pause', { ws: pzb.dataset.pz }).catch(() => {});
+  }
   const rm = e.target.closest('[data-remove]');
   if (rm) { e.stopPropagation(); return post('/api/recent/remove', { path: rm.dataset.remove }); }
   const chip = e.target.closest('[data-project]');
-  if (chip && !S.run?.active) return post('/api/project', { path: chip.dataset.project });
+  if (chip) return openProject(chip.dataset.project).catch(() => {});
   const h = e.target.closest('[data-hist]');
   if (h) return openHistory(h.dataset.hist);
   if (e.target.closest('[data-limits-refresh]')) { e.preventDefault(); return post('/api/limits/refresh'); }
   const b = e.target.closest('button');
   if (!b) return;
-  if (b.id === 'start') return post('/api/start', { request: $('request').value }).then(() => { $('request').value = ''; b.blur(); }).catch(() => {});
+  if (b.id === 'tabAdd') return browse();
+  if (b.id === 'start') {
+    const p = ws();
+    return post('/api/start', { ws: p, request: $('request').value }).then(() => { drafts[p] = ''; $('request').value = ''; b.blur(); }).catch(() => {});
+  }
   if (b.id === 'recheck') return post('/api/check');
   b.blur();
   if (b.hasAttribute('data-codex-login')) post('/api/codex-login');
   if (b.dataset.leader) {
-    const busy = S.run?.active || S.run?.paused;
-    if (!busy || confirm(`把 Leader 交接給 ${name(b.dataset.leader)}？\n新 Leader 會接手原始需求和目前的工作卡，不用重新輸入；正在工作的員工會繼續做。`)) post('/api/leader', { agent: b.dataset.leader });
+    const busy = W()?.run?.active || W()?.run?.paused;
+    if (!busy || confirm(`把 Leader 交接給 ${name(b.dataset.leader)}？\n新 Leader 會接手原始需求和目前的工作卡，不用重新輸入；正在工作的員工會繼續做。`)) post('/api/leader', { ws: ws(), agent: b.dataset.leader });
   }
-  if (b.dataset.reassign) post('/api/reassign', { taskId: b.dataset.reassign, agent: document.querySelector(`select[data-task="${b.dataset.reassign}"]`).value });
+  if (b.dataset.worker) post('/api/workers', { ws: ws(), agent: b.dataset.worker, on: b.dataset.on === '1' });
+  if (b.dataset.reassign) post('/api/reassign', { ws: ws(), taskId: b.dataset.reassign, agent: document.querySelector(`select[data-task="${b.dataset.reassign}"]`).value });
 });
 refresh();
 setInterval(refresh, 1000);

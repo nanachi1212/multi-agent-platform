@@ -25,20 +25,22 @@ A local web page where Claude Code, Codex and Antigravity work as one team. Pick
 
 Start: double-click `start-studio.cmd` (needs Node.js). The browser opens `http://127.0.0.1:4848`. Close the console window to stop the Studio.
 
-- Each agent has a seat card with its model and reasoning-effort picker (lists come from the agent itself; Antigravity uses its default). Changes apply from the next run.
-- Leader, project, recent projects and model choices are saved in `runtime/studio/settings.json`. Every run is saved in `runtime/studio/history/` and can be reopened from the 歷史紀錄 list.
+- Multiple projects at the same time: every opened project gets its own tab (`#p=<folder>`) with its own Leader, Workers (turn an agent off for one project), models, cards, team chat, pause/stop and history. Switching tabs never stops work. ✎ 改名 sets a display name used in tabs, overview and notifications. Projects run in parallel; one agent can work for two projects at once (separate conversations, shared plan limits).
+- 總覽 (overview) tab: one card per project (status, progress bar, current cards), one-click 暫停／繼續 per project, a 誰在做什麼 table (agents × projects) and all staff seats.
+- Each agent has a seat card with its model and reasoning-effort picker (lists come from the agent itself; Antigravity uses its default). Model choices are per project (set on the project page) and apply from the next run.
+- Open project tabs (with each Leader), recent projects and model choices are saved in `runtime/studio/settings.json`. Every run is saved in `runtime/studio/history/` and can be reopened from the 歷史紀錄 list.
 - The Leader spreads independent subtasks across Workers, which run at the same time (one task per Worker at a time).
 - Home page: today's finished cards, Leader office (hand the request to the Leader), staff seats showing model, effort, current card and last finished card.
 - 接手當 Leader works mid-run: the new Leader gets the original request and the current cards; Workers keep their cards.
-- 暫停 keeps cards and agent conversations; the paused job is shown again after restarting the Studio and 繼續 picks it up. Older paused jobs can be continued from 歷史紀錄.
+- 暫停 keeps cards and agent conversations; each open project's paused job is shown again after restarting the Studio and 繼續 picks it up. A working job is saved on every event, so closing the Studio mid-job shows it as 中斷（可繼續） after a restart. Older paused or interrupted jobs can be continued from 歷史紀錄.
 - Plan limits: Claude (5-hour + weekly) and Codex (weekly) usage bars with reset time on each seat. Claude is read with one tiny Haiku request that is not saved as a session (on start, after each job, or 更新); Codex is read from Studio's own Codex logs. Antigravity does not report limits.
-- Notifications (🔔 button): when a job finishes or fails, the open page plays a sound and shows a browser notification; with no page open, a Windows notification is sent instead.
+- Windows notifications (🔔 button): every finished job sends a Windows toast such as 「股票面板：Codex 已完成 3/3 工作」 or 「FamilyPDF：Claude Code 需要你處理」 (a card failed or the Leader could not plan). Clicking it opens that project tab. Open pages also play a sound. Turning 🔔 on shows a test toast. Windows Focus Assist / Do Not Disturb can hide toasts.
 - Paseo: status light and 用 Paseo 開啟目前專案 (opens Paseo and registers the folder as a Paseo workspace) for Paseo's own remote / phone features.
 - First start downloads AionCore v0.2.2 (official release, SHA-256 checked) into `runtime/`.
 - Studio runs Codex with its own home (`runtime/studio/codex-home`), so Studio sessions never show up in your normal Codex history. Log in once with the 登入 Codex（Studio 專用） button on the Codex card.
 - Agents must already be installed and logged in (`claude auth login`, `codex login`). The Team panel shows `Unavailable` with the reason otherwise; click 重新檢查 Agent after fixing.
 - Workers can edit files and run commands in the chosen folder without asking (Claude: `bypassPermissions`, Codex: `auto`). Use disposable or version-controlled projects only.
-- Known limits: AionCore writes an `.agents/` folder into the project when Antigravity works there. Restarting the Studio clears the current board (past runs stay in history).
+- Known limits: AionCore writes an `.agents/` folder into the project when Antigravity works there. A finished run is not shown on the board after a restart (it stays in history).
 
 ## Documentation
 

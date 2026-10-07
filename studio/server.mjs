@@ -24,8 +24,25 @@ const AGENTS = {
   antigravity: { name: 'Antigravity', create: (ws, lead) => ({ type: 'antigravity', extra: { backend: 'antigravity', workspace: ws, session_mode: lead ? 'plan' : 'yolo' } }) },
 };
 
-const S = { project: '', leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, tasks: [], activity: [], run: null,
+// S.leader is the default Leader for newly opened projects.
+const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [],
   limits: {}, notify: true, notices: [], noticeSeq: 0 };
+// One workspace per project folder: its own Leader, board, team chat and run, so projects work side by side.
+// name = optional display name (tabs, cards, notifications); the folder name is used when empty.
+// agentCfg = this project's model / effort per agent; workers = agents allowed to work here.
+// New projects start from S.agentCfg (the last choices).
+const newWs = (project, leader = S.leader, name = '', agentCfg = S.agentCfg, workers = Object.keys(AGENTS)) => ({
+  project, leader, name, run: null, tasks: [], activity: [],
+  agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...agentCfg?.[id] }])),
+  workers: workers.filter((id) => AGENTS[id]),
+});
+const label = (w) => w.name || path.basename(w.project);
+const same = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+function wsOf(p) {
+  const w = p && S.workspaces.find((x) => same(x.project, String(p)));
+  if (!w) throw new Error('沒有開啟這個專案：' + p);
+  return w;
+}
 for (const [id, a] of Object.entries(AGENTS)) {
   // models / efforts are the catalogs the agent itself reports (filled from AionCore events).
   S.agents[id] = { id, name: a.name, status: 'checking', note: '', working: 0, models: [], efforts: [] };
@@ -40,23 +57,27 @@ const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { retu
 try {
   const saved = JSON.parse(fs.readFileSync(SETTINGS, 'utf8'));
   if (AGENTS[saved.leader]) S.leader = saved.leader;
-  if (isDir(saved.project)) S.project = saved.project;
-  S.recent = (saved.recent || []).filter(isDir);
   for (const id in S.agentCfg) Object.assign(S.agentCfg[id], saved.agentCfg?.[id]);
+  // Older settings had one `project` and global models; it becomes the first open workspace with those models.
+  S.workspaces = (saved.workspaces || (saved.project ? [{ project: saved.project }] : []))
+    .filter((x) => isDir(x.project))
+    .map((x) => newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)));
+  S.recent = (saved.recent || []).filter(isDir);
   if (saved.notify === false) S.notify = false;
 } catch { /* first start: defaults */ }
 
 function saveSettings() {
   fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
-  fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, project: S.project, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify }, null, 2));
+  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers }));
+  fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify }, null, 2));
 }
 
-function saveRun(status) {
-  const run = S.run;
+function saveRun(w, status) {
+  const run = w.run;
   if (!run) return;
   fs.mkdirSync(HISTORY, { recursive: true });
   // phase + convs let a paused run continue in the same agent conversations after a Studio restart.
-  const rec = { id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, convs: run.convs, tasks: S.tasks, activity: S.activity };
+  const rec = { id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, convs: run.convs, tasks: w.tasks, activity: w.activity };
   fs.writeFileSync(path.join(HISTORY, run.id + '.json'), JSON.stringify(rec, null, 2));
   S.historyRev++;
 }
@@ -73,7 +94,7 @@ function historyItems() {
 }
 
 function listHistory() {
-  return historyItems().slice(0, 50).map((r) => ({ id: r.id, startedAt: r.startedAt, status: r.status, project: r.project, leader: r.leader, request: String(r.request).slice(0, 120), done: r.tasks.filter((t) => t.status === 'DONE').length, total: r.tasks.length }));
+  return historyItems().slice(0, 50).map((r) => ({ id: r.id, startedAt: r.startedAt, status: r.status === 'running' && resumable(r) ? 'interrupted' : r.status, project: r.project, leader: r.leader, request: String(r.request).slice(0, 120), done: r.tasks.filter((t) => t.status === 'DONE').length, total: r.tasks.length }));
 }
 
 // Cards finished today, and the latest finished card per agent (current board + history).
@@ -87,8 +108,9 @@ function teamStats() {
     if (new Date(at).toDateString() === today) todayDone++;
     if (!lastDone[t.agent] || at > lastDone[t.agent].at) lastDone[t.agent] = { title: t.title, at };
   };
-  for (const r of historyItems()) if (r.id !== S.run?.id) r.tasks.forEach((t) => count(t, r.finishedAt));
-  S.tasks.forEach((t) => count(t, new Date().toISOString()));
+  const live = new Set(S.workspaces.map((w) => w.run?.id));
+  for (const r of historyItems()) if (!live.has(r.id)) r.tasks.forEach((t) => count(t, r.finishedAt));
+  for (const w of S.workspaces) w.tasks.forEach((t) => count(t, new Date().toISOString()));
   return { todayDone, lastDone };
 }
 
@@ -97,8 +119,11 @@ function readHistory(id) {
   return JSON.parse(fs.readFileSync(path.join(HISTORY, id + '.json'), 'utf8'));
 }
 
-function log(who, role, text) {
-  S.activity.push({ time: new Date().toLocaleTimeString('zh-TW', { hour12: false }), who, role, text: String(text) });
+// Every event of a working run is also saved (status "running"), so closing the Studio mid-job loses nothing:
+// after a restart the job shows as interrupted and can be continued like a paused one.
+function log(w, who, role, text) {
+  w?.activity.push({ time: new Date().toLocaleTimeString('zh-TW', { hour12: false }), who, role, text: String(text) });
+  if (w?.run?.active) saveRun(w, 'running');
 }
 
 // ---------- AionCore ----------
@@ -148,11 +173,11 @@ async function api(method, p, body) {
 
 const convAgent = new Map(); // conversationId -> agent id (to route catalog events)
 
-async function createConv(agent, ws, lead, useCfg = true) {
+// cfg = the project's { model, effort } for this agent; none = agent defaults.
+async function createConv(agent, ws, lead, cfg) {
   const body = AGENTS[agent].create(ws, lead);
-  const cfg = S.agentCfg[agent];
-  if (useCfg && cfg.model) body.extra.current_model_id = cfg.model;
-  if (useCfg && cfg.effort) body.extra.thought_level = cfg.effort;
+  if (cfg?.model) body.extra.current_model_id = cfg.model;
+  if (cfg?.effort) body.extra.thought_level = cfg.effort;
   // Right after READY, create can briefly 400 (assistant catalog race seen in P0).
   for (let i = 0; ; i++) {
     try {
@@ -181,31 +206,40 @@ function watchCatalogs() {
   ws.onclose = () => setTimeout(watchCatalogs, 2000);
 }
 
-function setAgentCfg(agent, model, effort) {
+// Per project; the last choice is also the default for the next opened project.
+function setAgentCfg(w, agent, model, effort) {
   const a = S.agents[agent];
   if (!a) throw new Error('未知的 Agent');
   if (model && !a.models.some((m) => m.value === model)) throw new Error(`${a.name} 沒有這個模型：${model}`);
   if (effort && !a.efforts.includes(effort)) throw new Error(`${a.name} 不支援這個推理強度：${effort}`);
-  S.agentCfg[agent] = { model: model || '', effort: effort || '' };
+  w.agentCfg[agent] = { model: model || '', effort: effort || '' };
+  S.agentCfg[agent] = { ...w.agentCfg[agent] };
+  saveSettings();
+}
+
+// Which agents may take this project's cards (the Leader is never a Worker).
+function setWorker(w, agent, on) {
+  if (!AGENTS[agent]) throw new Error('未知的 Agent');
+  w.workers = on ? [...new Set([...w.workers, agent])] : w.workers.filter((x) => x !== agent);
   saveSettings();
 }
 
 const active = new Map(); // conversationId -> turnId (for Stop)
 
-async function answerConfirmations(convId, allow) {
+async function answerConfirmations(w, convId, allow) {
   // Modes are chosen so this should not happen; if it does, never leave a turn hanging.
   for (const c of (await api('GET', `/api/conversations/${convId}/confirmations`)) || []) {
     const opts = c.options || [];
     const re = allow ? /allow|approve|accept|yes|proceed/i : /reject|deny|cancel|abort|no/i;
     const pick = opts.find((o) => re.test(String(o.value))) || opts[allow ? 0 : opts.length - 1];
     await api('POST', `/api/conversations/${convId}/confirmations/${encodeURIComponent(c.callId ?? c.id)}/confirm`,
-      { msg_id: c.msgId ?? c.id, data: pick ? pick.value : allow ? 'allow' : 'reject' }).catch((e) => log('studio', 'system', '自動回應確認失敗：' + e.message));
+      { msg_id: c.msgId ?? c.id, data: pick ? pick.value : allow ? 'allow' : 'reject' }).catch((e) => log(w, 'studio', 'system', '自動回應確認失敗：' + e.message));
   }
 }
 
 // Send one message and wait until the agent's turn is over. Returns the agent's reply text.
-async function turn(agent, convId, text, { lead = false, check = false, timeout = 20 * 60e3 } = {}) {
-  const run = S.run;
+async function turn(agent, convId, text, { w, lead = false, check = false, timeout = 20 * 60e3 } = {}) {
+  const run = w?.run;
   const sent = await api('POST', `/api/conversations/${convId}/messages`, { content: text });
   active.set(convId, sent.turn_id);
   if (!check) S.agents[agent].working++;
@@ -213,7 +247,7 @@ async function turn(agent, convId, text, { lead = false, check = false, timeout 
     for (const t0 = Date.now(); ;) {
       await sleep(1500);
       const rt = (await api('GET', `/api/conversations/${convId}`)).runtime || {};
-      if (rt.pending_confirmations) await answerConfirmations(convId, !lead);
+      if (rt.pending_confirmations) await answerConfirmations(w, convId, !lead);
       if (rt.state === 'idle' && !rt.is_processing) break;
       if (Date.now() - t0 > timeout) throw new Error('逾時');
     }
@@ -242,7 +276,7 @@ async function checkAgent(id) {
     const ws = path.join(RT, 'studio', 'check');
     fs.mkdirSync(ws, { recursive: true });
     // The check uses agent defaults so a bad saved model can't make the agent look unavailable.
-    const reply = await turn(id, await createConv(id, ws, true, false), 'Reply with exactly: OK', { lead: true, check: true, timeout: 120e3 });
+    const reply = await turn(id, await createConv(id, ws, true), 'Reply with exactly: OK', { lead: true, check: true, timeout: 120e3 });
     if (!/OK/i.test(reply)) throw new Error('沒有正常回覆：' + (reply || '(空白)'));
     a.status = 'available';
   } catch (e) {
@@ -253,15 +287,17 @@ async function checkAgent(id) {
 const checkAll = () => Promise.all(Object.keys(AGENTS).map(checkAgent));
 const available = (id) => S.agents[id]?.status === 'available';
 
-async function conv(agent, lead) {
+async function conv(w, agent, lead) {
   const key = agent + (lead ? ':lead' : ':work');
-  return (S.run.convs[key] ??= await createConv(agent, S.run.project, lead));
+  return (w.run.convs[key] ??= await createConv(agent, w.run.project, lead, w.agentCfg[agent]));
 }
+// This run's conversations that have a turn in progress (other projects keep working).
+const busyConvs = (run) => Object.values(run.convs).filter((c) => active.has(c));
 
 // Thrown when a turn ends because the user paused or stopped the run.
 class Halt extends Error {}
 
-const workersFor = (lead) => Object.keys(AGENTS).filter((id) => id !== lead && available(id));
+const workersFor = (w, lead) => w.workers.filter((id) => id !== lead && available(id));
 const cancelTurn = (cid) => api('POST', `/api/conversations/${cid}/cancel`, { turn_id: active.get(cid) }).catch(() => {});
 
 function handoffNote(run) {
@@ -298,14 +334,23 @@ function parsePlan(reply, workers) {
   return { message: String(p.message || ''), subtasks };
 }
 
-function finish(run, status) {
+function finish(w, status) {
+  const run = w.run;
   run.active = false;
   run.paused = false;
   run.phase = 'finished';
-  saveRun(status);
+  saveRun(w, status);
   if (status === 'done' || status === 'failed') {
-    const done = S.tasks.filter((t) => t.status === 'DONE').length;
-    notify(status === 'done' ? '團隊工作完成' : '團隊工作結束（有失敗）', `${done}/${S.tasks.length} 張工作卡完成：${String(run.request).slice(0, 80)}`, status);
+    const done = w.tasks.filter((t) => t.status === 'DONE').length;
+    // e.g. "股票面板：Codex 已完成 3/3 工作" / "FamilyPDF：Claude Code 需要你處理"
+    const failed = w.tasks.find((t) => t.status === 'FAILED');
+    const workers = [...new Set(w.tasks.map((t) => t.agent))];
+    const title = status === 'done'
+      ? `${label(w)}：${workers.length === 1 ? AGENTS[workers[0]].name : '團隊'} 已完成 ${done}/${w.tasks.length} 工作`
+      : `${label(w)}：${AGENTS[failed?.agent ?? run.leader].name} 需要你處理`;
+    const body = status === 'done' ? String(run.request).slice(0, 100)
+      : failed ? `「${failed.title}」失敗：${failed.result}`.slice(0, 160) : 'Leader 沒有完成派工，打開專案查看原因';
+    notify(title, body, status, w.project);
   }
   refreshClaudeLimits();
 }
@@ -353,82 +398,92 @@ function refreshClaudeLimits() {
 }
 
 // ---------- Notifications ----------
-let lastPoll = 0; // last time a Studio page asked for state
-
-function notify(title, body, kind) {
+// Every finished / failed job sends a Windows toast (you can't watch every tab); open pages only play a sound.
+function notify(title, body, kind, project) {
   if (!S.notify) return;
   S.notices = [...S.notices, { id: ++S.noticeSeq, title, body, kind }].slice(-20);
-  // No page polling → Windows toast instead. 75 s because browsers slow background tabs to about one poll a minute.
-  if (Date.now() - lastPoll > 75000) windowsToast(title, body);
+  windowsToast(title, body, `http://127.0.0.1:${PORT}/#p=${encodeURIComponent(project)}`);
 }
 
-function windowsToast(title, body) {
+// Clicking the toast opens that project's tab in the browser.
+function windowsToast(title, body, url) {
   const ps = `[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
-$x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
+$x = New-Object Windows.Data.Xml.Dom.XmlDocument
+$x.LoadXml('<toast activationType="protocol"><visual><binding template="ToastGeneric"><text/><text/><text placement="attribution">Multi-Agent Studio</text></binding></visual></toast>')
+$x.DocumentElement.SetAttribute('launch', $env:STUDIO_URL)
 $t = $x.GetElementsByTagName('text'); [void]$t[0].AppendChild($x.CreateTextNode($env:STUDIO_TITLE)); [void]$t[1].AppendChild($x.CreateTextNode($env:STUDIO_BODY))
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))`;
   // Text goes through env vars, never into the script itself.
-  execFile('powershell.exe', ['-NoProfile', '-Command', ps], { windowsHide: true, env: { ...process.env, STUDIO_TITLE: 'Multi-Agent Studio：' + title, STUDIO_BODY: body } }, () => {});
+  execFile('powershell.exe', ['-NoProfile', '-Command', ps], { windowsHide: true, env: { ...process.env, STUDIO_TITLE: title, STUDIO_BODY: body, STUDIO_URL: url } },
+    (e, out, err) => { if (e) console.error('Windows 通知失敗：' + String(err || e.message).trim().slice(0, 300)); });
 }
 
-async function start(request) {
-  if (S.run?.active) throw new Error('團隊正在工作中，請先等待、暫停或按 Stop');
-  if (!S.project || !fs.existsSync(S.project)) throw new Error('請先選擇存在的專案資料夾');
+function renameWorkspace(w, name) {
+  w.name = String(name || '').trim().slice(0, 40);
+  saveSettings();
+}
+
+async function start(w, request) {
+  if (w.run?.active) throw new Error('這個專案的團隊正在工作中，請先等待、暫停或按 Stop');
+  if (!isDir(w.project)) throw new Error('專案資料夾不存在：' + w.project);
   if (!request.trim()) throw new Error('請輸入需求');
-  const lead = S.leader;
+  const lead = w.leader;
   if (!available(lead)) throw new Error(`Leader ${AGENTS[lead].name} 目前不可用`);
-  if (!workersFor(lead).length) throw new Error('至少需要一位可用的 Worker');
+  if (!workersFor(w, lead).length) throw new Error('這個專案至少需要一位可用的 Worker');
 
   // A paused run stays in history (status "paused") and can be continued from there later.
-  S.tasks = [];
-  S.activity = [];
+  w.tasks = [];
+  w.activity = [];
   const now = new Date();
   const id = now.toISOString().slice(0, 19).replace(/[-:T]/g, '') + '-' + crypto.randomUUID().slice(0, 4);
-  const run = (S.run = { id, startedAt: now.toISOString(), project: S.project, leader: lead, request, convs: {}, phase: 'planning', leaderGen: 0, active: true, paused: false, stopped: false, summarizing: false });
-  log('user', 'user', request);
-  log('studio', 'system', `Leader：${AGENTS[lead].name}；Workers：${workersFor(lead).map((w) => AGENTS[w].name).join('、')}`);
-  planPhase(run);
+  w.run = { id, startedAt: now.toISOString(), project: w.project, leader: lead, request, convs: {}, phase: 'planning', leaderGen: 0, active: true, paused: false, stopped: false, summarizing: false };
+  log(w, 'user', 'user', request);
+  log(w, 'studio', 'system', `Leader：${AGENTS[lead].name}；Workers：${workersFor(w, lead).map((x) => AGENTS[x].name).join('、')}`);
+  planPhase(w);
 }
 
-async function planPhase(run) {
+async function planPhase(w) {
+  const run = w.run;
   run.phase = 'planning';
   const gen = run.leaderGen, lead = run.leader;
   try {
-    const workers = workersFor(lead);
+    const workers = workersFor(w, lead);
     if (!workers.length) throw new Error('至少需要一位可用的 Worker');
-    const reply = await turn(lead, await conv(lead, true), planPrompt(run, workers), { lead: true });
+    const reply = await turn(lead, await conv(w, lead, true), planPrompt(run, workers), { w, lead: true });
     if (run.leaderGen !== gen) return; // a new Leader took over and plans again
     let plan;
     try { plan = parsePlan(reply, workers); } catch { throw new Error('Leader 回覆無法解析為工作清單：' + reply.slice(0, 500)); }
     if (!plan.subtasks.length) throw new Error('Leader 沒有產生任何工作：' + reply.slice(0, 500));
-    log(lead, 'leader', plan.message || `已拆成 ${plan.subtasks.length} 項工作`);
+    log(w, lead, 'leader', plan.message || `已拆成 ${plan.subtasks.length} 項工作`);
     for (const st of plan.subtasks) {
-      S.tasks.push({ id: crypto.randomUUID().slice(0, 8), ...st, status: 'WAITING', result: '' });
-      log(lead, 'leader', `派工給 ${AGENTS[st.agent].name}：${st.title}`);
+      w.tasks.push({ id: crypto.randomUUID().slice(0, 8), ...st, status: 'WAITING', result: '' });
+      log(w, lead, 'leader', `派工給 ${AGENTS[st.agent].name}：${st.title}`);
     }
     run.phase = 'working';
-    pump();
+    pump(w);
   } catch (e) {
     if (run.leaderGen !== gen || e instanceof Halt) return; // pause: resume() plans again; stop: stop() already saved
-    log('studio', 'system', 'Leader 失敗：' + e.message);
-    finish(run, 'failed');
+    log(w, 'studio', 'system', 'Leader 失敗：' + e.message);
+    finish(w, 'failed');
   }
 }
 
-// Start every WAITING task whose agent is free; when all are finished, the Leader writes the report.
-function pump() {
-  const run = S.run;
+// Start every WAITING task whose agent is free in this project; when all are finished, the Leader writes the report.
+// ponytail: an agent can work for two projects at once (separate conversations); add a global per-agent slot if plan limits suffer.
+function pump(w) {
+  const run = w.run;
   if (!run?.active || run.paused || run.phase !== 'working') return;
-  for (const t of S.tasks) {
-    if (t.status === 'WAITING' && !S.tasks.some((x) => x.status === 'WORKING' && x.agent === t.agent)) runTask(t);
+  for (const t of w.tasks) {
+    if (t.status === 'WAITING' && !w.tasks.some((x) => x.status === 'WORKING' && x.agent === t.agent)) runTask(w, t);
   }
-  if (!run.summarizing && S.tasks.length && S.tasks.every((t) => t.status === 'DONE' || t.status === 'FAILED')) summarize(run);
+  if (!run.summarizing && w.tasks.length && w.tasks.every((t) => t.status === 'DONE' || t.status === 'FAILED')) summarize(w);
 }
 
-async function runTask(t) {
-  const run = S.run;
+async function runTask(w, t) {
+  const run = w.run;
   t.status = 'WORKING';
-  log(t.agent, 'worker', (t.resumed ? '繼續工作：' : '開始工作：') + t.title);
+  log(w, t.agent, 'worker', (t.resumed ? '繼續工作：' : '開始工作：') + t.title);
   try {
     const prompt = `You are a WORKER in "Multi-Agent Studio". Your leader (${AGENTS[run.leader].name}) assigned you this task.
 Work only inside the project folder: ${run.project}
@@ -438,26 +493,27 @@ Instructions:
 ${t.instructions}
 
 When finished, reply with a short summary of what you did (1-3 sentences).`;
-    t.result = (await turn(t.agent, await conv(t.agent, false), prompt)) || '(完成，沒有文字回覆)';
+    t.result = (await turn(t.agent, await conv(w, t.agent, false), prompt, { w })) || '(完成，沒有文字回覆)';
     t.status = 'DONE';
     t.doneAt = new Date().toISOString();
-    log(t.agent, 'worker', t.result);
+    log(w, t.agent, 'worker', t.result);
   } catch (e) {
     if (e instanceof Halt && run.paused) { t.status = 'PAUSED'; t.result = '已暫停'; t.resumed = true; return; }
     t.status = 'FAILED';
     t.result = e.message;
-    log(t.agent, 'worker', '失敗：' + e.message);
+    log(w, t.agent, 'worker', '失敗：' + e.message);
   }
-  pump();
+  pump(w);
 }
 
-async function summarize(run) {
+async function summarize(w) {
+  const run = w.run;
   run.summarizing = true;
   run.phase = 'summarizing';
   const gen = run.leaderGen, lead = run.leader;
-  const results = S.tasks.map((t) => `- [${t.status}] ${t.title} (${AGENTS[t.agent].name}): ${t.result}`).join('\n');
+  const results = w.tasks.map((t) => `- [${t.status}] ${t.title} (${AGENTS[t.agent].name}): ${t.result}`).join('\n');
   try {
-    const txt = await turn(lead, await conv(lead, true), `You are the LEADER. The workers have finished.${handoffNote(run)}
+    const txt = await turn(lead, await conv(w, lead, true), `You are the LEADER. The workers have finished.${handoffNote(run)}
 Original user request:
 """
 ${run.request}
@@ -465,110 +521,128 @@ ${run.request}
 Results:
 ${results}
 
-Do not modify files. Write a short final report to the user (2-4 sentences, in the user's language). Plain text only.`, { lead: true });
+Do not modify files. Write a short final report to the user (2-4 sentences, in the user's language). Plain text only.`, { w, lead: true });
     if (run.leaderGen !== gen) return;
-    log(lead, 'leader', txt || '(沒有文字回覆)');
+    log(w, lead, 'leader', txt || '(沒有文字回覆)');
   } catch (e) {
     if (run.leaderGen !== gen || e instanceof Halt) return;
-    log('studio', 'system', 'Leader 總結失敗：' + e.message);
+    log(w, 'studio', 'system', 'Leader 總結失敗：' + e.message);
   }
   run.summarizing = false;
-  finish(run, S.tasks.every((t) => t.status === 'DONE') ? 'done' : 'failed');
+  finish(w, w.tasks.every((t) => t.status === 'DONE') ? 'done' : 'failed');
 }
 
-function stop() {
-  const run = S.run;
+function stop(w) {
+  const run = w.run;
   if (!run?.active && !run?.paused) return;
   run.stopped = true;
-  for (const cid of active.keys()) cancelTurn(cid);
-  for (const t of S.tasks) if (['WAITING', 'PAUSED'].includes(t.status)) { t.status = 'FAILED'; t.result = '已停止'; }
-  log('studio', 'system', '已按下 Stop：所有 Agent 停止目前工作。');
-  finish(run, 'stopped');
+  busyConvs(run).forEach(cancelTurn);
+  for (const t of w.tasks) if (['WAITING', 'PAUSED'].includes(t.status)) { t.status = 'FAILED'; t.result = '已停止'; }
+  log(w, 'studio', 'system', '已按下 Stop：這個專案的 Agent 停止目前工作。');
+  finish(w, 'stopped');
 }
 
-function pause() {
-  const run = S.run;
+function pause(w) {
+  const run = w.run;
   if (!run?.active) throw new Error('目前沒有進行中的工作');
   run.paused = true;
   run.active = false;
-  for (const cid of active.keys()) cancelTurn(cid);
-  for (const t of S.tasks) if (t.status === 'WORKING') { t.status = 'PAUSED'; t.result = '已暫停'; t.resumed = true; }
-  log('studio', 'system', '已暫停：工作卡和對話都保留，關掉 Studio 也沒關係，之後按「繼續」接著做。');
-  saveRun('paused');
+  busyConvs(run).forEach(cancelTurn);
+  for (const t of w.tasks) if (t.status === 'WORKING') { t.status = 'PAUSED'; t.result = '已暫停'; t.resumed = true; }
+  log(w, 'studio', 'system', '已暫停：工作卡和對話都保留，關掉 Studio 也沒關係，之後按「繼續」接著做。');
+  saveRun(w, 'paused');
 }
 
-function loadRun(r) {
-  S.tasks = r.tasks;
-  S.activity = r.activity;
-  S.run = { id: r.id, startedAt: r.startedAt, project: r.project, leader: r.leader, request: r.request, convs: r.convs || {}, phase: r.phase || 'working', leaderGen: 0, active: false, paused: true, stopped: false, summarizing: false };
-  for (const [k, cid] of Object.entries(S.run.convs)) convAgent.set(cid, k.split(':')[0]);
+// Can be continued: paused by the user, or "running" in the file but no longer live (Studio was closed mid-job).
+const resumable = (r) => r.status === 'paused' || (r.status === 'running' && !S.workspaces.some((w) => w.run?.id === r.id && w.run.active));
+
+function loadRun(w, r) {
+  // Cards that were mid-work when the Studio closed continue like paused cards.
+  for (const t of r.tasks) if (t.status === 'WORKING') Object.assign(t, { status: 'PAUSED', result: '已中斷', resumed: true });
+  w.tasks = r.tasks;
+  w.activity = r.activity;
+  w.run = { id: r.id, startedAt: r.startedAt, project: r.project, leader: r.leader, request: r.request, convs: r.convs || {}, phase: r.phase || 'working', leaderGen: 0, active: false, paused: true, stopped: false, summarizing: false };
+  for (const [k, cid] of Object.entries(w.run.convs)) convAgent.set(cid, k.split(':')[0]);
 }
 
-function resume(id) {
-  if (id && S.run?.id !== id) {
-    if (S.run?.active) throw new Error('目前有進行中的工作，請先暫停或停止');
+// w is null when continuing from history: the record's project picks (or opens) the workspace.
+function resume(w, id) {
+  if (id && w?.run?.id !== id) {
     const r = readHistory(id);
-    if (r.status !== 'paused') throw new Error('這筆紀錄不是暫停中的工作');
-    loadRun(r);
+    if (!resumable(r)) throw new Error('這筆紀錄不是暫停或中斷的工作');
+    w = wsOf(openWorkspace(r.project).project);
+    if (w.run?.id !== id) {
+      if (w.run?.active) throw new Error('這個專案有進行中的工作，請先暫停或停止');
+      loadRun(w, r);
+    }
   }
-  const run = S.run;
+  const run = w?.run;
   if (!run?.paused) throw new Error('沒有暫停中的工作');
-  if (active.size) throw new Error('Agent 還在停下中，請幾秒後再按繼續');
+  if (busyConvs(run).length) throw new Error('Agent 還在停下中，請幾秒後再按繼續');
   if (!isDir(run.project)) throw new Error('專案資料夾不存在：' + run.project);
-  if (!available(S.leader)) throw new Error(`Leader ${AGENTS[S.leader].name} 目前不可用`);
-  if (run.leader !== S.leader) { run.handoffFrom = run.leader; run.leader = S.leader; }
+  if (!available(w.leader)) throw new Error(`Leader ${AGENTS[w.leader].name} 目前不可用`);
+  if (run.leader !== w.leader) { run.handoffFrom = run.leader; run.leader = w.leader; }
   run.paused = false;
   run.active = true;
-  for (const t of S.tasks) if (t.status === 'PAUSED') t.status = 'WAITING';
-  log('studio', 'system', `繼續工作（Leader：${AGENTS[run.leader].name}）。`);
-  if (run.phase === 'planning') planPhase(run);
-  else if (run.phase === 'summarizing') summarize(run);
-  else { run.phase = 'working'; pump(); }
+  for (const t of w.tasks) if (t.status === 'PAUSED') t.status = 'WAITING';
+  log(w, 'studio', 'system', `繼續工作（Leader：${AGENTS[run.leader].name}）。`);
+  if (run.phase === 'planning') planPhase(w);
+  else if (run.phase === 'summarizing') summarize(w);
+  else { run.phase = 'working'; pump(w); }
 }
 
-function reassign(taskId, agent) {
-  const run = S.run;
-  const t = S.tasks.find((x) => x.id === taskId);
+function reassign(w, taskId, agent) {
+  const run = w.run;
+  const t = w.tasks.find((x) => x.id === taskId);
   if (!t) throw new Error('找不到這項工作');
   if (t.status === 'WORKING') throw new Error('工作進行中，請先暫停或 Stop');
   if (!available(agent)) throw new Error(`${AGENTS[agent]?.name ?? agent} 目前不可用`);
   t.agent = agent;
   t.result = '';
-  log('user', 'user', `重新指派「${t.title}」給 ${AGENTS[agent].name}`);
-  if (run.paused) { t.status = 'PAUSED'; saveRun('paused'); return; } // runs when the user continues
+  log(w, 'user', 'user', `重新指派「${t.title}」給 ${AGENTS[agent].name}`);
+  if (run.paused) { t.status = 'PAUSED'; saveRun(w, 'paused'); return; } // runs when the user continues
   t.status = 'WAITING';
   Object.assign(run, { active: true, stopped: false, phase: 'working' });
-  pump();
+  pump(w);
 }
 
 // Changing the Leader mid-run hands the same job over; Workers keep their cards.
-function setLeader(agent) {
+function setLeader(w, agent) {
   if (!AGENTS[agent]) throw new Error('未知的 Agent');
   if (!available(agent)) throw new Error(`${AGENTS[agent].name} 目前不可用`);
-  const old = S.leader;
+  const old = w.leader;
   if (old === agent) return;
-  S.leader = agent;
+  w.leader = S.leader = agent; // the last pick is also the default for the next opened project
   saveSettings();
-  const run = S.run;
-  if (!run || (!run.active && !run.paused)) return log('studio', 'system', `Leader 換成 ${AGENTS[agent].name}`);
+  const run = w.run;
+  if (!run || (!run.active && !run.paused)) return log(w, 'studio', 'system', `Leader 換成 ${AGENTS[agent].name}`);
   run.handoffFrom = run.leader;
   run.leader = agent;
   run.leaderGen++;
-  const n = S.tasks.length;
-  log('studio', 'system', `Leader 交接：${AGENTS[old].name} → ${AGENTS[agent].name}。新 Leader 接手原始需求${n ? `和 ${n} 張工作卡（已完成的結果保留）` : ''}，不需要重新輸入。`);
+  const n = w.tasks.length;
+  log(w, 'studio', 'system', `Leader 交接：${AGENTS[old].name} → ${AGENTS[agent].name}。新 Leader 接手原始需求${n ? `和 ${n} 張工作卡（已完成的結果保留）` : ''}，不需要重新輸入。`);
   const oldConv = run.convs[old + ':lead'];
   if (oldConv && active.has(oldConv)) cancelTurn(oldConv);
-  if (run.paused) return saveRun('paused');
-  if (run.phase === 'planning') planPhase(run);
-  else if (run.phase === 'summarizing') summarize(run);
+  if (run.paused) return saveRun(w, 'paused');
+  if (run.phase === 'planning') planPhase(w);
+  else if (run.phase === 'summarizing') summarize(w);
 }
 
-function setProject(p) {
-  p = path.resolve(String(p || '').trim());
+// Opens a project as its own tab (or returns the open one).
+function openWorkspace(p) {
+  if (!String(p || '').trim()) throw new Error('請輸入資料夾路徑');
+  p = path.resolve(String(p).trim());
   if (!isDir(p)) throw new Error('資料夾不存在：' + p);
-  if (S.run?.active) throw new Error('團隊工作中，請等工作結束再換專案');
-  S.project = p;
-  S.recent = [p, ...S.recent.filter((x) => x.toLowerCase() !== p.toLowerCase())].slice(0, 8);
+  let w = S.workspaces.find((x) => same(x.project, p));
+  if (!w) S.workspaces.push((w = newWs(p)));
+  S.recent = [w.project, ...S.recent.filter((x) => !same(x, w.project))].slice(0, 8);
+  saveSettings();
+  return { project: w.project };
+}
+
+function closeWorkspace(w) {
+  if (w.run?.active) throw new Error('這個專案的團隊還在工作，請先暫停或停止');
+  S.workspaces = S.workspaces.filter((x) => x !== w); // a paused job stays in 歷史紀錄
   saveSettings();
 }
 
@@ -577,9 +651,8 @@ function removeRecent(p) {
   saveSettings();
 }
 
-function readProjectProgress() {
-  if (!S.project) return { exists: false, text: '' };
-  const file = path.join(S.project, '.ai-workspace', 'progress.md');
+function readProjectProgress(w) {
+  const file = path.join(w.project, '.ai-workspace', 'progress.md');
   if (!fs.existsSync(file)) return { exists: false, text: '' };
   return { exists: true, text: fs.readFileSync(file, 'utf8'), file };
 }
@@ -611,15 +684,13 @@ async function pollPaseo() {
   catch { S.paseo = 'stopped'; }
 }
 
-async function openInPaseo() {
+async function openInPaseo(w) {
   if (!fs.existsSync(PASEO_EXE)) throw new Error('這台電腦沒有安裝 Paseo');
-  if (!S.project) throw new Error('請先選擇專案');
   spawn(PASEO_EXE, [], { detached: true, stdio: 'ignore' }).unref(); // opens Paseo, or brings the open window forward
   for (let i = 0; S.paseo !== 'running' && i < 20; i++) { await sleep(1500); await pollPaseo(); }
   if (S.paseo !== 'running') throw new Error('Paseo 已開啟，但它的背景服務還沒準備好，請稍後再按一次');
-  const same = (p) => path.resolve(p).toLowerCase() === S.project.toLowerCase();
-  if (!JSON.parse(await paseo(['workspace', 'ls', '--json'])).some((w) => same(w.cwd))) {
-    await paseo(['workspace', 'create', '--isolation', 'local', '--path', S.project, '--title', path.basename(S.project), '--json']);
+  if (!JSON.parse(await paseo(['workspace', 'ls', '--json'])).some((x) => same(x.cwd, w.project))) {
+    await paseo(['workspace', 'create', '--isolation', 'local', '--path', w.project, '--title', path.basename(w.project), '--json']);
   }
 }
 
@@ -628,23 +699,30 @@ const routes = {
   'POST /api/limits/refresh': async () => { refreshCodexLimits(); await refreshClaudeLimits(); },
   'POST /api/notify': (b) => { S.notify = !!b.on; saveSettings(); },
   'GET /api/state': () => {
-    lastPoll = Date.now();
-    const r = S.run;
-    return { ...S, ...teamStats(), agents: Object.values(S.agents), progress: readProjectProgress(),
-      run: r && { id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, project: r.project } };
+    const workspaces = S.workspaces.map((w) => {
+      const r = w.run;
+      return { project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, tasks: w.tasks, activity: w.activity, progress: readProjectProgress(w),
+        run: r && { id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt } };
+    });
+    return { ...S, ...teamStats(), agents: Object.values(S.agents), workspaces };
   },
-  'POST /api/pause': () => pause(),
-  'POST /api/resume': (b) => resume(b.id),
-  'POST /api/paseo/open': () => openInPaseo(),
-  'POST /api/project': (b) => setProject(b.path),
-  'POST /api/browse': async () => { const p = await browseFolder(); if (p) setProject(p); return { path: p }; },
-  'POST /api/leader': (b) => setLeader(b.agent),
-  'POST /api/start': (b) => start(String(b.request || '')),
-  'POST /api/stop': () => stop(),
-  'POST /api/reassign': (b) => reassign(b.taskId, b.agent),
+  // Project-scoped calls name their project in `ws` (its folder path).
+  'POST /api/pause': (b) => pause(wsOf(b.ws)),
+  'POST /api/resume': (b) => resume(b.ws ? wsOf(b.ws) : null, b.id),
+  'POST /api/paseo/open': (b) => openInPaseo(wsOf(b.ws)),
+  'POST /api/workspace/open': (b) => openWorkspace(b.path),
+  'POST /api/workspace/close': (b) => closeWorkspace(wsOf(b.ws)),
+  'POST /api/workspace/rename': (b) => renameWorkspace(wsOf(b.ws), b.name),
+  'POST /api/notify/test': () => windowsToast('測試通知：Studio 通知正常', '專案完成或需要你處理時會這樣通知你', `http://127.0.0.1:${PORT}/`),
+  'POST /api/browse': async () => { const p = await browseFolder(); return p ? openWorkspace(p) : {}; },
+  'POST /api/leader': (b) => setLeader(wsOf(b.ws), b.agent),
+  'POST /api/start': (b) => start(wsOf(b.ws), String(b.request || '')),
+  'POST /api/stop': (b) => stop(wsOf(b.ws)),
+  'POST /api/reassign': (b) => reassign(wsOf(b.ws), b.taskId, b.agent),
   'POST /api/check': () => { checkAll().then(refreshClaudeLimits); },
   'POST /api/recent/remove': (b) => removeRecent(b.path),
-  'POST /api/agent-config': (b) => setAgentCfg(b.agent, b.model, b.effort),
+  'POST /api/agent-config': (b) => setAgentCfg(wsOf(b.ws), b.agent, b.model, b.effort),
+  'POST /api/workers': (b) => setWorker(wsOf(b.ws), b.agent, !!b.on),
   // One-time login for Studio's separate Codex home, in a visible console window.
   'POST /api/codex-login': () => { spawn('cmd', ['/c', 'start', 'Codex login (Studio)', 'cmd', '/k', 'codex', 'login'], { env: { ...process.env, CODEX_HOME }, detached: true, stdio: 'ignore' }); },
   'GET /api/history': () => listHistory(),
@@ -668,9 +746,11 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-// Show the latest paused job again after a restart, ready to continue.
-const lastPaused = historyItems().find((r) => r.status === 'paused');
-if (lastPaused) loadRun(lastPaused);
+// Show each open project's latest paused job again after a restart, ready to continue.
+for (const w of S.workspaces) {
+  const r = historyItems().find((x) => (x.status === 'paused' || x.status === 'running') && same(x.project, w.project));
+  if (r) loadRun(w, r);
+}
 
 await startAion();
 watchCatalogs();
