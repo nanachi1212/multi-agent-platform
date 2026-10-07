@@ -217,6 +217,9 @@
   <nav class="tabs" id="tabs"></nav>
   <span class="spacer"></span>
   <button class="btn small" id="notifyBtn" title="每個專案完成或需要你處理時發 Windows 通知（點通知直接打開該專案分頁）；開著的網頁另外播提示音">🔔 通知：開</button>
+  <select id="fontSize" title="字體大小（整個畫面，記在這個瀏覽器）" style="width:auto;padding:4px 8px;font-size:13px;border-radius:8px">
+    <option value="1">字體：標準</option><option value="1.15">字體：大</option><option value="1.3">字體：特大</option><option value="1.5">字體：超大</option>
+  </select>
   <span class="pill" id="paseoPill">Paseo</span>
 </header>
 
@@ -929,6 +932,15 @@ document.addEventListener('click', (e) => {
   if (b.dataset.worker) post('/api/workers', { ws: ws(), agent: b.dataset.worker, on: b.dataset.on === '1' });
   if (b.dataset.reassign) post('/api/reassign', { ws: ws(), taskId: b.dataset.reassign, agent: document.querySelector(`select[data-task="${b.dataset.reassign}"]`).value });
 });
+// 字體大小: scales everything below the top bar; remembered per browser.
+(function () {
+  const sel = $('fontSize'), lay = document.querySelector('.layout');
+  const apply = (v) => { lay.style.zoom = v; sel.value = v; };
+  let saved = '1';
+  try { saved = localStorage.getItem('studio.fontScale') || '1'; } catch { /* storage blocked: stay at 標準 */ }
+  apply([...sel.options].some((o) => o.value === saved) ? saved : '1');
+  sel.onchange = () => { apply(sel.value); try { localStorage.setItem('studio.fontScale', sel.value); } catch { /* not remembered */ } };
+})();
 refresh();
 setInterval(refresh, 1000);
 </script>
