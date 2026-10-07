@@ -1,62 +1,121 @@
 # Multi-Agent Platform
 
-Windows-first experimental multi-agent collaboration platform.
+[繁體中文](#繁體中文) · [English](#english)
 
-Core direction:
+> **v0.1.0 預覽版 / preview** — 實驗性專案，只適合拋棄式或有版本控制的專案。 / Experimental. Use it only on disposable or version-controlled projects.
 
-- AionCore as the agent runtime
-- An external Conductor for orchestration, policy, and verification
-- Heterogeneous agents: Claude Code, OpenAI Codex, Google Antigravity, and future Gemini CLI or local LLM support
-- Separate Agent from Role
-- Future runtime Leader handoff
-- Per-task-attempt Git worktrees
-- Deterministic verification
-- Experiment mode
+---
 
-## Current Status
+## 繁體中文
 
-**Architecture V1 completed. P0 Spike completed with NO-GO for MVP-0 under current gates. Blocker resolution is in progress.**
+Windows 優先的多 AI 協作平台。**Multi-Agent Studio** 是一個本機網頁：Claude Code、Codex、Antigravity 組成一個團隊，你選一位當「工頭」，其他是「成員」。你用白話說要做什麼，工頭拆成工作卡派給成員，成員在你的專案資料夾裡動手做，工頭最後確認整件事是否真的完成。
 
-This is an experimental research project and is not ready for product use.
+### 快速開始
 
-## Multi-Agent Studio (MVP)
+1. 安裝 [Node.js](https://nodejs.org)，並先登入要用的 AI：`claude auth login`、`codex login`（Antigravity 需先安裝並登入）。
+2. 雙擊 `start-studio.cmd`，瀏覽器會打開 `http://127.0.0.1:4848`（連接埠被佔用時自動改用下一個）。關掉黑色視窗就會停止。
+3. 在左側「開啟專案」選一個資料夾，在「今天想讓『專案名』做什麼？」輸入需求，按「▶ 交給團隊」。
 
-A local web page where Claude Code, Codex and Antigravity work as one team. Pick any available agent as Leader; the others are Workers. The Leader splits your request into tasks and assigns them, Workers do the work in your project folder, and the Leader writes a final report.
+第一次啟動會下載 AionCore v0.2.2（官方版本，SHA-256 驗證）到 `runtime/`。Studio 的 Codex 使用獨立資料夾（`runtime/studio/codex-home`），不會出現在你平常的 Codex 紀錄裡；第一次要在 Codex 卡片按「登入 Codex（Studio 專用）」。
 
-Start: double-click `start-studio.cmd` (needs Node.js). The browser opens `http://127.0.0.1:4848`. Close the console window to stop the Studio.
+### 功能
 
-- Multiple projects at the same time: every opened project gets its own tab (`#p=<folder>`) with its own Leader, Workers (turn an agent off for one project), models, cards, team chat, pause/stop and history. Switching tabs never stops work. ✎ 改名 sets a display name used in tabs, overview and notifications. Projects run in parallel; one agent can work for two projects at once (separate conversations, shared plan limits).
-- 總覽 (overview) tab: one card per project (status, progress bar, current cards), one-click 暫停／繼續 per project, a 誰在做什麼 table (agents × projects) and all staff seats.
-- Work lifecycle: a worker's turn ending is not a card being done. Every worker reply ends with a STATUS line (DONE / WAITING_EXTERNAL / WAITING_AGENT / NEEDS_USER). Waiting cards are parked and woken in the same conversation: when the awaited agent finishes, when a GitHub PR's CI finishes (checked every minute with `gh`), or when you answer. Waits Studio cannot check say 「需要你按繼續」. Cards can depend on earlier cards (`after`). When every card has ended, the 工頭 checks the whole request and adds cards if it is not complete (max 3 extra rounds, then it asks you). Check: `node studio/lifecycle-check.cjs`.
-- 現在發生什麼 (top of each project page) and every overview card answer: progress, what we wait for, what happens next, and 你現在需要做什麼 (🔴 需要 Nana with the question and answer buttons).
-- Work memory: each project keeps a short summary of its latest job (goal, cards, results, PR / branch / commit, waits, open question). A new job gets it as background; 「↻ 接著上次的工作」 or a request starting with 繼續 continues from it (a paused job simply resumes), and a new 工頭 gets the same summary. Raw agent JSON and errors appear only under 查看技術細節.
-- Project State / Handoff Memory: with no job running, each project shows a state card (上次目標 / 已完成 / 目前 / 接下來 / 你現在) built from the last job plus the real Git / GitHub state read with `git` and `gh` (main SHA, local branch, open and merged PRs, CI per check, unresolved review threads). Git / GitHub wins over older agent notes. Refreshed when Studio starts, when a project tab opens (if older than 2 minutes), when a job ends, before ▶ 接著處理 and before a 工頭 handoff, or with ↻ 重新整理狀態. ▶ 接著處理 and a new 工頭 get the same handoff text.
-- 做完之後 (per project, on the project page): ① 完成就停 (default: report and wait), ② 完成後建議下一步 (the 工頭 adds 1–3 next steps with a reason; ▶ 做這個 starts one as a continuation), ③ 自動持續開發 (opt-in with a confirmation: after a done job the 工頭's first suggestion starts automatically; at most 5 in a row, and a failure, a question, pause or Stop ends the chain).
-- Instructions mid-job: while a job runs, the desk shows 「工作進行中，想補充或修改指示？」 with 📣 告訴工頭 (Ctrl + Enter). The 工頭 decides what to do: tell a worker on its card (a working worker gets it as soon as its current step ends, in the same conversation; a waiting card is woken with it; a card that has not started gets it in its instructions), cancel cards that have not started, or add cards. A busy 工頭 (planning, final check) handles the notes right after; new instructions beat a "done" check. While paused, notes are kept until 繼續. If the 工頭 is waiting for an answer, the instruction is the answer.
-- ⚡ 立刻打斷正在做的成員 (checkbox next to 📣 告訴工頭): working cards stop their current step at once and wait; after the 工頭 has read the instruction they continue in the same conversation with it (told to check the files first, since the stopped step may be half done).
-- Saving the Claude 工頭's quota: the 工頭 must not read files, search the repo or run commands (it plans from the request and the work context and sends investigations to workers), card results are shortened in its prompts, Claude Code gets a card only when codex and antigravity cannot do it, the 工頭 always uses the normal model tier, and the Claude plan-limit probe runs only at Studio start and on 更新 (not after every job).
-- Model strategy per project (模型策略, default 💰 省額度): the 工頭 marks each card normal or hard by itself; normal cards and every 工頭 turn use the normal tier, hard cards the hard tier (own conversation), and a normal card that fails is retried once on the hard tier. 💰 省額度 = Claude Sonnet / Opus, Codex Luna / Sol (medium / high); ⚖️ 均衡 = same models, one effort step higher; 🚀 品質優先 = Claude Opus / Fable, Codex Sol / Sol (max); 🛠️ 自訂 = the 平常 / 困難 settings on the seat cards.
-- Each agent has a seat card with its model and reasoning-effort picker (lists come from the agent itself; Antigravity uses its default). Model choices are per project (set on the project page) and apply from the next run.
-- Open project tabs (with each Leader), recent projects and model choices are saved in `runtime/studio/settings.json`. Every run is saved in `runtime/studio/history/` and can be reopened from the 歷史紀錄 list.
-- The Leader spreads independent subtasks across Workers, which run at the same time (one task per Worker at a time).
-- Home page: today's finished cards, Leader office (hand the request to the Leader), staff seats showing model, effort, current card and last finished card.
-- 接手當 Leader works mid-run: the new Leader gets the original request and the current cards; Workers keep their cards.
-- 暫停 keeps cards and agent conversations; each open project's paused job is shown again after restarting the Studio and 繼續 picks it up. A working job is saved on every event, so closing the Studio mid-job shows it as 中斷（可繼續） after a restart. Older paused or interrupted jobs can be continued from 歷史紀錄.
-- Plan limits: Claude (5-hour + weekly) and Codex (weekly) usage bars with reset time on each seat. Claude is read with one tiny Haiku request that is not saved as a session (on start, after each job, or 更新); Codex is read from Studio's own Codex logs. Antigravity does not report limits.
-- Windows notifications (🔔 button): every finished job sends a Windows toast such as 「股票面板：Codex 已完成 3/3 工作」 or 「FamilyPDF：Claude Code 需要你處理」 (a card failed or the Leader could not plan). Clicking it opens that project tab. Open pages also play a sound. Turning 🔔 on shows a test toast. Windows Focus Assist / Do Not Disturb can hide toasts.
-- Paseo: status light and 用 Paseo 開啟目前專案 (opens Paseo and registers the folder as a Paseo workspace) for Paseo's own remote / phone features.
-- First start downloads AionCore v0.2.2 (official release, SHA-256 checked) into `runtime/`.
-- Studio runs Codex with its own home (`runtime/studio/codex-home`), so Studio sessions never show up in your normal Codex history. Log in once with the 登入 Codex（Studio 專用） button on the Codex card.
-- Agents must already be installed and logged in (`claude auth login`, `codex login`). The Team panel shows `Unavailable` with the reason otherwise; click 重新檢查 Agent after fixing.
-- Workers can edit files and run commands in the chosen folder without asking (Claude: `bypassPermissions`, Codex: `auto`). Use disposable or version-controlled projects only.
-- Known limits: AionCore writes an `.agents/` folder into the project when Antigravity works there. A finished run is not shown on the board after a restart (it stays in history).
+**多專案同時工作**
+- 每個專案一個分頁，各自有工頭、成員、模型、工作卡、對話、暫停／Stop 和歷史；切換分頁不會停止工作。
+- 「總覽」頁：每個專案一張卡（狀態、進度、下一步、你要做什麼）、一鍵暫停／繼續、「誰在做什麼」表格。
+- 每個專案完成或需要你處理時發 Windows 通知，點通知會打開該專案分頁。
 
-## Documentation
+**工作流程（不用盯著看）**
+- 成員每次回覆都要標明狀態：完成／等外部結果（例如 CI）／等其他 AI／需要你決定。一回合結束不等於完成。
+- 在等的工作卡會自動接續：等的 AI 做完、GitHub PR 的 CI 跑完（用 `gh`，每分鐘檢查）、或你回覆。Studio 無法自己確認的等待，會明說「需要你按繼續」，不會假裝在背景等。
+- 工作卡可以設定「等前一張完成才開始」。全部做完後，工頭會確認整體需求是否真的完成，沒完成會自己追加工作卡（最多 3 輪，之後問你）。
+- 「現在發生什麼」：進度、在等什麼、接下來誰做什麼、你現在要不要處理（🔴 需要 Nana，可直接按選項回覆）。
+
+**專案記憶與接續**
+- 每個專案保存「專案狀態」：上次目標、已完成、目前、下一步，並用 `git`／`gh` 核對真實狀態（main SHA、開著與已合併的 PR、每項 CI、未解決的 review 意見）。Git／GitHub 的結果優先於 AI 以前留下的文字。
+- 重開 Studio、按「▶ 接著處理」或更換工頭，都會拿到同一份接力棒，不用重新解釋。
+
+**中途控制**
+- 工作進行中可以「📣 告訴工頭」補充或修改指示：工頭決定轉告哪位成員、取消或追加工作卡。勾「⚡ 立刻打斷」會讓正在做的成員馬上停下，看完指示再接著做。
+- 「做完之後」：① 完成就停（預設）、② 完成後建議 1–3 個下一步、③ 自動持續開發（需自己開啟並確認，最多連續 5 件）。
+
+**省額度**
+- 工頭不讀檔、不查 repo、不跑指令，只規劃與確認；調查和動手都交給成員。Claude Code 只在 Codex 和 Antigravity 做不了時才拿到工作卡。
+- 模型策略（每個專案）：💰 省額度（預設，普通卡 Sonnet／Luna，困難卡自動升級 Opus／Sol）、⚖️ 均衡、🚀 品質優先、🛠️ 自訂。工頭自己判斷普通或困難；普通卡失敗會自動改用強模型重試一次。
+- 員工卡顯示 Claude（5 小時＋每週）與 Codex（每週）的額度條。Claude 額度只在 Studio 啟動和按「更新」時讀取一次。
+
+### 已知限制（v0.1.0）
+
+- 「模型策略」搭配真的 Codex、以及困難卡實際自動升級，目前只用模擬回覆驗證過；其餘功能已在真實專案（PDF 編輯器、股票面板）上使用。
+- 沒有 CI；所有驗證都是手動的：`node studio/lifecycle-check.cjs`（模擬 AI 回覆的流程檢查）加上實際操作。
+- 成員正在進行的那一步不會被「告訴工頭」中途打斷，要用「立刻打斷」。
+- AionCore 在 Antigravity 工作時，會在專案裡寫一個 `.agents/` 資料夾。
+- 目前只支援 Windows。
+
+### 安全
+
+**成員會在你選的資料夾裡直接修改檔案、執行指令，不會先問**（Claude：`bypassPermissions`，Codex：`auto`）。Git worktree 不是安全沙箱。只適合拋棄式或有版本控制、不含敏感資料的專案；用在正式環境專案或有機密憑證的資料夾，尚未被核准。
+
+### 文件
+
+- [架構 V1](docs/architecture/MULTI_AGENT_PLATFORM_ARCHITECTURE_V1.md)
+- [Codex 架構審查](docs/architecture/ARCHITECTURE_REVIEW_CODEX.md)
+- [P0 Spike 報告](docs/reports/P0_SPIKE_REPORT.md)（P0 在當時的閘門條件下，結論為 NO-GO；那份架構研究與 Studio 是分開的）
+
+---
+
+## English
+
+A Windows-first multi-agent collaboration platform. **Multi-Agent Studio** is a local web page where Claude Code, Codex and Antigravity work as one team. You pick one as the **Leader**; the others are **Workers**. You say what you want in plain words, the Leader splits it into cards and assigns them, Workers do the work inside your project folder, and the Leader finally checks that the whole request is really done.
+
+### Quick start
+
+1. Install [Node.js](https://nodejs.org) and log in to the agents you want: `claude auth login`, `codex login` (Antigravity must be installed and logged in).
+2. Double-click `start-studio.cmd`. The browser opens `http://127.0.0.1:4848` (the next free port is used if it is taken). Close the console window to stop.
+3. Open a project folder in the sidebar, type what you want under "今天想讓「<project>」做什麼？", and press "▶ 交給團隊".
+
+The first start downloads AionCore v0.2.2 (official release, SHA-256 checked) into `runtime/`. Studio runs Codex with its own home (`runtime/studio/codex-home`), so its sessions never appear in your normal Codex history; log in once with the "登入 Codex（Studio 專用）" button on the Codex card.
+
+### Features
+
+**Several projects at once**
+- One tab per project with its own Leader, Workers, models, cards, chat, pause / Stop and history. Switching tabs never stops work.
+- Overview tab: one card per project (status, progress, next step, what you must do), one-click pause / continue, and an agents × projects table.
+- A Windows notification when a project finishes or needs you; clicking it opens that project tab.
+
+**Work lifecycle (no babysitting)**
+- Every worker reply states a status: done / waiting for something external (e.g. CI) / waiting for another agent / needs your decision. A turn ending is not "done".
+- Waiting cards continue by themselves when the awaited agent finishes, when a GitHub PR's CI finishes (`gh`, checked every minute), or when you answer. Waits Studio cannot check are shown as "needs you to press continue", never as a fake background wait.
+- Cards can depend on earlier cards. When all cards end, the Leader checks the whole request and adds cards if it is not complete (max 3 extra rounds, then it asks you).
+- "現在發生什麼" (what is happening now): progress, what is awaited, what happens next, and whether you need to act (🔴 needs Nana, with answer buttons).
+
+**Project memory and handoff**
+- Each project keeps a Project State: last goal, done, current, next, verified against real `git` / `gh` data (main SHA, open and merged PRs, CI per check, unresolved review threads). Git / GitHub wins over older agent notes.
+- Restarting Studio, pressing "▶ 接著處理", or changing the Leader all hand over the same state, so you never re-explain.
+
+**Control mid-job**
+- "📣 告訴工頭" sends new instructions while a job runs: the Leader decides which worker to tell, which cards to cancel or add. "⚡ 立刻打斷" stops the working workers at once; they continue after reading the instruction.
+- After a job is done: ① stop (default), ② suggest 1–3 next steps, ③ auto-continue (opt-in with a confirmation, max 5 in a row).
+
+**Saving quota**
+- The Leader does not read files, search the repo or run commands; it only plans and checks, and sends investigation and work to workers. Claude Code gets a card only when Codex and Antigravity cannot do it.
+- Model strategy per project: 💰 save (default; normal cards Sonnet / Luna, hard cards auto-upgrade to Opus / Sol), ⚖️ balanced, 🚀 quality, 🛠️ custom. The Leader marks cards normal or hard by itself; a failed normal card is retried once on the strong model.
+- Seat cards show Claude (5-hour + weekly) and Codex (weekly) usage bars. Claude usage is read only at Studio start and on refresh.
+
+### Known limits (v0.1.0)
+
+- The model strategy with real Codex, and a hard card actually auto-upgrading, were verified with scripted replies only; everything else has been used on real projects (a PDF editor, a stock panel).
+- No CI. All checks are manual: `node studio/lifecycle-check.cjs` (scripted-agent lifecycle check) plus hands-on use.
+- "告訴工頭" does not cut into a worker's current step; use "立刻打斷" for that.
+- AionCore writes an `.agents/` folder into the project when Antigravity works there.
+- Windows only.
+
+### Safety
+
+**Workers edit files and run commands in the chosen folder without asking** (Claude: `bypassPermissions`, Codex: `auto`). A Git worktree is not a security sandbox. Use it only on disposable or version-controlled projects without sensitive data; use on production repositories or folders with secrets has not been approved.
+
+### Documentation
 
 - [Architecture V1](docs/architecture/MULTI_AGENT_PLATFORM_ARCHITECTURE_V1.md)
 - [Codex Architecture Review](docs/architecture/ARCHITECTURE_REVIEW_CODEX.md)
-- [P0 Spike Report](docs/reports/P0_SPIKE_REPORT.md)
-
-## Safety Status
-
-Currently suitable only for disposable, non-sensitive repositories. A Git worktree is not a security sandbox. Use with production repositories or sensitive credentials has not been approved.
+- [P0 Spike Report](docs/reports/P0_SPIKE_REPORT.md) (the P0 spike ended NO-GO for MVP-0 under the gates of the time; that architecture track is separate from Studio)
