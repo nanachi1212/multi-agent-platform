@@ -389,6 +389,7 @@ function extFields(b) {
 async function saveExternal(b) {
   const f = extFields(b), key = String(b.apiKey || '').trim(), old = b.id ? extOf(b.id) : null;
   if (b.id && !old) throw new Error('找不到這個外部模型');
+  if (old && !key && (f.baseUrl !== old.baseUrl || f.platform !== old.platform)) throw new Error('改了網址或 API 格式，請重新輸入 API key（已存的 key 不會被送到新的位址）');
   if (!old && !key && !isLocalUrl(f.baseUrl)) throw new Error('請填 API key（只有本機位址如 Ollama 可以留空）');
   const body = { platform: f.platform, name: f.name, base_url: f.baseUrl, models: [f.model], enabled: true, is_full_url: f.isFullUrl };
   if (key) body.api_key = key; else if (!old) body.api_key = 'local';
@@ -419,9 +420,12 @@ async function deleteExternal(id) {
 
 // Ask the provider which models it offers (the key comes from the form, or from the saved provider when editing).
 async function extModels(b) {
-  const f = { platform: String(b.platform || 'openai'), baseUrl: String(b.baseUrl || '').trim().replace(/\/+$/, '') };
+  const f = extFields({ ...b, name: 'x', model: 'x' }), old = b.id ? extOf(b.id) : null;
   let key = String(b.apiKey || '').trim();
-  if (!key && b.id) key = (await extProvider(b.id)).api_key || '';
+  if (!key && old) { // the saved key only goes to the address it was saved for
+    if (f.baseUrl !== old.baseUrl || f.platform !== old.platform) throw new Error('改了網址或 API 格式，請重新輸入 API key（已存的 key 不會被送到新的位址）');
+    key = (await extProvider(b.id)).api_key || '';
+  }
   try { return (await api('POST', '/api/providers/fetch-models', { platform: f.platform, base_url: f.baseUrl, api_key: key || 'local' })).models || []; }
   catch (err) { throw hideKey(err, key); }
 }
