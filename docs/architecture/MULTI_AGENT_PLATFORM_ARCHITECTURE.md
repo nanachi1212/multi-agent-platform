@@ -320,7 +320,7 @@ Leader crash 時：Conductor 偵測 turn error/timeout → Run 進 `LEADER_UNAVA
 ## 14. Open Questions（無法由程式碼或官方資料確認，需使用者決定）
 1. **是否同意 P0 安裝 AionUi**（新桌面程式，會建立自己的資料目錄與 DB；不修改 Claude/Codex/Gemini 設定，但 agy 的 hook 檔會寫進工作目錄）？
 2. **訂閱與額度**：Claude / Codex / Antigravity 各自的方案與可接受的同時 session 數、每日用量上限？（影響 concurrency 與實驗排程；官方 rate limit 依帳號方案而定）
-3. **Experiment 的目標 repo 與任務**：用哪個 repo（建議先用一個可拋棄的測試 repo，而非 TWstock 正式 repo）？
+3. **Experiment 的目標 repo 與任務**：用哪個 repo（建議先用一個可拋棄的測試 repo，而非正式 repo）？
 4. **Antigravity 審批方式**：接受 AionCore 的 workspace hook gate（寫 `.agents/hooks.json` 到 worktree），還是先讓 Antigravity 只擔任唯讀角色（Reviewer/Researcher）？
 5. **是否需要安裝 Ollama**，或本機 LLM 先只用已安裝的 LM Studio？
 
