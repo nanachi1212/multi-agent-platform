@@ -334,19 +334,26 @@ const fmt = (iso) => new Date(iso).toLocaleString('zh-TW', { month:'numeric', da
 const when = (iso) => new Date(iso).toDateString() === new Date().toDateString() ? new Date(iso).toLocaleTimeString('zh-TW', { hour:'2-digit', minute:'2-digit', hour12:false }) : fmt(iso);
 
 // w = the project whose settings are shown; no w (overview) = settings live on each project page.
-function modelLabel(a, w) {
-  if (!w) return '依專案設定';
-  const cfg = w.agentCfg[a.id] || {};
+const STRATEGY = [['save', '💰 省額度：普通卡用便宜模型，困難卡自動升級強模型'], ['balanced', '⚖️ 均衡：同樣分兩檔，思考強度高一級'], ['quality', '🚀 品質優先：普通卡就用強模型，困難卡用最強'], ['custom', '🛠️ 自訂：用員工卡上自己設的模型']];
+function modelName(a, value) {
   if (!a.models.length) return a.status === 'checking' ? '讀取中…' : '預設';
-  if (cfg.model) return a.models.find((m) => m.value === cfg.model)?.name || cfg.model;
+  if (value) return a.models.find((m) => m.value === value)?.name || value;
   const def = a.models.find((m) => m.value === 'default');
   return def ? `預設（${def.description.split(' · ')[0]}）` : '預設';
 }
-const effortLabel = (a, w) => !w ? '依專案設定' : (w.agentCfg[a.id] || {}).effort || (a.efforts.length ? '預設' : '—');
+function modelLabel(a, w) {
+  if (!w) return '依專案設定';
+  return modelName(a, w.tiers?.[a.id]?.normal.model);
+}
+const effortLabel = (a, w) => !w ? '依專案設定' : w.tiers?.[a.id]?.normal.effort || (a.efforts.length ? '預設' : '—');
 
 function cfgHtml(a, w) {
   if (!w) return '<div class="cfg-note">模型／思考強度在各專案頁分開設定。</div>';
   if (!a.models.length && !a.efforts.length) return `<div class="cfg-note">${a.status === 'checking' ? '讀取模型清單中…' : '這位 AI 員工使用預設模型（不支援切換）'}</div>`;
+  if (w.strategy !== 'custom') {
+    const t = w.tiers?.[a.id] || {}, tier = (x) => `${esc(modelName(a, x?.model))}${x?.effort ? ' · ' + esc(x.effort) : ''}`;
+    return `<div class="cfg-note">依模型策略「${esc((STRATEGY.find(([k]) => k === w.strategy) || [, ''])[1].split('：')[0])}」：普通卡 ${tier(t.normal)}；困難卡 ${tier(t.hard)}。想自己指定模型，把模型策略改成「🛠️ 自訂」。</div>`;
+  }
   const cfg = w.agentCfg[a.id] || {}, busy = w.run?.active;
   const models = (k) => `<select data-cfg="${a.id}" data-k="${k}"><option value="">${k === 'hardModel' ? '同平常' : '預設'}</option>${a.models.map((m) => `<option value="${esc(m.value)}" title="${esc(m.description)}" ${m.value === cfg[k] ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select>`;
   const efforts = (k) => `<select data-cfg="${a.id}" data-k="${k}" ${a.efforts.length ? '' : 'disabled'}><option value="">${k === 'hardEffort' ? '同平常' : '預設'}</option>${a.efforts.map((x) => `<option value="${esc(x)}" ${x === cfg[k] ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select>`;
@@ -425,7 +432,7 @@ function seatHtml(a, w) {
     <dl class="facts">
       <dt>模型</dt><dd title="${esc(modelLabel(a, w))}">${esc(modelLabel(a, w))}</dd>
       <dt>思考強度</dt><dd>${esc(effortLabel(a, w))}</dd>
-      ${w && (w.agentCfg[a.id] || {}).hardModel ? `<dt>困難卡</dt><dd>${esc(a.models.find((m) => m.value === w.agentCfg[a.id].hardModel)?.name || w.agentCfg[a.id].hardModel)}${w.agentCfg[a.id].hardEffort ? ' · ' + esc(w.agentCfg[a.id].hardEffort) : ''}</dd>` : ''}
+      ${w && a.models.length && w.tiers?.[a.id]?.hard.model && w.tiers[a.id].hard.model !== w.tiers[a.id].normal.model ? `<dt>困難卡</dt><dd>${esc(modelName(a, w.tiers[a.id].hard.model))}${w.tiers[a.id].hard.effort ? ' · ' + esc(w.tiers[a.id].hard.effort) : ''}</dd>` : ''}
       <dt>最近完成</dt><dd title="${esc(done?.title || '')}">${done ? `${esc(done.title)} · ${when(done.at)}` : '—'}</dd>
     </dl>
     <div class="seat-last">${esc(lastTxt)}</div>
@@ -445,7 +452,7 @@ function boardHtml(tasks, agents, editable) {
     const list = tasks.filter((t) => st.includes(t.status));
     return `<div class="lane"><div class="lane-h">${label}<span class="n">${list.length}</span></div>${list.map((t) => `
       <div class="card" style="--c:${look(t.agent).c}">
-        <div class="t">${esc(t.title)} ${t.hard ? '<span class="tag">困難</span>' : ''}${t.status === 'PAUSED' || t.status === 'INTERRUPTED' || PARKED.includes(t.status) ? `<span class="tag ${t.status === 'NEEDS_USER' ? 'bad' : 'pz'}">${STEP_WORD[t.status]}</span>` : ''}</div>
+        <div class="t">${esc(t.title)} ${t.escalated ? '<span class="tag">已升級強模型</span>' : t.hard ? '<span class="tag">困難</span>' : ''}${t.status === 'PAUSED' || t.status === 'INTERRUPTED' || PARKED.includes(t.status) ? `<span class="tag ${t.status === 'NEEDS_USER' ? 'bad' : 'pz'}">${STEP_WORD[t.status]}</span>` : ''}</div>
         <span class="who"><i></i>${esc(agents.find((a) => a.id === t.agent)?.name || t.agent)}</span>
         ${t.result && t.status !== 'PAUSED' ? `<div class="res">${esc(t.result)}</div>` : ''}
         ${PARKED.includes(t.status) ? `<div class="res"><b>${esc(waitLine(t))}</b></div>` : ''}
@@ -537,7 +544,8 @@ function officeHtml(w) {
     <div class="row" style="gap:6px;font-size:13px"><span class="hint" style="font-size:13px">做完之後：</span>
       <select data-after-done style="width:auto;padding:4px 8px;font-size:13px" title="只影響這個專案">
         ${[['stop', '① 完成就停（報告後等我）'], ['suggest', '② 完成後建議下一步（等我按）'], ['auto', '③ 自動持續開發（自動做下一個小目標）']].map(([k, t]) => `<option value="${k}" ${(w.afterDone || 'stop') === k ? 'selected' : ''}>${t}</option>`).join('')}
-      </select><button class="btn small ghost" data-model-preset title="Claude：平常 Sonnet、困難 Opus；Codex：平常 Luna、困難 Sol。工頭只用平常那一組。">💰 套用省額度預設模型</button>${w.afterDone === 'auto' ? `<span class="tag pz">🔁 自動中 ${w.autoRounds || 0}/5</span>` : ''}</div>
+      </select><span class="hint" style="font-size:13px;margin-left:8px">模型策略：</span>
+      <select data-strategy style="width:auto;padding:4px 8px;font-size:13px" title="工頭自己判斷普通卡／困難卡；普通卡失敗會自動改用強模型重試一次">${STRATEGY.map(([k, t]) => `<option value="${k}" ${(w.strategy || 'save') === k ? 'selected' : ''}>${t}</option>`).join('')}</select>${w.afterDone === 'auto' ? `<span class="tag pz">🔁 自動中 ${w.autoRounds || 0}/5</span>` : ''}</div>
     <div class="team-line">${esc(lead.name)} 工頭 · ${crew.length ? esc(crew.join(' + ')) + ' 協作' : '目前沒有可用的成員'} · Product First · 自動派工</div>
     <details class="rules"><summary>查看 AI 工作規則 ▾</summary><div class="rules-b">${r && (running || paused) ? `<b>目前交辦的內容</b>${esc(r.request)}` : ''}<b>工頭的工作方式</b>${esc(RULES)}</div></details>
     ${!running && !paused && ['open', 'wait', 'need'].includes(w.pstate?.level) ? '<div class="hint" style="border-top:1px dashed var(--line);padding-top:10px;font-weight:700">或者，開始新的工作</div>' : ''}
@@ -629,7 +637,7 @@ function nowHtml(w, att) {
     <details class="rules" ${r.active || r.paused ? 'open' : ''}><summary>每張工作卡的進度 ▾</summary><div class="steps" style="margin-top:6px">
       ${step('📝', r.continues ? '你要團隊接著上次的工作' : '你交辦了工作', firstLine.slice(0, 140))}
       ${step(planned ? '✅' : r.active ? '⏳' : '🕒', planned ? `工頭 ${esc(name(r.leader))} 拆成 ${ts.length} 張工作卡` : `工頭 ${esc(name(r.leader))} 拆工作中`, '', !planned && r.active)}
-      ${ts.map((t) => step(ICON[t.status] || '•', `${esc(t.title)}${t.hard ? '（困難）' : ''} · ${esc(name(t.agent))} · ${STEP_WORD[t.status] || t.status}`,
+      ${ts.map((t) => step(ICON[t.status] || '•', `${esc(t.title)}${t.escalated ? '（已自動升級強模型）' : t.hard ? '（困難）' : ''} · ${esc(name(t.agent))} · ${STEP_WORD[t.status] || t.status}`,
         PARKED.includes(t.status) ? waitLine(t) : t.status === 'WORKING' ? '正在做…' : t.status === 'WAITING' ? (blocked.includes(t) ? '等前一張卡完成' : '等成員有空就開始') : t.result, t.status === 'WORKING')).join('')}
       ${planned ? step(report ? '✅' : r.summarizing ? '⏳' : '🕒', '工頭確認整體完成', report || '', r.summarizing) : ''}
     </div></details>`;
@@ -850,6 +858,8 @@ document.addEventListener('input', (e) => {
 });
 document.addEventListener('toggle', (e) => { if (e.target.id === 'doneDrop') doneOpen = e.target.open; }, true);
 document.addEventListener('change', (e) => {
+  const sg = e.target.closest('select[data-strategy]');
+  if (sg) return post('/api/strategy', { ws: ws(), strategy: sg.value }).catch(() => {});
   const ad = e.target.closest('select[data-after-done]');
   if (ad) {
     const mode = ad.value;
@@ -890,10 +900,6 @@ document.addEventListener('click', (e) => {
   if (b.dataset.suggest !== undefined) {
     const x = W()?.pstate?.suggestions?.[+b.dataset.suggest];
     if (x) { b.disabled = true; return post('/api/start', { ws: ws(), request: x.request, continue: true }).catch(() => {}); }
-  }
-  if (b.hasAttribute('data-model-preset')) {
-    if (!confirm('套用省額度預設模型到這個專案？\n\nClaude：平常 Sonnet（medium）、困難 Opus（high）\nCodex：平常 Luna（medium）、困難 Sol（high）\nAntigravity：維持預設\n\n工頭只用「平常」那一組；之後可以在員工卡的設定裡再改。')) return;
-    return post('/api/model-preset', { ws: ws() }).catch(() => {});
   }
   if (b.id === 'instructBtn') {
     const p = ws();

@@ -35,7 +35,7 @@ const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}
 // agentCfg = this project's model / effort per agent; workers = agents allowed to work here.
 // New projects start from S.agentCfg (the last choices).
 const newWs = (project, leader = S.leader, name = '', agentCfg = S.agentCfg, workers = Object.keys(AGENTS)) => ({
-  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0,
+  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, strategy: 'save',
   agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...agentCfg?.[id] }])),
   workers: workers.filter((id) => AGENTS[id]),
 });
@@ -64,14 +64,14 @@ try {
   // Older settings had one `project` and global models; it becomes the first open workspace with those models.
   S.workspaces = (saved.workspaces || (saved.project ? [{ project: saved.project }] : []))
     .filter((x) => isDir(x.project))
-    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop' }));
+    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save' }));
   S.recent = (saved.recent || []).filter(isDir);
   if (saved.notify === false) S.notify = false;
 } catch { /* first start: defaults */ }
 
 function saveSettings() {
   fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
-  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone }));
+  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, strategy: w.strategy }));
   fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify }, null, 2));
 }
 
@@ -222,22 +222,32 @@ function setAgentCfg(w, agent, model, effort, hardModel = '', hardEffort = '') {
   saveSettings();
 }
 
-// 省額度預設: cheaper model for normal cards and the Leader, a stronger one for hard cards.
-// Patterns match the catalogs the agents report (first match = newest in their list).
-const PRESET = {
-  claude: { model: /^sonnet$/, effort: 'medium', hardModel: /^opus$/, hardEffort: 'high' },
-  codex: { model: /luna/, effort: 'medium', hardModel: /sol/, hardEffort: 'high' },
+// Model strategy per project. The Leader marks hard cards; normal cards (and every Leader turn) use the
+// normal tier, hard cards the hard tier, and a normal card that fails is retried once on the hard tier.
+// Patterns match the catalogs the agents report (first match = newest). 'custom' = the seat-card settings.
+const STRATEGIES = {
+  save: { claude: [['^sonnet$', 'medium'], ['^opus$', 'high']], codex: [['luna', 'medium'], ['sol', 'high']] },
+  balanced: { claude: [['^sonnet$', 'high'], ['^opus$', 'xhigh']], codex: [['luna', 'high'], ['sol', 'xhigh']] },
+  quality: { claude: [['^opus$', 'high'], ['^fable$', 'high']], codex: [['sol', 'high'], ['sol', 'max']] },
 };
-function applyModelPreset(w) {
-  for (const [id, p] of Object.entries(PRESET)) {
-    const a = S.agents[id];
-    if (!a.models.length) continue; // catalog not known yet (agent unavailable): keep its settings
-    const pick = (re) => a.models.find((m) => re.test(m.value))?.value || '';
-    const eff = (e) => (a.efforts.includes(e) ? e : '');
-    w.agentCfg[id] = { model: pick(p.model), effort: eff(p.effort), hardModel: pick(p.hardModel), hardEffort: eff(p.hardEffort) };
+const STRATEGY_IDS = [...Object.keys(STRATEGIES), 'custom'];
+
+// The { model, effort } an agent uses in a project for one tier ('' = the agent's default).
+function tierCfg(w, agent, hard) {
+  const st = STRATEGIES[w.strategy]?.[agent], a = S.agents[agent];
+  if (st) {
+    const [re, eff] = st[hard ? 1 : 0];
+    return { model: a?.models.find((m) => new RegExp(re).test(m.value))?.value || '', effort: a?.efforts.includes(eff) ? eff : '' };
   }
+  const c = w.agentCfg[agent] || {};
+  return hard ? { model: c.hardModel || c.model || '', effort: c.hardEffort || c.effort || '' } : { model: c.model || '', effort: c.effort || '' };
+}
+const tiersOf = (w) => Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { normal: tierCfg(w, id, false), hard: tierCfg(w, id, true) }]));
+
+function setStrategy(w, strategy) {
+  if (!STRATEGY_IDS.includes(strategy)) throw new Error('未知的模型策略');
+  w.strategy = strategy;
   saveSettings();
-  return w.agentCfg;
 }
 
 // Which agents may take this project's cards (the Leader is never a Worker).
@@ -315,9 +325,7 @@ const available = (id) => S.agents[id]?.status === 'available';
 const workKey = (t) => t.agent + ':work' + (t.hard ? ':hard' : '');
 async function conv(w, agent, lead, hard = false) {
   const key = agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : '');
-  const c = w.agentCfg[agent] || {};
-  const cfg = hard ? { model: c.hardModel || c.model, effort: c.hardEffort || c.effort } : c;
-  return (w.run.convs[key] ??= await createConv(agent, w.run.project, lead, cfg));
+  return (w.run.convs[key] ??= await createConv(agent, w.run.project, lead, tierCfg(w, agent, hard)));
 }
 // This run's conversations that have a turn in progress (other projects keep working).
 const busyConvs = (run) => Object.values(run.convs).filter((c) => active.has(c));
@@ -726,6 +734,11 @@ ${STATUS_RULES}`;
     applyStatus(w, t, st, last);
   } catch (e) {
     if (e instanceof Halt && run.paused) { t.status = 'PAUSED'; t.result = '已暫停'; t.resumed = true; t.wakeNote = note; return; }
+    if (!(e instanceof Halt) && !t.hard && JSON.stringify(tierCfg(w, t.agent, true)) !== JSON.stringify(tierCfg(w, t.agent, false))) {
+      Object.assign(t, { hard: true, escalated: true, status: 'WAITING', resumed: true, detail: e.message });
+      log(w, 'studio', 'system', `「${t.title}」用平常的模型沒做成，自動改用強模型重試一次。`, e.message);
+      return pump(w);
+    }
     t.status = 'FAILED';
     t.result = '這張卡執行時出錯，沒有完成。';
     t.detail = e.message;
@@ -1316,7 +1329,7 @@ const routes = {
   'GET /api/state': () => {
     const workspaces = S.workspaces.map((w) => {
       const r = w.run;
-      return { project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, tasks: w.tasks, activity: w.activity, progress: readProjectProgress(w),
+      return { project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, tiers: tiersOf(w), tasks: w.tasks, activity: w.activity, progress: readProjectProgress(w),
         run: r && { id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
     });
     return { ...S, ...teamStats(), agents: Object.values(S.agents), workspaces };
@@ -1338,7 +1351,7 @@ const routes = {
   'POST /api/continue': (b) => { const w = wsOf(b.ws); w.autoRounds = 0; return continueProject(w); },
   'POST /api/project-state/refresh': (b) => refreshState(wsOf(b.ws)),
   'POST /api/instruct': (b) => instruct(wsOf(b.ws), b.text, !!b.interrupt),
-  'POST /api/model-preset': (b) => applyModelPreset(wsOf(b.ws)),
+  'POST /api/strategy': (b) => setStrategy(wsOf(b.ws), b.strategy),
   'POST /api/answer': (b) => answer(wsOf(b.ws), b.taskId, b.text),
   'POST /api/continue-card': (b) => continueCard(wsOf(b.ws), b.taskId),
   'POST /api/check': () => { checkAll().then(refreshClaudeLimits); },
