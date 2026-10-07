@@ -272,9 +272,8 @@
         <h3>完整對話紀錄（細節）</h3>
         <div class="chat" id="chat"></div>
       </section>
-      <section class="panel">
-        <h3>Product First · 專案進度</h3>
-        <div class="sub" id="progressPath" style="margin-top:0"></div>
+      <section class="panel" id="progressBox" hidden>
+        <h3 id="progressTitle">專案進度</h3>
         <pre id="progress"></pre>
       </section>
     </div>
@@ -482,8 +481,13 @@ function waitLine(t) {
 }
 
 // "你現在需要做什麼" for one project: { ic, cls, text, need }.
+const STATE_LOOK = { need:['🔴','bad'], open:['🟡','on'], wait:['🟡','on'], done:['✅','ok'], idle:['⚪',''] };
 function attention(w) {
   const r = w.run, ts = w.tasks;
+  if (!r?.active && !r?.paused && w.pstate) {
+    const ps = w.pstate, [ic, cls] = STATE_LOOK[ps.level] || ['⚪', ''];
+    return { ic, cls, need: ps.level === 'need', text: ps.level === 'wait' ? ps.headline + '（不需要操作）' : ps.level === 'need' ? '需要 Nana：' + ps.you : ps.headline, state: ps };
+  }
   if (!r) return { ic:'⚪', cls:'', text:'待命：還沒有交辦工作' };
   const askCard = ts.find((t) => t.status === 'NEEDS_USER');
   if (r.active && (askCard || (r.ask && !r.summarizing))) return { ic:'🔴', cls:'bad', need:true, text:'需要 Nana：' + (askCard ? askCard.ask?.question : r.ask.question) };
@@ -529,16 +533,37 @@ function officeHtml(w) {
       ${others.length ? `<select data-swap-leader title="換一位 AI 員工當工頭${running || paused ? '；新工頭會接手目前的工作' : ''}"><option value="">更換工頭…</option>${others.map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select>` : ''}</div>
     <div class="team-line">${esc(lead.name)} 工頭 · ${crew.length ? esc(crew.join(' + ')) + ' 協作' : '目前沒有可用的成員'} · Product First · 自動派工</div>
     <details class="rules"><summary>查看 AI 工作規則 ▾</summary><div class="rules-b">${r && (running || paused) ? `<b>目前交辦的內容</b>${esc(r.request)}` : ''}<b>工頭的工作方式</b>${esc(RULES)}</div></details>
+    ${!running && !paused && ['open', 'wait', 'need'].includes(w.pstate?.level) ? '<div class="hint" style="border-top:1px dashed var(--line);padding-top:10px;font-weight:700">或者，開始新的工作</div>' : ''}
     <div class="ask">今天想讓「${esc(w.name)}」做什麼？</div>
     <textarea id="request" placeholder="例如：幫我把「匯出 PDF」功能做好，做完告訴我怎麼試用。\n或：首頁載入太慢，幫我找出原因並修好。">${esc(drafts[w.project] || '')}</textarea>
     <div class="row"><span class="hint">${running ? '團隊正在做上一件事，做完才能交下一件（可以先打好）。' : 'Ctrl + Enter 也可以送出'}</span><span class="err" id="err"></span><span class="spacer"></span>
-      ${!running && (r || histCount) ? `<button class="btn" id="continueJob" title="工頭會拿到上次的進度摘要（需求、完成的卡、PR、在等什麼），從那裡接著做；不用重講">↻ 接著上次的工作</button>` : ''}
       <button class="btn primary" id="start" ${running ? 'disabled' : ''} title="交辦一件新的工作">▶ 交給團隊</button></div>`;
 }
 
 // 現在發生什麼: status, progress, what we wait for, what happens next, and what the user must do (if anything).
+// Project State card: last goal, done, current (verified with Git / GitHub), next, and what Nana does.
+function stateCardHtml(w, att) {
+  const ps = w.pstate;
+  if (!ps) return `<div class="wf-head"><span class="big">⏳</span><div><div class="st-line">${esc(w.name)}</div><div class="sub" style="margin:0">正在讀取專案狀態（Git／GitHub）…</div></div></div>`;
+  const g = ps.git || {};
+  const pending = ['open', 'wait', 'need'].includes(ps.level);
+  const src = g.error ? `只根據上次的工作紀錄（${g.error}）` : `Git／GitHub 已核對 · ${when(g.checkedAt)}${g.mainSha ? ' · main ' + g.mainSha : ''}${g.branch ? ' · 本機 ' + g.branch : ''}`;
+  const list = (xs, mark) => (xs.length ? xs.map((x) => `${mark} ${esc(x)}`).join('\n') : '—');
+  return `${pending ? '<div class="hint" style="font-weight:700;margin-bottom:6px">繼續上一件事</div>' : ''}
+    <div class="wf-head"><span class="big">${att.ic}</span><div><div class="st-line">${esc(w.name)}</div><div class="att ${att.cls}" style="display:inline-block;margin-top:4px">${esc(ps.headline)}</div></div></div>
+    <div class="row hint" style="margin:-4px 0 10px">${esc(src)}<button class="btn small ghost" data-refresh-state>↻ 重新整理狀態</button></div>
+    <dl class="wf">
+      ${ps.goal ? `<dt>上次目標</dt><dd>${esc(ps.goal)}</dd>` : ''}
+      ${ps.level !== 'idle' ? `<dt>已完成</dt><dd>${list(ps.done, '✓')}</dd><dt>目前</dt><dd>${list(ps.current, '⏳')}</dd>` : ''}
+      ${ps.next ? `<dt>接下來</dt><dd>${esc(ps.next)}</dd>` : ''}
+      <dt>你現在</dt><dd>${esc(ps.you)}</dd>
+    </dl>
+    ${pending ? '<div class="row"><button class="btn primary" data-continue-state title="Studio 先重新核對 Git／GitHub，再把專案接力棒交給工頭">▶ 接著處理</button></div>' : ''}`;
+}
+
 function nowHtml(w, att) {
   const r = w.run, ts = w.tasks;
+  if (!r?.active && !r?.paused) return stateCardHtml(w, att);
   if (!r) return `<div class="wf-head"><span class="big">⚪</span><div><div class="st-line">待命</div><div class="sub" style="margin:0">在下面說你要什麼，按「交給團隊」就開始${histCount ? '；或按「↻ 接著上次的工作」接著上次做' : ''}。</div></div></div>`;
   const done = ts.filter((t) => t.status === 'DONE');
   const lastDone = done.at(-1);
@@ -603,11 +628,12 @@ function projCardHtml(w) {
   const total = w.tasks.length, done = n('DONE'), working = n('WORKING'), failed = n('FAILED');
   const seg = (v, c) => (total && v ? `<i style="width:${(v / total) * 100}%;background:var(--${c})"></i>` : '');
   return `<a class="pcard" href="#p=${encodeURIComponent(w.project)}" style="--c:${look(w.leader).c}">
-    <div class="pc-top"><span class="nm">${esc(w.name)}</span><span class="pill ${pill}">${label}</span>
+    <div class="pc-top"><span class="nm">${esc(w.name)}</span>${r?.active || r?.paused || !w.pstate ? `<span class="pill ${pill}">${label}</span>` : ''}
       ${r?.active || r?.paused ? `<button class="btn small ${r.paused ? 'pz' : ''}" data-pz="${esc(w.project)}">${r.paused ? '繼續' : '暫停'}</button>` : ''}</div>
     <div class="sub" style="margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(w.project)}">${esc(w.project)}</div>
     <div class="att ${attention(w).cls}">${attention(w).ic} ${esc(attention(w).text)}</div>
-    <div class="pc-req">${r ? esc(r.request) : '<span class="empty">還沒有工作，點進來交給團隊。</span>'}</div>
+    ${attention(w).state && attention(w).state.level !== 'idle' ? `<div class="lim-f"><b>下一步</b> ${esc(attention(w).state.next)}</div><div class="lim-f"><b>Nana</b> ${esc(attention(w).state.you)}</div>` : ''}
+    <div class="pc-req">${r?.active || r?.paused ? esc(r.request) : w.pstate?.goal ? '上次目標：' + esc(w.pstate.goal) : r ? esc(r.request) : '<span class="empty">還沒有工作，點進來交給團隊。</span>'}</div>
     ${total ? `<div class="sbar">${seg(done, 'ok')}${seg(working, 'work')}${seg(failed, 'bad')}</div>
       <div class="lim-f">完成 ${done}/${total}${working ? ` · 進行中 ${working}` : ''}${failed ? ` · 失敗 ${failed}` : ''}</div>` : ''}
     <div class="lim-f">工頭 <span class="who" style="--c:${look(w.leader).c}"><i></i>${esc(name(w.leader))}</span></div>
@@ -652,8 +678,9 @@ function renderProject(w, force) {
   $('pvPath').textContent = $('pvPath').title = w.project;
   $('paseoOpen').hidden = S.paseo === 'missing';
   if (!$('paseoOpen').dataset.busy) $('paseoOpen').disabled = false;
-  $('runPill').textContent = running ? `團隊工作中 · 工頭 ${name(r.leader)}` : paused ? '已暫停 · 可稍後繼續' : (r?.stopped ? '已停止' : '待命');
-  $('runPill').className = 'pill ' + (running ? 'on' : paused ? 'pz' : '');
+  // Without a live job the pill shows the project state, not a bare 待命.
+  $('runPill').textContent = running ? `團隊工作中 · 工頭 ${name(r.leader)}` : paused ? '已暫停 · 可稍後繼續' : w.pstate ? w.pstate.headline : (r?.stopped ? '已停止' : '待命');
+  $('runPill').className = 'pill ' + (running ? 'on' : paused ? 'pz' : w.pstate ? { need:'bad', open:'on', wait:'on', done:'ok' }[w.pstate.level] || '' : '');
   $('pauseResume').textContent = paused ? '繼續' : '暫停';
   $('pauseResume').disabled = !running && !paused;
   $('stop').disabled = !running && !paused;
@@ -661,6 +688,8 @@ function renderProject(w, force) {
 
   const avail = S.agents.filter((a) => a.status === 'available').length;
   const n = (st) => w.tasks.filter((t) => t.status === st).length;
+  $('kpis').hidden = !(running || paused);
+  if (force && !running && (!w.pstate || Date.now() - new Date(w.pstate.updatedAt) > 120000)) post('/api/project-state/refresh', { ws: w.project }).catch(() => {});
   setHtml($('kpis'), doneDropHtml(w) + kpi(n('WORKING'), '進行中') +
     kpi(n('WAITING') + n('PAUSED'), paused ? '等待／已暫停' : '等待中') + kpi(`${avail}/${S.agents.length}`, '可用的 AI 員工'));
 
@@ -678,8 +707,10 @@ function renderProject(w, force) {
   box.innerHTML = chatHtml(w.activity);
   if (atBottom) box.scrollTop = box.scrollHeight;
 
-  $('progressPath').textContent = w.progress?.exists ? w.progress.file : '專案裡的 .ai-workspace/progress.md';
-  $('progress').textContent = w.progress?.exists ? w.progress.text : '尚未建立 .ai-workspace/progress.md';
+  $('progressBox').hidden = !w.progress?.exists;
+  $('progressBox').parentElement.style.gridTemplateColumns = w.progress?.exists ? '' : '1fr';
+  $('progressTitle').title = w.progress?.file || '';
+  $('progress').textContent = w.progress?.text || '';
 }
 
 function render() {
@@ -827,10 +858,9 @@ document.addEventListener('click', (e) => {
   const b = e.target.closest('button');
   if (!b) return;
   if (b.id === 'tabAdd') return browse();
-  if (b.id === 'continueJob') {
-    const p = ws();
-    if (W()?.run?.paused) return post('/api/resume', { ws: p }).catch(() => {});
-    return post('/api/start', { ws: p, request: $('request').value.trim() || '繼續上次的工作', continue: true }).then(() => { drafts[p] = ''; }).catch(() => {});
+  if (b.hasAttribute('data-continue-state') || b.hasAttribute('data-refresh-state')) {
+    b.disabled = true; b.textContent = b.hasAttribute('data-refresh-state') ? '讀取中…' : '核對狀態中…';
+    return post(b.hasAttribute('data-refresh-state') ? '/api/project-state/refresh' : '/api/continue', { ws: ws() }).catch(() => {});
   }
   if (b.hasAttribute('data-resume-job')) return post('/api/resume', { ws: ws() }).catch(() => {});
   if (b.dataset.continueCard) return post('/api/continue-card', { ws: ws(), taskId: b.dataset.continueCard }).catch(() => {});
