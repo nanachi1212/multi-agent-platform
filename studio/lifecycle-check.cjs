@@ -754,6 +754,7 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
   assert.deepStrictEqual(parseStatus('x\nSTATUS：NEEDS_USER：A 還是 B？\nOPTIONS: A | B').options, ['A', 'B']);
   assert.strictEqual(parseStatus('no status here'), null);
   console.log('6 status-line parser: PASS');
+  await require('./test-runtime.cjs').runRuntimeTests();
   await new Promise((r) => setTimeout(r, 300));
   for (const d of [...TMP_DIRS, ...tmpRepos]) { try { require('fs').rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 }); } catch { /* temp folder still in use */ } }
 })().catch((e) => { console.error('FAIL', e.message); process.exit(1); });

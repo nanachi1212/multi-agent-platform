@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, execFile } from 'node:child_process';
+import { cleanupJobRuntimes, cleanupStaleRuntimes, checkPortOwnership, listRuntimes, registerRuntime } from './runtime-registry.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const RT = path.join(ROOT, 'runtime');
@@ -177,6 +178,16 @@ async function startAion() {
   const logFile = fs.createWriteStream(path.join(RT, 'studio', 'aioncore.out.txt'));
   const p = spawn(AION, ['--local', '--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)],
     { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, CODEX_HOME } });
+  if (p.pid) {
+    registerRuntime({
+      job_id: 'studio_core',
+      purpose: 'helper',
+      root_pid: p.pid,
+      executable: AION,
+      command: `${AION} --local --port 0`,
+      rtDir: RT
+    });
+  }
   process.on('exit', () => p.kill());
   await new Promise((res, rej) => {
     let buf = '';
@@ -611,6 +622,7 @@ function finish(w, status) {
   run.paused = false;
   run.phase = 'finished';
   releaseJobLeases(w, 'job ended');
+  if (w.run?.id && typeof cleanupJobRuntimes === 'function') cleanupJobRuntimes(w.run.id, { rtDir: RT }).catch(() => {});
   run.result = status;
   run.ask = null;
   saveRun(w, status);
@@ -1999,6 +2011,9 @@ const routes = {
   // One-time login for Studio's separate Codex home, in a visible console window.
   'POST /api/codex-login': () => { spawn('cmd', ['/c', 'start', 'Codex login (Studio)', 'cmd', '/k', 'codex', 'login'], { env: { ...process.env, CODEX_HOME }, detached: true, stdio: 'ignore' }); },
   'GET /api/history': () => listHistory(),
+  'GET /api/runtimes': () => listRuntimes({ rtDir: RT }),
+  'POST /api/runtime/check-port': (b) => checkPortOwnership(Number(b.port), { desiredJobId: b.jobId, desiredDataDir: b.dataDir, rtDir: RT }),
+  'POST /api/runtime/cleanup-stale': () => cleanupStaleRuntimes({ rtDir: RT }),
 };
 
 const server = http.createServer(async (req, res) => {
@@ -2031,6 +2046,7 @@ pollPaseo();
 setInterval(pollPaseo, 10000);
 setInterval(watchExternal, 60000); // GitHub PR / CI waits
 loadLeases(); // who held which working tree before this start
+await cleanupStaleRuntimes({ rtDir: RT }).catch(() => {});
 setInterval(beatLeases, LEASE_BEAT_MS); // heartbeat of the leases this Studio holds
 setInterval(() => checkWorkspaces().catch(() => {}), 15000); // unknown changes to a tree Studio holds
 // Port taken (e.g. another Studio copy is open): use the next free one, unless STUDIO_PORT asked for an exact port.
