@@ -32,7 +32,7 @@ const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}
 // agentCfg = this project's model / effort per agent; workers = agents allowed to work here.
 // New projects start from S.agentCfg (the last choices).
 const newWs = (project, leader = S.leader, name = '', agentCfg = S.agentCfg, workers = Object.keys(AGENTS)) => ({
-  project, leader, name, run: null, tasks: [], activity: [],
+  project, leader, name, run: null, tasks: [], activity: [], pstate: null,
   agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...agentCfg?.[id] }])),
   workers: workers.filter((id) => AGENTS[id]),
 });
@@ -61,14 +61,14 @@ try {
   // Older settings had one `project` and global models; it becomes the first open workspace with those models.
   S.workspaces = (saved.workspaces || (saved.project ? [{ project: saved.project }] : []))
     .filter((x) => isDir(x.project))
-    .map((x) => newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)));
+    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null }));
   S.recent = (saved.recent || []).filter(isDir);
   if (saved.notify === false) S.notify = false;
 } catch { /* first start: defaults */ }
 
 function saveSettings() {
   fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
-  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers }));
+  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate }));
   fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify }, null, 2));
 }
 
@@ -316,7 +316,7 @@ const SUBTASK_RULES = `- Each subtask goes to exactly one worker id from the lis
 function memoryNote(run) {
   if (!run.context) return '';
   return `\n${run.continues
-    ? 'This is a CONTINUATION of the earlier job below. Start where it stopped: do not redo DONE cards, do not open a duplicate PR, pick up the waiting and unfinished items.'
+    ? 'This is a CONTINUATION of the earlier job below. Start from the "Next action" and the verified project state: do not redo DONE work, do not re-research the whole repository, do not open a duplicate PR, and do not ask the user for PR / branch / commit facts listed here.'
     : 'Earlier Studio work in this project folder (background; reuse it, do not redo it):'}
 """
 ${run.context}
@@ -345,7 +345,7 @@ Rules:
 ${SUBTASK_RULES}
 
 Reply with ONLY one JSON object, no markdown fences, in exactly this shape:
-{"message":"<one short sentence to the user, in the user's language; for a continuation say where the job stands and where you pick up>","subtasks":[${SUBTASK_SHAPE}]}`;
+{"message":"<one short sentence to the user, in the user's language; for a continuation say where the project stands (PR / CI state) and where you pick up>","subtasks":[${SUBTASK_SHAPE}]}`;
 }
 
 const parseJson = (reply) => JSON.parse(reply.slice(reply.indexOf('{'), reply.lastIndexOf('}') + 1));
@@ -434,6 +434,7 @@ function finish(w, status) {
     notify(title, body, status, w.project);
   }
   refreshClaudeLimits();
+  refreshState(w); // save the project state at job end
 }
 
 // ---------- Plan limits (5-hour / weekly) ----------
@@ -519,7 +520,7 @@ function latestJob(w) {
 }
 
 function knownRefs(job) {
-  const found = job.tasks.flatMap((t) => [...String(t.result).matchAll(REF_RE)].map((m) => m[0]).concat(t.wait?.pr ? [/^\d+$/.test(t.wait.pr) ? 'PR #' + t.wait.pr : String(t.wait.pr)] : []));
+  const found = [...String(job.run.request || '').matchAll(REF_RE)].map((m) => m[0]).concat(job.tasks.flatMap((t) => [...String(t.result).matchAll(REF_RE)].map((m) => m[0]).concat(t.wait?.pr ? [/^\d+$/.test(t.wait.pr) ? 'PR #' + t.wait.pr : String(t.wait.pr)] : [])));
   return [...new Set([...(job.run.refs || []), ...found])].slice(-12);
 }
 
@@ -556,8 +557,8 @@ async function start(w, request, cont = false) {
   if (!workersFor(w, lead).length) throw new Error('這個專案至少需要一位可用的 Worker');
 
   const prev = latestJob(w);
-  const continues = cont && !!prev;
-  const context = workContext(prev);
+  const continues = cont && (!!prev || ['open', 'wait', 'need'].includes(w.pstate?.level));
+  const context = projectContext(w);
   // A paused run stays in history (status "paused") and can be continued from there later.
   w.tasks = [];
   w.activity = [];
@@ -739,6 +740,140 @@ function watchExternal() {
   for (const w of S.workspaces) if (w.run?.active) for (const t of w.tasks) if (t.status === 'WAITING_EXTERNAL') checkExternal(w, t);
 }
 
+// ---------- Project State / Handoff Memory ----------
+// Per project: what the last job was for, what is done, and the REAL Git / GitHub state (read with git / gh).
+// Refreshed when Studio starts, when a project tab opens, when a job ends, before 接著處理 and before a Leader handoff.
+// Git / GitHub wins over what agents wrote earlier.
+const sh = (cmd, args, cwd) => new Promise((res) => execFile(cmd, args, { cwd, windowsHide: true, timeout: 30000, maxBuffer: 8 << 20 },
+  (e, out, err) => res(e ? { err: String(err || e.message).trim().slice(0, 200) } : { out: String(out) })));
+const git = (cwd, ...args) => sh('git', ['-c', 'safe.directory=*', ...args], cwd);
+const PR_FIELDS = 'number,title,state,headRefName,mergedAt,url,statusCheckRollup,reviewDecision';
+const UNRESOLVED_Q = 'query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){reviewThreads(first:100){nodes{isResolved}}}}}';
+
+function ciOf(rollup = []) {
+  const name = (c) => c.name || c.context || 'check';
+  const failed = rollup.filter((c) => ['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED'].includes(c.conclusion || c.state)).map(name);
+  const pending = rollup.filter((c) => (c.__typename === 'CheckRun' ? c.status !== 'COMPLETED' : ['PENDING', 'EXPECTED'].includes(c.state))).map(name);
+  const state = !rollup.length ? 'none' : failed.length ? 'failed' : pending.length ? 'running' : 'passed';
+  return { state, total: rollup.length, done: rollup.length - pending.length, failed, pending };
+}
+
+// Reads the folder's real state. prNums = PR numbers the last job mentioned.
+async function readGitState(project, prNums) {
+  const g = { checkedAt: new Date().toISOString(), prs: [] };
+  const st = await git(project, 'status', '--porcelain=v1', '-b');
+  if (st.err) return { ...g, error: '這個資料夾不是 Git 專案' };
+  const lines = st.out.split('\n').filter(Boolean);
+  const head = (lines[0] || '').replace(/^## /, '');
+  Object.assign(g, { branch: head.split('...')[0].replace(/^No commits yet on /, ''), dirty: lines.length - 1,
+    ahead: +(head.match(/ahead (\d+)/)?.[1] || 0), behind: +(head.match(/behind (\d+)/)?.[1] || 0) });
+  g.headSha = (await git(project, 'rev-parse', '--short', 'HEAD')).out?.trim() || '';
+  const repo = await originRepo(project);
+  if (!repo) return { ...g, error: '沒有 GitHub origin，只能看本機 Git' };
+  g.repo = repo;
+  g.mainSha = (await git(project, 'ls-remote', 'origin', 'HEAD')).out?.split(/\s/)[0]?.slice(0, 7) || '';
+  let list;
+  try { list = await ghJson(['pr', 'list', '--repo', repo, '--state', 'all', '--limit', '8', '--json', PR_FIELDS], project); }
+  catch (e) { return { ...g, error: '讀不到 GitHub（' + e.message + '）' }; }
+  for (const n of prNums.filter((n) => !list.some((p) => p.number === n)).slice(0, 3)) {
+    try { list.push(await ghJson(['pr', 'view', String(n), '--repo', repo, '--json', PR_FIELDS], project)); } catch { /* deleted or another repo */ }
+  }
+  const [o, r] = repo.split('/');
+  for (const p of list) {
+    const pr = { n: p.number, title: p.title, state: p.state, branch: p.headRefName, mergedAt: p.mergedAt, url: p.url, review: p.reviewDecision || '', ci: ciOf(p.statusCheckRollup), mentioned: prNums.includes(p.number) };
+    if (pr.state === 'OPEN' || pr.mentioned) {
+      try {
+        const q = await ghJson(['api', 'graphql', '-f', 'query=' + UNRESOLVED_Q, '-F', 'o=' + o, '-F', 'r=' + r, '-F', 'n=' + pr.n], project);
+        pr.unresolved = (q.data?.repository?.pullRequest?.reviewThreads?.nodes || []).filter((x) => !x.isResolved).length;
+      } catch { /* threads unknown */ }
+    }
+    g.prs.push(pr);
+  }
+  return g;
+}
+
+const CARD_WORD = { WAITING: '還沒開始', WORKING: '做到一半', PAUSED: '已暫停', INTERRUPTED: '被中斷', FAILED: '沒有完成', WAITING_EXTERNAL: '在等外部結果', WAITING_AGENT: '在等其他 AI', NEEDS_USER: '在等你回覆' };
+const ciWord = (ci) => ({ none: '沒有 CI', passed: `CI 全綠（${ci.total}/${ci.total}）`, failed: `CI 失敗：${ci.failed.join('、')}`, running: `CI 跑到 ${ci.done}/${ci.total}（還在跑：${ci.pending.join('、')}）` })[ci.state];
+
+// Turns the last job + the real Git / GitHub state into what the page and the next Leader need.
+function deriveState(job, g) {
+  const run = job?.run, tasks = job?.tasks || [];
+  const started = run?.startedAt || '';
+  const prs = g?.prs || [];
+  const open = prs.filter((p) => p.state === 'OPEN');
+  const merged = prs.filter((p) => p.state === 'MERGED' && (p.mentioned || (started && p.mergedAt >= started)));
+  const jobDone = run?.result === 'done' || run?.status === 'done';
+  const unfinished = run && !jobDone ? tasks.filter((t) => t.status !== 'DONE') : [];
+  const done = [...tasks.filter((t) => t.status === 'DONE').map((t) => t.title), ...merged.map((p) => `PR #${p.n} 已 merge：${p.title}`)];
+  const current = [
+    ...open.map((p) => `PR #${p.n} 開著：${p.title} · ${ciWord(p.ci)}${p.review === 'CHANGES_REQUESTED' ? ' · review 要求修改' : ''}${p.unresolved ? ` · ${p.unresolved} 個 review 意見沒解決` : ''}`),
+    ...merged.filter((p) => p.unresolved).map((p) => `PR #${p.n}（已 merge）還有 ${p.unresolved} 個 review 意見沒標成已解決`),
+    ...unfinished.map((t) => `「${t.title}」${CARD_WORD[t.status] || t.status}`),
+    ...(g?.dirty ? [`本機 ${g.branch} 有 ${g.dirty} 個檔案還沒 commit`] : []),
+  ];
+  const ask = run?.ask?.question || tasks.find((t) => t.status === 'NEEDS_USER')?.ask?.question;
+  const ciFail = open.find((p) => p.ci.state === 'failed');
+  const review = open.find((p) => p.unresolved || p.review === 'CHANGES_REQUESTED');
+  const ciRun = open.find((p) => p.ci.state === 'running');
+  const ready = open.find((p) => p.ci.state === 'passed' || p.ci.state === 'none');
+  const CONT = '按「▶ 接著處理」讓團隊接手';
+  const s = ask ? { level: 'need', headline: '需要 Nana', next: '你回覆後，工頭接著安排', you: `回答這個問題：${ask}（按「▶ 接著處理」後在上方回覆）` }
+    : ciFail ? { level: 'open', headline: `PR #${ciFail.n} CI 失敗`, next: '工頭派人查 CI 失敗原因並修正', you: CONT }
+    : review ? { level: 'open', headline: `PR #${review.n} 有 review 意見還沒解決`, next: '工頭派人處理 review 意見', you: CONT }
+    : ciRun ? { level: 'wait', headline: `PR #${ciRun.n} 等待 CI`, next: 'CI 全綠 → 工頭完成 merge 與收尾', you: '☕ 不急：CI 還在跑。按「▶ 接著處理」後，團隊會等 CI 跑完再收尾（Studio 每分鐘檢查）' }
+    : ready ? { level: 'open', headline: `PR #${ready.n} ${ready.ci.state === 'passed' ? 'CI 全綠，' : ''}還沒 merge`, next: '工頭確認後完成 merge 與收尾', you: CONT }
+    : unfinished.length ? { level: 'open', headline: '上一件工作還沒完成', next: `接著做「${unfinished[0].title}」`, you: CONT }
+    : g?.dirty ? { level: 'open', headline: '本機有還沒 commit 的修改', next: '工頭確認這些修改要不要交付', you: CONT + '，或自己處理這些修改' }
+    : run ? { level: 'done', headline: '上一件工作已完成', next: '沒有剩下的事', you: '可以開始新的工作' }
+    : { level: 'idle', headline: '待命', next: '', you: '在下面說你要什麼，按「交給團隊」' };
+  const loose = merged.filter((p) => p.unresolved).map((p) => `PR #${p.n}`);
+  if (loose.length && s.level !== 'idle') {
+    s.next = (s.level === 'done' ? '' : s.next + '；') + `把 ${loose.join('、')} 的 review 意見標成已解決`;
+    if (s.level === 'done') Object.assign(s, { level: 'open', headline: `${loose.join('、')} 有 review 意見沒標成已解決`, you: '按「▶ 接著處理」讓團隊收尾' });
+  }
+  return { ...s, goal: run ? clip(String(run.goal || run.request).split('\n').find((x) => x.trim()) || '', 160) : '', leader: run?.leader || '',
+    done: done.slice(-8), current, git: g || null, updatedAt: new Date().toISOString() };
+}
+
+// The handoff text every Leader gets: last job (work memory) + the verified state.
+function projectContext(w) {
+  const job = latestJob(w), ps = w.pstate;
+  const memory = workContext(job);
+  if (!ps) return memory;
+  const g = ps.git || {};
+  const pr = (p) => `- PR #${p.n} ${p.state} "${p.title}" (branch ${p.branch})${p.state === 'OPEN' ? `: ${p.ci.state === 'none' ? 'no CI' : `CI ${p.ci.state} (${p.ci.done}/${p.ci.total} done${p.ci.failed.length ? '; failed: ' + p.ci.failed.join(', ') : ''}${p.ci.pending.length ? '; running: ' + p.ci.pending.join(', ') : ''})`}; review: ${p.review || 'none'}` : p.mergedAt ? ` merged ${p.mergedAt.slice(0, 16)}` : ''}${p.unresolved != null ? `; unresolved review threads: ${p.unresolved}` : ''}`;
+  const verified = g.error ? `Git / GitHub could not be read: ${g.error}.` : [
+    `Project state checked with git / gh at ${g.checkedAt}. This is the truth; it overrides older notes above.`,
+    `- repo ${g.repo || '?'}; main ${g.mainSha || '?'}; local branch ${g.branch || '?'} @ ${g.headSha || '?'} (${g.dirty || 0} uncommitted, ahead ${g.ahead || 0}, behind ${g.behind || 0})`,
+    ...(g.prs || []).filter((p) => p.state === 'OPEN' || p.mentioned).map(pr),
+  ].join('\n');
+  return [memory, verified, `Done: ${ps.done.join('; ') || 'nothing recorded'}`, `Still open: ${ps.current.join('; ') || 'nothing'}`, `Next action: ${ps.next || 'none'}`].filter(Boolean).join('\n');
+}
+
+const refreshing = new Map(); // project -> promise (one refresh at a time per project)
+function refreshState(w) {
+  if (refreshing.has(w.project)) return refreshing.get(w.project);
+  const p = (async () => {
+    const job = latestJob(w);
+    const nums = job ? [...new Set(knownRefs(job).map((x) => +(String(x).match(/(?:pull\/|#)(\d+)/)?.[1] || 0)).filter(Boolean))] : [];
+    w.pstate = deriveState(job, await readGitState(w.project, nums));
+    saveSettings();
+  })().catch((e) => console.error('Project State 讀取失敗：' + e.message)).finally(() => refreshing.delete(w.project));
+  refreshing.set(w.project, p);
+  return p;
+}
+
+// ▶ 接著處理: refresh the state, then continue the paused job or start a continuation that gets the handoff.
+async function continueProject(w) {
+  if (w.run?.active) throw new Error('團隊正在工作中');
+  await refreshState(w);
+  if (w.run?.paused) {
+    w.run.context = projectContext(w);
+    return resume(w);
+  }
+  return start(w, '接著處理上一件工作', true);
+}
+
 // ---------- The Leader checks the whole request ----------
 const MAX_ROUNDS = 3; // extra card rounds before the Leader must ask the user
 
@@ -908,7 +1043,7 @@ function reassign(w, taskId, agent) {
 }
 
 // Changing the Leader mid-run hands the same job over; Workers keep their cards.
-function setLeader(w, agent) {
+async function setLeader(w, agent) {
   if (!AGENTS[agent]) throw new Error('未知的 Agent');
   if (!available(agent)) throw new Error(`${AGENTS[agent].name} 目前不可用`);
   const old = w.leader;
@@ -924,6 +1059,10 @@ function setLeader(w, agent) {
   log(w, 'studio', 'system', `Leader 交接：${AGENTS[old].name} → ${AGENTS[agent].name}。新 Leader 接手原始需求${n ? `和 ${n} 張工作卡（已完成的結果保留）` : ''}，不需要重新輸入。`);
   const oldConv = run.convs[old + ':lead'];
   if (oldConv && active.has(oldConv)) cancelTurn(oldConv);
+  const gen = run.leaderGen;
+  await refreshState(w); // the new Leader starts from the verified project state
+  if (run.leaderGen !== gen || w.run !== run) return;
+  run.context = projectContext(w);
   if (run.paused) return saveRun(w, 'paused');
   if (run.phase === 'planning') planPhase(w);
   else if (run.phase === 'summarizing' && !run.ask) summarize(w);
@@ -935,7 +1074,7 @@ function openWorkspace(p) {
   p = path.resolve(String(p).trim());
   if (!isDir(p)) throw new Error('資料夾不存在：' + p);
   let w = S.workspaces.find((x) => same(x.project, p));
-  if (!w) S.workspaces.push((w = newWs(p)));
+  if (!w) { S.workspaces.push((w = newWs(p))); refreshState(w); }
   S.recent = [w.project, ...S.recent.filter((x) => !same(x, w.project))].slice(0, 8);
   saveSettings();
   return { project: w.project };
@@ -1002,7 +1141,7 @@ const routes = {
   'GET /api/state': () => {
     const workspaces = S.workspaces.map((w) => {
       const r = w.run;
-      return { project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, tasks: w.tasks, activity: w.activity, progress: readProjectProgress(w),
+      return { project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, tasks: w.tasks, activity: w.activity, progress: readProjectProgress(w),
         run: r && { id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing } };
     });
     return { ...S, ...teamStats(), agents: Object.values(S.agents), workspaces };
@@ -1020,6 +1159,8 @@ const routes = {
   'POST /api/start': (b) => start(wsOf(b.ws), String(b.request || ''), !!b.continue),
   'POST /api/stop': (b) => stop(wsOf(b.ws)),
   'POST /api/reassign': (b) => reassign(wsOf(b.ws), b.taskId, b.agent),
+  'POST /api/continue': (b) => continueProject(wsOf(b.ws)),
+  'POST /api/project-state/refresh': (b) => refreshState(wsOf(b.ws)),
   'POST /api/answer': (b) => answer(wsOf(b.ws), b.taskId, b.text),
   'POST /api/continue-card': (b) => continueCard(wsOf(b.ws), b.taskId),
   'POST /api/check': () => { checkAll().then(refreshClaudeLimits); },
@@ -1074,3 +1215,4 @@ server.on('listening', () => {
 server.listen(PORT, '127.0.0.1');
 refreshCodexLimits();
 checkAll().then(refreshClaudeLimits);
+for (const w of S.workspaces) refreshState(w);

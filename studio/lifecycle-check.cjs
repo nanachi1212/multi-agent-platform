@@ -13,12 +13,12 @@ function makeEnv(script) {
     S: { workspaces: [] }, crypto: nodeCrypto, logs, notices, prompts,
     log: (w, who, role, text, detail) => logs.push({ who, role, text, detail }),
     notify: (title, body, kind) => notices.push({ title, body, kind }),
-    label: () => 'TestProj', refreshClaudeLimits() {}, saveRun() {},
+    label: () => 'TestProj', refreshClaudeLimits() {}, saveRun() {}, saveSettings() {}, latestJob: () => null,
     Halt: class extends Error {}, active: new Map(), busyConvs: () => [], cancelTurn() {}, convAgent: new Map(),
     available: () => true, workersFor: (w, lead) => w.workers.filter((x) => x !== lead),
     conv: async (w, agent, lead) => agent + (lead ? ':lead' : ':work'),
     turn: async (agent, cid, text) => { prompts.push({ agent, text }); await new Promise((r) => setTimeout(r, 5)); return script(agent, text); },
-    execFile: () => { throw new Error('no gh in test'); }, isDir: () => true, readHistory() {}, openWorkspace() {}, wsOf() {},
+    execFile: (cmd, args, opts, cb) => cb(new Error('no git / gh in test'), '', ''), isDir: () => true, readHistory() {}, openWorkspace() {}, wsOf() {},
   };
   const names = Object.keys(env);
   const api = new Function(...names, code + '\nreturn { planPhase, pump, summarize, answer, continueCard, wake, parseStatus, finish };')(...names.map((k) => env[k])); // test harness: our own code
