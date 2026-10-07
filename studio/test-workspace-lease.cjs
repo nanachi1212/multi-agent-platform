@@ -5,10 +5,10 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { execFile, execFileSync, spawn } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
-async function store(rt, instance) {
+async function store(rt, instance, fileSystem = fs) {
   const { createWorkspaceLeaseStore } = await import(pathToFileURL(path.join(__dirname, 'workspace-lease.mjs')));
   const S = { leases: [] };
-  const api = createWorkspaceLeaseStore({ fs, path, crypto, S, RT: rt, INSTANCE: instance,
+  const api = createWorkspaceLeaseStore({ fs: fileSystem, path, crypto, S, RT: rt, INSTANCE: instance,
     AGENTS: { codex: { name: 'Codex' }, claude: { name: 'Claude Code' } }, nowIso: () => new Date().toISOString(),
     pidAlive: (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } }, LEASE_HUNG_MS: 1800000, LEASE_RESERVED_TTL_MS: 43200000 });
   return { S, api };
@@ -139,6 +139,25 @@ module.exports = async function run({ makeEnv, mkTmp, region }) {
     fs.writeFileSync(path.join(rtLock, 'studio', 'leases.json.lock'), JSON.stringify({ pid: process.pid }));
     assert.throws(() => lockStore.api.acquireWrite(E.w, E.t, info), /locked/); assert.equal(lockStore.S.leases.length, 0);
     console.log('lease corrupt/locked persistence prevents admission: PASS');
+
+    // A transient Windows lock-file unlink error must not fail a committed transaction;
+    // the next operation reclaims only this Studio's exact token and keeps other locks safe.
+    const flakyRt = tmp('lease-unlink-retry-'); let denyUnlock = true;
+    const flakyFs = { ...fs, unlinkSync(file) {
+      if (denyUnlock && file.endsWith('leases.json.lock')) {
+        denyUnlock = false;
+        throw Object.assign(new Error('simulated antivirus handle'), { code: 'EPERM' });
+      }
+      return fs.unlinkSync(file);
+    } };
+    const flakyStore = await store(flakyRt, 'unlock-retry', flakyFs), retryInfo = await E.api.workspaceOf(E.w.project);
+    const flakyAdmission = flakyStore.api.acquireWrite(E.w, E.t, retryInfo);
+    assert.equal(flakyAdmission.ok, true, 'transient lock-file unlink error does not overturn successful persistence');
+    assert.ok(fs.existsSync(path.join(flakyRt, 'studio', 'leases.json.lock')), 'failed unlink retains a recoverable lock record');
+    assert.doesNotThrow(() => flakyStore.api.saveLeases(), 'next transaction safely reclaims its own leftover lock');
+    assert.equal(fs.existsSync(path.join(flakyRt, 'studio', 'leases.json.lock')), false);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(flakyRt, 'studio', 'leases.json'), 'utf8')).length, 1);
+    console.log('lease transient EPERM unlock is recovered by exact same-Studio token: PASS');
 
 
     // Atomic git-dir mirrors protect installations using different leases.json files.
