@@ -659,7 +659,7 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
     const E = leaseEnv(async (agent, text) => { if (text.includes('Task: blocked card')) { const m = text.match(/Work only inside this folder: (.+)/); seenDirs.push(m && m[1].trim()); wt = m && m[1].trim(); nfs.writeFileSync(npath.join(wt, 'feature.txt'), 'f'); repo.g('-C', wt, 'add', '.'); repo.g('-C', wt, 'commit', '-q', '-m', 'feature'); repo.g('merge', '-q', '--ff-only', (await E.api.workspaceOf(wt)).branch); return DONE; } await g1.p; return DONE; }, rt);
     const w1 = jobOf(repo), w2 = jobOf(repo, 'antigravity'); E.env.S.workspaces.push(w1, w2);
     const c1 = mkCard(w1, 'codex', 'holder'), c2 = mkCard(w2, 'claude', 'blocked card');
-    startJob(E.api, w1, 'jk1'); assert.ok(await waitFor(() => c1.status === 'WORKING'));
+    startJob(E.api, w1, 'jk1'); assert.ok(await waitFor(() => c1.status === 'WORKING' && writeLeases(E.env).length === 1));
     startJob(E.api, w2, 'jk2'); assert.ok(await waitFor(() => c2.status === 'WAITING' && c2.blocked));
     const r = await E.api.useWorktree(w2, c2.id);
     assert.ok(await waitFor(() => c2.status === 'DONE'), 'the blocked card runs in its own worktree at the same time');
@@ -672,11 +672,79 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
     const E3 = leaseEnv(async (agent, text) => { if (agent === 'codex') await g3.p; return DONE; }, rt3);
     const a1 = jobOf(repo3), a2 = jobOf(repo3, 'antigravity'); E3.env.S.workspaces.push(a1, a2);
     const h1 = mkCard(a1, 'codex', 'holder2'), b2 = mkCard(a2, 'claude', 'review me');
-    startJob(E3.api, a1, 'jk3'); assert.ok(await waitFor(() => h1.status === 'WORKING'));
+    startJob(E3.api, a1, 'jk3'); assert.ok(await waitFor(() => h1.status === 'WORKING' && writeLeases(E3.env).length === 1));
     startJob(E3.api, a2, 'jk4'); assert.ok(await waitFor(() => b2.status === 'WAITING' && b2.blocked));
     E3.api.useReadOnly(a2, b2.id); assert.ok(await waitFor(() => b2.status === 'DONE'), 'switched to read-only, it runs next to the writer'); g3.open();
   }
   console.log('15 workspace lease A-K: same tree blocked, reader allowed, handoff, restart safety, stop, pause, stale, worktrees, external takeover, unknown changes: PASS');
+
+  // 16) review findings of PR #23 (regressions)
+  // P1: STOP does not give the lease back until the agent has really stopped
+  {
+    const rt = mkTmp('lease-rt-'), repo = mkRepo(); let wk; let release;
+    const E = leaseEnv(async (agent, text) => { if (!text.includes('Task: ')) return '{"done":true,"report":"ok"}'; await new Promise((r) => { release = r; }); throw new E.env.Halt('已停止'); }, rt, keepRuns);
+    wk = jobOf(repo); E.env.S.workspaces.push(wk); const c = mkCard(wk, 'codex', 'winding down');
+    startJob(E.api, wk, 'jr1'); assert.ok(await waitFor(() => c.status === 'WORKING' && writeLeases(E.env).length === 1 && release));
+    E.api.stop(wk);
+    await new Promise((r) => setTimeout(r, 120));
+    assert.strictEqual(writeLeases(E.env).length, 1, 'the lease is still held while the agent winds down');
+    const other = jobOf(repo, 'antigravity'); E.env.S.workspaces.push(other); const oc = mkCard(other, 'claude', 'another writer'); other.run.id = 'jr1b';
+    const got = await E.api.acquireWrite(other, oc, await E.api.workspaceOf(repo.d));
+    assert.strictEqual(got.ok, false, 'nobody can take the tree before the agent stopped');
+    release(); assert.ok(await waitFor(() => c.status === 'FAILED' && writeLeases(E.env).length === 0), 'released once the agent really stopped');
+  }
+  // P2: pausing while a step winds down: the agent's own edits are not "unknown changes"
+  {
+    const rt = mkTmp('lease-rt-'), repo = mkRepo(); let wk; let release; let first = true;
+    const E = leaseEnv(async (agent, text) => { if (!text.includes('Task: ')) return '{"done":true,"report":"ok"}'; if (first) { first = false; nfs.writeFileSync(npath.join(repo.d, 'agent-edit.txt'), 'its own edit'); await new Promise((r) => { release = r; }); throw new E.env.Halt('已暫停'); } return DONE; }, rt, keepRuns);
+    wk = jobOf(repo); E.env.S.workspaces.push(wk); const c = mkCard(wk, 'codex', 'pauses');
+    startJob(E.api, wk, 'jr2'); assert.ok(await waitFor(() => c.status === 'WORKING' && release));
+    E.api.pause(wk); await E.api.checkWorkspaces();
+    assert.ok(!wk.run.extMod, 'a step that is winding down is not an outside edit');
+    release(); assert.ok(await waitFor(() => c.status === 'PAUSED' && writeLeases(E.env)[0]?.status === 'RESERVED'));
+    await E.api.checkWorkspaces(); assert.ok(!wk.run.extMod, 'the tree it left is the new baseline');
+  }
+  // P2: a pending "may Studio take over?" question is not overtaken by the watcher
+  {
+    const rt = mkTmp('lease-rt-'), repo = mkRepo(); let turns = 0;
+    const E = leaseEnv(async (agent, text) => { if (!text.includes('Task: ') && !text.startsWith('Update')) return '{"done":true,"report":"ok"}'; return ++turns === 1 ? 'x' + String.fromCharCode(10) + 'STATUS: WAITING_EXTERNAL: CI' : DONE; }, rt, keepRuns);
+    const wk = jobOf(repo); E.env.S.workspaces.push(wk); const c = mkCard(wk, 'codex', 'asks first');
+    startJob(E.api, wk, 'jr3'); assert.ok(await waitFor(() => c.status === 'WAITING_EXTERNAL' && wk.run.treeStamp));
+    repo.g('commit', '-q', '--allow-empty', '-m', 'meanwhile'); E.api.wake(wk, c, 'CI finished');
+    assert.ok(await waitFor(() => c.status === 'NEEDS_USER' && c.takeover));
+    await E.api.checkWorkspaces();
+    assert.ok(!wk.run.extMod && wk.run.active, 'the watcher leaves the question alone');
+    E.api.answer(wk, c.id, '確認接手，繼續'); assert.ok(await waitFor(() => c.status === 'DONE'), 'the user can still answer it');
+  }
+  // P2: a lease the card already owned stays RESERVED when it has to wait again
+  {
+    const rt = mkTmp('lease-rt-'), repo = mkRepo(); let turns = 0;
+    const E = leaseEnv(async (agent, text) => { if (!text.includes('Task: ') && !text.startsWith('Update')) return '{"done":true,"report":"ok"}'; return ++turns === 1 ? 'x' + String.fromCharCode(10) + 'STATUS: WAITING_EXTERNAL: CI' : DONE; }, rt, keepRuns);
+    const wk = jobOf(repo); E.env.S.workspaces.push(wk); const c = mkCard(wk, 'codex', 'keeps its lease');
+    startJob(E.api, wk, 'jr4'); assert.ok(await waitFor(() => c.status === 'WAITING_EXTERNAL' && wk.run.leftAt && writeLeases(E.env)[0]?.status === 'RESERVED'));
+    await new Promise((r) => setTimeout(r, 30)); nfs.writeFileSync(npath.join(repo.d, 'typing.txt'), 'someone is editing now');
+    E.api.wake(wk, c, 'CI finished');
+    assert.ok(await waitFor(() => /秒前有檔案被改過/.test(c.blockReason || '')));
+    assert.deepStrictEqual(writeLeases(E.env).map((l) => l.status), ['RESERVED'], 'the owner keeps its reservation while it waits');
+    const other = jobOf(repo, 'antigravity'); E.env.S.workspaces.push(other); const oc = mkCard(other, 'claude', 'intruder'); other.run.id = 'jr4b';
+    assert.strictEqual((await E.api.acquireWrite(other, oc, await E.api.workspaceOf(repo.d))).ok, false, 'nobody else slips in');
+  }
+  // P2: two Studios sharing one lease file see each other and never overwrite each other's records
+  {
+    const rt = mkTmp('lease-rt-'), repo = mkRepo(), g = mkGate();
+    const A = leaseEnv(async () => { await g.p; return DONE; }, rt), B = leaseEnv(async () => DONE, rt); // B loaded the (empty) file before A took the tree
+    const wa = jobOf(repo), wb = jobOf(repo, 'antigravity'); A.env.S.workspaces.push(wa); B.env.S.workspaces.push(wb);
+    const ca = mkCard(wa, 'codex', 'A writes'), cb = mkCard(wb, 'claude', 'B wants in');
+    startJob(A.api, wa, 'jr5a'); assert.ok(await waitFor(() => ca.status === 'WORKING' && writeLeases(A.env).length === 1));
+    wb.run.id = 'jr5b';
+    const got = await B.api.acquireWrite(wb, cb, await B.api.workspaceOf(repo.d));
+    assert.strictEqual(got.ok, false, 'B sees the lease A took, although B loaded the file before');
+    B.api.saveLeases();
+    const onDisk = JSON.parse(nfs.readFileSync(npath.join(rt, 'studio', 'leases.json'), 'utf8'));
+    assert.ok(onDisk.some((l) => l.owner.agent === 'codex' && l.status === 'ACTIVE'), "B's save kept A's record");
+    g.open(); assert.ok(await waitFor(() => ca.status === 'DONE'));
+  }
+  console.log('16 review findings (stop timing, pause wind-down, takeover question, kept reservation, two Studios): PASS');
 
   // status-line parser
   const { parseStatus } = api;

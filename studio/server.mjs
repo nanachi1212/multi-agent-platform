@@ -798,7 +798,20 @@ async function workspaceOf(dir) {
 
 // ----- persistence -----
 const leasesFile = () => path.join(RT, 'studio', 'leases.json');
+// Another Studio sharing this folder may have added or changed leases: take its records in (ours stay the truth for our own).
+function mergeLeasesFromDisk() {
+  let disk;
+  try { disk = JSON.parse(fs.readFileSync(leasesFile(), 'utf8')); } catch { return; }
+  for (const d of disk) {
+    const m = S.leases.find((l) => l.id === d.id);
+    if (!m) { S.leases.push(d); continue; }
+    if (m.instance === INSTANCE) continue;
+    if (d.status === 'RELEASED' && m.status !== 'RELEASED') Object.assign(m, d);
+    else if (Date.parse(d.heartbeatAt || 0) > Date.parse(m.heartbeatAt || 0)) Object.assign(m, d);
+  }
+}
 function saveLeases() {
+  mergeLeasesFromDisk();
   try {
     const f = leasesFile();
     fs.mkdirSync(path.dirname(f), { recursive: true });
@@ -838,20 +851,29 @@ function newLease(w, t, info, mode) {
 
 // Write lease for a card about to modify files. { ok:false, holder } when somebody else holds the tree: nothing is taken.
 async function acquireWrite(w, t, info) {
+  mergeLeasesFromDisk();
   const cur = writerOf(info.key);
   if (cur && !sameCard(cur, w, t)) return { ok: false, holder: cur };
   for (const l of S.leases) if (l.key === info.key && l.mode === 'write' && l.status !== 'RELEASED' && leaseState(l) === 'STALE') retire(l, 'stale: reclaimed by ' + ownerName({ owner: { kind: 'studio', agent: t.agent } }));
   const l = cur || newLease(w, t, info, 'write');
   Object.assign(l, { branch: info.branch, status: 'ACTIVE', heartbeatAt: nowIso(), instance: INSTANCE, pid: process.pid, reason: '', cardTitle: t.title });
   saveLeases();
-  return { ok: true, lease: l };
+  return { ok: true, lease: l, reused: !!cur };
 }
 function acquireRead(w, t, info) { newLease(w, t, info, 'read'); saveLeases(); }
 
-const cardLeases = (w, t) => S.leases.filter((l) => l.status !== 'RELEASED' && l.jobId === w.run?.id && l.cardId === t.id);
-function releaseCardLeases(w, t, reason) { for (const l of cardLeases(w, t)) retire(l, reason); saveLeases(); }
-function reserveCardLeases(w, t, reason) { for (const l of cardLeases(w, t)) if (l.mode === 'write' && l.status === 'ACTIVE') Object.assign(l, { status: 'RESERVED', reason, heartbeatAt: nowIso() }); saveLeases(); }
-function releaseJobLeases(w, reason) { for (const l of S.leases) if (l.status !== 'RELEASED' && l.jobId === w.run?.id && l.owner.kind === 'studio') retire(l, reason); saveLeases(); }
+const cardLeases = (w, t, agent) => S.leases.filter((l) => l.status !== 'RELEASED' && l.jobId === w.run?.id && l.cardId === t.id && (!agent || l.owner.agent === agent));
+function releaseCardLeases(w, t, reason, agent) { for (const l of cardLeases(w, t, agent)) retire(l, reason); saveLeases(); }
+function reserveCardLeases(w, t, reason, agent) { for (const l of cardLeases(w, t, agent)) if (l.mode === 'write' && l.status === 'ACTIVE') Object.assign(l, { status: 'RESERVED', reason, heartbeatAt: nowIso() }); saveLeases(); }
+// A card whose agent is still winding down (status WORKING) keeps its lease: endWriteStep gives it back once the agent really stopped.
+function releaseJobLeases(w, reason) {
+  for (const l of S.leases) {
+    if (l.status === 'RELEASED' || l.jobId !== w.run?.id || l.owner.kind !== 'studio') continue;
+    if (l.mode === 'write' && w.tasks.some((t) => t.id === l.cardId && t.status === 'WORKING')) continue;
+    retire(l, reason);
+  }
+  saveLeases();
+}
 function reserveJobLeases(w, reason) { for (const l of S.leases) if (l.status === 'ACTIVE' && l.mode === 'write' && l.jobId === w.run?.id && l.instance === INSTANCE) Object.assign(l, { status: 'RESERVED', reason, heartbeatAt: nowIso() }); saveLeases(); }
 function beatLeases() { let n = 0; for (const l of S.leases) if (l.status !== 'RELEASED' && l.instance === INSTANCE && l.owner.kind === 'studio') { l.heartbeatAt = nowIso(); n++; } if (n) saveLeases(); }
 
@@ -954,7 +976,8 @@ async function takeWriteSlot(w, t) {
   const why = await externalReason(w, t);
   if (!why) { Object.assign(t, { trust: false, blockReason: '', blockLogged: '', blocked: null }); await acquireLock(w, t); return true; }
   if (why.kind === 'busy') {
-    retire(got.lease, 'not started: ' + why.text); saveLeases();
+    if (got.reused) Object.assign(got.lease, { status: 'RESERVED', reason: 'waiting: ' + why.text }); else retire(got.lease, 'not started: ' + why.text); // a lease the card already owned stays reserved
+    saveLeases();
     Object.assign(t, { status: 'WAITING', blockReason: why.text, blocked: null });
     if (t.blockLogged !== why.text) { t.blockLogged = why.text; log(w, 'studio', 'system', `「${t.title}」先不動：${why.text}。等對方做完，Studio 每 30 秒再看一次。`); }
     retryLater(w);
@@ -967,28 +990,32 @@ async function takeWriteSlot(w, t) {
   return false;
 }
 
-// After a writing step: remember what the tree looks like, and keep or give back the lease.
-async function endWriteStep(w, t) {
-  const dir = t.workdir || w.project;
-  if (!isWriter(t)) { releaseCardLeases(w, t, 'read finished'); return; }
+// After a writing step: remember what the tree looks like, and keep or give back the lease of the agent that ran the step.
+async function endWriteStep(w, t, ranAs = t.agent) {
+  if (!isWriter(t)) { releaseCardLeases(w, t, 'read finished', ranAs); return; }
   if (w.run && !t.workdir) { w.run.treeStamp = await treeStamp(w); w.run.leftAt = nowIso(); }
-  if (w.run?.stopped) releaseCardLeases(w, t, 'stopped');
-  else if (w.run?.paused) reserveCardLeases(w, t, 'paused');
-  else if (holdsWriteLock(t)) reserveCardLeases(w, t, 'waiting');
-  else releaseCardLeases(w, t, 'card finished');
+  if (t.agent !== ranAs) releaseCardLeases(w, t, 'handed off', ranAs); // the card moved on while this step was ending: not our lease any more
+  else if (w.run?.stopped) releaseCardLeases(w, t, 'stopped', ranAs);
+  else if (w.run?.paused) reserveCardLeases(w, t, 'paused', ranAs);
+  else if (holdsWriteLock(t)) reserveCardLeases(w, t, 'waiting', ranAs);
+  else releaseCardLeases(w, t, 'card finished', ranAs);
   if (!w.tasks.some((x) => holdsWriteLock(x) && sameTree(x, t))) await releaseLock(w, t);
 }
 
 async function runTask(w, t) {
-  t.status = 'WORKING'; // reserve the slot at once: no second writer may start while the checks below run
-  if (!(await takeWriteSlot(w, t))) return;
-  if (!w.run?.active || t.status !== 'WORKING') { // paused or stopped while the check ran
-    if (t.status === 'WORKING') Object.assign(t, w.run?.stopped ? { status: 'FAILED', result: '已停止' } : { status: 'PAUSED', result: '已暫停', resumed: true });
-    await endWriteStep(w, t);
-    return;
-  }
-  try { await runCard(w, t); } finally { await endWriteStep(w, t); }
-  if (t.status === 'DONE' && t.worktree) await cleanupWorktree(w, t);
+  const ranAs = t.agent;
+  w.stepsInFlight = (w.stepsInFlight || 0) + 1; // from now until the lease is settled, the watcher must not call our own edits "unknown"
+  try {
+    t.status = 'WORKING'; // reserve the slot at once: no second writer may start while the checks below run
+    if (!(await takeWriteSlot(w, t))) return;
+    if (!w.run?.active || t.status !== 'WORKING') { // paused or stopped while the check ran
+      if (t.status === 'WORKING') Object.assign(t, w.run?.stopped ? { status: 'FAILED', result: '已停止' } : { status: 'PAUSED', result: '已暫停', resumed: true });
+      await endWriteStep(w, t, ranAs);
+      return;
+    }
+    try { await runCard(w, t); } finally { await endWriteStep(w, t, ranAs); }
+    if (t.status === 'DONE' && t.worktree) await cleanupWorktree(w, t);
+  } finally { w.stepsInFlight--; }
   pump(w);
   for (const x of S.workspaces) if (x !== w && x.run?.active) pump(x); // a lease was just given back: jobs that were refused can go now
 }
@@ -1142,9 +1169,9 @@ async function checkWorkspaces() {
   for (const w of S.workspaces) {
     const run = w.run;
     if (!run || run.extMod || run.stopped) continue;
-    const holding = w.tasks.filter((t) => isWriter(t) && !t.workdir && cardLeases(w, t).some((l) => l.mode === 'write'));
+    const holding = w.tasks.filter((t) => isWriter(t) && !t.workdir && !t.takeover && cardLeases(w, t).some((l) => l.mode === 'write'));
     if (!holding.length) continue;
-    if (holding.some((t) => t.status === 'WORKING')) {
+    if ((w.stepsInFlight || 0) > 0 || holding.some((t) => t.status === 'WORKING')) { // an agent is executing or winding down: its own edits are not "unknown"
       const lock = await foreignLock(w);
       if (lock) flagExternalModification(w, `${lock.owner || '另一個程式'} 在 Studio 寫入期間也開始修改這個工作區（鎖定檔）`);
       continue;
@@ -1156,6 +1183,7 @@ async function checkWorkspaces() {
 async function runCard(w, t) {
   const run = w.run;
   const note = t.wakeNote;
+  const startAgent = t.agent;
   t.status = 'WORKING';
   t.wakeNote = '';
   log(w, t.agent, 'worker', (note ? '收到等待的結果，繼續：' : t.resumed ? '繼續工作：' : '開始工作：') + t.title);
@@ -1206,7 +1234,7 @@ ${STATUS_RULES}`;
     }
     applyStatus(w, t, st, last);
   } catch (e) {
-    if (e instanceof Halt && run.paused) { t.status = 'PAUSED'; t.result = '已暫停'; t.resumed = true; t.wakeNote = note; return; }
+    if (e instanceof Halt && run.paused) { if (t.agent === startAgent) Object.assign(t, { status: 'PAUSED', result: '已暫停', resumed: true, wakeNote: note }); return; } // handed off meanwhile: the card is the new agent's now
     if (e instanceof Halt && run.stopped) { t.status = 'FAILED'; t.result = '已停止'; return; }
     if (e.stuck && !t.convReset) { // the worker's conversation will not stop: start a fresh one (the card brief carries the task)
       delete run.convs[workKey(t)];
