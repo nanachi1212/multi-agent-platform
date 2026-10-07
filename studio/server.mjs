@@ -271,18 +271,61 @@ async function answerConfirmations(w, convId, allow) {
 }
 
 // Send one message and wait until the agent's turn is over. Returns the agent's reply text.
-async function turn(agent, convId, text, { w, lead = false, check = false, timeout = 20 * 60e3 } = {}) {
+// Stops whatever the conversation is doing (a step still waiting for a permission answer, a runaway command)
+// and waits until it is idle. Returns false when it will not stop.
+async function stopTurn(convId) {
+  // An orphan turn (e.g. left by a timed-out step) is not in `active`: ask the conversation which turn is running.
+  const turnId = active.get(convId) ?? (await api('GET', `/api/conversations/${convId}`).catch(() => ({}))).runtime?.turn_id;
+  await api('POST', `/api/conversations/${convId}/cancel`, { turn_id: turnId }).catch(() => {});
+  for (let k = 0; k < 10; k++) {
+    const rt = (await api('GET', `/api/conversations/${convId}`).catch(() => ({}))).runtime || {};
+    if (rt.state === 'idle' && !rt.is_processing) return true;
+    await sleep(2000);
+  }
+  return false;
+}
+
+// "Conversation already running" = an older step is still busy: stop it, then send once more.
+async function sendMessage(convId, text) {
+  try { return await api('POST', `/api/conversations/${convId}/messages`, { content: text }); }
+  catch (e) {
+    if (!/already running|CONFLICT/i.test(e.message)) throw e;
+    if (!(await stopTurn(convId))) throw Object.assign(e, { stuck: true });
+    return api('POST', `/api/conversations/${convId}/messages`, { content: text });
+  }
+}
+
+// Changes whenever the agent adds or updates a message: the sign that a long step is still making progress.
+async function progressMark(convId) {
+  const items = (await api('GET', `/api/conversations/${convId}/messages`)).items || [];
+  return items.length + '|' + items.slice(-3).map((m) => `${m.id}:${m.status}:${m.created_at}`).join(',');
+}
+
+const HARD_CAP_MS = 3 * 3600e3; // no single step may run longer than this
+// timeout = how long the agent may show NO progress (new messages); a long job that keeps working is never cut off.
+async function turn(agent, convId, text, { w, lead = false, check = false, timeout = 25 * 60e3, progressEvery = 30000 } = {}) {
   const run = w?.run;
-  const sent = await api('POST', `/api/conversations/${convId}/messages`, { content: text });
+  const sent = await sendMessage(convId, text);
   active.set(convId, sent.turn_id);
   if (!check) S.agents[agent].working++;
   try {
+    let mark = '', markAt = Date.now(), checkedAt = 0;
     for (const t0 = Date.now(); ;) {
       await sleep(1500);
       const rt = (await api('GET', `/api/conversations/${convId}`)).runtime || {};
       if (rt.pending_confirmations) await answerConfirmations(w, convId, !lead);
       if (rt.state === 'idle' && !rt.is_processing) break;
-      if (Date.now() - t0 > timeout) throw new Error('逾時');
+      const now = Date.now();
+      if (now - checkedAt >= progressEvery) {
+        checkedAt = now;
+        const m = await progressMark(convId).catch(() => mark);
+        if (m !== mark) { mark = m; markAt = now; }
+      }
+      if (now - markAt > timeout || now - t0 > HARD_CAP_MS) {
+        const mins = Math.round((now - markAt) / 60e3);
+        await stopTurn(convId); // never leave the conversation busy: the next card on it would bounce with "already running"
+        throw Object.assign(new Error(`逾時：${mins >= 1 ? mins + ' 分鐘' : '一段時間'}沒有任何新進度，Studio 已停止這一步`), { timeout: true });
+      }
     }
   } finally {
     active.delete(convId);
@@ -588,7 +631,7 @@ function workContext(job) {
   const { run, tasks } = job;
   const state = run.active ? 'in progress' : run.paused ? 'paused' : run.result || 'ended';
   const report = run.phase === 'finished' ? [...(job.activity || [])].reverse().find((m) => m.role === 'leader')?.text : '';
-  const card = (t) => `- [${t.status}] ${t.title} (${AGENTS[t.agent]?.name || t.agent}): ${clip(t.result, 400)}`
+  const card = (t) => `- [${t.status}] ${t.title} (${AGENTS[t.agent]?.name || t.agent}): ${clip(t.result, 400)}${t.status === 'FAILED' && t.detail ? ` [technical reason: ${clip(t.detail, 160)}]` : ''}`
     + (t.wait ? ` | waiting for: ${t.wait.what}${t.wait.pr ? ` (PR ${t.wait.pr}${t.wait.ci ? ', ' + t.wait.ci : ''})` : ''}${t.wait.agent ? ` (from ${AGENTS[t.wait.agent]?.name})` : ''}` : '')
     + (t.ask ? ` | question to the user: ${t.ask.question}` : '');
   return [
@@ -734,15 +777,23 @@ ${STATUS_RULES}`;
     applyStatus(w, t, st, last);
   } catch (e) {
     if (e instanceof Halt && run.paused) { t.status = 'PAUSED'; t.result = '已暫停'; t.resumed = true; t.wakeNote = note; return; }
-    if (!(e instanceof Halt) && !t.hard && JSON.stringify(tierCfg(w, t.agent, true)) !== JSON.stringify(tierCfg(w, t.agent, false))) {
+    if (e.stuck && !t.convReset) { // the worker's conversation will not stop: start a fresh one (the card brief carries the task)
+      delete run.convs[workKey(t)];
+      Object.assign(t, { convReset: true, status: 'WAITING', resumed: true, detail: e.message });
+      log(w, 'studio', 'system', `${AGENTS[t.agent].name} 的對話卡住停不下來，改開一個新的對話重做「${t.title}」。`, e.message);
+      return pump(w);
+    }
+    if (!(e instanceof Halt) && !e.timeout && !e.stuck && !t.hard && JSON.stringify(tierCfg(w, t.agent, true)) !== JSON.stringify(tierCfg(w, t.agent, false))) {
       Object.assign(t, { hard: true, escalated: true, status: 'WAITING', resumed: true, detail: e.message });
       log(w, 'studio', 'system', `「${t.title}」用平常的模型沒做成，自動改用強模型重試一次。`, e.message);
       return pump(w);
     }
     t.status = 'FAILED';
-    t.result = '這張卡執行時出錯，沒有完成。';
+    t.result = e.timeout ? '沒有完成：' + e.message.replace(/^逾時：/, '')
+      : e.stuck ? '沒有完成：這位 AI 員工的對話卡在上一步（可能在等權限確認），Studio 試著停止但沒有成功。'
+      : '這張卡執行時出錯，沒有完成。';
     t.detail = e.message;
-    log(w, t.agent, 'worker', '這張卡執行時出錯，沒有完成：' + t.title, e.message);
+    log(w, t.agent, 'worker', t.result + '：' + t.title, e.message);
     wakeWaiters(w, t);
   }
   pump(w);
@@ -1064,7 +1115,7 @@ async function summarize(w, userAnswer = '') {
   run.ask = null;
   const gen = run.leaderGen, lead = run.leader;
   const workers = workersFor(w, lead);
-  const results = w.tasks.map((t) => `- [${t.status}] ${t.title} (${AGENTS[t.agent].name}): ${clip(t.result, 500)}`).join('\n');
+  const results = w.tasks.map((t) => `- [${t.status}] ${t.title} (${AGENTS[t.agent].name}): ${clip(t.result, 500)}${t.status === 'FAILED' && t.detail ? ` [technical reason: ${clip(t.detail, 200)}]` : ''}`).join('\n');
   try {
     const reply = await turn(lead, await conv(w, lead, true), `You are the LEADER. Every current card has ended.${handoffNote(run)}
 Original user request:
@@ -1082,7 +1133,8 @@ ${w.afterDone === 'stop' ? '{"done":true,"report":"<final report to the user, 2-
     : '{"done":true,"report":"<final report to the user, 2-4 sentences, in the user\'s language>","next":[{"title":"<short title, user\'s language>","why":"<one sentence why it is worth doing>","request":"<the full request to give the team>"}]}'}
 {"done":false,"message":"<one sentence to the user>","subtasks":[${SUBTASK_SHAPE}]}
 {"needs_user":"<question to the user, in the user's language>","options":["<choice>","<choice>"]}
-Use needs_user only for a real decision the team cannot make.${w.afterDone === 'stop' ? '' : `
+Use needs_user only for a real decision about the work itself that the team cannot make.
+A FAILED card with a technical reason (timeout, conversation busy, provider error) is a tooling problem, not a problem with the task: never ask the user to read logs or restart Studio. Add a retry card instead (smaller, or for another worker), and give the retry the facts it needs.${w.afterDone === 'stop' ? '' : `
 When done, also give 1 to 3 small, valuable next steps for this project in "next", best first, based on what you just saw (empty list if nothing is worth doing).${w.afterDone === 'auto' ? ' The first one may start automatically without the user: it must not need a decision from the user and must not be destructive (no deleting data, no force push, no release or deploy).' : ''}`}
 Rules for new subtasks:
 ${SUBTASK_RULES}`, { w, lead: true });

@@ -220,6 +220,70 @@ const settle = () => new Promise((r) => setTimeout(r, 300));
   assert.ok(env.logs.some((l) => l.text.includes('自動改用強模型重試')));
   console.log('10 model strategies resolve to real models + failed normal card retried on the strong model: PASS');
 
+  // 11) a worker that keeps working is never timed out; a stuck step is stopped; "already running" recovers or resets
+  const turnCode = region('// Stops whatever the conversation is doing', '// ---------- Team ----------');
+  const makeTurn = (script) => {
+    const state = { running: false, cancels: 0, posts: 0 };
+    const api = async (method, path, body) => {
+      if (method === 'POST' && path.endsWith('/messages')) { state.posts++; return script.post(state); }
+      if (method === 'POST' && path.endsWith('/cancel')) { state.cancels++; state.cancelTurnId = body.turn_id; script.cancel(state); return {}; }
+      if (path.endsWith('/messages')) return { items: [{ id: 'm1', type: 'text', position: 'left', status: 'finish', created_at: script.mark(state), content: { content: 'done' } }] };
+      return { runtime: { turn_id: 'turn_orphan', ...script.runtime(state) } };
+    };
+    const env = { api, sleep: () => new Promise((r) => setTimeout(r, 1)), active: new Map(), S: { agents: { codex: { working: 0 } } },
+      answerConfirmations: async () => {}, refreshCodexLimits() {}, Halt: class extends Error {} };
+    const fn = new Function(...Object.keys(env), turnCode + String.fromCharCode(10) + 'return { turn, sendMessage };')(...Object.values(env)); // test harness: our own code
+    return { ...fn, state };
+  };
+  const idleRt = { state: 'idle', is_processing: false }, busyRt = { state: 'running', is_processing: true };
+  // A: busy for ~150 ms with new messages all the time, idle limit 60 ms -> no timeout
+  let T = makeTurn({ post: (st) => { st.running = true; st.t0 = Date.now(); return { turn_id: 't', msg_id: 'm0' }; },
+    cancel: () => {}, mark: (st) => Math.random(), runtime: (st) => (Date.now() - st.t0 > 150 ? idleRt : busyRt) });
+  assert.strictEqual(await T.turn('codex', 'c1', 'x', { timeout: 60, progressEvery: 5 }), 'done');
+  assert.strictEqual(T.state.cancels, 0, 'a working agent is not cancelled');
+  // B: busy and silent -> timeout error, the step is stopped (cancel -> idle)
+  T = makeTurn({ post: (st) => { st.running = true; return { turn_id: 't', msg_id: 'm0' }; },
+    cancel: (st) => { st.running = false; }, mark: () => 'same', runtime: (st) => (st.running ? busyRt : idleRt) });
+  await assert.rejects(T.turn('codex', 'c1', 'x', { timeout: 60, progressEvery: 5 }), (e) => e.timeout === true && /沒有任何新進度/.test(e.message));
+  assert.strictEqual(T.state.cancels, 1); assert.strictEqual(T.state.running, false, 'conversation left idle');
+  // C: "already running" on send -> cancel the old step, send again, turn completes
+  T = makeTurn({ post: (st) => { if (st.posts === 1) { st.running = true; throw new Error('AionCore POST /api/conversations/c1/messages → 409 {"code":"CONFLICT"}'); } return { turn_id: 't', msg_id: 'm0' }; },
+    cancel: (st) => { st.running = false; }, mark: () => 'x', runtime: (st) => (st.running ? busyRt : idleRt) });
+  assert.strictEqual(await T.turn('codex', 'c1', 'x', { timeout: 60, progressEvery: 5 }), 'done');
+  assert.deepStrictEqual([T.state.posts, T.state.cancels], [2, 1]);
+  assert.strictEqual(T.state.cancelTurnId, 'turn_orphan', 'an orphan turn is cancelled by the turn id the conversation reports');
+  // D: it will not stop -> error marked stuck (the card then gets a fresh conversation)
+  T = makeTurn({ post: () => { throw new Error('AionCore POST /api/conversations/c1/messages → 409 {"code":"CONFLICT"}'); },
+    cancel: () => {}, mark: () => 'x', runtime: () => busyRt });
+  await assert.rejects(T.turn('codex', 'c1', 'x'), (e) => e.stuck === true);
+  console.log('11 idle-based timeout, stuck step stopped, "already running" recovery: PASS');
+
+  // 12) a stuck worker conversation gets a fresh one; the 工頭 sees the real failure reason, no strong-model upgrade for tooling errors
+  let tries = 0;
+  ({ env, api } = makeEnv((agent, text) => {
+    if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"build","agent":"codex","instructions":"x"}]}';
+    if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+    if (++tries === 1) throw Object.assign(new Error('AionCore POST /api/conversations/c1/messages → 409 CONFLICT'), { stuck: true });
+    return 'ok' + String.fromCharCode(10) + 'STATUS: DONE';
+  }));
+  w = newW(); w.run.convs = { 'codex:work': 'old-conv' }; env.S.workspaces.push(w);
+  await api.planPhase(w); await settle(); await settle();
+  assert.deepStrictEqual([w.tasks[0].status, w.tasks[0].convReset, w.tasks[0].escalated], ['DONE', true, undefined]);
+  assert.ok(env.logs.some((l) => l.text.includes('改開一個新的對話')));
+  // a card that timed out: friendly result, raw reason kept, and the 工頭's final-check prompt carries it
+  ({ env, api } = makeEnv((agent, text) => {
+    if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"slow","agent":"codex","instructions":"x"}]}';
+    if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+    throw Object.assign(new Error('逾時：25 分鐘沒有任何新進度，Studio 已停止這一步'), { timeout: true });
+  }));
+  w = newW(); env.S.workspaces.push(w);
+  await api.planPhase(w); await settle();
+  assert.strictEqual(w.tasks[0].status, 'FAILED'); assert.strictEqual(w.tasks[0].escalated, undefined, 'a timeout is not retried on the strong model');
+  assert.ok(w.tasks[0].result.startsWith('沒有完成：25 分鐘沒有任何新進度'));
+  const check12 = env.prompts.find((p) => p.text.includes('Every current card has ended')).text;
+  assert.ok(check12.includes('[technical reason: 逾時：25 分鐘沒有任何新進度') && check12.includes('never ask the user to read logs'));
+  console.log('12 stuck conversation reset + failure reason reaches the 工頭: PASS');
+
   // status-line parser
   const { parseStatus } = api;
   assert.deepStrictEqual([parseStatus('Built.\nSTATUS: DONE').kind, parseStatus('Built.\nSTATUS: DONE').text], ['DONE', 'Built.']);
