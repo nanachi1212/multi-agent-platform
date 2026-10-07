@@ -54,6 +54,8 @@ const newWs = (project, leader = S.leader, name = '', agentCfg = S.agentCfg, wor
   agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...agentCfg?.[id] }])),
   workers: workers.filter((id) => AGENTS[id]),
 });
+// An agent may be gone (an external model that was deleted); old cards still name it.
+const agentName = (id) => AGENTS[id]?.name || id;
 const label = (w) => w.name || path.basename(w.project);
 const same = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
 function wsOf(p) {
@@ -413,6 +415,7 @@ async function deleteExternal(id) {
   if (w) throw new Error(`「${label(w)}」正在用 ${e.name}（工頭或未完成的工作卡）；先換掉或等它做完再刪除`);
   await api('DELETE', '/api/providers/' + e.providerId, {}).catch((err) => { if (!/404|not found/i.test(err.message)) throw err; });
   S.external = S.external.filter((x) => x !== e);
+  if (S.leader === id) S.leader = 'codex';
   delete AGENTS[id]; delete S.agents[id]; delete S.agentCfg[id];
   for (const x of S.workspaces) { delete x.agentCfg[id]; x.workers = x.workers.filter((a) => a !== id); }
   saveSettings();
@@ -432,7 +435,7 @@ async function extModels(b) {
 
 // ---------- Team ----------
 async function checkAgent(id) {
-  const a = S.agents[id];
+  const a = S.agents[id], tok = (a.checkTok = {}); // a newer check (after an edit or re-test) wins over this one
   a.status = 'checking';
   a.note = '';
   try {
@@ -442,8 +445,9 @@ async function checkAgent(id) {
     if (AGENTS[id].external) await extProvider(id);
     const reply = await turn(id, await createConv(id, ws, true), 'Reply with exactly: OK', { lead: true, check: true, timeout: 120e3 });
     if (!/OK/i.test(reply)) throw new Error('沒有正常回覆：' + (reply || '(空白)'));
-    a.status = 'available';
+    if (a.checkTok === tok) a.status = 'available';
   } catch (e) {
+    if (a.checkTok !== tok) return;
     a.status = 'unavailable';
     a.note = e.message.slice(0, 200);
   }
@@ -469,7 +473,7 @@ const workersFor = (w, lead) => w.workers.filter((id) => id !== lead && availabl
 const cancelTurn = (cid) => api('POST', `/api/conversations/${cid}/cancel`, { turn_id: active.get(cid) }).catch(() => {});
 
 function handoffNote(run) {
-  return run.handoffFrom ? `\nYou are taking over as LEADER from ${AGENTS[run.handoffFrom].name}. Continue the same job; do not ask the user to repeat the request.\n` : '';
+  return run.handoffFrom ? `\nYou are taking over as LEADER from ${agentName(run.handoffFrom)}. Continue the same job; do not ask the user to repeat the request.\n` : '';
 }
 
 const SUBTASK_RULES = `- Each subtask goes to exactly one worker id from the list above.
@@ -517,7 +521,7 @@ const SUBTASK_SHAPE = `{"title":"<short title>","agent":"<worker id>","instructi
 function planPrompt(run, workers, delivery) {
   return `You are the LEADER (foreman) of a small AI team in "Multi-Agent Studio".
 Project folder: ${run.project}
-Workers you can assign: ${workers.map((w) => `${w} (${AGENTS[w].name})`).join(', ')}
+Workers you can assign: ${workers.map((w) => `${w} (${agentName(w)})`).join(', ')}
 ${handoffNote(run)}
 User request:
 """
@@ -556,7 +560,7 @@ function addCards(w, subtasks, lead) {
   const ids = subtasks.map(() => crypto.randomUUID().slice(0, 8));
   subtasks.forEach((st, i) => {
     w.tasks.push({ id: ids[i], hard: st.hard, writes: st.writes, title: st.title, instructions: st.instructions, agent: st.agent, after: st.after.map((n) => ids[n]), status: 'WAITING', result: '' });
-    log(w, lead, 'leader', `派工給 ${AGENTS[st.agent].name}：${st.title}${st.after.length ? `（等「${st.after.map((n) => subtasks[n].title).join('」「')}」完成後開始）` : ''}`);
+    log(w, lead, 'leader', `派工給 ${agentName(st.agent)}：${st.title}${st.after.length ? `（等「${st.after.map((n) => subtasks[n].title).join('」「')}」完成後開始）` : ''}`);
   });
 }
 
@@ -588,7 +592,7 @@ const findPr = (s) => s.match(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d
 function wake(w, t, note) {
   if (!PARKED.includes(t.status)) return;
   Object.assign(t, { status: 'WAITING', wakeNote: note, wait: null, ask: null });
-  log(w, 'studio', 'system', `「${t.title}」等待的結果到了，交回 ${AGENTS[t.agent].name} 繼續。`);
+  log(w, 'studio', 'system', `「${t.title}」等待的結果到了，交回 ${agentName(t.agent)} 繼續。`);
   pump(w);
 }
 
@@ -596,7 +600,7 @@ function wake(w, t, note) {
 function wakeWaiters(w, done) {
   for (const t of w.tasks) {
     if (t !== done && t.status === 'WAITING_AGENT' && t.wait?.agent === done.agent) {
-      wake(w, t, `${AGENTS[done.agent].name} finished "${done.title}" (${done.status}). Their result:\n${done.result}`);
+      wake(w, t, `${agentName(done.agent)} finished "${done.title}" (${done.status}). Their result:\n${done.result}`);
     }
   }
 }
@@ -617,7 +621,7 @@ function finish(w, status) {
     const workers = [...new Set(w.tasks.map((t) => t.agent))];
     const title = status === 'done'
       ? `${label(w)}：${workers.length === 1 ? AGENTS[workers[0]].name : '團隊'} 已完成 ${done}/${w.tasks.length} 工作`
-      : `${label(w)}：${AGENTS[failed?.agent ?? run.leader].name} 需要你處理`;
+      : `${label(w)}：${agentName(failed?.agent ?? run.leader)} 需要你處理`;
     const body = status === 'done' ? String(run.request).slice(0, 100)
       : failed ? `「${failed.title}」失敗：${failed.result}`.slice(0, 160) : '工頭沒有完成派工，打開專案查看';
     notify(title, body, status, w.project);
@@ -769,7 +773,7 @@ async function start(w, request, cont = false, inherit = false) {
   if (!isDir(w.project)) throw new Error('專案資料夾不存在：' + w.project);
   if (!request.trim()) throw new Error('請輸入需求');
   const lead = w.leader;
-  if (!available(lead)) throw new Error(`Leader ${AGENTS[lead].name} 目前不可用`);
+  if (!available(lead)) throw new Error(`Leader ${agentName(lead)} 目前不可用`);
   if (!workersFor(w, lead).length) throw new Error('這個專案至少需要一位可用的 Worker');
 
   const prev = latestJob(w);
@@ -784,7 +788,7 @@ async function start(w, request, cont = false, inherit = false) {
   w.run = { treeStamp: inherit ? prev?.run?.treeStamp : undefined, leftAt: inherit ? prev?.run?.leftAt : undefined, id, startedAt: now.toISOString(), project: w.project, leader: lead, request, convs: {}, phase: 'planning', leaderGen: 0, rounds: 0, ask: null, continues, context, goal: continues ? prev.run.goal || prev.run.request : request, refs: continues ? knownRefs(prev) : [], active: true, paused: false, stopped: false, summarizing: false };
   log(w, 'user', 'user', request);
   if (continues) log(w, 'studio', 'system', '接續上次的工作：工頭會拿到目前的進度摘要，不用重講。', context);
-  log(w, 'studio', 'system', `Leader：${AGENTS[lead].name}；Workers：${workersFor(w, lead).map((x) => AGENTS[x].name).join('、')}`);
+  log(w, 'studio', 'system', `Leader：${agentName(lead)}；Workers：${workersFor(w, lead).map((x) => agentName(x)).join('、')}`);
   planPhase(w);
 }
 
@@ -1068,7 +1072,7 @@ async function takeWriteSlot(w, t) {
   reserveCardLeases(w, t, 'asking the user'); // the lease stays ours while the user decides
   Object.assign(t, { status: 'NEEDS_USER', takeover: true, ask: { question: why.text + '。要讓 Studio 接手繼續寫嗎？', options: ['確認接手，繼續', '先不要（暫停）'] } });
   log(w, 'studio', 'system', `「${t.title}」先不動：${why.text}。需要你決定要不要讓 Studio 接手。`);
-  notify(`${label(w)}：${AGENTS[t.agent].name} 需要你處理`, why.text, 'ask', w.project);
+  notify(`${label(w)}：${agentName(t.agent)} 需要你處理`, why.text, 'ask', w.project);
   return false;
 }
 
@@ -1146,7 +1150,7 @@ async function releaseClaim(dir) {
 
 // ----- formal handoff: the writer role of a card moves from one agent to another -----
 function writerHandoffNote(from, to, prior) {
-  return `HANDOFF: ${AGENTS[from].name} was working on this card and has been stopped by the user's handoff; you (${AGENTS[to].name}) take over the SAME working tree and branch. First check git status / log and the files, continue from where it stopped, do not redo finished work and do not open a duplicate PR. ${AGENTS[from].name} no longer writes here.${prior ? `\nIts last report: ${prior}` : ''}`;
+  return `HANDOFF: ${agentName(from)} was working on this card and has been stopped by the user's handoff; you (${agentName(to)}) take over the SAME working tree and branch. First check git status / log and the files, continue from where it stopped, do not redo finished work and do not open a duplicate PR. ${agentName(from)} no longer writes here.${prior ? `\nIts last report: ${prior}` : ''}`;
 }
 async function lastAgentText(cid) {
   if (!cid) return '';
@@ -1154,19 +1158,19 @@ async function lastAgentText(cid) {
 }
 async function handoffWriter(w, toAgent, taskId) {
   if (!AGENTS[toAgent]) throw new Error('未知的 Agent');
-  if (!available(toAgent)) throw new Error(`${AGENTS[toAgent].name} 目前不可用`);
+  if (!available(toAgent)) throw new Error(`${agentName(toAgent)} 目前不可用`);
   const run = w.run;
   if (!run) throw new Error('這個專案目前沒有工作可以交接');
   const held = S.leases.find((l) => l.mode === 'write' && l.jobId === run.id && ['ACTIVE', 'RESERVED'].includes(leaseState(l)));
   const t = taskId ? w.tasks.find((x) => x.id === taskId) : held && w.tasks.find((x) => x.id === held.cardId);
   if (!t) throw new Error('目前沒有人在這個工作區寫入，不需要交接（直接把工作卡改派即可）');
   const from = t.agent;
-  if (from === toAgent) throw new Error(`${AGENTS[toAgent].name} 已經是這張卡的寫入者`);
+  if (from === toAgent) throw new Error(`${agentName(toAgent)} 已經是這張卡的寫入者`);
   // 1-3. stop the old agent's execution and wait until it has really stopped
   if (t.status === 'WORKING') {
     Object.assign(t, { hold: true, interrupted: true });
     const cid = run.convs[workKey(t)];
-    const fail = () => { Object.assign(t, { hold: false, interrupted: false }); return new Error(`${AGENTS[from].name} 還沒有真的停下來，沒有交接`); };
+    const fail = () => { Object.assign(t, { hold: false, interrupted: false }); return new Error(`${agentName(from)} 還沒有真的停下來，沒有交接`); };
     if (cid && active.has(cid) && !(await stopTurn(cid))) throw fail();
     for (let i = 0; i < 150 && t.status === 'WORKING'; i++) await sleep(100); // the card body parks itself once the turn ended
     if (t.status === 'WORKING') throw fail();
@@ -1174,15 +1178,15 @@ async function handoffWriter(w, toAgent, taskId) {
   // 4-5. the old agent gives up the lease; the card (with its conversation, history) goes to the new agent
   const prior = await lastAgentText(run.convs[workKey(t)]);
   const wasReserved = cardLeases(w, t).some((l) => l.mode === 'write');
-  releaseCardLeases(w, t, `交接給 ${AGENTS[toAgent].name}`);
+  releaseCardLeases(w, t, `交接給 ${agentName(toAgent)}`);
   (t.handoffs ||= []).push({ from, to: toAgent, at: nowIso() });
   Object.assign(t, { agent: toAgent, hold: false, interrupted: false, resumed: true, trust: true, convReset: false, detail: '',
     status: ['PAUSED', 'INTERRUPTED'].includes(t.status) ? t.status : 'WAITING', wakeNote: writerHandoffNote(from, toAgent, prior) });
-  log(w, 'studio', 'system', `工作區交接：${AGENTS[from].name} 已停止並放下寫入權，改由 ${AGENTS[toAgent].name} 從目前的資料夾和 branch 接續「${t.title}」。${AGENTS[from].name} 的對話和紀錄都保留，但不再是寫入者。`);
+  log(w, 'studio', 'system', `工作區交接：${agentName(from)} 已停止並放下寫入權，改由 ${agentName(toAgent)} 從目前的資料夾和 branch 接續「${t.title}」。${agentName(from)} 的對話和紀錄都保留，但不再是寫入者。`);
   if (run.paused || wasReserved && !run.active) { // a paused job: the reservation moves with the card, nobody else can slip in
     const info = await workspaceOf(t.workdir || w.project);
     const l = newLease(w, t, info, 'write');
-    Object.assign(l, { status: 'RESERVED', reason: `交接自 ${AGENTS[from].name}` });
+    Object.assign(l, { status: 'RESERVED', reason: `交接自 ${agentName(from)}` });
     saveLeases();
   } else pump(w);
   saveRun(w, run.paused ? 'paused' : 'running'); // the record now says who owns the card
@@ -1276,13 +1280,13 @@ async function runCard(w, t) {
 ${note}
 
 Continue the task. End your reply with a short summary (1-3 sentences).
-${STATUS_RULES}` : `You are a WORKER in "Multi-Agent Studio". Your leader (${AGENTS[run.leader].name}) assigned you this task.
+${STATUS_RULES}` : `You are a WORKER in "Multi-Agent Studio". Your leader (${agentName(run.leader)}) assigned you this task.
 Work only inside this folder: ${t.workdir || run.project}
 ${note ? `\nNOTE FROM STUDIO:\n${note}\n` : ''}${t.resumed ? '\nYou were interrupted while doing this task earlier. First check the current state of the project folder, then finish the task without redoing work that is already done.\n' : ''}
 Task: ${t.title}
 Instructions:
 ${t.instructions}
-${deps.length ? `\nResults of the earlier cards this task builds on:\n${deps.map((d) => `- ${d.title} (${AGENTS[d.agent].name}): ${d.result}`).join('\n')}\n` : ''}
+${deps.length ? `\nResults of the earlier cards this task builds on:\n${deps.map((d) => `- ${d.title} (${agentName(d.agent)}): ${d.result}`).join('\n')}\n` : ''}
 ${accessRules(t)}
 ${deliveryRules(w.delivery, 'worker')}
 When you end your turn, reply with a short summary of what you did (1-3 sentences).
@@ -1309,7 +1313,7 @@ ${STATUS_RULES}`;
     let last = reply;
     while (t.notes?.length) {
       const note = t.notes.splice(0).join('\n');
-      log(w, 'studio', 'system', `把你的指示交給 ${AGENTS[t.agent].name}，接著調整「${t.title}」。`);
+      log(w, 'studio', 'system', `把你的指示交給 ${agentName(t.agent)}，接著調整「${t.title}」。`);
       last = await step(`New instruction from the user (via the leader) for your task "${t.title}":\n${note}\n\nApply it to this task now. End your reply with a short summary (1-3 sentences).\n${STATUS_RULES}`);
       if (t.interrupted) { park(); return; }
       st = parseStatus(last) || { kind: 'DONE', detail: '', options: [], text: last.trim() };
@@ -1321,7 +1325,7 @@ ${STATUS_RULES}`;
     if (e.stuck && !t.convReset) { // the worker's conversation will not stop: start a fresh one (the card brief carries the task)
       delete run.convs[workKey(t)];
       Object.assign(t, { convReset: true, status: 'WAITING', resumed: true, detail: e.message });
-      log(w, 'studio', 'system', `${AGENTS[t.agent].name} 的對話卡住停不下來，改開一個新的對話重做「${t.title}」。`, e.message);
+      log(w, 'studio', 'system', `${agentName(t.agent)} 的對話卡住停不下來，改開一個新的對話重做「${t.title}」。`, e.message);
       return;
     }
     if (!(e instanceof Halt) && !e.timeout && !e.stuck && !t.hard && JSON.stringify(tierCfg(w, t.agent, true)) !== JSON.stringify(tierCfg(w, t.agent, false))) {
@@ -1340,7 +1344,7 @@ ${STATUS_RULES}`;
 }
 
 function applyStatus(w, t, st, reply) {
-  const who = AGENTS[t.agent].name;
+  const who = agentName(t.agent);
   t.result = st.text || '(沒有文字回覆)';
   log(w, t.agent, 'worker', t.result);
   if (st.kind === 'DONE') {
@@ -1362,14 +1366,14 @@ function applyStatus(w, t, st, reply) {
     return;
   }
   if (st.kind === 'WAITING_AGENT') {
-    const a = Object.keys(AGENTS).find((id) => st.detail.toLowerCase().includes(id) || st.detail.includes(AGENTS[id].name));
+    const a = Object.keys(AGENTS).find((id) => st.detail.toLowerCase().includes(id) || st.detail.includes(agentName(id)));
     t.status = 'WAITING_AGENT';
     t.wait = { agent: a || '', what: st.detail.replace(/^[\w-]+\s*[:：]\s*/, '') || '另一位成員的結果' };
     if (!a || a === t.agent) return wake(w, t, `Studio could not tell which other team member you wait for (ids: ${Object.keys(AGENTS).join(', ')}). Continue without waiting, or report NEEDS_USER.`);
     if (!w.tasks.some((x) => x !== t && x.agent === a && OPEN.includes(x.status))) {
-      return wake(w, t, `${AGENTS[a].name} has no open card in this job, so nothing will arrive from them. Do what you can without it, or report NEEDS_USER.`);
+      return wake(w, t, `${agentName(a)} has no open card in this job, so nothing will arrive from them. Do what you can without it, or report NEEDS_USER.`);
     }
-    log(w, 'studio', 'system', `「${t.title}」在等 ${AGENTS[a].name}：它做完會自動交回 ${who}。`);
+    log(w, 'studio', 'system', `「${t.title}」在等 ${agentName(a)}：它做完會自動交回 ${who}。`);
     return;
   }
   t.status = 'NEEDS_USER';
@@ -1395,7 +1399,7 @@ function instruct(w, text, interrupt = false) {
       const cid = run.convs[workKey(t)];
       if (cid && active.has(cid)) cancelTurn(cid);
     }
-    if (working.length) log(w, 'studio', 'system', `已打斷 ${working.map((t) => AGENTS[t.agent].name).join('、')}：等工頭看完你的指示再接著做。`);
+    if (working.length) log(w, 'studio', 'system', `已打斷 ${working.map((t) => agentName(t.agent)).join('、')}：等工頭看完你的指示再接著做。`);
   }
   (run.notes ??= []).push(text);
   if (run.paused) return log(w, 'studio', 'system', '工作暫停中：指示先保留，按「繼續」後交給工頭。');
@@ -1420,7 +1424,7 @@ ${notes.join('\n')}
 """
 Current cards:
 ${w.tasks.map((t) => `- id ${t.id} [${t.status}] ${t.title} (${t.agent})`).join('\n')}
-Workers you can assign: ${workers.map((x) => `${x} (${AGENTS[x].name})`).join(', ')}
+Workers you can assign: ${workers.map((x) => `${x} (${agentName(x)})`).join(', ')}
 
 Decide how to apply the instructions. Do not modify files, open files or run commands.
 - "tell" reaches that card's worker right away (a working worker gets it as soon as its current step ends; a card that has not started gets it before it starts).
@@ -1449,7 +1453,7 @@ ${SUBTASK_RULES}`;
       else if (t.status === 'WAITING' && t.wakeNote) t.wakeNote += '\nNew instruction from the user (via the leader): ' + note; // an interrupted card
       else if (['WAITING', 'PAUSED', 'INTERRUPTED'].includes(t.status)) t.instructions += '\n\nInstruction added by the user during the job: ' + note;
       else continue;
-      log(w, 'studio', 'system', `已把指示轉給 ${AGENTS[t.agent].name}（「${t.title}」）。`);
+      log(w, 'studio', 'system', `已把指示轉給 ${agentName(t.agent)}（「${t.title}」）。`);
     }
     for (const id of Array.isArray(d.cancel) ? d.cancel : []) {
       const t = w.tasks.find((y) => y.id === String(id));
@@ -1657,7 +1661,7 @@ async function summarize(w, userAnswer = '') {
   run.ask = null;
   const gen = run.leaderGen, lead = run.leader;
   const workers = workersFor(w, lead);
-  const results = w.tasks.map((t) => `- [${t.status}] ${t.title} (${AGENTS[t.agent].name}): ${clip(t.result, 500)}${t.status === 'FAILED' && t.detail ? ` [technical reason: ${clip(t.detail, 200)}]` : ''}`).join('\n');
+  const results = w.tasks.map((t) => `- [${t.status}] ${t.title} (${agentName(t.agent)}): ${clip(t.result, 500)}${t.status === 'FAILED' && t.detail ? ` [technical reason: ${clip(t.detail, 200)}]` : ''}`).join('\n');
   try {
     const reply = await turn(lead, await conv(w, lead, true), `You are the LEADER. Every current card has ended.${handoffNote(run)}
 Original user request:
@@ -1668,7 +1672,7 @@ Cards so far:
 ${results}
 ${memoryNote(run)}${userAnswer ? `\nThe user answered your question:\n"""\n${userAnswer}\n"""\n` : ''}
 Decide whether the user's WHOLE request is complete: built, reviewed, verified, and delivered or merged when the request asks for it. Do not modify files, open files or run commands: judge from the card results (add a verification subtask if they are not enough).
-Workers you can assign: ${workers.map((x) => `${x} (${AGENTS[x].name})`).join(', ') || '(none available)'}
+Workers you can assign: ${workers.map((x) => `${x} (${agentName(x)})`).join(', ') || '(none available)'}
 
 Reply with ONLY one JSON object, no markdown fences, one of:
 ${w.afterDone === 'stop' ? '{"done":true,"report":"<final report to the user, 2-4 sentences, in the user\'s language>"}'
@@ -1720,7 +1724,7 @@ function askUser(w, question, options) {
   run.phase = 'summarizing';
   run.ask = { question, options: (Array.isArray(options) ? options : []).map(String).filter(Boolean).slice(0, 4) };
   log(w, run.leader, 'leader', '需要你決定：' + question);
-  notify(`${label(w)}：${AGENTS[run.leader].name} 需要你處理`, question.slice(0, 160), 'ask', w.project);
+  notify(`${label(w)}：${agentName(run.leader)} 需要你處理`, question.slice(0, 160), 'ask', w.project);
 }
 
 // The user's reply to a card (taskId) or to the Leader (no taskId).
@@ -1811,7 +1815,7 @@ async function resume(w, id, opts = {}) {
   if (!run?.paused) throw new Error('沒有暫停中的工作');
   if (busyConvs(run).length) throw new Error('Agent 還在停下中，請幾秒後再按繼續');
   if (!isDir(run.project)) throw new Error('專案資料夾不存在：' + run.project);
-  if (!available(w.leader)) throw new Error(`Leader ${AGENTS[w.leader].name} 目前不可用`);
+  if (!available(w.leader)) throw new Error(`Leader ${agentName(w.leader)} 目前不可用`);
   // Is the tree still this job's? (Somebody else may hold it now: another agent after a handoff, an external session.)
   const holder = await leaseBlocker(w);
   if (holder) throw new Error(`工作區已由${holder.owner.kind === 'external' ? '外部 Agent 接手' : '另一個 Agent 接手'}，本工作保持暫停。（${holderText(holder)}）`);
@@ -1825,7 +1829,7 @@ async function resume(w, id, opts = {}) {
   run.paused = false;
   run.active = true;
   for (const t of w.tasks) { if (t.status === 'PAUSED' || t.status === 'INTERRUPTED') t.status = 'WAITING'; if (t.status === 'WAITING') t.trust = true; } // you pressed 繼續: files changed while paused are expected
-  log(w, 'studio', 'system', `繼續工作（Leader：${AGENTS[run.leader].name}）。`);
+  log(w, 'studio', 'system', `繼續工作（Leader：${agentName(run.leader)}）。`);
   if (run.phase === 'planning') planPhase(w);
   else if (run.phase === 'summarizing') { if (!run.ask) summarize(w); } // a pending question waits for the user's answer
   else { run.phase = 'working'; pump(w); watchExternal(); processNotes(w); }
@@ -1838,12 +1842,12 @@ function reassign(w, taskId, agent) {
   if (t.status === 'WORKING') throw new Error('工作進行中，請先暫停或 Stop');
   if (!available(agent)) throw new Error(`${AGENTS[agent]?.name ?? agent} 目前不可用`);
   for (const l of cardLeases(w, t)) if (l.owner.agent !== agent) { // the lease follows the card to its new agent
-    retire(l, `改派給 ${AGENTS[agent].name}`);
+    retire(l, `改派給 ${agentName(agent)}`);
     if (l.mode === 'write' && l.status === 'RELEASED' && run.paused) S.leases.push({ ...l, id: crypto.randomUUID().slice(0, 8), owner: { kind: 'studio', agent }, status: 'RESERVED', acquiredAt: nowIso(), heartbeatAt: nowIso(), releasedAt: undefined, reason: '改派' });
   }
   saveLeases();
   Object.assign(t, { agent, result: '', wakeNote: '', wait: null, ask: null });
-  log(w, 'user', 'user', `重新指派「${t.title}」給 ${AGENTS[agent].name}`);
+  log(w, 'user', 'user', `重新指派「${t.title}」給 ${agentName(agent)}`);
   if (run.paused) { t.status = 'PAUSED'; saveRun(w, 'paused'); return; } // runs when the user continues
   t.status = 'WAITING';
   Object.assign(run, { active: true, stopped: false, phase: 'working' });
@@ -1853,18 +1857,18 @@ function reassign(w, taskId, agent) {
 // Changing the Leader mid-run hands the same job over; Workers keep their cards.
 async function setLeader(w, agent) {
   if (!AGENTS[agent]) throw new Error('未知的 Agent');
-  if (!available(agent)) throw new Error(`${AGENTS[agent].name} 目前不可用`);
+  if (!available(agent)) throw new Error(`${agentName(agent)} 目前不可用`);
   const old = w.leader;
   if (old === agent) return;
   w.leader = S.leader = agent; // the last pick is also the default for the next opened project
   saveSettings();
   const run = w.run;
-  if (!run || (!run.active && !run.paused)) return log(w, 'studio', 'system', `Leader 換成 ${AGENTS[agent].name}`);
+  if (!run || (!run.active && !run.paused)) return log(w, 'studio', 'system', `Leader 換成 ${agentName(agent)}`);
   run.handoffFrom = run.leader;
   run.leader = agent;
   run.leaderGen++;
   const n = w.tasks.length;
-  log(w, 'studio', 'system', `Leader 交接：${AGENTS[old].name} → ${AGENTS[agent].name}。新 Leader 接手原始需求${n ? `和 ${n} 張工作卡（已完成的結果保留）` : ''}，不需要重新輸入。`);
+  log(w, 'studio', 'system', `Leader 交接：${agentName(old)} → ${agentName(agent)}。新 Leader 接手原始需求${n ? `和 ${n} 張工作卡（已完成的結果保留）` : ''}，不需要重新輸入。`);
   const oldConv = run.convs[old + ':lead'];
   if (oldConv && active.has(oldConv)) cancelTurn(oldConv);
   const gen = run.leaderGen;
