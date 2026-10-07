@@ -746,7 +746,9 @@ function watchExternal() {
 // Git / GitHub wins over what agents wrote earlier.
 const sh = (cmd, args, cwd) => new Promise((res) => execFile(cmd, args, { cwd, windowsHide: true, timeout: 30000, maxBuffer: 8 << 20 },
   (e, out, err) => res(e ? { err: String(err || e.message).trim().slice(0, 200) } : { out: String(out) })));
-const git = (cwd, ...args) => sh('git', ['-c', 'safe.directory=*', ...args], cwd);
+// Folders owned by another Windows account (e.g. the Codex sandbox user) need safe.directory to be readable.
+// Only local reads that run no repo-configured programs go through it: fsmonitor is off, and nothing here talks to a remote.
+const git = (cwd, ...args) => sh('git', ['-c', 'safe.directory=*', '-c', 'core.fsmonitor=false', ...args], cwd);
 const PR_FIELDS = 'number,title,state,headRefName,mergedAt,url,statusCheckRollup,reviewDecision';
 const UNRESOLVED_Q = 'query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){reviewThreads(first:100){nodes{isResolved}}}}}';
 
@@ -771,7 +773,7 @@ async function readGitState(project, prNums) {
   const repo = await originRepo(project);
   if (!repo) return { ...g, error: '沒有 GitHub origin，只能看本機 Git' };
   g.repo = repo;
-  g.mainSha = (await git(project, 'ls-remote', 'origin', 'HEAD')).out?.split(/\s/)[0]?.slice(0, 7) || '';
+  try { g.mainSha = String(await ghJson(['api', `repos/${repo}/commits/HEAD`, '--jq', '{sha: .sha}'], project).then((x) => x.sha)).slice(0, 7); } catch { g.mainSha = ''; }
   let list;
   try { list = await ghJson(['pr', 'list', '--repo', repo, '--state', 'all', '--limit', '8', '--json', PR_FIELDS], project); }
   catch (e) { return { ...g, error: '讀不到 GitHub（' + e.message + '）' }; }
