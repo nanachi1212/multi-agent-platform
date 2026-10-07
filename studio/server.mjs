@@ -11,7 +11,7 @@ const RT = path.join(ROOT, 'runtime');
 const AION = path.join(RT, 'aioncore', 'aioncore.exe');
 const AION_URL = 'https://github.com/iOfficeAI/AionCore/releases/download/v0.2.2/aioncore-v0.2.2-x86_64-pc-windows-msvc.zip';
 const AION_ZIP_SHA256 = 'd1ed8d1da869230c18701747d07e8f068db5b8c9442e65261304aeb4c27eacf6';
-const PORT = Number(process.env.STUDIO_PORT || 4848);
+let PORT = Number(process.env.STUDIO_PORT || 4848); // moves up when the port is taken (see server.listen)
 // Studio's Codex gets its own home so its sessions never show up in the user's own Codex history.
 const CODEX_HOME = path.join(RT, 'studio', 'codex-home');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -756,10 +756,17 @@ await startAion();
 watchCatalogs();
 pollPaseo();
 setInterval(pollPaseo, 10000);
-server.listen(PORT, '127.0.0.1', () => {
+// Port taken (e.g. another Studio copy is open): use the next free one, unless STUDIO_PORT asked for an exact port.
+server.on('error', (e) => {
+  if (e.code !== 'EADDRINUSE' || process.env.STUDIO_PORT || PORT >= 4858) throw e;
+  console.log(`Port ${PORT} 已被其他程式使用（可能是另一個 Studio），改用 ${PORT + 1}`);
+  server.listen(++PORT, '127.0.0.1');
+});
+server.on('listening', () => {
   const url = `http://127.0.0.1:${PORT}`;
   console.log(`Multi-Agent Studio 已啟動：${url}  （關閉此視窗即停止）`);
   if (!process.env.STUDIO_NO_OPEN) spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore' });
 });
+server.listen(PORT, '127.0.0.1');
 refreshCodexLimits();
 checkAll().then(refreshClaudeLimits);
