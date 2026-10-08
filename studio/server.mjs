@@ -60,7 +60,7 @@ const newWs = (project, leader = S.leader, name = '', agentCfg = S.agentCfg, wor
 // An agent may be gone (an external model that was deleted); old cards still name it.
 const agentName = (id) => AGENTS[id]?.name || id;
 const label = (w) => w.name || path.basename(w.project);
-const same = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+const same = (a, b) => treeKey(a) === treeKey(b); // treeKey is defined with the workspace lease code below
 function wsOf(p) {
   const w = p && S.workspaces.find((x) => same(x.project, String(p)));
   if (!w) throw new Error('沒有開啟這個專案：' + p);
@@ -645,7 +645,7 @@ function finish(w, status) {
   run.phase = 'finished';
   markRuntimeStops(w);
   releaseJobLeases(w, 'job ended');
-  if (typeof cleanupJobRuntimes === 'function') {
+  {
     run.runtimeCleanup = Promise.all([...w.recoverySteps?.values() || [], ...w.runtimeStarts?.values() || []].map((step) => step.catch(() => {}))).then(() => cleanupCardRuntimes(w, finishedCards, run.id)).then(() => {
       if (w.run === run) { releaseJobLeases(w, 'runtime stopped'); saveRun(w, status); }
     }).catch((error) => log(w, 'studio', 'system', error.message));
@@ -660,7 +660,7 @@ function finish(w, status) {
     const failed = w.tasks.find((t) => t.status === 'FAILED');
     const workers = [...new Set(w.tasks.map((t) => t.agent))];
     const title = status === 'done'
-      ? `${label(w)}：${workers.length === 1 ? AGENTS[workers[0]].name : '團隊'} 已完成 ${done}/${w.tasks.length} 工作`
+      ? `${label(w)}：${workers.length === 1 ? agentName(workers[0]) : '團隊'} 已完成 ${done}/${w.tasks.length} 工作`
       : `${label(w)}：${agentName(failed?.agent ?? run.leader)} 需要你處理`;
     const body = status === 'done' ? String(run.request).slice(0, 100)
       : failed ? `「${failed.title}」失敗：${failed.result}`.slice(0, 160) : '工頭沒有完成派工，打開專案查看';
@@ -1091,7 +1091,7 @@ async function takeWriteSlot(w, t) {
 async function endWriteStep(w, t, ranAs = t.agent) {
   if (!isWriter(t)) { releaseCardLeases(w, t, 'read finished', ranAs); return; }
   if (w.run?.paused || w.run?.stopped || ['DONE', 'FAILED'].includes(t.status)) await w.runtimeStarts?.get(t.id)?.catch(() => {});
-  if (typeof cleanupJobRuntimes === 'function' && (w.run?.paused || w.run?.stopped || ['DONE', 'FAILED'].includes(t.status))) {
+  if (w.run?.paused || w.run?.stopped || ['DONE', 'FAILED'].includes(t.status)) {
     try { await cleanupCardRuntimes(w, [t]); }
     catch { t.runtimeStopPending = true; }
   }
@@ -1150,14 +1150,12 @@ async function leaseBlocker(w) {
 // Runtime ownership hook: stopTurn must confirm cancellation, then all card cleanup must finish.
 function markRuntimeStops(w) {
   for (const task of w.tasks) if (w.recoverySteps?.has(task.id) || w.runtimeStarts?.has(task.id)) task.runtimeStopPending = true;
-  if (typeof listRuntimes !== 'function') return;
   for (const runtime of listRuntimes({ rtDir: RT })) if (runtime.job_id === w.run?.id && ['running', 'exited', 'stale'].includes(runtime.status)) {
     const task = w.tasks.find((t) => t.id === runtime.card_id);
     if (task) task.runtimeStopPending = true;
   }
 }
 async function cleanupCardRuntimes(w, cards, jobId = w.run.id) {
-  if (typeof cleanupJobRuntimes !== 'function') return;
   const result = await cleanupJobRuntimes(jobId, { rtDir: RT, cardIds: cards.map((t) => t.id) });
   if (result.blocked?.length) {
     for (const t of cards) t.runtimeStopPending = true;
@@ -2402,22 +2400,11 @@ const routes = {
       const writerStr = wr ? `${wr.owner} / ${repo} / ${branch}` : '—';
       const workspace_summary = `Writer: ${writerStr} · Readers: ${readers} · branch: ${branch} · worktree: ${w.wsInfo?.path || w.project} · lease: ${wr?.state || (wr ? 'ACTIVE' : 'FREE')}`;
       const tasks = (w.tasks || []).map((t) => {
-        let blocked_reason = '';
-        if (t.wait?.recoveryReason) {
-          const raw = String(t.wait.recoveryReason).trim();
-          blocked_reason = raw.startsWith('Blocked') ? raw.replace(/^Blocked\s*[:：]\s*/i, 'Blocked：') : `Blocked：${raw}`;
-        } else if (t.blocked?.owner) {
-          blocked_reason = `Blocked：workspace currently owned by ${t.blocked.owner}`;
-        } else if (t.blockReason) {
-          const raw = String(t.blockReason).trim();
-          blocked_reason = raw.startsWith('Blocked') ? raw.replace(/^Blocked\s*[:：]\s*/i, 'Blocked：') : `Blocked：${raw}`;
-        } else if (t.wait?.error) {
-          const raw = String(t.wait.error).trim();
-          blocked_reason = raw.startsWith('Blocked') ? raw.replace(/^Blocked\s*[:：]\s*/i, 'Blocked：') : `Blocked：${raw}`;
-        }
-        return { ...t, blocked_reason: blocked_reason || null, ...(t.status === 'WORKING' ? { activity: convActivity.get(convOf(w, t)) || null } : {}) };
+        const why = t.wait?.recoveryReason || (t.blocked?.owner && `workspace currently owned by ${t.blocked.owner}`) || t.blockReason || t.wait?.error;
+        const blocked_reason = why ? 'Blocked：' + String(why).trim().replace(/^Blocked\s*[:：]?\s*/i, '') : null;
+        return { ...t, blocked_reason, ...(t.status === 'WORKING' ? { activity: convActivity.get(convOf(w, t)) || null } : {}) };
       });
-      return { wsInfo: w.wsInfo, lease, workspace_summary, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, delivery: w.delivery, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
+      return { wsInfo: w.wsInfo, lease, workspace_summary, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, backendPort: w.backendPort, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
         run: r && { extMod: r.extMod, claimedBy: r.claimedBy, id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
     });
     return { ...S, runtimes: S.runtimes, ...teamStats(), agents: Object.values(S.agents), workspaces };
