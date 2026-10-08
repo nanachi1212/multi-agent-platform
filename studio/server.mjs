@@ -53,7 +53,7 @@ const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}
 // agentCfg = this project's model / effort per agent; workers = agents allowed to work here.
 // New projects start from S.agentCfg (the last choices).
 const newWs = (project, leader = S.leader, name = '', agentCfg = S.agentCfg, workers = Object.keys(AGENTS)) => ({
-  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, strategy: 'save', delivery: 'auto',
+  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, strategy: 'save', delivery: 'auto', finisher: '',
   agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...agentCfg?.[id] }])),
   workers: workers.filter((id) => AGENTS[id]),
 });
@@ -85,7 +85,7 @@ try {
   // Older settings had one `project` and global models; it becomes the first open workspace with those models.
   S.workspaces = (saved.workspaces || (saved.project ? [{ project: saved.project }] : []))
     .filter((x) => isDir(x.project))
-    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto' }));
+    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto', finisher: AGENTS[x.finisher] ? x.finisher : '' }));
   S.recent = (saved.recent || []).filter(isDir);
   if (saved.notify === false) S.notify = false;
 } catch (e) {
@@ -97,7 +97,7 @@ try {
 
 function saveSettings() {
   fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
-  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, strategy: w.strategy, delivery: w.delivery }));
+  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher }));
   fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external }, null, 2));
 }
 
@@ -448,7 +448,7 @@ async function deleteExternal(id) {
   S.external = S.external.filter((x) => x !== e);
   if (S.leader === id) S.leader = 'codex';
   delete AGENTS[id]; delete S.agents[id]; delete S.agentCfg[id];
-  for (const x of S.workspaces) { delete x.agentCfg[id]; x.workers = x.workers.filter((a) => a !== id); }
+  for (const x of S.workspaces) { delete x.agentCfg[id]; x.workers = x.workers.filter((a) => a !== id); if (x.finisher === id) x.finisher = ''; }
   saveSettings();
 }
 
@@ -488,11 +488,12 @@ const available = (id) => S.agents[id]?.status === 'available';
 
 // One conversation per agent and role; hard cards get their own conversation on the hard model.
 // The Leader always uses the normal tier (it should be cheap: it only plans and checks).
+// A read-only card (ro) gets a conversation in the agent's non-writing mode, like the Leader: the prompt alone is not a fence.
 const dirTag = (d) => (d ? '@' + crypto.createHash('sha1').update(String(d)).digest('hex').slice(0, 6) : '');
-const workKey = (t) => t.agent + ':work' + (t.hard ? ':hard' : '') + dirTag(t.workdir);
-async function conv(w, agent, lead, hard = false, workdir = '') {
-  const key = agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : '') + dirTag(workdir);
-  return (w.run.convs[key] ??= await createConv(agent, workdir || w.run.project, lead, tierCfg(w, agent, hard)));
+const workKey = (t) => t.agent + ':work' + (t.hard ? ':hard' : '') + (isWriter(t) ? '' : ':ro') + dirTag(t.workdir);
+async function conv(w, agent, lead, hard = false, workdir = '', ro = false) {
+  const key = agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : '') + (ro ? ':ro' : '') + dirTag(workdir);
+  return (w.run.convs[key] ??= await createConv(agent, workdir || w.run.project, lead || ro, tierCfg(w, agent, hard)));
 }
 // This run's conversations that have a turn in progress (other projects keep working).
 const busyConvs = (run) => Object.values(run.convs).filter((c) => active.has(c));
@@ -616,14 +617,15 @@ function parseStatus(reply) {
 }
 
 const PARKED = ['WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'];
+const POKE_MS = 5 * 60e3, MAX_POKES = 3; // a wait Studio cannot check: the worker looks itself every POKE_MS, MAX_POKES times, then the user is asked
 const OPEN = ['WAITING', 'WORKING', 'PAUSED', 'INTERRUPTED', ...PARKED];
 const findPr = (s) => s.match(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/)?.[0] || s.match(/\bPR\s*#(\d+)/i)?.[1] || '';
 
 // A parked card goes back to the queue with a note; the worker continues in the same conversation.
-function wake(w, t, note) {
+function wake(w, t, note, why = '') {
   if (!PARKED.includes(t.status)) return;
   Object.assign(t, { status: 'WAITING', wakeNote: note, wait: null, ask: null });
-  log(w, 'studio', 'system', `「${t.title}」等待的結果到了，交回 ${agentName(t.agent)} 繼續。`);
+  log(w, 'studio', 'system', why || `「${t.title}」等待的結果到了，交回 ${agentName(t.agent)} 繼續。`);
   pump(w);
 }
 
@@ -685,6 +687,15 @@ function autoNext(w, run) {
 function setDelivery(w, mode) {
   if (!DELIVERY_IDS.includes(mode)) throw new Error('未知的交付方式');
   w.delivery = mode;
+  saveSettings();
+}
+
+// 收尾者: who takes a card over when the CI it waited for is done ('' = the card's own agent). A cheap agent can do
+// the merge / sync main / cleanup chain so the strong model's quota is not spent on it.
+function setFinisher(w, agent) {
+  if (agent && !AGENTS[agent]) throw new Error('未知的 Agent');
+  if (agent && agent === w.leader) throw new Error('工頭不能當收尾者（工頭不修改檔案）');
+  w.finisher = agent || '';
   saveSettings();
 }
 
@@ -1235,7 +1246,7 @@ async function lastAgentText(cid) {
   if (!cid) return '';
   try { const items = (await api('GET', `/api/conversations/${cid}/messages`)).items || []; const m = items.filter((x) => x.type === 'text' && x.position === 'left' && !isAskAnswer(x)).at(-1); return clip(m?.content?.content || '', 700); } catch { return ''; }
 }
-async function handoffWriter(w, toAgent, taskId) {
+async function handoffWriter(w, toAgent, taskId, extraNote = '') {
   if (!AGENTS[toAgent]) throw new Error('未知的 Agent');
   if (!available(toAgent)) throw new Error(`${agentName(toAgent)} 目前不可用`);
   const run = w.run;
@@ -1251,7 +1262,7 @@ async function handoffWriter(w, toAgent, taskId) {
   if (t.status === 'WORKING' || w.executingSteps?.has(t.id)) t.interrupted = true;
   saveRun(w, run.paused ? 'paused' : 'running');
   try { await drainExecution(w, [t]); }
-  catch (e) { t.interrupted = false; throw e; }
+  catch (e) { t.hold = false; t.interrupted = false; throw e; }
   // 4-5. the old agent gives up the lease; the card (with its conversation, history) goes to the new agent
   const prior = await lastAgentText(run.convs[workKey(t)]);
   const info = await workspaceOf(t.workdir || w.project);
@@ -1263,7 +1274,7 @@ async function handoffWriter(w, toAgent, taskId) {
   (t.handoffs ||= []).push({ from, to: toAgent, at: nowIso() });
   t.leaseGeneration = (t.leaseGeneration || 0) + 1;
   Object.assign(t, { agent: toAgent, hold: false, interrupted: false, resumed: true, trust: true, convReset: false, detail: '',
-    status: ['PAUSED', 'INTERRUPTED'].includes(t.status) ? t.status : 'WAITING', wakeNote: writerHandoffNote(from, toAgent, prior) });
+    status: ['PAUSED', 'INTERRUPTED'].includes(t.status) ? t.status : 'WAITING', wakeNote: writerHandoffNote(from, toAgent, prior) + (extraNote ? '\n\n' + extraNote : '') });
   log(w, 'studio', 'system', `工作區交接：${agentName(from)} 已停止並放下寫入權，改由 ${agentName(toAgent)} 從目前的資料夾和 branch 接續「${t.title}」。${agentName(from)} 的對話和紀錄都保留，但不再是寫入者。`);
   const got = acquireWrite(w, t, info);
   if (!got.ok) throw new Error('新 Agent 無法取得寫入租約');
@@ -1362,7 +1373,7 @@ async function runCard(w, t) {
   log(w, t.agent, 'worker', (note ? '收到等待的結果，繼續：' : t.resumed ? '繼續工作：' : '開始工作：') + t.title);
   try {
     const deps = (t.after || []).map((id) => w.tasks.find((x) => x.id === id)).filter(Boolean);
-    const knowsTask = !!run.convs[workKey(t)]; // a new conversation (e.g. after a handoff) has not seen the task yet
+    const knowsTask = t.briefed === workKey(t); // this agent's conversation has had the full card brief (a handoff or a new tier starts over)
     const prompt = note && knowsTask ? `Update from Multi-Agent Studio for your task "${t.title}":
 ${note}
 
@@ -1379,7 +1390,8 @@ ${accessRules(t)}
 ${deliveryRules(w.delivery, 'worker')}
 When you end your turn, reply with a short summary of what you did (1-3 sentences).
 ${STATUS_RULES}`;
-    const cid = await conv(w, t.agent, false, t.hard, t.workdir);
+    if (!(note && knowsTask)) t.briefed = workKey(t);
+    const cid = await conv(w, t.agent, false, t.hard, t.workdir, !isWriter(t));
     // A step stopped by 立刻打斷 ends early (maybe with an error): park the card until the Leader has read the note.
     const step = async (text) => {
       cardStep.add(cid);
@@ -1427,7 +1439,7 @@ ${STATUS_RULES}`;
     if (e instanceof Halt && run.stopped) { t.status = 'FAILED'; t.result = '已停止'; return; }
     if (e.stuck && !t.convReset) { // the worker's conversation will not stop: start a fresh one (the card brief carries the task)
       delete run.convs[workKey(t)];
-      Object.assign(t, { convReset: true, status: 'WAITING', resumed: true, detail: e.message });
+      Object.assign(t, { convReset: true, briefed: '', status: 'WAITING', resumed: true, detail: e.message });
       log(w, 'studio', 'system', `${agentName(t.agent)} 的對話卡住停不下來，改開一個新的對話重做「${t.title}」。`, e.message);
       return;
     }
@@ -1466,6 +1478,9 @@ function applyStatus(w, t, st, reply) {
     } else if (backendPort) {
       log(w, 'studio', 'system', `「${t.title}」正在檢查 backend 3018 是否能安全自動恢復；listener 必須通過 health 與 application ready 才會繼續。`);
       recoverBackendWait(w, t);
+    } else if ((t.pokes || 0) < MAX_POKES) {
+      Object.assign(t.wait, { manual: false, pokeAt: Date.now() + POKE_MS });
+      log(w, 'studio', 'system', `「${t.title}」在等「${t.wait.what}」：Studio 無法自動確認，每 ${POKE_MS / 60e3} 分鐘請 ${who} 自己看一次（最多 ${MAX_POKES} 次），之後才請你按「繼續」。`);
     } else {
       log(w, 'studio', 'system', `「${t.title}」在等「${t.wait.what}」：Studio 無法自動確認，結果好了請按「繼續」。`);
       notify(`${label(w)}：需要你按「繼續」`, `${who} 在等「${t.wait.what}」，Studio 無法自動確認`, 'ask', w.project);
@@ -1725,9 +1740,18 @@ async function checkExternal(w, t) {
     // A new PR can take a minute to register its checks: zero checks three times in a row means there are none.
     if (j.state === 'OPEN' && (pending.length || (!checks.length && t.wait.empty < 3))) return;
     const summary = checks.map((c) => `${c.name || c.context || 'check'}: ${c.conclusion || c.state || c.status}`).join(', ') || 'no CI checks found';
-    wake(w, t, `GitHub PR ${j.url}: state ${j.state}, review decision ${j.reviewDecision || 'none'}. CI: ${summary}.`);
+    const note = `GitHub PR ${j.url}: state ${j.state}, review decision ${j.reviewDecision || 'none'}. CI: ${summary}.`;
+    const fin = w.finisher;
+    if (fin && fin !== t.agent && fin !== w.run?.leader && isWriter(t) && available(fin)) { // 收尾者 does the merge / cleanup instead of the strong model
+      log(w, 'studio', 'system', `PR ${t.wait.pr} 的 CI 跑完了：依「收尾者」設定，「${t.title}」改由 ${agentName(fin)} 接手 merge 與收尾。`);
+      try { await handoffWriter(w, fin, t.id, `The result this card was waiting for has arrived:\n${note}`); return; }
+      catch (e) { log(w, 'studio', 'system', `收尾者 ${agentName(fin)} 接手失敗（${e.message}），交回 ${agentName(t.agent)}。`); }
+    }
+    wake(w, t, note);
   } catch (e) {
     if (t.status !== 'WAITING_EXTERNAL') return;
+    t.wait.errors = (t.wait.errors || 0) + 1; // gh hiccups (network, rate limit): try again next minute before asking the user
+    if (t.wait.errors < 3) { if (t.wait.errors === 1) log(w, 'studio', 'system', `查不到 PR ${t.wait.pr} 的狀態（${e.message}）：下一分鐘再試。`); return; }
     Object.assign(t.wait, { manual: true, error: e.message });
     log(w, 'studio', 'system', `查不到 PR ${t.wait.pr} 的狀態（${e.message}）：結果好了請按「繼續」。`);
     notify(`${label(w)}：需要你按「繼續」`, `Studio 查不到 PR ${t.wait.pr} 的 CI 狀態`, 'ask', w.project);
@@ -1735,7 +1759,13 @@ async function checkExternal(w, t) {
 }
 
 function watchExternal() {
-  for (const w of S.workspaces) if (w.run?.active) for (const t of w.tasks) if (t.status === 'WAITING_EXTERNAL') checkExternal(w, t);
+  for (const w of S.workspaces) if (w.run?.active) for (const t of w.tasks) if (t.status === 'WAITING_EXTERNAL') { if (t.wait?.pokeAt) pokeExternal(w, t); else checkExternal(w, t); }
+}
+function pokeExternal(w, t) {
+  if (Date.now() < t.wait.pokeAt) return;
+  t.pokes = (t.pokes || 0) + 1;
+  wake(w, t, `Studio cannot check "${t.wait.what}" by itself. About ${POKE_MS / 60e3} minutes have passed (check ${t.pokes} of ${MAX_POKES}): look whether it is ready now and continue the task; if it is still not ready, report STATUS: WAITING_EXTERNAL again with what you wait for.`,
+    `「${t.title}」：請 ${agentName(t.agent)} 自己確認「${t.wait.what}」好了沒（第 ${t.pokes}/${MAX_POKES} 次）。`);
 }
 
 // ---------- Project State / Handoff Memory ----------
@@ -1983,6 +2013,7 @@ function continueCard(w, taskId) {
   const t = w.tasks.find((x) => x.id === taskId);
   if (!['WAITING_EXTERNAL', 'WAITING_AGENT'].includes(t?.status)) throw new Error('這張工作卡沒有在等待');
   if (!w.run?.active) throw new Error('這個專案目前沒有在工作（暫停中請先按「繼續」）');
+  t.pokes = 0;
   log(w, 'user', 'user', `「${t.title}」在等的東西好了，請繼續`);
   wake(w, t, `The user says what you were waiting for ("${t.wait?.what || ''}") should be ready now. Check it yourself and continue.`);
 }
@@ -2099,6 +2130,27 @@ async function reassign(w, taskId, agent) {
   t.agent = agent; t.status = w.run.paused ? 'PAUSED' : 'WAITING';
   saveRun(w, w.run.paused ? 'paused' : 'running');
   if (w.run.active) pump(w);
+}
+
+// 撤出: the agent leaves this project (e.g. its quota is gone); every card it still holds goes to another agent.
+async function withdrawAgent(w, agent, to) {
+  if (!AGENTS[agent]) throw new Error('未知的 Agent');
+  if (agent === w.leader) throw new Error('它是工頭：請先「更換工頭」');
+  const open = w.run && !w.run.stopped ? w.tasks.filter((t) => t.agent === agent && OPEN.includes(t.status)) : [];
+  if (open.length && (!to || to === agent || to === w.leader || !available(to))) throw new Error('它還有未完成的工作卡，請選一位可用的成員接手');
+  setWorker(w, agent, false);
+  if (w.finisher === agent) setFinisher(w, '');
+  const moved = [];
+  for (const t of open) {
+    try {
+      if (isWriter(t)) await handoffWriter(w, to, t.id);
+      else if (t.status === 'WORKING') continue; // a read-only step finishes by itself
+      else { t.agent = to; t.status = w.run.paused ? 'PAUSED' : 'WAITING'; }
+      moved.push(t.title);
+    } catch (e) { log(w, 'studio', 'system', `「${t.title}」改派給 ${agentName(to)} 失敗：${e.message}`); }
+  }
+  log(w, 'studio', 'system', `已撤出 ${agentName(agent)}：這個專案不再派工給它${moved.length ? `；${moved.length} 張卡改由 ${agentName(to)} 接手：${moved.join('、')}` : ''}。`);
+  if (w.run) { saveRun(w, w.run.paused ? 'paused' : 'running'); if (w.run.active) pump(w); }
 }
 
 // Changing the Leader mid-run hands the same job over; Workers keep their cards.
@@ -2427,6 +2479,8 @@ const routes = {
   'POST /api/recent/remove': (b) => removeRecent(b.path),
   'POST /api/agent-config': (b) => setAgentCfg(wsOf(b.ws), b.agent, b.model, b.effort, b.hardModel, b.hardEffort),
   'POST /api/workers': (b) => setWorker(wsOf(b.ws), b.agent, !!b.on),
+  'POST /api/workers/withdraw': (b) => withdrawAgent(wsOf(b.ws), b.agent, b.to),
+  'POST /api/finisher': (b) => setFinisher(wsOf(b.ws), b.agent),
   'POST /api/external/save': (b) => saveExternal(b),
   'POST /api/external/delete': (b) => deleteExternal(b.id),
   'POST /api/external/models': (b) => extModels(b),

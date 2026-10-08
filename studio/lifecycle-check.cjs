@@ -32,15 +32,19 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"design","agent":"codex","instructions":"x"},{"title":"build","agent":"antigravity","instructions":"y","writes":false}]}';
     if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
     if (text.includes('Task: design') || (agent === 'codex' && text.startsWith('Update'))) { askTurns++; return askTurns === 1 ? 'Two layouts.\nSTATUS: NEEDS_USER: 要 A 還是 B？\nOPTIONS: A | B' : 'Used ' + (text.includes('"""\nB\n"""') ? 'B' : '?') + '.\nSTATUS: DONE'; }
-    extTurns++; return extTurns === 1 ? 'Started nightly build.\nSTATUS: WAITING_EXTERNAL: the nightly build' : 'Build fine.\nSTATUS: DONE';
+    extTurns++; return extTurns === 1 ? 'Started nightly build.\nSTATUS: WAITING_EXTERNAL: the nightly build' : extTurns === 2 ? 'Still running.\nSTATUS: WAITING_EXTERNAL: the nightly build' : 'Build fine.\nSTATUS: DONE';
   }));
   w = newW(); env.S.workspaces.push(w);
   await api.planPhase(w); await settle();
   assert.deepStrictEqual(w.tasks.map((t) => t.status), ['NEEDS_USER', 'WAITING_EXTERNAL']);
   assert.deepStrictEqual(w.tasks[0].ask, { question: '要 A 還是 B？', options: ['A', 'B'] });
-  assert.strictEqual(w.tasks[1].wait.manual, true, 'no PR → honest manual continue');
-  assert.ok(env.notices.some((n) => n.title.includes('需要你處理')) && env.notices.some((n) => n.title.includes('需要你按「繼續」')));
+  assert.strictEqual(w.tasks[1].wait.manual, false, 'no PR → the worker is asked to look itself before the user is');
+  assert.ok(w.tasks[1].wait.pokeAt > Date.now() && !env.notices.some((n) => n.title.includes('需要你按「繼續」')), 'self-check scheduled, user not bothered yet');
+  assert.ok(env.notices.some((n) => n.title.includes('需要你處理')));
   assert.strictEqual(w.run.active, true, 'run stays open while cards wait');
+  w.tasks[1].wait.pokeAt = 1; api.watchExternal(); await settle();
+  assert.deepStrictEqual([extTurns, w.tasks[1].status, w.tasks[1].pokes], [2, 'WAITING_EXTERNAL', 1], 'the worker looked once and still waits');
+  assert.ok(env.prompts.at(-1).text.includes('check 1 of 3'), 'the poke says which check it is');
   api.answer(w, w.tasks[0].id, 'B'); api.continueCard(w, w.tasks[1].id); await settle(); await settle();
   assert.deepStrictEqual(w.tasks.map((t) => t.status), ['DONE', 'DONE']);
   assert.strictEqual(w.tasks[0].result, 'Used B.');
@@ -807,6 +811,35 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     assert.deepStrictEqual([q.state, q.answer], ['answered', '正在跑 backend 測試，沒有卡住。']);
   }
   console.log('17 progress questions (safe point, mid-turn, no new card, stuck hint): PASS');
+
+  // 18) 收尾者: CI done → the card is handed to the cheap finisher with the full brief and the CI result; 撤出: an agent leaves, its cards move
+  {
+    const pr = { url: 'https://github.com/o/r/pull/7', state: 'OPEN', reviewDecision: 'APPROVED', statusCheckRollup: [{ __typename: 'CheckRun', name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
+    ({ env, api } = makeEnv((agent, text) => {
+      if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"ship","agent":"claude","instructions":"open a PR and merge it"},{"title":"docs","agent":"claude","instructions":"write docs","after":[0]}]}';
+      if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+      if (agent === 'claude' && text.includes('Task: ship')) return 'Opened PR.\nSTATUS: WAITING_EXTERNAL: CI https://github.com/o/r/pull/7';
+      if (agent === 'claude' && text.includes('Task: docs')) return 'draft ready\nSTATUS: NEEDS_USER: publish?';
+      return 'merged\nSTATUS: DONE';
+    }, { execFile: (cmd, args, opts, cb) => (cmd === 'gh' ? cb(null, JSON.stringify(pr), '') : cb(new Error('no git in test'), '', '')),
+      setWorker: (w, agent, on) => { w.workers = on ? [...new Set([...w.workers, agent])] : w.workers.filter((x) => x !== agent); } }));
+    w = newW(); w.leader = 'antigravity'; w.workers = ['claude', 'codex']; w.finisher = 'codex'; w.run.leader = 'antigravity'; env.S.workspaces.push(w);
+    api.planPhase(w);
+    assert.ok(await waitFor(() => w.tasks[0]?.status === 'DONE'), 'CI is checked as soon as the card parks; the finisher merged');
+    const ship = w.tasks[0], fin = env.prompts.filter((p) => p.agent === 'codex').at(-1);
+    assert.strictEqual(ship.agent, 'codex', 'the card now belongs to the finisher');
+    assert.deepStrictEqual(ship.handoffs.map((h) => h.from + '>' + h.to), ['claude>codex']);
+    assert.ok(fin.text.includes('Task: ship') && fin.text.includes('HANDOFF:') && fin.text.includes('pull/7: state OPEN') && fin.text.includes('ci: SUCCESS'), 'full brief + handoff + CI result: ' + fin.text.slice(0, 200));
+    assert.ok(env.logs.some((l) => l.text.includes('收尾者')));
+    // withdraw claude: its parked "docs" card moves to codex (same tree, handoff note), claude gets no more cards here
+    assert.ok(await waitFor(() => w.tasks[1].status === 'NEEDS_USER'));
+    await api.withdrawAgent(w, 'claude', 'codex');
+    assert.deepStrictEqual([w.tasks[1].agent, w.workers], ['codex', ['codex']]);
+    assert.ok(await waitFor(() => w.run.result === 'done'), 'codex finished the moved card');
+    assert.ok(env.prompts.filter((p) => p.agent === 'codex').at(-1).text.includes('Task: docs'), 'the moved card was briefed in full');
+    await assert.rejects(api.withdrawAgent(w, 'antigravity', 'codex'), /工頭/);
+    console.log('18 finisher takes over after CI + withdraw moves cards: PASS');
+  }
 
   await require('./test-workspace-lease.cjs')({ makeEnv, mkTmp, region });
 
