@@ -220,7 +220,6 @@
   <select id="fontSize" title="字體大小（整個畫面，記在這個瀏覽器）" style="width:auto;padding:4px 8px;font-size:13px;border-radius:8px">
     <option value="1">字體：標準</option><option value="1.15">字體：大</option><option value="1.3">字體：特大</option><option value="1.5">字體：超大</option>
   </select>
-  <span class="pill" id="paseoPill">Paseo</span>
 </header>
 
 <div class="layout">
@@ -255,7 +254,6 @@
       <div style="min-width:0"><div class="row" style="gap:6px"><span class="nm" id="pvName"></span><button class="btn small ghost" id="renameWs" title="改顯示名稱（分頁、總覽、Windows 通知都用這個名稱）">✎ 改名</button></div><div class="sub" id="pvPath"></div></div>
       <span class="spacer"></span>
       <span class="pill" id="runPill">待命</span>
-      <button class="btn small" id="paseoOpen">用 Paseo 開啟</button>
       <button class="btn pz" id="pauseResume" title="暫停：成員馬上停下，工作卡和進度都保留，Studio 不會自己恢復；要你按「繼續」才會接著做。">暫停</button>
       <button class="btn danger" id="stop" title="停止：這件工作到此為止，未完成的卡標成失敗，不能再「繼續」；要接著做請用「▶ 接著處理」開新的一輪。">Stop</button>
       <button class="btn small ghost" id="closeWs" title="關閉這個分頁（暫停中的工作仍在歷史紀錄）">關閉分頁</button>
@@ -792,7 +790,8 @@ function officeHtml(w) {
       </select><span class="hint" style="font-size:13px;margin-left:8px">交付：</span>
       <select data-delivery style="width:auto;padding:4px 8px;font-size:13px" title="需求清楚、沒有高風險時，AI 要做到哪裡才停">${[['auto', '🚚 自動做到 merge'], ['pr', '✋ 做到 PR 就停（merge 等我）']].map(([k, t]) => `<option value="${k}" ${(w.delivery || 'auto') === k ? 'selected' : ''}>${t}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">模型策略：</span>
       <select data-strategy style="width:auto;padding:4px 8px;font-size:13px" title="工頭自己判斷普通卡／困難卡；普通卡失敗會自動改用強模型重試一次">${STRATEGY.map(([k, t]) => `<option value="${k}" ${(w.strategy || 'save') === k ? 'selected' : ''}>${t}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">收尾者：</span>
-      <select data-finisher style="width:auto;padding:4px 8px;font-size:13px" title="CI 跑完後，merge／同步 main／清分支改由這位接手，省下強模型的額度（等 CI 本身不花額度，Studio 自己查）"><option value="">原成員自己收尾</option>${S.agents.filter((a) => a.id !== w.leader && w.workers.includes(a.id)).map((a) => `<option value="${a.id}" ${w.finisher === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select>${w.afterDone === 'auto' ? `<span class="tag pz">🔁 自動中 ${w.autoRounds || 0}/5</span>` : ''}</div>
+      <select data-finisher style="width:auto;padding:4px 8px;font-size:13px" title="CI 跑完後，merge／同步 main／清分支改由這位接手，省下強模型的額度（等 CI 本身不花額度，Studio 自己查）"><option value="">原成員自己收尾</option>${S.agents.filter((a) => a.id !== w.leader && w.workers.includes(a.id)).map((a) => `<option value="${a.id}" ${w.finisher === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">驗證用後端 port：</span>
+      <input data-backend-port type="number" min="1" max="65535" value="${w.backendPort || ''}" placeholder="無" style="width:72px;padding:4px 8px;font-size:13px" title="專案有自己的後端服務時填它的 port（例如 3018）：成員會請 Studio 代管啟動，卡片在等它時 Studio 會自動檢查 health 並安全恢復；留空＝不用">${w.afterDone === 'auto' ? `<span class="tag pz">🔁 自動中 ${w.autoRounds || 0}/5</span>` : ''}</div>
     ${leaseHtml(w)}
     ${workspaceLine(w)}
     ${runtimeHtml(w)}
@@ -968,8 +967,6 @@ function renderProject(w, force) {
   $('pvHead').style.setProperty('--c', look(w.leader).c);
   $('pvName').textContent = w.name;
   $('pvPath').textContent = $('pvPath').title = w.project;
-  $('paseoOpen').hidden = S.paseo === 'missing';
-  if (!$('paseoOpen').dataset.busy) $('paseoOpen').disabled = false;
   // Without a live job the pill shows the project state, not a bare 待命.
   $('runPill').textContent = running ? `團隊工作中 · 工頭 ${name(r.leader)}` : paused ? '已暫停 · 可稍後繼續' : w.pstate ? w.pstate.headline : (r?.stopped ? '已停止' : '待命');
   $('runPill').className = 'pill ' + (running ? 'on' : paused ? 'pz' : w.pstate ? { need:'bad', open:'on', wait:'on', done:'ok' }[w.pstate.level] || '' : '');
@@ -1014,9 +1011,6 @@ function render() {
   if (w) renderProject(w, force); else renderOverview();
   document.title = (w ? w.name + ' · ' : '') + 'Multi-Agent Studio';
 
-  const pz = { running:['Paseo 執行中','ok'], stopped:['Paseo 未開啟',''], missing:['Paseo 未安裝',''], checking:['Paseo 檢查中…',''] }[S.paseo] || ['Paseo',''];
-  $('paseoPill').textContent = pz[0];
-  $('paseoPill').className = 'pill ' + pz[1];
 
   const open = (p) => S.workspaces.some((x) => sameP(x.project, p));
   $('recent').innerHTML = S.recent.length ? S.recent.map((p) => `
@@ -1059,7 +1053,7 @@ async function refresh() {
     if (txt === last && Date.now() - lastRender < 30000) return; // re-render now and then so reset bars move
     last = txt; S = JSON.parse(txt); render(); lastRender = Date.now();
     handleNotices();
-  } catch { $('paseoPill').textContent = '無法連到 Studio（視窗是否已關閉？）'; }
+  } catch { document.title = '無法連到 Studio（視窗是否已關閉？）'; }
 }
 
 // ---------- Notifications: the server sends the Windows toast; open pages add a sound ----------
@@ -1132,11 +1126,6 @@ $('extSave').onclick = async () => {
   try { await extCall('/api/external/save', extForm()); $('extDlg').close(); refresh(); } catch { /* shown in the dialog */ } finally { b.disabled = false; }
 };
 $('histResume').onclick = () => post('/api/resume', { id: histOpenId }).then(() => { $('histDlg').close(); go(histOpenProject); });
-$('paseoOpen').onclick = async () => {
-  const b = $('paseoOpen');
-  b.dataset.busy = '1'; b.disabled = true; b.textContent = '開啟中…';
-  try { await post('/api/paseo/open', { ws: ws() }); } catch {} finally { delete b.dataset.busy; b.disabled = false; b.textContent = '用 Paseo 開啟'; }
-};
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter' || !e.ctrlKey) return;
   if (e.target.id === 'request' && !$('start').disabled) $('start').click();
@@ -1155,6 +1144,8 @@ document.addEventListener('change', (e) => {
     if (id && confirm('把寫入權交給 ' + name(id) + '？\n\n' + (wr ? name(wr.agent) || wr.owner : '現在的寫入者') + ' 會先停下（等它真的停住），這張卡的紀錄和對話都保留，但它不再是這個工作區的寫入者；' + name(id) + ' 從目前的資料夾和 branch 接續。')) return post('/api/handoff', { ws: ws(), agent: id }).catch(() => {});
     return;
   }
+  const bp = e.target.closest('input[data-backend-port]');
+  if (bp) return post('/api/backend-port', { ws: ws(), port: bp.value }).catch(() => {});
   const fi = e.target.closest('select[data-finisher]');
   if (fi) return post('/api/finisher', { ws: ws(), agent: fi.value }).catch(() => {});
   const wd = e.target.closest('select[data-withdraw]');

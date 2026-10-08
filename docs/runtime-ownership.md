@@ -65,7 +65,7 @@ Multi-Agent Studio 管理多個 Agent、背景進程與測試執行。為確保�
 
 - `POST /api/runtime/start` 只接受進行中工作卡、絕對 executable、字串 args、工作區內的 cwd 與既有 data directory；Studio 直接啟動並登記 PID。
 - `POST /api/runtime/readiness` 以 `runtimeId` 查詢 readiness；`GET /api/runtimes` 與 `/api/state` 也提供 runtime readiness。
-- 一般 `WAITING_EXTERNAL` 若明確提到 backend 3018／`MiningProcessLockError`，Studio 會尋找該卡建立的 runtime。已確認可安全重啟時會自動清理、重啟、檢查 `/health`、執行 smoke path 並繼續原卡；否則 UI 顯示 `Blocked` 原因，要求人工處理。
+- 只有專案頁設定了「驗證用後端 port」（例如 3018）時才啟用：一般 `WAITING_EXTERNAL` 若明確提到 backend 該 port／`MiningProcessLockError`，Studio 會尋找該卡建立的 runtime。已確認可安全重啟時會自動清理、重啟、檢查 `/health`、執行 smoke path 並繼續原卡；否則 UI 顯示 `Blocked` 原因，要求人工處理。
 - listener 存在但 FastAPI startup 失敗時仍是 `BLOCKED`，health response 的啟動錯誤會顯示給使用者。
 
 ---

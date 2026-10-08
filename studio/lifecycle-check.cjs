@@ -841,6 +841,24 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     console.log('18 finisher takes over after CI + withdraw moves cards: PASS');
   }
 
+  // 19) backend recovery only for the project's own backend port; no port set = an ordinary external wait, nothing in the prompt
+  {
+    ({ env, api } = makeEnv(() => 'ok\nSTATUS: DONE'));
+    const reply = 'backend 3018 is restarting\nSTATUS: WAITING_EXTERNAL: backend 3018 恢復';
+    const st = () => api.parseStatus(reply);
+    w = newW(); env.S.workspaces.push(w);
+    const t0 = { id: 'a', title: 'a', agent: 'codex', status: 'WORKING' }; w.tasks.push(t0);
+    api.applyStatus(w, t0, st(), reply);
+    assert.ok(!t0.wait.backendPort && t0.wait.pokeAt, 'no backendPort set: plain self-check wait');
+    w.backendPort = 3018;
+    const t1 = { id: 'b', title: 'b', agent: 'codex', status: 'WORKING' }; w.tasks.push(t1);
+    api.applyStatus(w, t1, st(), reply);
+    assert.ok(t1.wait.backendPort === 3018 && !t1.wait.pokeAt, 'backendPort set: the backend check takes the wait');
+    assert.ok(/Workspace ownership/.test(t1.wait.recoveryReason || ''), 'without a write lease the recovery refuses to touch the backend');
+    w.run.active = false; // stop the recovery watcher touching this fake run
+    console.log('19 backend recovery only with a project backendPort: PASS');
+  }
+
   await require('./test-workspace-lease.cjs')({ makeEnv, mkTmp, region });
 
   // status-line parser
