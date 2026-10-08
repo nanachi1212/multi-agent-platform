@@ -328,6 +328,7 @@ const look = (id) => LOOK[id] || { c:'#8d8678', ab:String(id).slice(0, 2).toUppe
 // Board lanes; a lane can hold several card states.
 const LANES = [[['WAITING','PAUSED','INTERRUPTED'],'待做'], [['WORKING'],'工作中'], [['WAITING_EXTERNAL','WAITING_AGENT','NEEDS_USER'],'在等'], [['DONE'],'已完成'], [['FAILED'],'失敗 / 停止']];
 const PARKED = ['WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'];
+const OPEN = ['WAITING', 'WORKING', 'PAUSED', 'INTERRUPTED', ...PARKED];
 const STATUS = { done:'完成', failed:'有失敗', stopped:'已停止', paused:'暫停中', running:'進行中', interrupted:'中斷（可繼續）' };
 let S = null, last = '', histKey = '', histOpenId = null, histOpenProject = '', shownView = null;
 const drafts = {}; // unsent request text per project
@@ -507,7 +508,8 @@ function seatHtml(a, w) {
     ${a.id === 'codex' && a.status === 'unavailable' ? `<div class="cfg-note">Studio 的 Codex 使用獨立資料夾，不會出現在你平常的 Codex 紀錄。登入一次後按「重新檢查」。</div><button class="btn small" data-codex-login>登入 Codex（Studio 專用）</button>` : ''}
     ${a.id === 'claude' && a.status === 'unavailable' ? `<div class="cfg-note">Studio 的 Claude 使用你電腦上 Claude Code 的登入。在跳出的視窗登入完成後按「重新檢查」。</div><button class="btn small" data-claude-login>登入 Claude</button>` : ''}
     ${!w || lead ? '' : `<div class="row"><button class="btn small" data-leader="${a.id}" ${a.status !== 'available' ? 'disabled' : ''}>${busy ? '接手當工頭' : '設為工頭'}</button>
-      <button class="btn small ghost" data-worker="${a.id}" data-on="${out ? 1 : 0}" title="只影響這個專案；下一次派工生效">${out ? '讓它參與這個專案' : '這個專案不用它'}</button></div>`}
+      <button class="btn small ghost" data-worker="${a.id}" data-on="${out ? 1 : 0}" title="只影響這個專案；下一次派工生效">${out ? '讓它參與這個專案' : '這個專案不用它'}</button>
+      ${!out && w.tasks.some((t) => t.agent === a.id && OPEN.includes(t.status)) ? `<select data-withdraw="${a.id}" title="例如額度用完：把它移出這個專案，手上還沒做完的卡改派給別人（正在寫入的卡會先停下再交接）"><option value="">⏏ 撤出，卡改派給…</option>${S.agents.filter((x) => x.id !== a.id && x.id !== w.leader && x.status === 'available').map((x) => `<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select>` : ''}</div>`}
   </div>`;
 }
 
@@ -726,6 +728,7 @@ function waitLine(t) {
   if (wt.backendPort) return wt.recoveryReason || `Studio 正在安全檢查 backend ${wt.backendPort}；health 與 application ready 通過後會自動重啟 smoke 並繼續`;
   if (wt.recoveryReason) return wt.recoveryReason;
   if (wt.pr && !wt.manual) return `在等 GitHub CI（PR ${prShort(wt.pr)}）：${wt.ci || '檢查中'}（Studio 每分鐘檢查，跑完自動交回 ${name(t.agent)}）`;
+  if (wt.pokeAt) return `在等「${wt.what || '外部結果'}」：Studio 無法自動確認，每 5 分鐘請 ${name(t.agent)} 自己看一次（已看 ${t.pokes || 0}/3 次，之後才問你）`;
   return `在等「${wt.what || '外部結果'}」：Studio 無法自動確認${wt.error ? '（' + wt.error + '）' : ''}，好了請按「繼續」`;
 }
 
@@ -788,7 +791,8 @@ function officeHtml(w) {
         ${[['stop', '① 完成就停（報告後等我）'], ['suggest', '② 完成後建議下一步（等我按）'], ['auto', '③ 自動持續開發（自動做下一個小目標）']].map(([k, t]) => `<option value="${k}" ${(w.afterDone || 'stop') === k ? 'selected' : ''}>${t}</option>`).join('')}
       </select><span class="hint" style="font-size:13px;margin-left:8px">交付：</span>
       <select data-delivery style="width:auto;padding:4px 8px;font-size:13px" title="需求清楚、沒有高風險時，AI 要做到哪裡才停">${[['auto', '🚚 自動做到 merge'], ['pr', '✋ 做到 PR 就停（merge 等我）']].map(([k, t]) => `<option value="${k}" ${(w.delivery || 'auto') === k ? 'selected' : ''}>${t}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">模型策略：</span>
-      <select data-strategy style="width:auto;padding:4px 8px;font-size:13px" title="工頭自己判斷普通卡／困難卡；普通卡失敗會自動改用強模型重試一次">${STRATEGY.map(([k, t]) => `<option value="${k}" ${(w.strategy || 'save') === k ? 'selected' : ''}>${t}</option>`).join('')}</select>${w.afterDone === 'auto' ? `<span class="tag pz">🔁 自動中 ${w.autoRounds || 0}/5</span>` : ''}</div>
+      <select data-strategy style="width:auto;padding:4px 8px;font-size:13px" title="工頭自己判斷普通卡／困難卡；普通卡失敗會自動改用強模型重試一次">${STRATEGY.map(([k, t]) => `<option value="${k}" ${(w.strategy || 'save') === k ? 'selected' : ''}>${t}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">收尾者：</span>
+      <select data-finisher style="width:auto;padding:4px 8px;font-size:13px" title="CI 跑完後，merge／同步 main／清分支改由這位接手，省下強模型的額度（等 CI 本身不花額度，Studio 自己查）"><option value="">原成員自己收尾</option>${S.agents.filter((a) => a.id !== w.leader && w.workers.includes(a.id)).map((a) => `<option value="${a.id}" ${w.finisher === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select>${w.afterDone === 'auto' ? `<span class="tag pz">🔁 自動中 ${w.autoRounds || 0}/5</span>` : ''}</div>
     ${leaseHtml(w)}
     ${workspaceLine(w)}
     ${runtimeHtml(w)}
@@ -854,7 +858,7 @@ function nowHtml(w, att) {
     : r.summarizing ? '工頭確認整體是否完成；還沒完成會自己追加工作卡'
     : [...working.map((t) => `${name(t.agent)} 做完「${t.title}」${ready ? ` → ${name(ready.agent)} 接著做「${ready.title}」` : ''}`),
       ...ts.filter((t) => PARKED.includes(t.status) && t.status !== 'NEEDS_USER' && !(t.status === 'WAITING_EXTERNAL' && t.wait?.manual))
-        .map((t) => `${t.status === 'WAITING_AGENT' ? name(t.wait?.agent) + ' 做完' : 'CI 跑完'} → ${name(t.agent)} 自動繼續「${t.title}」`)].join('\n')
+        .map((t) => `${t.status === 'WAITING_AGENT' ? name(t.wait?.agent) + ' 做完' : t.wait?.pr ? 'CI 跑完' : '它自己確認好了'} → ${name(t.agent)} 自動繼續「${t.title}」`)].join('\n')
       || '全部工作卡結束後，工頭會確認整體是否完成';
   const askCard = r.active && ts.find((t) => t.status === 'NEEDS_USER');
   const leadAsk = r.active && !askCard && r.ask && !r.summarizing ? r.ask : null;
@@ -1149,6 +1153,15 @@ document.addEventListener('change', (e) => {
     const id = ho.value, wr = W()?.lease?.writer;
     ho.value = '';
     if (id && confirm('把寫入權交給 ' + name(id) + '？\n\n' + (wr ? name(wr.agent) || wr.owner : '現在的寫入者') + ' 會先停下（等它真的停住），這張卡的紀錄和對話都保留，但它不再是這個工作區的寫入者；' + name(id) + ' 從目前的資料夾和 branch 接續。')) return post('/api/handoff', { ws: ws(), agent: id }).catch(() => {});
+    return;
+  }
+  const fi = e.target.closest('select[data-finisher]');
+  if (fi) return post('/api/finisher', { ws: ws(), agent: fi.value }).catch(() => {});
+  const wd = e.target.closest('select[data-withdraw]');
+  if (wd) {
+    const to = wd.value, from = wd.dataset.withdraw;
+    wd.value = '';
+    if (to && confirm(`撤出 ${name(from)}，把它在這個專案還沒做完的卡都改派給 ${name(to)}？\n\n正在寫入的卡會先停下（等它真的停住）再交接；${name(from)} 的對話和紀錄都保留，之後不再派工給它。`)) return post('/api/workers/withdraw', { ws: ws(), agent: from, to }).catch(() => {});
     return;
   }
   const dl = e.target.closest('select[data-delivery]');
