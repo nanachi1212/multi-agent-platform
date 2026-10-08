@@ -53,7 +53,7 @@ const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}
 // agentCfg = this project's model / effort per agent; workers = agents allowed to work here.
 // New projects start from S.agentCfg (the last choices).
 const newWs = (project, leader = S.leader, name = '', agentCfg = S.agentCfg, workers = Object.keys(AGENTS)) => ({
-  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, strategy: 'save', delivery: 'auto', finisher: '',
+  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, strategy: 'save', delivery: 'auto', finisher: '', backendPort: 0,
   agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...agentCfg?.[id] }])),
   workers: workers.filter((id) => AGENTS[id]),
 });
@@ -85,7 +85,7 @@ try {
   // Older settings had one `project` and global models; it becomes the first open workspace with those models.
   S.workspaces = (saved.workspaces || (saved.project ? [{ project: saved.project }] : []))
     .filter((x) => isDir(x.project))
-    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto', finisher: AGENTS[x.finisher] ? x.finisher : '' }));
+    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto', finisher: AGENTS[x.finisher] ? x.finisher : '', backendPort: Number(x.backendPort) || 0 }));
   S.recent = (saved.recent || []).filter(isDir);
   if (saved.notify === false) S.notify = false;
 } catch (e) {
@@ -97,7 +97,7 @@ try {
 
 function saveSettings() {
   fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
-  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher }));
+  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, backendPort: w.backendPort }));
   fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external }, null, 2));
 }
 
@@ -696,6 +696,15 @@ function setFinisher(w, agent) {
   if (agent && !AGENTS[agent]) throw new Error('未知的 Agent');
   if (agent && agent === w.leader) throw new Error('工頭不能當收尾者（工頭不修改檔案）');
   w.finisher = agent || '';
+  saveSettings();
+}
+
+// The project's own backend port ('' / 0 = none): only then do workers hear about Studio-managed runtimes and does a
+// card waiting on that backend get the automatic health check / recovery.
+function setBackendPort(w, port) {
+  port = Number(port) || 0;
+  if (port && !(Number.isInteger(port) && port > 0 && port < 65536)) throw new Error('port 必須是 1–65535 的整數');
+  w.backendPort = port;
   saveSettings();
 }
 
@@ -1380,8 +1389,7 @@ ${note}
 Continue the task. End your reply with a short summary (1-3 sentences).
 ${STATUS_RULES}` : `You are a WORKER in "Multi-Agent Studio". Your leader (${agentName(run.leader)}) assigned you this task.
 Work only inside this folder: ${t.workdir || run.project}
-If you must run this project's backend on port 3018 for validation, let Studio own the process so it can verify and recover it: POST JSON to http://127.0.0.1:${PORT}/api/runtime/start with ws (project path), cardId (${t.id}), executable (absolute path), args (string array), cwd (inside this workspace), dataDir (an existing directory inside this workspace), port (3018), smokePath, and noCredentialsConfirmed:true only when restart needs no account credentials. Never register or stop an unknown process. A listener is not ready until Studio confirms process alive + reachable port + GET /health HTTP 200 + application ready.
-${note ? `\nNOTE FROM STUDIO:\n${note}\n` : ''}${t.resumed ? '\nYou were interrupted while doing this task earlier. First check the current state of the project folder, then finish the task without redoing work that is already done.\n' : ''}
+${w.backendPort ? `If you must run this project's backend on port ${w.backendPort} for validation, let Studio own the process so it can verify and recover it: POST JSON to http://127.0.0.1:${PORT}/api/runtime/start with ws (project path), cardId (${t.id}), executable (absolute path), args (string array), cwd (inside this workspace), dataDir (an existing directory inside this workspace), port (${w.backendPort}), smokePath, and noCredentialsConfirmed:true only when restart needs no account credentials. Never register or stop an unknown process. A listener is not ready until Studio confirms process alive + reachable port + GET /health HTTP 200 + application ready.\n` : ''}${note ? `\nNOTE FROM STUDIO:\n${note}\n` : ''}${t.resumed ? '\nYou were interrupted while doing this task earlier. First check the current state of the project folder, then finish the task without redoing work that is already done.\n' : ''}
 Task: ${t.title}
 Instructions:
 ${t.instructions}
@@ -1469,14 +1477,14 @@ function applyStatus(w, t, st, reply) {
   }
   if (st.kind === 'WAITING_EXTERNAL') {
     const pr = findPr(st.detail + '\n' + reply);
-    const backendPort = /MiningProcessLockError|(?:backend|後端).{0,30}3018|3018.{0,60}(?:恢復|ready|health|啟動)|(?:恢復|等待).{0,30}3018/i.test(st.detail + '\n' + reply) ? 3018 : 0;
+    const bp = w.backendPort, backendPort = bp && new RegExp(`MiningProcessLockError|(?:backend|後端).{0,30}${bp}|${bp}.{0,60}(?:恢復|ready|health|啟動)|(?:恢復|等待).{0,30}${bp}`, 'i').test(st.detail + '\n' + reply) ? bp : 0;
     t.status = 'WAITING_EXTERNAL';
     t.wait = { what: st.detail || '外部結果', pr, manual: !pr && !backendPort, ...(backendPort ? { backendPort, manual: false } : {}) };
     if (pr) {
       log(w, 'studio', 'system', `「${t.title}」在等 PR ${pr} 的 CI：Studio 每分鐘檢查一次，跑完會自動交回 ${who}。`);
       checkExternal(w, t);
     } else if (backendPort) {
-      log(w, 'studio', 'system', `「${t.title}」正在檢查 backend 3018 是否能安全自動恢復；listener 必須通過 health 與 application ready 才會繼續。`);
+      log(w, 'studio', 'system', `「${t.title}」正在檢查 backend ${backendPort} 是否能安全自動恢復；listener 必須通過 health 與 application ready 才會繼續。`);
       recoverBackendWait(w, t);
     } else if ((t.pokes || 0) < MAX_POKES) {
       Object.assign(t.wait, { manual: false, pokeAt: Date.now() + POKE_MS });
@@ -2215,36 +2223,6 @@ $d.Description = 'Choose project folder'; if ($d.ShowDialog($f) -eq 'OK') { $d.S
   return new Promise((res) => execFile('powershell.exe', ['-NoProfile', '-STA', '-Command', ps], { windowsHide: false }, (e, out) => res(String(out || '').trim())));
 }
 
-// ---------- Paseo (extra tool entry: its own app gives remote / phone access) ----------
-const PASEO_EXE = path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Paseo', 'Paseo.exe');
-const PASEO_RES = path.join(path.dirname(PASEO_EXE), 'resources');
-S.paseo = 'checking'; // missing | stopped | running
-
-// Same as Paseo's bundled paseo.cmd, without going through cmd.exe.
-function paseo(args) {
-  const argv = ['--disable-warning=DEP0040', path.join(PASEO_RES, 'app.asar.unpacked', 'dist', 'daemon', 'node-entrypoint-runner.js'),
-    'node-script', path.join(PASEO_RES, 'app.asar', 'node_modules', '@getpaseo', 'cli', 'dist', 'index.js'), ...args];
-  const env = { ...process.env, ELECTRON_RUN_AS_NODE: '1', PASEO_NODE_ENV: 'production', PASEO_DESKTOP_MANAGED: '1' };
-  return new Promise((res, rej) => execFile(PASEO_EXE, argv, { env, windowsHide: true, timeout: 30000 },
-    (e, out, err) => (e ? rej(new Error(String(err || e.message).trim().slice(0, 300))) : res(String(out)))));
-}
-
-async function pollPaseo() {
-  if (!fs.existsSync(PASEO_EXE)) return (S.paseo = 'missing');
-  try { S.paseo = JSON.parse(await paseo(['status', '--json'])).localDaemon === 'running' ? 'running' : 'stopped'; }
-  catch { S.paseo = 'stopped'; }
-}
-
-async function openInPaseo(w) {
-  if (!fs.existsSync(PASEO_EXE)) throw new Error('這台電腦沒有安裝 Paseo');
-  spawn(PASEO_EXE, [], { detached: true, stdio: 'ignore' }).unref(); // opens Paseo, or brings the open window forward
-  for (let i = 0; S.paseo !== 'running' && i < 20; i++) { await sleep(1500); await pollPaseo(); }
-  if (S.paseo !== 'running') throw new Error('Paseo 已開啟，但它的背景服務還沒準備好，請稍後再按一次');
-  if (!JSON.parse(await paseo(['workspace', 'ls', '--json'])).some((x) => same(x.cwd, w.project))) {
-    await paseo(['workspace', 'create', '--isolation', 'local', '--path', w.project, '--title', path.basename(w.project), '--json']);
-  }
-}
-
 // ---------- HTTP ----------
 async function refreshRuntimeReadiness() {
   const runtimes = listRuntimes({ rtDir: RT });
@@ -2455,7 +2433,6 @@ const routes = {
   'POST /api/card/readonly': (b) => useReadOnly(wsOf(b.ws), b.taskId),
   'POST /api/card/worktree': (b) => useWorktree(wsOf(b.ws), b.taskId),
   'POST /api/lease/release': (b) => { const l = S.leases.find((x) => x.id === b.id); if (!l) throw new Error('找不到這個租約'); if (['ACTIVE', 'EXTERNAL'].includes(leaseState(l))) throw new Error('這個租約的持有者還活著，不能強制釋放；請先暫停或交接'); retire(l, '使用者手動釋放'); saveLeases(); },
-  'POST /api/paseo/open': (b) => openInPaseo(wsOf(b.ws)),
   'POST /api/workspace/open': (b) => openWorkspace(b.path),
   'POST /api/workspace/close': (b) => closeWorkspace(wsOf(b.ws)),
   'POST /api/workspace/rename': (b) => renameWorkspace(wsOf(b.ws), b.name),
@@ -2481,6 +2458,7 @@ const routes = {
   'POST /api/workers': (b) => setWorker(wsOf(b.ws), b.agent, !!b.on),
   'POST /api/workers/withdraw': (b) => withdrawAgent(wsOf(b.ws), b.agent, b.to),
   'POST /api/finisher': (b) => setFinisher(wsOf(b.ws), b.agent),
+  'POST /api/backend-port': (b) => setBackendPort(wsOf(b.ws), b.port),
   'POST /api/external/save': (b) => saveExternal(b),
   'POST /api/external/delete': (b) => deleteExternal(b.id),
   'POST /api/external/models': (b) => extModels(b),
@@ -2530,8 +2508,6 @@ for (const w of S.workspaces) {
 
 await startAion();
 watchCatalogs();
-pollPaseo();
-setInterval(pollPaseo, 10000);
 setInterval(watchExternal, 60000); // GitHub PR / CI waits
 await refreshRuntimeReadiness();
 setInterval(() => refreshRuntimeReadiness().catch(() => {}), 10000);

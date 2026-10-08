@@ -30,6 +30,7 @@ Windows 優先的多 AI 協作平台。**Multi-Agent Studio** 是一個本機網
 **工作流程（不用盯著看）**
 - 成員每次回覆都要標明狀態：完成／等外部結果（例如 CI）／等其他 AI／需要你決定。一回合結束不等於完成。
 - 在等的工作卡會自動接續：等的 AI 做完、GitHub PR 的 CI 跑完（用 `gh`，每分鐘檢查）、或你回覆。Studio 無法自己確認的等待（例如 nightly build）：先每 5 分鐘請成員自己看一次、最多 3 次，之後才明說「需要你按繼續」，不會假裝在背景等；查 PR 狀態失敗會先重試兩次。
+- 專案有自己的後端服務時，在專案頁填「驗證用後端 port」：成員會請 Studio 代管啟動它，卡片在等它時 Studio 自動檢查 health 並安全恢復；留空就完全不管。
 - 工作卡可以設定「等前一張完成才開始」。全部做完後，工頭會確認整體需求是否真的完成，沒完成會自己追加工作卡（最多 3 輪，之後問你）。
 - 「現在發生什麼」：進度、在等什麼、接下來誰做什麼、你現在要不要處理（🔴 需要 Nana，可直接按選項回覆）。
 
@@ -80,9 +81,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 ### 文件
 
 - [Workspace lease API 與生命週期](docs/workspace-lease.md)
-- [架構 V1](docs/architecture/MULTI_AGENT_PLATFORM_ARCHITECTURE_V1.md)
-- [Codex 架構審查](docs/architecture/ARCHITECTURE_REVIEW_CODEX.md)
-- [P0 Spike 報告](docs/reports/P0_SPIKE_REPORT.md)（P0 在當時的閘門條件下，結論為 NO-GO；那份架構研究與 Studio 是分開的）
+- [Runtime ownership 與後端恢復](docs/runtime-ownership.md)
 
 ### 授權
 
@@ -127,6 +126,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 **Project memory and handoff**
 - Every worker reply states a status: done / waiting for something external (e.g. CI) / waiting for another agent / needs your decision. A turn ending is not "done".
 - Waiting cards continue by themselves when the awaited agent finishes, when a GitHub PR's CI finishes (`gh`, checked every minute), or when you answer. A wait Studio cannot check (e.g. a nightly build): the worker is asked to look itself every 5 minutes, 3 times, before the card says "needs you to press continue"; it is never a fake background wait. A failed PR status query is retried twice first.
+- If the project has its own backend, set "驗證用後端 port" on the project page: workers ask Studio to own that process, and a card waiting on it gets an automatic health check and safe recovery; leave it empty and Studio stays out of it.
 - Cards can depend on earlier cards. When all cards end, the Leader checks the whole request and adds cards if it is not complete (max 3 extra rounds, then it asks you).
 - "現在發生什麼" (what is happening now): progress, what is awaited, what happens next, and whether you need to act (🔴 needs Nana, with answer buttons).
 
@@ -162,9 +162,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 ### Documentation
 
 - [Workspace lease API and lifecycle](docs/workspace-lease.md)
-- [Architecture V1](docs/architecture/MULTI_AGENT_PLATFORM_ARCHITECTURE_V1.md)
-- [Codex Architecture Review](docs/architecture/ARCHITECTURE_REVIEW_CODEX.md)
-- [P0 Spike Report](docs/reports/P0_SPIKE_REPORT.md) (the P0 spike ended NO-GO for MVP-0 under the gates of the time; that architecture track is separate from Studio)
+- [Runtime ownership and backend recovery](docs/runtime-ownership.md)
 
 ### License
 
