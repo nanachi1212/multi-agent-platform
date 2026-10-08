@@ -557,7 +557,7 @@ function boardHtml(tasks, agents, editable) {
     return `<div class="lane"><div class="lane-h">${label}<span class="n">${list.length}</span></div>${list.map((t) => {
       const blk = cardBlockedReason(t);
       const ws = formatWorkspace(w, t);
-      const rts = (S.runtimes || []).filter((r) => r.card_id === t.id || ((w.run?.id && r.job_id === w.run.id) && t.status === 'WORKING' && t.writes !== false) || (!r.card_id && (r.workspace || '').toLowerCase() === (t.workdir || w.project || '').toLowerCase()));
+      const rts = runtimesOf(w, t);
       const tagHtml = blk ? '<span class="tag bad">Blocked</span>' : (t.status === 'PAUSED' || t.status === 'INTERRUPTED' || PARKED.includes(t.status) ? `<span class="tag ${t.status === 'NEEDS_USER' ? 'bad' : 'pz'}">${STEP_WORD[t.status]}</span>` : '');
       return `
       <div class="card" style="--c:${look(t.agent).c}">
@@ -683,12 +683,15 @@ function cardBlockedReason(t) {
   return '';
 }
 
-function runtimeHtml(w, task = null) {
-  const all = S.runtimes || [];
-  const items = task
-    ? all.filter((r) => r.card_id === task.id || (w.run?.id && r.job_id === w.run.id && task.status === 'WORKING' && task.writes !== false))
-    : all.filter((r) => (w.run?.id && r.job_id === w.run.id) ||
-        ((r.workspace || '').toLowerCase() === (w.project || '').toLowerCase()));
+// Runtimes of a project (no t), or of one card: its own, the job's while it is the working writer, or unowned ones in its folder.
+function runtimesOf(w, t) {
+  const inDir = (r, dir) => (r.workspace || '').toLowerCase() === (dir || '').toLowerCase();
+  return (S.runtimes || []).filter((r) => (t
+    ? r.card_id === t.id || (w.run?.id && r.job_id === w.run.id && t.status === 'WORKING' && t.writes !== false) || (!r.card_id && inDir(r, t.workdir || w.project))
+    : (w.run?.id && r.job_id === w.run.id) || inDir(r, w.project)));
+}
+function runtimeHtml(w) {
+  const items = runtimesOf(w);
   if (!items.length) return '<div class="lim-f"><b>Runtime</b> —</div>';
   return items.map((r) => `<div class="lim-f"><b>Runtime</b> ${esc(formatRuntimeItem(r))}</div>`).join('');
 }
@@ -882,7 +885,7 @@ function nowHtml(w, att) {
     <dl class="wf">
       <dt>目前進度</dt><dd>${esc(progress)}</dd>
       <dt>Workspace</dt><dd>${esc(formatWorkspace(w).fullLine)}</dd>
-      <dt>Runtime</dt><dd>${(S.runtimes || []).filter((r) => (w.run?.id && r.job_id === w.run.id) || ((r.workspace || '').toLowerCase() === (w.project || '').toLowerCase())).map(formatRuntimeItem).join(' · ') || '—'}</dd>
+      <dt>Runtime</dt><dd>${runtimesOf(w).map(formatRuntimeItem).join(' · ') || '—'}</dd>
       <dt>正在等待</dt><dd>${waits.length ? esc(waits.join('\n')) : '—'}</dd>
       <dt>接下來</dt><dd>${esc(next)}</dd>
       <dt>你現在</dt><dd>${you}</dd>
@@ -893,7 +896,7 @@ function nowHtml(w, att) {
       ${ts.map((t) => {
         const blk = cardBlockedReason(t);
         const ws = formatWorkspace(w, t);
-        const crun = (S.runtimes || []).filter((r) => (w.run?.id && r.job_id === w.run.id) || r.card_id === t.id || (!r.card_id && (r.workspace || '').toLowerCase() === (t.workdir || w.project || '').toLowerCase()));
+        const crun = runtimesOf(w, t);
         const statusLabel = blk ? 'Blocked' : (STEP_WORD[t.status] || t.status);
         const details = [
           blk ? `🚫 ${blk}` : (PARKED.includes(t.status) ? waitLine(t) : t.status === 'WORKING' ? '正在做…' : t.status === 'WAITING' ? (blocked.includes(t) ? '等前一張卡完成' : t.writes !== false && ts.some((x) => x !== t && x.writes !== false && ['WORKING', 'WAITING_EXTERNAL', 'NEEDS_USER'].includes(x.status)) ? '另一張卡正在修改這個專案（同一時間只有一位能改檔案），輪到它才開始' : '等成員有空就開始') : t.result),

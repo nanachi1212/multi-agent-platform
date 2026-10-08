@@ -37,6 +37,7 @@ module.exports = async function () {
     'formatRuntimeItem',
     'cardBlockedReason',
     'workspaceLine',
+    'runtimesOf',
     'runtimeHtml',
     'blockedHtml',
     'waitLine',
