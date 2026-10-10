@@ -635,12 +635,13 @@ STATUS: DONE   (the goal of this task is fully reached; nothing more to do for i
 STATUS: WAITING_EXTERNAL: <what you wait for; include the PR URL if there is one>   (GitHub CI, a build, a deploy...)
 STATUS: WAITING_AGENT: <agent id>: <what you need from them>   (ids: ${Object.keys(AGENTS).join(', ')})
 STATUS: NEEDS_USER: <question to the user, in the user's language>   (only for a real decision: choose between options, a destructive action, a login)
-Never use NEEDS_USER for a technical problem (your tools are blocked, a program is missing, a command keeps failing): the user is not a programmer. Stop retrying, describe the problem in your summary and end with STATUS: DONE; the leader will retry the task another way.
+STATUS: BLOCKED: <the technical reason>   (your tools are blocked, a program is missing, a command keeps failing: the task could NOT be done)
+Never use NEEDS_USER for a technical problem: the user is not a programmer. Stop retrying and report STATUS: BLOCKED; the leader retries the task another way. Never report DONE for work that was not done.
 With NEEDS_USER and choices, add one more line: OPTIONS: <choice 1> | <choice 2>
 Never say DONE while you still wait for something. Do not wait or poll inside your turn: report the status and end the turn; Studio wakes you with the result.`;
 
 function parseStatus(reply) {
-  const m = [...reply.matchAll(/^\s*[*_`]*STATUS[*_`]*\s*[:：]\s*[*_`]*\s*(DONE|WAITING_EXTERNAL|WAITING_AGENT|NEEDS_USER)\b[*_`]*\s*[:：]?\s*(.*)$/gim)].at(-1);
+  const m = [...reply.matchAll(/^\s*[*_`]*STATUS[*_`]*\s*[:：]\s*[*_`]*\s*(DONE|WAITING_EXTERNAL|WAITING_AGENT|NEEDS_USER|BLOCKED)\b[*_`]*\s*[:：]?\s*(.*)$/gim)].at(-1);
   if (!m) return null;
   const options = (reply.match(/^\s*[*_`]*OPTIONS[*_`]*\s*[:：]\s*[*_`]*\s*(.+)$/im)?.[1] || '').split('|').map((x) => x.trim()).filter(Boolean).slice(0, 4);
   const text = reply.replace(m[0], '').replace(/^\s*[*_`]*OPTIONS[*_`]*\s*[:：].*$/im, '').trim();
@@ -1516,6 +1517,11 @@ function applyStatus(w, t, st, reply) {
   const who = agentName(t.agent);
   t.result = st.text || '(沒有文字回覆)';
   log(w, t.agent, 'worker', t.result);
+  if (st.kind === 'BLOCKED') { // not done: the card fails, cards that build on it do not start, the Leader decides the retry
+    Object.assign(t, { status: 'FAILED', detail: st.detail || 'technical problem' });
+    log(w, 'studio', 'system', `「${t.title}」技術上卡住，沒有完成；後面依賴它的卡先不開始，交給工頭換方法或換人重試。`, st.detail);
+    return wakeWaiters(w, t);
+  }
   if (st.kind === 'DONE') {
     t.status = 'DONE';
     t.doneAt = new Date().toISOString();
