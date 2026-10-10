@@ -179,6 +179,8 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
   assert.deepStrictEqual(pick('balanced'), ['sonnet', 'opus', 'gpt-6-luna', 'gpt-6.1-sol', 'xhigh']);
   assert.deepStrictEqual(pick('quality'), ['opus', 'fable', 'gpt-6.1-sol', 'gpt-6.1-sol', 'max']);
   assert.deepStrictEqual(pick('custom').slice(0, 2), ['haiku', 'haiku'], 'custom uses the seat settings');
+  // the Leader always runs on the hard tier (conv() passes hard || lead to tierCfg)
+  assert.ok(/tierCfg\(w, agent, hard \|\| lead\)/.test(src), 'Leader conversations use the hard tier');
   let workerTries = 0;
   ({ env, api } = makeEnv((agent, text) => {
     if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"tricky","agent":"codex","instructions":"x"}]}';
@@ -957,6 +959,24 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     const ip = env.prompts.find((p) => p.text.includes('Task: impl')).text;
     assert.ok(!ip.includes('subagent') && !ip.includes('custom agent'), 'a build card is not delegated');
     console.log('23 card roles (build / check / review), author never reviews itself, NO-GO blocks the merge: PASS');
+
+    // 24) token cap per card: a card over its budget is not given another step; the Leader retries; no cap = unchanged
+    let capTurns = 0;
+    ({ env, api } = makeEnv((agent, text) => {
+      if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"long","agent":"codex","instructions":"x"}]}';
+      if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+      capTurns++; return capTurns === 1 ? 'started\nSTATUS: WAITING_EXTERNAL: the nightly build' : 'ok\nSTATUS: DONE';
+    }));
+    w = newW(); w.tokenCap = 500; env.S.workspaces.push(w);
+    api.planPhase(w);
+    assert.ok(await waitFor(() => w.tasks[0]?.status === 'WAITING_EXTERNAL'));
+    w.tasks[0].usage = { in: 600, out: 10, cache: 0, turns: 1 }; // what the first step cost (charged by turn() in production)
+    assert.ok(api.overCap(w, w.tasks[0]) && !api.overCap({ tokenCap: 0 }, w.tasks[0]), 'cap check; 0 = no cap');
+    api.continueCard(w, w.tasks[0].id);
+    assert.ok(await waitFor(() => w.run.result === 'done'));
+    assert.deepStrictEqual([w.tasks[0].status, capTurns], ['FAILED', 1], 'over the cap: no second step, the card fails');
+    assert.ok(w.tasks[0].result.includes('token 上限') && env.notices.some((n) => n.title.includes('超過 token 上限')));
+    console.log('24 token cap per card: PASS');
   }
 
   await require('./test-workspace-lease.cjs')({ makeEnv, mkTmp, region });

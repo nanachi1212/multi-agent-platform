@@ -458,11 +458,13 @@ function modelName(a, value) {
   const def = a.models.find((m) => m.value === 'default');
   return def ? `預設（${def.description.split(' · ')[0]}）` : '預設';
 }
+// The Leader runs on the hard tier, workers on the normal one.
+const tierOf = (a, w) => w?.tiers?.[a.id]?.[a.id === w.leader ? 'hard' : 'normal'];
 function modelLabel(a, w) {
   if (!w) return '依專案設定';
-  return modelName(a, w.tiers?.[a.id]?.normal.model);
+  return modelName(a, tierOf(a, w)?.model);
 }
-const effortLabel = (a, w) => !w ? '依專案設定' : w.tiers?.[a.id]?.normal.effort || (a.efforts.length ? '預設' : '—');
+const effortLabel = (a, w) => !w ? '依專案設定' : tierOf(a, w)?.effort || (a.efforts.length ? '預設' : '—');
 
 function cfgHtml(a, w) {
   if (!w) return '<div class="cfg-note">模型／思考強度在各專案頁分開設定。</div>';
@@ -665,7 +667,7 @@ function boardHtml(tasks, agents, editable) {
         ${PARKED.includes(t.status) && !blk ? `<div class="res"><b>${esc(waitLine(t))}</b></div>` : ''}
         ${workState(t) ? `<div class="res"><b>${workState(t).ic} ${esc(workState(t).text)}</b></div>` : ''}
         ${editable && ASKABLE.includes(t.status) ? workButtons(t, curPath()) : ''}
-        ${t.usage ? `<div class="res" style="font-size:12px;opacity:0.85">🪙 ${esc(usageLine(t.usage))}</div>` : ''}
+        ${t.usage ? `<div class="res" style="font-size:12px;opacity:0.85">🪙 ${esc(usageLine(t.usage))}${w.tokenCap ? ' ／ 上限 ' + fmtTok(w.tokenCap) : ''}</div>` : ''}
         <div class="res" style="font-size:12px;opacity:0.85">📁 <b>Workspace</b> ${esc(ws.fullLine)}</div>
         <div class="res" style="font-size:12px;opacity:0.85">⚡ <b>Runtime</b> ${rts.length ? esc(rts.map(formatRuntimeItem).join(' · ')) : '—'}</div>
         ${t.blocked && editable ? blockedHtml(w, t) : ''}
@@ -894,6 +896,8 @@ function officeHtml(w) {
       <span class="hint" style="font-size:13px;margin-left:8px">備援：</span>
       <select data-fallback style="width:auto;padding:4px 8px;font-size:13px" title="成員額度用完或被限流時，它的卡自動改派給這位（例如本地模型）"><option value="">不自動換人</option>${S.agents.filter((a) => a.id !== w.leader).map((a) => `<option value="${a.id}" ${w.fallback === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">收尾者：</span>
       <select data-finisher style="width:auto;padding:4px 8px;font-size:13px" title="CI 跑完後，merge／同步 main／清分支改由這位接手，省下強模型的額度（等 CI 本身不花額度，Studio 自己查）"><option value="">原成員自己收尾</option>${S.agents.filter((a) => a.id !== w.leader && w.workers.includes(a.id)).map((a) => `<option value="${a.id}" ${w.finisher === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">驗證用後端 port：</span>
+      <span class="hint" style="font-size:13px;margin-left:8px">每張卡 token 上限：</span>
+      <input data-token-cap type="number" min="0" step="10000" value="${w.tokenCap ?? ''}" placeholder="0 = 不限" style="width:92px;padding:4px 8px;font-size:13px" title="一張卡用超過這個數就停下來交給工頭（在每一步之間檢查，正在跑的那一步不會中斷；AI 沒回報用量就無法計算）。0 = 不限">
       <input data-backend-port type="number" min="1" max="65535" value="${w.backendPort || ''}" placeholder="無" style="width:72px;padding:4px 8px;font-size:13px" title="專案有自己的後端服務時填它的 port（例如 3018）：成員會請 Studio 代管啟動，卡片在等它時 Studio 會自動檢查 health 並安全恢復；留空＝不用">${w.afterDone === 'auto' ? `<span class="tag pz">🔁 自動中 ${w.autoRounds || 0}/5</span>` : ''}</div>
     ${leaseHtml(w)}
     ${workspaceLine(w)}
@@ -1291,6 +1295,8 @@ document.addEventListener('change', (e) => {
     if (id && confirm('把寫入權交給 ' + name(id) + '？\n\n' + (wr ? name(wr.agent) || wr.owner : '現在的寫入者') + ' 會先停下（等它真的停住），這張卡的紀錄和對話都保留，但它不再是這個工作區的寫入者；' + name(id) + ' 從目前的資料夾和 branch 接續。')) return post('/api/handoff', { ws: ws(), agent: id }).catch(() => {});
     return;
   }
+  const tc = e.target.closest('input[data-token-cap]');
+  if (tc) return post('/api/token-cap', { ws: ws(), cap: tc.value }).catch(() => {});
   const bp = e.target.closest('input[data-backend-port]');
   if (bp) return post('/api/backend-port', { ws: ws(), port: bp.value }).catch(() => {});
   const fb = e.target.closest('select[data-fallback]');

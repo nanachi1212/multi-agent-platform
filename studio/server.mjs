@@ -45,6 +45,7 @@ const AFTER_DONE = ['stop', 'suggest', 'auto'];
 const STRATEGY_IDS = ['save', 'balanced', 'quality', 'custom']; // model strategies (see STRATEGIES)
 const DELIVERY_IDS = ['auto', 'pr']; // delivery: auto = all the way to merge (default), pr = stop at the pull request
 const AUTO_MAX = 5; // auto-started jobs in a row before Studio stops and waits for the user
+const TOKEN_CAP_DEFAULT = 300000; // tokens one card may spend before Studio stops it (0 = no cap); checked between steps, not inside one
 // S.leader is the default Leader for newly opened projects.
 const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [], leases: [], external: [],
   limits: {}, notify: true, notices: [], noticeSeq: 0, runtimes: [] };
@@ -53,7 +54,7 @@ const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}
 // agentCfg = this project's model / effort per agent; workers = agents allowed to work here.
 // New projects start from S.agentCfg (the last choices).
 const newWs = (project, leader = S.leader, name = '', agentCfg = S.agentCfg, workers = Object.keys(AGENTS)) => ({
-  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, strategy: 'save', delivery: 'auto', finisher: '', fallback: '', backendPort: 0,
+  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, strategy: 'save', delivery: 'auto', finisher: '', fallback: '', backendPort: 0, tokenCap: TOKEN_CAP_DEFAULT,
   agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...agentCfg?.[id] }])),
   workers: workers.filter((id) => AGENTS[id]),
 });
@@ -85,7 +86,7 @@ try {
   // Older settings had one `project` and global models; it becomes the first open workspace with those models.
   S.workspaces = (saved.workspaces || (saved.project ? [{ project: saved.project }] : []))
     .filter((x) => isDir(x.project))
-    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto', finisher: AGENTS[x.finisher] ? x.finisher : '', fallback: AGENTS[x.fallback] ? x.fallback : '', backendPort: Number(x.backendPort) || 0 }));
+    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto', finisher: AGENTS[x.finisher] ? x.finisher : '', fallback: AGENTS[x.fallback] ? x.fallback : '', backendPort: Number(x.backendPort) || 0, tokenCap: x.tokenCap == null ? TOKEN_CAP_DEFAULT : Number(x.tokenCap) || 0 }));
   S.recent = (saved.recent || []).filter(isDir);
   if (saved.notify === false) S.notify = false;
 } catch (e) {
@@ -97,7 +98,7 @@ try {
 
 function saveSettings() {
   fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
-  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort }));
+  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tokenCap: w.tokenCap }));
   fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external }, null, 2));
 }
 
@@ -491,7 +492,8 @@ const checkAll = () => Promise.all(Object.keys(AGENTS).map(checkAgent));
 const available = (id) => S.agents[id]?.status === 'available';
 
 // One conversation per agent and role; hard cards get their own conversation on the hard model.
-// The Leader always uses the normal tier (it should be cheap: it only plans and checks).
+// The Leader always uses the HARD tier: it plans, judges and signs off, which is where a wrong answer costs the most;
+// it makes few turns, so the strong model's quota goes to judgement, not to chores.
 // A read-only card (ro) gets a conversation in the agent's non-writing mode, like the Leader: the prompt alone is not a fence.
 // Not for Antigravity: its non-writing mode makes AionCore install a per-tool permission hook that runs aioncore.exe,
 // which fails on a non-ASCII install path and blocks every tool (even reading). Its read-only cards keep the prompt fence.
@@ -500,7 +502,7 @@ const dirTag = (d) => (d ? '@' + crypto.createHash('sha1').update(String(d)).dig
 const workKey = (t) => t.agent + ':work' + (t.hard ? ':hard' : '') + (isWriter(t) ? '' : ':ro') + dirTag(t.workdir);
 async function conv(w, agent, lead, hard = false, workdir = '', ro = false) {
   const key = agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : '') + (ro ? ':ro' : '') + dirTag(workdir);
-  return (w.run.convs[key] ??= await createConv(agent, workdir || w.run.project, lead || (ro && RO_MODE(agent)), tierCfg(w, agent, hard)));
+  return (w.run.convs[key] ??= await createConv(agent, workdir || w.run.project, lead || (ro && RO_MODE(agent)), tierCfg(w, agent, hard || lead)));
 }
 // This run's conversations that have a turn in progress (other projects keep working).
 const busyConvs = (run) => Object.values(run.convs).filter((c) => active.has(c));
@@ -753,6 +755,16 @@ function setFinisher(w, agent) {
 
 // The project's own backend port ('' / 0 = none): only then do workers hear about Studio-managed runtimes and does a
 // card waiting on that backend get the automatic health check / recovery.
+// 每張卡 token 上限: a card over it is not started again (its next step is refused); the Leader decides the retry.
+function setTokenCap(w, cap) {
+  cap = Number(cap) || 0;
+  if (cap < 0 || !Number.isInteger(cap)) throw new Error('token 上限必須是 0（不限）或正整數');
+  w.tokenCap = cap;
+  saveSettings();
+}
+const cardTokens = (t) => (t.usage?.in || 0) + (t.usage?.out || 0);
+const overCap = (w, t) => !!w.tokenCap && cardTokens(t) >= w.tokenCap;
+
 function setBackendPort(w, port) {
   port = Number(port) || 0;
   if (port && !(Number.isInteger(port) && port > 0 && port < 65536)) throw new Error('port 必須是 1–65535 的整數');
@@ -1464,6 +1476,7 @@ ${STATUS_RULES}`;
     const cid = await conv(w, t.agent, false, t.hard, t.workdir, !isWriter(t));
     // A step stopped by 立刻打斷 ends early (maybe with an error): park the card until the Leader has read the note.
     const step = async (text) => {
+      if (overCap(w, t)) throw Object.assign(new Error(`這張卡已用 ${cardTokens(t)} tokens，超過上限 ${w.tokenCap}`), { cap: true });
       cardStep.add(cid);
       try {
         if (askBusy.has(cid)) { // a progress question is being answered: Stop / Pause / 打斷 / handoff meanwhile cancelled that turn, not this step
@@ -1507,6 +1520,12 @@ ${STATUS_RULES}`;
     }
     if (e instanceof Halt && run.paused) { if (t.agent === startAgent) Object.assign(t, { status: 'PAUSED', result: '已暫停', resumed: true, wakeNote: note }); return; } // handed off meanwhile: the card is the new agent's now
     if (e instanceof Halt && run.stopped) { t.status = 'FAILED'; t.result = '已停止'; return; }
+    if (e.cap) { // the card's own budget is gone: stop it here, the Leader decides whether and how to retry
+      Object.assign(t, { status: 'FAILED', result: `沒有完成：超過這張卡的 token 上限（${e.message}）。Studio 停止這張卡，交給工頭決定要不要換方法重試。`, detail: e.message });
+      log(w, t.agent, 'worker', t.result + '：' + t.title, e.message);
+      notify(`${label(w)}：「${t.title}」超過 token 上限`, `${agentName(t.agent)} 已用 ${cardTokens(t)} tokens，Studio 停止這張卡`, 'ask', w.project);
+      return wakeWaiters(w, t);
+    }
     if (e.stuck && !t.convReset) { // the worker's conversation will not stop: start a fresh one (the card brief carries the task)
       delete run.convs[workKey(t)];
       Object.assign(t, { convReset: true, briefed: '', status: 'WAITING', resumed: true, detail: e.message });
@@ -2505,7 +2524,7 @@ const routes = {
         const blocked_reason = why ? 'Blocked：' + String(why).trim().replace(/^Blocked\s*[:：]?\s*/i, '') : null;
         return { ...t, blocked_reason, ...(t.status === 'WORKING' ? { activity: convActivity.get(convOf(w, t)) || null } : {}) };
       });
-      return { wsInfo: w.wsInfo, lease, workspace_summary, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
+      return { wsInfo: w.wsInfo, lease, workspace_summary, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tokenCap: w.tokenCap, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
         run: r && { usage: r.usage || null, extMod: r.extMod, claimedBy: r.claimedBy, id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
     });
     return { ...S, runtimes: S.runtimes, ...teamStats(), agents: Object.values(S.agents), workspaces };
@@ -2549,6 +2568,7 @@ const routes = {
   'POST /api/finisher': (b) => setFinisher(wsOf(b.ws), b.agent),
   'POST /api/fallback': (b) => setFallback(wsOf(b.ws), b.agent),
   'POST /api/backend-port': (b) => setBackendPort(wsOf(b.ws), b.port),
+  'POST /api/token-cap': (b) => setTokenCap(wsOf(b.ws), b.cap),
   'POST /api/external/save': (b) => saveExternal(b),
   'POST /api/external/delete': (b) => deleteExternal(b.id),
   'POST /api/external/models': (b) => extModels(b),
