@@ -911,6 +911,23 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     const dp = env.prompts.filter((p) => p.agent === 'codex').at(-1).text;
     assert.ok(w.tasks[0].agent === 'codex' && dp.includes('Task: read') && dp.includes('勾點阻斷工具') && dp.includes('not a programmer'), 'full brief + the question + solve it yourself');
     console.log('21 hand a question to another agent (交給 X 處理): PASS');
+
+    // 22) BLOCKED (technical): the card fails, the card after it does not start, the Leader adds a retry
+    let checks22 = 0;
+    ({ env, api } = makeEnv((agent, text) => {
+      if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"test","agent":"antigravity","instructions":"run tests"},{"title":"merge","agent":"codex","instructions":"merge","after":[0]}]}';
+      if (text.includes('Every current card has ended')) { checks22++; return checks22 === 1 ? '{"done":false,"message":"retry","subtasks":[{"title":"test again","agent":"codex","instructions":"run tests"}]}' : '{"done":true,"report":"ok"}'; }
+      if (text.includes('Task: test\n')) return 'pytest is missing\nSTATUS: BLOCKED: pytest not installed';
+      return 'ok\nSTATUS: DONE';
+    }));
+    w = newW(); w.workers = ['antigravity', 'codex']; env.S.workspaces.push(w);
+    api.planPhase(w);
+    assert.ok(await waitFor(() => w.run.result === 'done'));
+    assert.deepStrictEqual(w.tasks.map((t) => [t.title, t.status]), [['test', 'FAILED'], ['merge', 'FAILED'], ['test again', 'DONE']], 'BLOCKED is not DONE: merge never ran');
+    assert.ok(!env.prompts.some((p) => p.text.includes('Task: merge')), 'the merge card was never started');
+    assert.strictEqual(w.tasks[0].detail, 'pytest not installed');
+    assert.strictEqual(api.parseStatus('x\nSTATUS: BLOCKED: no git').kind, 'BLOCKED');
+    console.log('22 BLOCKED fails the card and keeps dependents from starting: PASS');
   }
 
   await require('./test-workspace-lease.cjs')({ makeEnv, mkTmp, region });
