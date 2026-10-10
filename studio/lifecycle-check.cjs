@@ -954,6 +954,8 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     const gp = env.prompts.find((p) => p.text.includes('Task: gate')).text;
     assert.ok(gp.includes('ROLE: REVIEW') && gp.includes('"reviewer" subagent') && gp.includes('ACCESS: READ-ONLY'), 'hard review on Claude: reviewer subagent, read-only');
     assert.ok(env.prompts.find((p) => p.text.includes('Task: impl')).text.includes('ROLE: BUILD'));
+    const ip = env.prompts.find((p) => p.text.includes('Task: impl')).text;
+    assert.ok(!ip.includes('subagent') && !ip.includes('custom agent'), 'a build card is not delegated');
     console.log('23 card roles (build / check / review), author never reviews itself, NO-GO blocks the merge: PASS');
   }
 
