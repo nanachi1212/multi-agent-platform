@@ -2538,6 +2538,7 @@ const server = http.createServer(async (req, res) => {
   // Local-only: reject other hosts (DNS rebinding) and non-JSON POSTs (cross-site form posts).
   if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(req.headers.host || '')) return send(403, { error: 'forbidden' });
   if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) return send(200, fs.readFileSync(path.join(import.meta.dirname, 'index.html')), 'text/html; charset=utf-8');
+  if (req.method === 'GET' && req.url === '/favicon.ico') return send(200, fs.readFileSync(path.join(import.meta.dirname, 'assets', 'morandi', 'app-icon.ico')), 'image/x-icon');
   const hist = req.method === 'GET' && req.url.match(/^\/api\/history\/([\w-]+)$/);
   const fn = hist ? () => readHistory(hist[1]) : routes[`${req.method} ${req.url}`];
   if (!fn) return send(404, { error: 'not found' });
