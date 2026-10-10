@@ -179,6 +179,8 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
   assert.deepStrictEqual(pick('balanced'), ['sonnet', 'opus', 'gpt-6-luna', 'gpt-6.1-sol', 'xhigh']);
   assert.deepStrictEqual(pick('quality'), ['opus', 'fable', 'gpt-6.1-sol', 'gpt-6.1-sol', 'max']);
   assert.deepStrictEqual(pick('custom').slice(0, 2), ['haiku', 'haiku'], 'custom uses the seat settings');
+  // the Leader always runs on the hard tier (conv() passes hard || lead to tierCfg)
+  assert.ok(/tierCfg\(w, agent, hard \|\| lead\)/.test(src), 'Leader conversations use the hard tier');
   let workerTries = 0;
   ({ env, api } = makeEnv((agent, text) => {
     if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"tricky","agent":"codex","instructions":"x"}]}';
@@ -957,6 +959,72 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     const ip = env.prompts.find((p) => p.text.includes('Task: impl')).text;
     assert.ok(!ip.includes('subagent') && !ip.includes('custom agent'), 'a build card is not delegated');
     console.log('23 card roles (build / check / review), author never reviews itself, NO-GO blocks the merge: PASS');
+
+    // 24) token cap per card: a card over its budget is not given another step; the Leader retries; no cap = unchanged
+    let capTurns = 0;
+    ({ env, api } = makeEnv((agent, text) => {
+      if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"long","agent":"codex","instructions":"x"}]}';
+      if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+      capTurns++; return capTurns === 1 ? 'started\nSTATUS: WAITING_EXTERNAL: the nightly build' : 'ok\nSTATUS: DONE';
+    }));
+    w = newW(); w.tokenCap = 500; env.S.workspaces.push(w);
+    api.planPhase(w);
+    assert.ok(await waitFor(() => w.tasks[0]?.status === 'WAITING_EXTERNAL'));
+    w.tasks[0].usage = { in: 600, out: 10, cache: 0, turns: 1 }; // what the first step cost (charged by turn() in production)
+    assert.ok(api.overCap(w, w.tasks[0]) && !api.overCap({ tokenCap: 0 }, w.tasks[0]), 'cap check; 0 = no cap');
+    api.continueCard(w, w.tasks[0].id);
+    assert.ok(await waitFor(() => w.run.result === 'done'));
+    assert.deepStrictEqual([w.tasks[0].status, capTurns], ['FAILED', 1], 'over the cap: no second step, the card fails');
+    assert.ok(w.tasks[0].result.includes('token 上限') && env.notices.some((n) => n.title.includes('超過 token 上限')));
+    // the cap is enforced after a step too: a one-step card that blows it is not parked; a DONE card keeps its work but is flagged
+    ({ env, api } = makeEnv((agent, text) => {
+      if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"big","agent":"codex","instructions":"x"},{"title":"big2","agent":"antigravity","instructions":"y"}]}';
+      if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+      const t = w.tasks.find((c) => c.agent === agent); t.usage = { in: 900, out: 0, cache: 0, turns: 1 }; // what turn() would have charged
+      return agent === 'codex' ? 'parked\nSTATUS: WAITING_EXTERNAL: nightly' : 'built\nSTATUS: DONE';
+    }));
+    w = newW(); w.tokenCap = 500; env.S.workspaces.push(w);
+    api.planPhase(w);
+    assert.ok(await waitFor(() => w.run.result === 'done'));
+    assert.deepStrictEqual(w.tasks.map((t) => [t.status, !!t.overCap]), [['FAILED', false], ['DONE', true]], 'over the cap after the step: not parked / finished but flagged');
+    assert.ok(env.notices.filter((n) => n.title.includes('超過 token 上限')).length === 2);
+    // a job saved by an older Studio keeps its Leader conversation on the cheap tier: it is dropped on load, newer ones are kept
+    { const w2 = newW(); api.loadRun(w2, { status: 'paused', tasks: [], activity: [], convs: { 'claude:lead': 'old', 'codex:work': 'wk' } }); assert.deepStrictEqual(Object.keys(w2.run.convs), ['codex:work']); }
+    { const w3 = newW(); api.loadRun(w3, { status: 'paused', leadTier: 'hard', tasks: [], activity: [], convs: { 'claude:lead': 'new' } }); assert.deepStrictEqual(Object.keys(w3.run.convs), ['claude:lead']); }
+    console.log('24 token cap per card (before and after a step), legacy Leader conversations dropped: PASS');
+
+    // 25) verdicts: only PASS / GO pass; UNKNOWN or no verdict blocks; a missing verdict is asked once; authors are transitive
+    const t25 = api.parseSubtasks([
+      { title: 'build', agent: 'codex', instructions: 'x', role: 'Build' },
+      { title: 'check', agent: 'claude', instructions: 'y', role: 'CHECK', after: [0] },
+      { title: 'review', agent: 'codex', instructions: 'z', role: 'review', after: [1] }], ['codex', 'claude', 'antigravity']);
+    assert.deepStrictEqual(t25.map((s) => [s.role, s.agent]), [['build', 'codex'], ['check', 'claude'], ['review', 'claude']], 'roles are case-insensitive; the author two steps back still cannot review (first non-author takes it)');
+    assert.ok(t25.every((s) => /Acceptance:/.test(s.instructions)), 'a missing acceptance line gets the generic one');
+    assert.deepStrictEqual([api.verdictOf({ role: 'check' }, '**UNKNOWN** no tests'), api.verdictOf({ role: 'review' }, 'GO WITH CHANGES\n- x'), api.verdictOf({ role: 'review' }, 'looks fine'), api.verdictOf({ role: 'build' }, 'PASS')], ['UNKNOWN', 'GO WITH CHANGES', '', '']);
+    let asks25 = 0;
+    ({ env, api } = makeEnv((agent, text) => {
+      if (text.includes('LEADER (foreman)')) return JSON.stringify({ message: 'ok', subtasks: [
+        { title: 'impl', agent: 'codex', instructions: 'build', role: 'build' },
+        { title: 'verify', agent: 'antigravity', instructions: 'check', role: 'check', after: [0] },
+        { title: 'ship', agent: 'codex', instructions: 'merge', after: [1] },
+        { title: 'lint', agent: 'claude', instructions: 'check lint', role: 'check' }] });
+      if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+      if (text.includes('Task: verify')) return 'UNKNOWN\ncould not run the tests\nSTATUS: DONE';
+      if (text.includes('Task: lint')) return 'all clean, no warnings\nSTATUS: DONE'; // no verdict line
+      if (text.startsWith('Your summary did not start with your verdict')) { asks25++; return 'PASS'; }
+      return 'ok\nSTATUS: DONE';
+    }));
+    w = newW(); w.workers = ['codex', 'antigravity', 'claude']; w.leader = 'claude'; w.run.leader = 'claude'; w.workers = ['codex', 'antigravity']; env.S.workspaces.push(w);
+    api.planPhase(w);
+    assert.ok(await waitFor(() => w.run.result === 'done'));
+    assert.deepStrictEqual(w.tasks.map((t) => [t.title, t.status]), [['impl', 'DONE'], ['verify', 'FAILED'], ['ship', 'FAILED'], ['lint', 'DONE']], 'UNKNOWN blocks the merge; a verdict asked once then PASS');
+    assert.ok(asks25 === 1 && w.tasks[3].result.startsWith('PASS'), 'the missing verdict was asked for once and prepended');
+    assert.ok(!env.prompts.some((p) => p.text.includes('Task: verify') && p.text.includes('Delivery policy')), 'read-only roles get no delivery chain');
+    // a review may not be handed to an author later either
+    w.tasks.push({ id: 'rv', title: 'rv', role: 'review', writes: false, agent: 'antigravity', after: ['' + w.tasks[1].id], status: 'WAITING', result: '' });
+    assert.deepStrictEqual([...api.reviewAuthors(w, w.tasks[4])], ['codex'], 'authors are found through the check card');
+    await assert.rejects(api.reassign(w, 'rv', 'codex'), /審查不能交給它/);
+    console.log('25 verdicts (PASS/GO only), verdict asked once, transitive authors, no delivery chain for readers: PASS');
   }
 
   await require('./test-workspace-lease.cjs')({ makeEnv, mkTmp, region });

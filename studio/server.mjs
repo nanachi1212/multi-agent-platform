@@ -45,6 +45,7 @@ const AFTER_DONE = ['stop', 'suggest', 'auto'];
 const STRATEGY_IDS = ['save', 'balanced', 'quality', 'custom']; // model strategies (see STRATEGIES)
 const DELIVERY_IDS = ['auto', 'pr']; // delivery: auto = all the way to merge (default), pr = stop at the pull request
 const AUTO_MAX = 5; // auto-started jobs in a row before Studio stops and waits for the user
+const TOKEN_CAP_DEFAULT = 300000; // tokens one card may spend before Studio stops it (0 = no cap); checked between steps, not inside one
 // S.leader is the default Leader for newly opened projects.
 const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [], leases: [], external: [],
   limits: {}, notify: true, notices: [], noticeSeq: 0, runtimes: [] };
@@ -53,7 +54,7 @@ const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}
 // agentCfg = this project's model / effort per agent; workers = agents allowed to work here.
 // New projects start from S.agentCfg (the last choices).
 const newWs = (project, leader = S.leader, name = '', agentCfg = S.agentCfg, workers = Object.keys(AGENTS)) => ({
-  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, strategy: 'save', delivery: 'auto', finisher: '', fallback: '', backendPort: 0,
+  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, strategy: 'save', delivery: 'auto', finisher: '', fallback: '', backendPort: 0, tokenCap: TOKEN_CAP_DEFAULT,
   agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...agentCfg?.[id] }])),
   workers: workers.filter((id) => AGENTS[id]),
 });
@@ -85,7 +86,7 @@ try {
   // Older settings had one `project` and global models; it becomes the first open workspace with those models.
   S.workspaces = (saved.workspaces || (saved.project ? [{ project: saved.project }] : []))
     .filter((x) => isDir(x.project))
-    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto', finisher: AGENTS[x.finisher] ? x.finisher : '', fallback: AGENTS[x.fallback] ? x.fallback : '', backendPort: Number(x.backendPort) || 0 }));
+    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto', finisher: AGENTS[x.finisher] ? x.finisher : '', fallback: AGENTS[x.fallback] ? x.fallback : '', backendPort: Number(x.backendPort) || 0, tokenCap: x.tokenCap == null ? TOKEN_CAP_DEFAULT : Number(x.tokenCap) || 0 }));
   S.recent = (saved.recent || []).filter(isDir);
   if (saved.notify === false) S.notify = false;
 } catch (e) {
@@ -97,7 +98,7 @@ try {
 
 function saveSettings() {
   fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
-  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort }));
+  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tokenCap: w.tokenCap }));
   fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external }, null, 2));
 }
 
@@ -106,7 +107,7 @@ function saveRun(w, status) {
   if (!run) return;
   fs.mkdirSync(HISTORY, { recursive: true });
   // phase + convs let a paused run continue in the same agent conversations after a Studio restart.
-  const rec = { usage: run.usage, treeStamps: run.treeStamps, treeStamp: run.treeStamp, leftAt: run.leftAt, extMod: run.extMod, claimedBy: run.claimedBy, id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, notes: run.notes, suggestions: run.suggestions, convs: run.convs, tasks: w.tasks, activity: w.activity };
+  const rec = { leadTier: run.leadTier, usage: run.usage, treeStamps: run.treeStamps, treeStamp: run.treeStamp, leftAt: run.leftAt, extMod: run.extMod, claimedBy: run.claimedBy, id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, notes: run.notes, suggestions: run.suggestions, convs: run.convs, tasks: w.tasks, activity: w.activity };
   fs.writeFileSync(path.join(HISTORY, run.id + '.json'), JSON.stringify(rec, null, 2));
   S.historyRev++;
 }
@@ -491,7 +492,8 @@ const checkAll = () => Promise.all(Object.keys(AGENTS).map(checkAgent));
 const available = (id) => S.agents[id]?.status === 'available';
 
 // One conversation per agent and role; hard cards get their own conversation on the hard model.
-// The Leader always uses the normal tier (it should be cheap: it only plans and checks).
+// The Leader always uses the HARD tier: it plans, judges and signs off, which is where a wrong answer costs the most;
+// it makes few turns, so the strong model's quota goes to judgement, not to chores.
 // A read-only card (ro) gets a conversation in the agent's non-writing mode, like the Leader: the prompt alone is not a fence.
 // Not for Antigravity: its non-writing mode makes AionCore install a per-tool permission hook that runs aioncore.exe,
 // which fails on a non-ASCII install path and blocks every tool (even reading). Its read-only cards keep the prompt fence.
@@ -500,7 +502,7 @@ const dirTag = (d) => (d ? '@' + crypto.createHash('sha1').update(String(d)).dig
 const workKey = (t) => t.agent + ':work' + (t.hard ? ':hard' : '') + (isWriter(t) ? '' : ':ro') + dirTag(t.workdir);
 async function conv(w, agent, lead, hard = false, workdir = '', ro = false) {
   const key = agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : '') + (ro ? ':ro' : '') + dirTag(workdir);
-  return (w.run.convs[key] ??= await createConv(agent, workdir || w.run.project, lead || (ro && RO_MODE(agent)), tierCfg(w, agent, hard)));
+  return (w.run.convs[key] ??= await createConv(agent, workdir || w.run.project, lead || (ro && RO_MODE(agent)), tierCfg(w, agent, hard || lead)));
 }
 // This run's conversations that have a turn in progress (other projects keep working).
 const busyConvs = (run) => Object.values(run.convs).filter((c) => active.has(c));
@@ -610,16 +612,19 @@ Reply with ONLY one JSON object, no markdown fences, in exactly this shape:
 const parseJson = (reply) => JSON.parse(reply.slice(reply.indexOf('{'), reply.lastIndexOf('}') + 1));
 
 const CARD_ROLES = ['build', 'check', 'review'];
+// A card the Leader sent without an acceptance line gets the generic one for its role, so the worker still owes proof.
+const withAcceptance = (role, ins) => /acceptance\s*[:：]/i.test(ins) ? ins : ins + '\nAcceptance: ' + (role === 'check' ? 'report PASS, FAIL or UNKNOWN with the evidence.' : role === 'review' ? 'report GO, GO WITH CHANGES or NO-GO with the findings.' : 'state what you changed and the command you ran to verify it, with its result.');
 function parseSubtasks(list, workers) {
   return (list || []).filter((x) => x && (x.instructions || x.title)).slice(0, 6).map((x, i) => {
     const a = String(x.agent || '').toLowerCase();
     const after = (Array.isArray(x.after) ? x.after : []).map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n < i);
-    const role = CARD_ROLES.includes(x.role) ? x.role : 'build';
-    return { role, hard: x.hard === true, writes: role === 'build' && x.writes !== false, title: String(x.title || x.instructions).slice(0, 120), instructions: String(x.instructions || x.title), agent: workers.find((w) => a.includes(w)) || workers[0], after };
-  }).map((st, i, all) => { // the one who wrote it does not review it
+    const r = String(x.role || '').trim().toLowerCase(), role = CARD_ROLES.includes(r) ? r : 'build';
+    return { role, hard: x.hard === true, writes: role === 'build' && x.writes !== false, title: String(x.title || x.instructions).slice(0, 120), instructions: withAcceptance(role, String(x.instructions || x.title)), agent: workers.find((w) => a.includes(w)) || workers[0], after };
+  }).map((st, i, all) => { // nobody reviews their own work: authors are every build card upstream, not only the one right before
     if (st.role !== 'review') return st;
-    const authors = st.after.map((n) => all[n]).filter((d) => d.role === 'build').map((d) => d.agent);
-    if (authors.includes(st.agent)) st.agent = workers.find((x) => !authors.includes(x)) || st.agent;
+    const authors = new Set(), seen = new Set(), walk = (n) => { if (seen.has(n)) return; seen.add(n); if (all[n].role === 'build') authors.add(all[n].agent); all[n].after.forEach(walk); };
+    st.after.forEach(walk);
+    if (authors.has(st.agent)) st.agent = workers.find((x) => !authors.has(x)) || st.agent;
     return st;
   });
 }
@@ -753,6 +758,16 @@ function setFinisher(w, agent) {
 
 // The project's own backend port ('' / 0 = none): only then do workers hear about Studio-managed runtimes and does a
 // card waiting on that backend get the automatic health check / recovery.
+// 每張卡 token 上限: a card over it is not started again (its next step is refused); the Leader decides the retry.
+function setTokenCap(w, cap) {
+  cap = Number(cap) || 0;
+  if (cap < 0 || !Number.isInteger(cap)) throw new Error('token 上限必須是 0（不限）或正整數');
+  w.tokenCap = cap;
+  saveSettings();
+}
+const cardTokens = (t) => (t.usage?.in || 0) + (t.usage?.out || 0);
+const overCap = (w, t) => !!w.tokenCap && cardTokens(t) >= w.tokenCap;
+
 function setBackendPort(w, port) {
   port = Number(port) || 0;
   if (port && !(Number.isInteger(port) && port > 0 && port < 65536)) throw new Error('port 必須是 1–65535 的整數');
@@ -896,7 +911,7 @@ async function start(w, request, cont = false, inherit = false) {
   const now = new Date();
   const id = now.toISOString().slice(0, 19).replace(/[-:T]/g, '') + '-' + crypto.randomUUID().slice(0, 4);
   // Auto-continue inherits the fingerprint of the tree the last job left, so changes made in between are noticed.
-  w.run = { treeStamp: inherit ? prev?.run?.treeStamp : undefined, leftAt: inherit ? prev?.run?.leftAt : undefined, id, startedAt: now.toISOString(), project: w.project, leader: lead, request, convs: {}, phase: 'planning', leaderGen: 0, rounds: 0, ask: null, continues, context, goal: continues ? prev.run.goal || prev.run.request : request, refs: continues ? knownRefs(prev) : [], active: true, paused: false, stopped: false, summarizing: false };
+  w.run = { leadTier: 'hard', treeStamp: inherit ? prev?.run?.treeStamp : undefined, leftAt: inherit ? prev?.run?.leftAt : undefined, id, startedAt: now.toISOString(), project: w.project, leader: lead, request, convs: {}, phase: 'planning', leaderGen: 0, rounds: 0, ask: null, continues, context, goal: continues ? prev.run.goal || prev.run.request : request, refs: continues ? knownRefs(prev) : [], active: true, paused: false, stopped: false, summarizing: false };
   log(w, 'user', 'user', request);
   if (continues) log(w, 'studio', 'system', '接續上次的工作：工頭會拿到目前的進度摘要，不用重講。', context);
   log(w, 'studio', 'system', `Leader：${agentName(lead)}；Workers：${workersFor(w, lead).map((x) => agentName(x)).join('、')}`);
@@ -977,6 +992,23 @@ const nowIso = () => new Date().toISOString();
 // What a card's role asks of the worker. Claude Code and Codex may hand checks / irreversible reviews to their own subagents:
 // Claude ~/.claude/agents/checker.md (Haiku) / reviewer.md (Fable); Studio's Codex runtime/studio/codex-home/agents/
 // checker.toml / reviewer.toml. If a subagent is missing the worker does the work itself.
+const VERDICT_RE = { check: /^(PASS|FAIL|UNKNOWN)\b/i, review: /^(GO WITH CHANGES|GO|NO-GO)\b/i };
+// The verdict a check / review card opened its summary with, or '' when it gave none.
+function verdictOf(t, text) {
+  const re = VERDICT_RE[t.role];
+  if (!re) return '';
+  const line = (String(text || '').split('\n').find((l) => l.trim()) || '').replace(/^[^A-Za-z]+/, '');
+  return (line.match(re)?.[1] || '').toUpperCase();
+}
+const verdictOk = (t, v) => t.role === 'check' ? v === 'PASS' : t.role === 'review' ? v === 'GO' || v === 'GO WITH CHANGES' : true;
+// Everyone who wrote what a review card reviews: every build card upstream of it, including agents it was handed off from.
+function reviewAuthors(w, t) {
+  const authors = new Set(), seen = new Set();
+  const walk = (id) => { if (seen.has(id)) return; seen.add(id); const d = w.tasks.find((x) => x.id === id); if (!d) return; if (d.role === 'build') { authors.add(d.agent); for (const h of d.handoffs || []) authors.add(h.from); } (d.after || []).forEach(walk); };
+  if (t.role === 'review') (t.after || []).forEach(walk);
+  return authors;
+}
+
 function roleRules(t) {
   const sub = (name) => t.agent === 'claude' ? ` Delegate this to your "${name}" subagent (Agent tool, subagent_type "${name}") and report its result; if that subagent is not available, do it yourself.`
     : t.agent === 'codex' ? ` Delegate this to your custom agent "${name}" (spawn it by that name) and report its result; if that agent is not available, do it yourself.` : '';
@@ -1457,13 +1489,15 @@ ${t.instructions}
 ${deps.length ? `\nResults of the earlier cards this task builds on:\n${deps.map((d) => `- ${d.title} (${agentName(d.agent)}): ${d.result}`).join('\n')}\n` : ''}
 ${roleRules(t)}
 ${accessRules(t)}
-${deliveryRules(w.delivery, 'worker')}
+${isWriter(t) ? deliveryRules(w.delivery, 'worker') : ''}
 When you end your turn, reply with a short summary of what you did (1-3 sentences).
 ${STATUS_RULES}`;
     if (!(note && knowsTask)) t.briefed = workKey(t);
     const cid = await conv(w, t.agent, false, t.hard, t.workdir, !isWriter(t));
     // A step stopped by 立刻打斷 ends early (maybe with an error): park the card until the Leader has read the note.
+    const capErr = () => Object.assign(new Error(`這張卡已用 ${cardTokens(t)} tokens，超過上限 ${w.tokenCap}`), { cap: true });
     const step = async (text) => {
+      if (overCap(w, t)) throw capErr(); // no further step for a card over its budget
       cardStep.add(cid);
       try {
         if (askBusy.has(cid)) { // a progress question is being answered: Stop / Pause / 打斷 / handoff meanwhile cancelled that turn, not this step
@@ -1490,6 +1524,12 @@ ${STATUS_RULES}`;
       if (st) st.text = reply.trim();
     }
     st ||= { kind: 'DONE', detail: '', options: [], text: reply.trim() + '\n（沒有回報狀態，先當作完成，由工頭確認整體結果）' };
+    if (VERDICT_RE[t.role] && st.kind === 'DONE' && !verdictOf(t, st.text)) { // a check / review must open with its verdict: ask once instead of guessing
+      const v = await step(`Your summary did not start with your verdict. Reply with ONLY one line: ${t.role === 'check' ? 'PASS, FAIL or UNKNOWN' : 'GO, GO WITH CHANGES or NO-GO'}.`);
+      if (t.interrupted) { park(); return; }
+      const got = verdictOf(t, v);
+      if (got) st.text = got + '\n' + st.text;
+    }
     let last = reply;
     while (t.notes?.length) {
       const note = t.notes.splice(0).join('\n');
@@ -1498,7 +1538,13 @@ ${STATUS_RULES}`;
       if (t.interrupted) { park(); return; }
       st = parseStatus(last) || { kind: 'DONE', detail: '', options: [], text: last.trim() };
     }
+    if (st.kind !== 'DONE' && overCap(w, t)) throw capErr(); // the step that just ended blew the budget and the card is not finished: stop it now, not at the next wake-up
     applyStatus(w, t, st, last);
+    if (t.status === 'DONE' && overCap(w, t)) { // finished, but the last step went over: the work stays, the user hears about it
+      t.overCap = true;
+      log(w, 'studio', 'system', `「${t.title}」已完成，但用了 ${cardTokens(t)} tokens，超過上限 ${w.tokenCap}。`);
+      notify(`${label(w)}：「${t.title}」超過 token 上限`, `${agentName(t.agent)} 做完了，但用了 ${cardTokens(t)} tokens`, 'ask', w.project);
+    }
   } catch (e) {
     if (e.stopUnconfirmed) {
       t.stopUnconfirmed = true; t.status = 'PAUSED'; t.result = 'Agent 尚未確認停止，保留租約';
@@ -1507,6 +1553,12 @@ ${STATUS_RULES}`;
     }
     if (e instanceof Halt && run.paused) { if (t.agent === startAgent) Object.assign(t, { status: 'PAUSED', result: '已暫停', resumed: true, wakeNote: note }); return; } // handed off meanwhile: the card is the new agent's now
     if (e instanceof Halt && run.stopped) { t.status = 'FAILED'; t.result = '已停止'; return; }
+    if (e.cap) { // the card's own budget is gone: stop it here, the Leader decides whether and how to retry
+      Object.assign(t, { status: 'FAILED', result: `沒有完成：超過這張卡的 token 上限（${e.message}）。Studio 停止這張卡，交給工頭決定要不要換方法重試。`, detail: e.message });
+      log(w, t.agent, 'worker', t.result + '：' + t.title, e.message);
+      notify(`${label(w)}：「${t.title}」超過 token 上限`, `${agentName(t.agent)} 已用 ${cardTokens(t)} tokens，Studio 停止這張卡`, 'ask', w.project);
+      return wakeWaiters(w, t);
+    }
     if (e.stuck && !t.convReset) { // the worker's conversation will not stop: start a fresh one (the card brief carries the task)
       delete run.convs[workKey(t)];
       Object.assign(t, { convReset: true, briefed: '', status: 'WAITING', resumed: true, detail: e.message });
@@ -1546,10 +1598,10 @@ function applyStatus(w, t, st, reply) {
     log(w, 'studio', 'system', `「${t.title}」技術上卡住，沒有完成；後面依賴它的卡先不開始，交給工頭換方法或換人重試。`, st.detail);
     return wakeWaiters(w, t);
   }
-  const verdict = (t.result.split('\n').find((l) => l.trim()) || '').replace(/^[^A-Za-z]+/, '');
-  if (st.kind === 'DONE' && (t.role === 'review' && /^NO-GO\b/i.test(verdict) || t.role === 'check' && /^FAIL\b/i.test(verdict))) {
-    Object.assign(t, { status: 'FAILED', detail: verdict });
-    log(w, 'studio', 'system', `「${t.title}」的結論是 ${t.role === 'review' ? 'NO-GO' : 'FAIL'}：後面依賴它的卡先不開始，交給工頭安排修正。`);
+  const verdict = verdictOf(t, t.result);
+  if (st.kind === 'DONE' && VERDICT_RE[t.role] && !verdictOk(t, verdict)) { // anything but a clear pass keeps the cards after it from starting
+    Object.assign(t, { status: 'FAILED', detail: verdict || '沒有明確的結論' });
+    log(w, 'studio', 'system', `「${t.title}」的結論是 ${verdict || '不明'}（${t.role === 'check' ? '只有 PASS' : '只有 GO／GO WITH CHANGES'} 算通過）：後面依賴它的卡先不開始，交給工頭安排。`);
     return wakeWaiters(w, t);
   }
   if (st.kind === 'DONE') {
@@ -2145,6 +2197,8 @@ function loadRun(w, r) {
   w.activity = r.activity;
   w.run = { id: r.id, startedAt: r.startedAt, project: r.project, leader: r.leader, request: r.request, convs: r.convs || {}, phase: r.phase || 'working', leaderGen: 0, rounds: r.rounds || 0, ask: r.ask || null, notes: r.notes || [], goal: r.goal, refs: r.refs, context: r.context, continues: r.continues, active: false, paused: true, stopped: false, summarizing: false };
   Object.assign(w.run, { usage: r.usage, treeStamps: r.treeStamps || {}, treeStamp: r.treeStamp, leftAt: r.leftAt, extMod: r.extMod, claimedBy: r.claimedBy });
+  if (r.leadTier !== 'hard') { for (const k of Object.keys(w.run.convs)) if (k.endsWith(':lead')) delete w.run.convs[k]; } // created on the normal tier by an older Studio: a fresh one gets the hard tier (its context is in run.context)
+  w.run.leadTier = 'hard';
   for (const [k, cid] of Object.entries(w.run.convs)) convAgent.set(cid, k.split(':')[0]);
 }
 
@@ -2217,6 +2271,7 @@ async function reassign(w, taskId, agent) {
   if (w.executingSteps?.has(t.id) || t.status === 'WORKING' || t.stopUnconfirmed) throw new Error('Agent 還在停下中，請先完成暫停');
   if (isWriter(t)) return handoffWriter(w, agent, taskId);
   if (!available(agent)) throw new Error('Agent 目前不可用');
+  if (reviewAuthors(w, t).has(agent)) throw new Error(`${agentName(agent)} 寫了這張卡要審的東西，審查不能交給它`);
   t.agent = agent; t.status = w.run.paused ? 'PAUSED' : 'WAITING';
   saveRun(w, w.run.paused ? 'paused' : 'running');
   if (w.run.active) pump(w);
@@ -2235,7 +2290,11 @@ async function withdrawAgent(w, agent, to) {
     try {
       if (isWriter(t)) await handoffWriter(w, to, t.id);
       else if (t.status === 'WORKING') continue; // a read-only step finishes by itself
-      else { t.agent = to; t.hold = false; t.status = w.run.paused ? 'PAUSED' : 'WAITING'; }
+      else {
+        const authors = reviewAuthors(w, t), dest = authors.has(to) ? w.workers.find((x) => x !== agent && x !== w.leader && available(x) && !authors.has(x)) : to;
+        if (!dest) { Object.assign(t, { status: 'FAILED', hold: false, result: `審查不能交給寫程式的 ${agentName(to)}，也沒有其他可用的成員；交給工頭安排。` }); wakeWaiters(w, t); continue; }
+        t.agent = dest; t.hold = false; t.status = w.run.paused ? 'PAUSED' : 'WAITING';
+      }
       moved.push(t.title);
     } catch (e) { log(w, 'studio', 'system', `「${t.title}」改派給 ${agentName(to)} 失敗：${e.message}`); }
   }
@@ -2255,6 +2314,7 @@ async function delegateAsk(w, taskId, agent) {
   log(w, 'user', 'user', `「${t.title}」交給 ${agentName(agent)} 處理`);
   if (agent === t.agent) return wake(w, t, note);
   if (isWriter(t)) { await handoffWriter(w, agent, t.id, note); t.ask = null; return; }
+  if (reviewAuthors(w, t).has(agent)) throw new Error(`${agentName(agent)} 寫了這張卡要審的東西，審查不能交給它`);
   Object.assign(t, { agent, status: w.run.paused ? 'PAUSED' : 'WAITING', ask: null, wakeNote: note, resumed: true });
   saveRun(w, w.run.paused ? 'paused' : 'running');
   if (w.run.active) pump(w);
@@ -2505,7 +2565,7 @@ const routes = {
         const blocked_reason = why ? 'Blocked：' + String(why).trim().replace(/^Blocked\s*[:：]?\s*/i, '') : null;
         return { ...t, blocked_reason, ...(t.status === 'WORKING' ? { activity: convActivity.get(convOf(w, t)) || null } : {}) };
       });
-      return { wsInfo: w.wsInfo, lease, workspace_summary, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
+      return { wsInfo: w.wsInfo, lease, workspace_summary, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tokenCap: w.tokenCap, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
         run: r && { usage: r.usage || null, extMod: r.extMod, claimedBy: r.claimedBy, id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
     });
     return { ...S, runtimes: S.runtimes, ...teamStats(), agents: Object.values(S.agents), workspaces };
@@ -2549,6 +2609,7 @@ const routes = {
   'POST /api/finisher': (b) => setFinisher(wsOf(b.ws), b.agent),
   'POST /api/fallback': (b) => setFallback(wsOf(b.ws), b.agent),
   'POST /api/backend-port': (b) => setBackendPort(wsOf(b.ws), b.port),
+  'POST /api/token-cap': (b) => setTokenCap(wsOf(b.ws), b.cap),
   'POST /api/external/save': (b) => saveExternal(b),
   'POST /api/external/delete': (b) => deleteExternal(b.id),
   'POST /api/external/models': (b) => extModels(b),

@@ -458,26 +458,28 @@ function modelName(a, value) {
   const def = a.models.find((m) => m.value === 'default');
   return def ? `預設（${def.description.split(' · ')[0]}）` : '預設';
 }
+// The Leader runs on the hard tier, workers on the normal one.
+const tierOf = (a, w) => w?.tiers?.[a.id]?.[a.id === w.leader ? 'hard' : 'normal'];
 function modelLabel(a, w) {
   if (!w) return '依專案設定';
-  return modelName(a, w.tiers?.[a.id]?.normal.model);
+  return modelName(a, tierOf(a, w)?.model);
 }
-const effortLabel = (a, w) => !w ? '依專案設定' : w.tiers?.[a.id]?.normal.effort || (a.efforts.length ? '預設' : '—');
+const effortLabel = (a, w) => !w ? '依專案設定' : tierOf(a, w)?.effort || (a.efforts.length ? '預設' : '—');
 
 function cfgHtml(a, w) {
   if (!w) return '<div class="cfg-note">模型／思考強度在各專案頁分開設定。</div>';
   if (!a.models.length && !a.efforts.length) return `<div class="cfg-note">${a.status === 'checking' ? '讀取模型清單中…' : '這位 AI 員工使用預設模型（不支援切換）'}</div>`;
   if (w.strategy !== 'custom') {
     const t = w.tiers?.[a.id] || {}, tier = (x) => `${esc(modelName(a, x?.model))}${x?.effort ? ' · ' + esc(x.effort) : ''}`;
-    return `<div class="cfg-note">依模型策略「${esc((STRATEGY.find(([k]) => k === w.strategy) || [, ''])[1].split('：')[0])}」：普通卡 ${tier(t.normal)}；困難卡 ${tier(t.hard)}。想自己指定模型，把模型策略改成「🛠️ 自訂」。</div>`;
+    return `<div class="cfg-note">依模型策略「${esc((STRATEGY.find(([k]) => k === w.strategy) || [, ''])[1].split('：')[0])}」：成員普通卡 ${tier(t.normal)}；困難卡與工頭 ${tier(t.hard)}。想自己指定模型，把模型策略改成「🛠️ 自訂」。</div>`;
   }
   const cfg = w.agentCfg[a.id] || {}, busy = w.run?.active;
   const models = (k) => `<select data-cfg="${a.id}" data-k="${k}"><option value="">${k === 'hardModel' ? '同平常' : '預設'}</option>${a.models.map((m) => `<option value="${esc(m.value)}" title="${esc(m.description)}" ${m.value === cfg[k] ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select>`;
   const efforts = (k) => `<select data-cfg="${a.id}" data-k="${k}" ${a.efforts.length ? '' : 'disabled'}><option value="">${k === 'hardEffort' ? '同平常' : '預設'}</option>${a.efforts.map((x) => `<option value="${esc(x)}" ${x === cfg[k] ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select>`;
   return `<details class="cfg-box"><summary>這個專案的模型／思考強度${busy ? '（下一次開始工作生效）' : ''}</summary><div class="cfg">
     <label>平常的模型${models('model')}</label><label>平常的思考強度${efforts('effort')}</label>
-    <label>困難卡的模型${models('hardModel')}</label><label>困難卡的思考強度${efforts('hardEffort')}</label>
-  </div><div class="cfg-note">工頭只用「平常」；工頭標成「困難」的工作卡才用困難那一組。</div></details>`;
+    <label>困難卡／工頭的模型${models('hardModel')}</label><label>困難卡／工頭的思考強度${efforts('hardEffort')}</label>
+  </div><div class="cfg-note">工頭一律用「困難卡／工頭」那一組（它負責規劃和拍板）；成員平常用「平常」，被工頭標成「困難」的卡才用困難那一組。</div></details>`;
 }
 
 // 5-hour / weekly plan limits: usage bar + thin bar for how far the window is toward its reset.
@@ -665,7 +667,7 @@ function boardHtml(tasks, agents, editable) {
         ${PARKED.includes(t.status) && !blk ? `<div class="res"><b>${esc(waitLine(t))}</b></div>` : ''}
         ${workState(t) ? `<div class="res"><b>${workState(t).ic} ${esc(workState(t).text)}</b></div>` : ''}
         ${editable && ASKABLE.includes(t.status) ? workButtons(t, curPath()) : ''}
-        ${t.usage ? `<div class="res" style="font-size:12px;opacity:0.85">🪙 ${esc(usageLine(t.usage))}</div>` : ''}
+        ${t.usage ? `<div class="res" style="font-size:12px;opacity:0.85">🪙 ${esc(usageLine(t.usage))}${w.tokenCap ? ' ／ 上限 ' + fmtTok(w.tokenCap) : ''}</div>` : ''}
         <div class="res" style="font-size:12px;opacity:0.85">📁 <b>Workspace</b> ${esc(ws.fullLine)}</div>
         <div class="res" style="font-size:12px;opacity:0.85">⚡ <b>Runtime</b> ${rts.length ? esc(rts.map(formatRuntimeItem).join(' · ')) : '—'}</div>
         ${t.blocked && editable ? blockedHtml(w, t) : ''}
@@ -893,7 +895,9 @@ function officeHtml(w) {
       <select data-strategy style="width:auto;padding:4px 8px;font-size:13px" title="工頭自己判斷普通卡／困難卡；普通卡失敗會自動改用強模型重試一次">${STRATEGY.map(([k, t]) => `<option value="${k}" ${(w.strategy || 'save') === k ? 'selected' : ''}>${t}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">收尾者：</span>
       <span class="hint" style="font-size:13px;margin-left:8px">備援：</span>
       <select data-fallback style="width:auto;padding:4px 8px;font-size:13px" title="成員額度用完或被限流時，它的卡自動改派給這位（例如本地模型）"><option value="">不自動換人</option>${S.agents.filter((a) => a.id !== w.leader).map((a) => `<option value="${a.id}" ${w.fallback === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">收尾者：</span>
-      <select data-finisher style="width:auto;padding:4px 8px;font-size:13px" title="CI 跑完後，merge／同步 main／清分支改由這位接手，省下強模型的額度（等 CI 本身不花額度，Studio 自己查）"><option value="">原成員自己收尾</option>${S.agents.filter((a) => a.id !== w.leader && w.workers.includes(a.id)).map((a) => `<option value="${a.id}" ${w.finisher === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">驗證用後端 port：</span>
+      <select data-finisher style="width:auto;padding:4px 8px;font-size:13px" title="CI 跑完後，merge／同步 main／清分支改由這位接手，省下強模型的額度（等 CI 本身不花額度，Studio 自己查）"><option value="">原成員自己收尾</option>${S.agents.filter((a) => a.id !== w.leader && w.workers.includes(a.id)).map((a) => `<option value="${a.id}" ${w.finisher === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">每張卡 token 上限：</span>
+      <input data-token-cap type="number" min="0" step="10000" value="${w.tokenCap ?? ''}" placeholder="0 = 不限" style="width:92px;padding:4px 8px;font-size:13px" title="一張卡用超過這個數就停下來交給工頭（在每一步之間檢查，正在跑的那一步不會中斷；AI 沒回報用量就無法計算）。0 = 不限">
+      <span class="hint" style="font-size:13px;margin-left:8px">驗證用後端 port：</span>
       <input data-backend-port type="number" min="1" max="65535" value="${w.backendPort || ''}" placeholder="無" style="width:72px;padding:4px 8px;font-size:13px" title="專案有自己的後端服務時填它的 port（例如 3018）：成員會請 Studio 代管啟動，卡片在等它時 Studio 會自動檢查 health 並安全恢復；留空＝不用">${w.afterDone === 'auto' ? `<span class="tag pz">🔁 自動中 ${w.autoRounds || 0}/5</span>` : ''}</div>
     ${leaseHtml(w)}
     ${workspaceLine(w)}
@@ -1291,6 +1295,8 @@ document.addEventListener('change', (e) => {
     if (id && confirm('把寫入權交給 ' + name(id) + '？\n\n' + (wr ? name(wr.agent) || wr.owner : '現在的寫入者') + ' 會先停下（等它真的停住），這張卡的紀錄和對話都保留，但它不再是這個工作區的寫入者；' + name(id) + ' 從目前的資料夾和 branch 接續。')) return post('/api/handoff', { ws: ws(), agent: id }).catch(() => {});
     return;
   }
+  const tc = e.target.closest('input[data-token-cap]');
+  if (tc) return post('/api/token-cap', { ws: ws(), cap: tc.value }).catch(() => {});
   const bp = e.target.closest('input[data-backend-port]');
   if (bp) return post('/api/backend-port', { ws: ws(), port: bp.value }).catch(() => {});
   const fb = e.target.closest('select[data-fallback]');
