@@ -82,6 +82,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 
 - [Workspace lease API 與生命週期](docs/workspace-lease.md)
 - [Runtime ownership 與後端恢復](docs/runtime-ownership.md)
+- [多模型協作設計原則](docs/multi-model-principles.md)
 
 ### 授權
 
@@ -163,6 +164,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 
 - [Workspace lease API and lifecycle](docs/workspace-lease.md)
 - [Runtime ownership and backend recovery](docs/runtime-ownership.md)
+- [Multi-model collaboration principles](docs/multi-model-principles.md) (Traditional Chinese)
 
 ### License
 
