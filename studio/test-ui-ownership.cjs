@@ -38,6 +38,8 @@ module.exports = async function () {
     'cardBlockedReason',
     'workspaceLine',
     'runtimesOf',
+    'fmtTok',
+    'usageLine',
     'runtimeHtml',
     'blockedHtml',
     'waitLine',

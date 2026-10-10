@@ -610,6 +610,7 @@ function workHtml(d) {
       <dt>開始時間</dt><dd>${hhmm(d.workingSince || d.firstStartedAt)}</dd>
       ${d.status === 'WORKING' && d.workingSince ? `<dt>已執行</dt><dd>${dur(Date.now() - Date.parse(d.workingSince))}</dd>` : ''}
       <dt>目前狀態</dt><dd>${esc(now)}</dd>
+      ${d.usage ? `<dt>Token</dt><dd>${esc(usageLine(d.usage))}</dd>` : ''}
     </dl>
     <h3>最近活動</h3><ul style="margin:0;padding-left:18px">${acts}</ul>
     ${d.lastSay ? `<h3>最近一句 AI 訊息</h3><div class="res" style="white-space:pre-wrap">${esc(d.lastSay)}</div>` : ''}
@@ -634,6 +635,15 @@ async function askWork(text) {
   loadWork();
 }
 
+// Token usage (what the AI reported; some AIs report nothing).
+function fmtTok(n) {
+  n = n || 0;
+  return n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n);
+}
+function usageLine(u) {
+  return u ? `${fmtTok(u.in + u.out)} tokens（輸入 ${fmtTok(u.in)}／輸出 ${fmtTok(u.out)}${u.cache ? '，快取讀取 ' + fmtTok(u.cache) : ''}）` : '';
+}
+
 function boardHtml(tasks, agents, editable) {
   if (!tasks.length) return '<div class="empty">還沒有工作卡。在上面說你要什麼、按「交給團隊」，工頭會拆成工作卡派給成員。</div>';
   const avail = agents.filter((a) => a.status === 'available');
@@ -654,6 +664,7 @@ function boardHtml(tasks, agents, editable) {
         ${PARKED.includes(t.status) && !blk ? `<div class="res"><b>${esc(waitLine(t))}</b></div>` : ''}
         ${workState(t) ? `<div class="res"><b>${workState(t).ic} ${esc(workState(t).text)}</b></div>` : ''}
         ${editable && ASKABLE.includes(t.status) ? workButtons(t, curPath()) : ''}
+        ${t.usage ? `<div class="res" style="font-size:12px;opacity:0.85">🪙 ${esc(usageLine(t.usage))}</div>` : ''}
         <div class="res" style="font-size:12px;opacity:0.85">📁 <b>Workspace</b> ${esc(ws.fullLine)}</div>
         <div class="res" style="font-size:12px;opacity:0.85">⚡ <b>Runtime</b> ${rts.length ? esc(rts.map(formatRuntimeItem).join(' · ')) : '—'}</div>
         ${t.blocked && editable ? blockedHtml(w, t) : ''}
@@ -879,6 +890,8 @@ function officeHtml(w) {
       </select><span class="hint" style="font-size:13px;margin-left:8px">交付：</span>
       <select data-delivery style="width:auto;padding:4px 8px;font-size:13px" title="需求清楚、沒有高風險時，AI 要做到哪裡才停">${[['auto', '🚚 自動做到 merge'], ['pr', '✋ 做到 PR 就停（merge 等我）']].map(([k, t]) => `<option value="${k}" ${(w.delivery || 'auto') === k ? 'selected' : ''}>${t}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">模型策略：</span>
       <select data-strategy style="width:auto;padding:4px 8px;font-size:13px" title="工頭自己判斷普通卡／困難卡；普通卡失敗會自動改用強模型重試一次">${STRATEGY.map(([k, t]) => `<option value="${k}" ${(w.strategy || 'save') === k ? 'selected' : ''}>${t}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">收尾者：</span>
+      <span class="hint" style="font-size:13px;margin-left:8px">備援：</span>
+      <select data-fallback style="width:auto;padding:4px 8px;font-size:13px" title="成員額度用完或被限流時，它的卡自動改派給這位（例如本地模型）"><option value="">不自動換人</option>${S.agents.filter((a) => a.id !== w.leader).map((a) => `<option value="${a.id}" ${w.fallback === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">收尾者：</span>
       <select data-finisher style="width:auto;padding:4px 8px;font-size:13px" title="CI 跑完後，merge／同步 main／清分支改由這位接手，省下強模型的額度（等 CI 本身不花額度，Studio 自己查）"><option value="">原成員自己收尾</option>${S.agents.filter((a) => a.id !== w.leader && w.workers.includes(a.id)).map((a) => `<option value="${a.id}" ${w.finisher === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">驗證用後端 port：</span>
       <input data-backend-port type="number" min="1" max="65535" value="${w.backendPort || ''}" placeholder="無" style="width:72px;padding:4px 8px;font-size:13px" title="專案有自己的後端服務時填它的 port（例如 3018）：成員會請 Studio 代管啟動，卡片在等它時 Studio 會自動檢查 health 並安全恢復；留空＝不用">${w.afterDone === 'auto' ? `<span class="tag pz">🔁 自動中 ${w.autoRounds || 0}/5</span>` : ''}</div>
     ${leaseHtml(w)}
@@ -950,11 +963,12 @@ function nowHtml(w, att) {
       || '全部工作卡結束後，工頭會確認整體是否完成';
   const askCard = r.active && ts.find((t) => t.status === 'NEEDS_USER');
   const leadAsk = r.active && !askCard && r.ask && !r.summarizing ? r.ask : null;
-  const ask = askCard ? { q: askCard.ask?.question, opts: askCard.ask?.options || [], id: askCard.id, who: name(askCard.agent) } : leadAsk ? { q: leadAsk.question, opts: leadAsk.options || [], id: '', who: '工頭 ' + name(r.leader) } : null;
+  const ask = askCard ? { q: askCard.ask?.question, opts: askCard.ask?.options || [], id: askCard.id, who: name(askCard.agent), agent: askCard.agent, takeover: !!askCard.takeover } : leadAsk ? { q: leadAsk.question, opts: leadAsk.options || [], id: '', who: '工頭 ' + name(r.leader) } : null;
   const manual = r.active ? ts.filter((t) => t.status === 'WAITING_EXTERNAL' && t.wait?.manual) : [];
   let you = '☕ 不需要操作';
   if (ask) you = `<div class="askbox"><div class="q">${esc(ask.who)} 問你：${esc(ask.q)}</div>
       ${ask.opts.length ? `<div class="row">${ask.opts.map((o) => `<button class="btn" data-answer="${esc(o)}" data-for="${ask.id}">${esc(o)}</button>`).join('')}</div>` : ''}
+      ${ask.takeover ? '' : `<div class="row"><span class="hint">看不懂？交給 AI 自己查清楚、處理好：</span>${S.agents.filter((a) => a.status === 'available' && a.id !== ask.agent && a.id !== r.leader).sort((a, b) => ['claude', 'codex'].indexOf(b.id) - ['claude', 'codex'].indexOf(a.id)).map((a) => `<button class="btn small" data-delegate="${a.id}" data-for="${ask.id}">🛠 交給 ${esc(a.name)}</button>`).join('')}</div>`}
       <textarea id="answerText" placeholder="${ask.opts.length ? '或直接打字回覆…' : '在這裡回覆…'}"></textarea>
       <div class="row"><span class="spacer"></span><button class="btn primary" data-answer-send data-for="${ask.id}">送出回覆</button></div></div>`;
   else if (ts.some((t) => t.blocked && t.status === 'WAITING')) you = ts.filter((t) => t.blocked && t.status === 'WAITING').map((t) => blockedHtml(w, t)).join('');
@@ -972,6 +986,7 @@ function nowHtml(w, att) {
       <dt>目前進度</dt><dd>${esc(progress)}</dd>
       <dt>Workspace</dt><dd>${esc(formatWorkspace(w).fullLine)}</dd>
       <dt>Runtime</dt><dd>${runtimesOf(w).map(formatRuntimeItem).join(' · ') || '—'}</dd>
+      <dt>Token</dt><dd>${r.usage ? esc(`工頭 ${fmtTok(r.usage.lead.in + r.usage.lead.out)} · 成員 ${fmtTok(r.usage.work.in + r.usage.work.out)}　（${Object.entries(r.usage.agents).map(([id, u]) => name(id) + ' ' + fmtTok(u.in + u.out)).join('、')}）`) : '還沒有回報（有些 AI 不回報用量）'}</dd>
       <dt>正在等待</dt><dd>${waits.length ? esc(waits.join('\n')) : '—'}</dd>
       <dt>接下來</dt><dd>${esc(next)}</dd>
       <dt>你現在</dt><dd>${you}</dd>
@@ -1277,6 +1292,8 @@ document.addEventListener('change', (e) => {
   }
   const bp = e.target.closest('input[data-backend-port]');
   if (bp) return post('/api/backend-port', { ws: ws(), port: bp.value }).catch(() => {});
+  const fb = e.target.closest('select[data-fallback]');
+  if (fb) return post('/api/fallback', { ws: ws(), agent: fb.value }).catch(() => {});
   const fi = e.target.closest('select[data-finisher]');
   if (fi) return post('/api/finisher', { ws: ws(), agent: fi.value }).catch(() => {});
   const wd = e.target.closest('select[data-withdraw]');
@@ -1351,6 +1368,7 @@ document.addEventListener('click', (e) => {
   }
   if (b.hasAttribute('data-resume-job')) return post('/api/resume', { ws: ws() }).catch(() => {});
   if (b.dataset.continueCard) return post('/api/continue-card', { ws: ws(), taskId: b.dataset.continueCard }).catch(() => {});
+  if (b.dataset.delegate) { b.disabled = true; return post('/api/card/delegate', { ws: ws(), taskId: b.dataset.for || '', agent: b.dataset.delegate }).catch(() => { b.disabled = false; }); }
   if (b.dataset.answer !== undefined || b.hasAttribute('data-answer-send')) {
     const text = b.dataset.answer ?? $('answerText')?.value ?? '';
     return post('/api/answer', { ws: ws(), taskId: b.dataset.for || '', text }).catch(() => {});
