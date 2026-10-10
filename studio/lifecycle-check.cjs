@@ -928,6 +928,33 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     assert.strictEqual(w.tasks[0].detail, 'pytest not installed');
     assert.strictEqual(api.parseStatus('x\nSTATUS: BLOCKED: no git').kind, 'BLOCKED');
     console.log('22 BLOCKED fails the card and keeps dependents from starting: PASS');
+
+    // 23) card roles: the author never reviews itself; check/review are read-only; NO-GO keeps the merge from starting;
+    //     Claude hands a hard review to its reviewer subagent
+    const ps = api.parseSubtasks([
+      { title: 'build', agent: 'codex', instructions: 'x', role: 'build' },
+      { title: 'review', agent: 'codex', instructions: 'y', role: 'review', after: [0], writes: true },
+      { title: 'odd', agent: 'codex', instructions: 'z', role: 'nonsense' }], ['codex', 'claude', 'antigravity']);
+    assert.deepStrictEqual(ps.map((s) => [s.role, s.agent, s.writes]), [['build', 'codex', true], ['review', 'claude', false], ['build', 'codex', true]]);
+    let checks23 = 0;
+    ({ env, api } = makeEnv((agent, text) => {
+      if (text.includes('LEADER (foreman)')) return JSON.stringify({ message: 'ok', subtasks: [
+        { title: 'impl', agent: 'codex', instructions: 'build it\nAcceptance: tests pass', role: 'build' },
+        { title: 'gate', agent: 'codex', instructions: 'review it', role: 'review', hard: true, after: [0] },
+        { title: 'merge', agent: 'codex', instructions: 'merge', after: [1] }] });
+      if (text.includes('Every current card has ended')) { checks23++; return checks23 === 1 ? '{"done":false,"message":"fix","subtasks":[{"title":"fix","agent":"codex","instructions":"fix it"}]}' : '{"done":true,"report":"ok"}'; }
+      if (text.includes('Task: gate')) return '**NO-GO**\nsrc/a.js:3 deletes the data dir\nSTATUS: DONE';
+      return 'ok\nSTATUS: DONE';
+    }));
+    w = newW(); w.workers = ['codex', 'claude']; w.leader = 'antigravity'; w.run.leader = 'antigravity'; env.S.workspaces.push(w);
+    api.planPhase(w);
+    assert.ok(await waitFor(() => w.run.result === 'done'));
+    assert.deepStrictEqual(w.tasks.map((t) => [t.title, t.agent, t.status]), [['impl', 'codex', 'DONE'], ['gate', 'claude', 'FAILED'], ['merge', 'codex', 'FAILED'], ['fix', 'codex', 'DONE']]);
+    assert.ok(!env.prompts.some((p) => p.text.includes('Task: merge')), 'NO-GO: the merge never started');
+    const gp = env.prompts.find((p) => p.text.includes('Task: gate')).text;
+    assert.ok(gp.includes('ROLE: REVIEW') && gp.includes('"reviewer" subagent') && gp.includes('ACCESS: READ-ONLY'), 'hard review on Claude: reviewer subagent, read-only');
+    assert.ok(env.prompts.find((p) => p.text.includes('Task: impl')).text.includes('ROLE: BUILD'));
+    console.log('23 card roles (build / check / review), author never reviews itself, NO-GO blocks the merge: PASS');
   }
 
   await require('./test-workspace-lease.cjs')({ makeEnv, mkTmp, region });

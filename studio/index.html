@@ -658,7 +658,7 @@ function boardHtml(tasks, agents, editable) {
       const tagHtml = blk ? '<span class="tag bad">Blocked</span>' : (t.status === 'PAUSED' || t.status === 'INTERRUPTED' || PARKED.includes(t.status) ? `<span class="tag ${t.status === 'NEEDS_USER' ? 'bad' : 'pz'}">${STEP_WORD[t.status]}</span>` : '');
       return `
       <div class="card" style="--c:${look(t.agent).c}">
-        <div class="t">${esc(t.title)} ${t.writes === false ? '<span class="tag" title="只讀程式、審查或調查，不會修改檔案">唯讀</span> ' : ''}${t.escalated ? '<span class="tag">已升級強模型</span>' : t.hard ? '<span class="tag">困難</span>' : ''}${tagHtml}</div>
+        <div class="t">${esc(t.title)} ${t.role === 'check' ? '<span class="tag" title="能用證據對照的檢查：PASS / FAIL">🔍 檢查</span> ' : t.role === 'review' ? '<span class="tag" title="獨立審查：GO / NO-GO，寫程式的人不審自己">🛡 審查</span> ' : ''}${t.writes === false ? '<span class="tag" title="只讀程式、審查或調查，不會修改檔案">唯讀</span> ' : ''}${t.escalated ? '<span class="tag">已升級強模型</span>' : t.hard ? '<span class="tag">困難</span>' : ''}${tagHtml}</div>
         <span class="who"><i></i>${esc(agents.find((a) => a.id === t.agent)?.name || t.agent)}</span>
         ${blk ? `<div class="res" style="color:var(--bad);font-weight:700">🚫 ${esc(blk)}</div>` : ''}
         ${t.result && t.status !== 'PAUSED' ? `<div class="res">${esc(t.result)}</div>` : ''}
