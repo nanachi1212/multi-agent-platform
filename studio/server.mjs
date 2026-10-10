@@ -53,7 +53,7 @@ const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}
 // agentCfg = this project's model / effort per agent; workers = agents allowed to work here.
 // New projects start from S.agentCfg (the last choices).
 const newWs = (project, leader = S.leader, name = '', agentCfg = S.agentCfg, workers = Object.keys(AGENTS)) => ({
-  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, strategy: 'save', delivery: 'auto', finisher: '', backendPort: 0,
+  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, strategy: 'save', delivery: 'auto', finisher: '', fallback: '', backendPort: 0,
   agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...agentCfg?.[id] }])),
   workers: workers.filter((id) => AGENTS[id]),
 });
@@ -85,7 +85,7 @@ try {
   // Older settings had one `project` and global models; it becomes the first open workspace with those models.
   S.workspaces = (saved.workspaces || (saved.project ? [{ project: saved.project }] : []))
     .filter((x) => isDir(x.project))
-    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto', finisher: AGENTS[x.finisher] ? x.finisher : '', backendPort: Number(x.backendPort) || 0 }));
+    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto', finisher: AGENTS[x.finisher] ? x.finisher : '', fallback: AGENTS[x.fallback] ? x.fallback : '', backendPort: Number(x.backendPort) || 0 }));
   S.recent = (saved.recent || []).filter(isDir);
   if (saved.notify === false) S.notify = false;
 } catch (e) {
@@ -97,7 +97,7 @@ try {
 
 function saveSettings() {
   fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
-  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, backendPort: w.backendPort }));
+  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort }));
   fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external }, null, 2));
 }
 
@@ -106,7 +106,7 @@ function saveRun(w, status) {
   if (!run) return;
   fs.mkdirSync(HISTORY, { recursive: true });
   // phase + convs let a paused run continue in the same agent conversations after a Studio restart.
-  const rec = { treeStamps: run.treeStamps, treeStamp: run.treeStamp, leftAt: run.leftAt, extMod: run.extMod, claimedBy: run.claimedBy, id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, notes: run.notes, suggestions: run.suggestions, convs: run.convs, tasks: w.tasks, activity: w.activity };
+  const rec = { usage: run.usage, treeStamps: run.treeStamps, treeStamp: run.treeStamp, leftAt: run.leftAt, extMod: run.extMod, claimedBy: run.claimedBy, id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, notes: run.notes, suggestions: run.suggestions, convs: run.convs, tasks: w.tasks, activity: w.activity };
   fs.writeFileSync(path.join(HISTORY, run.id + '.json'), JSON.stringify(rec, null, 2));
   S.historyRev++;
 }
@@ -346,9 +346,12 @@ const convActivity = new Map();
 
 const HARD_CAP_MS = 3 * 3600e3; // no single step may run longer than this
 // timeout = how long the agent may show NO progress (new messages); a long job that keeps working is never cut off.
-async function turn(agent, convId, text, { w, lead = false, check = false, allowStart, ask = false, timeout = 25 * 60e3, progressEvery = 30000 } = {}) {
+// bill = where this turn's tokens go: a card, 'lead' (default for Leader turns), or nothing (availability checks).
+async function turn(agent, convId, text, { w, lead = false, check = false, allowStart, ask = false, timeout = 25 * 60e3, progressEvery = 30000, bill = lead && !check ? 'lead' : null } = {}) {
   const run = w?.run;
   if (!check && (run?.stopped || run?.paused || allowStart && !allowStart())) throw new Halt('執行已停止');
+  if (!run) bill = null;
+  const usage0 = bill ? await usageOf(convId) : null;
   const sent = await sendMessage(convId, text);
   active.set(convId, sent.turn_id);
   convActivity.set(convId, { at: Date.now(), tool: '', confirm: false }); // a fresh turn starts with fresh activity
@@ -384,6 +387,7 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
     convActivity.delete(convId);
     if (!check) S.agents[agent].working--;
     if (agent === 'codex') refreshCodexLimits();
+    if (bill) chargeUsage(run, agent, bill === 'lead' ? null : bill, usageDelta(usage0, await usageOf(convId)));
   }
   if (!check && (run?.stopped || run?.paused)) throw new Halt(run.stopped ? '已停止' : '已暫停');
   const items = (await api('GET', `/api/conversations/${convId}/messages`)).items || [];
@@ -448,7 +452,7 @@ async function deleteExternal(id) {
   S.external = S.external.filter((x) => x !== e);
   if (S.leader === id) S.leader = 'codex';
   delete AGENTS[id]; delete S.agents[id]; delete S.agentCfg[id];
-  for (const x of S.workspaces) { delete x.agentCfg[id]; x.workers = x.workers.filter((a) => a !== id); if (x.finisher === id) x.finisher = ''; }
+  for (const x of S.workspaces) { delete x.agentCfg[id]; x.workers = x.workers.filter((a) => a !== id); if (x.finisher === id) x.finisher = ''; if (x.fallback === id) x.fallback = ''; }
   saveSettings();
 }
 
@@ -489,11 +493,14 @@ const available = (id) => S.agents[id]?.status === 'available';
 // One conversation per agent and role; hard cards get their own conversation on the hard model.
 // The Leader always uses the normal tier (it should be cheap: it only plans and checks).
 // A read-only card (ro) gets a conversation in the agent's non-writing mode, like the Leader: the prompt alone is not a fence.
+// Not for Antigravity: its non-writing mode makes AionCore install a per-tool permission hook that runs aioncore.exe,
+// which fails on a non-ASCII install path and blocks every tool (even reading). Its read-only cards keep the prompt fence.
+const RO_MODE = (agent) => agent !== 'antigravity';
 const dirTag = (d) => (d ? '@' + crypto.createHash('sha1').update(String(d)).digest('hex').slice(0, 6) : '');
 const workKey = (t) => t.agent + ':work' + (t.hard ? ':hard' : '') + (isWriter(t) ? '' : ':ro') + dirTag(t.workdir);
 async function conv(w, agent, lead, hard = false, workdir = '', ro = false) {
   const key = agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : '') + (ro ? ':ro' : '') + dirTag(workdir);
-  return (w.run.convs[key] ??= await createConv(agent, workdir || w.run.project, lead || ro, tierCfg(w, agent, hard)));
+  return (w.run.convs[key] ??= await createConv(agent, workdir || w.run.project, lead || (ro && RO_MODE(agent)), tierCfg(w, agent, hard)));
 }
 // This run's conversations that have a turn in progress (other projects keep working).
 const busyConvs = (run) => Object.values(run.convs).filter((c) => active.has(c));
@@ -507,6 +514,29 @@ const cancelTurn = (cid) => api('POST', `/api/conversations/${cid}/cancel`, { tu
 function handoffNote(run) {
   return run.handoffFrom ? `\nYou are taking over as LEADER from ${agentName(run.handoffFrom)}. Continue the same job; do not ask the user to repeat the request.\n` : '';
 }
+
+// ---------- Token usage (AionCore keeps the LAST turn's usage per conversation) ----------
+const usageOf = (cid) => api('GET', `/api/conversations/${cid}/usage`).catch(() => null);
+// The turn's tokens, or null when the backend did not report a new usage frame for it (unchanged snapshot).
+function usageDelta(before, after) {
+  const m = after?._meta;
+  if (!m || JSON.stringify(before) === JSON.stringify(after)) return null;
+  const n = (x) => Math.max(0, Number(x) || 0);
+  const d = { in: n(m.input_tokens), out: n(m.output_tokens), cache: n(m.cached_read_tokens) };
+  return d.in + d.out ? d : null;
+}
+// Adds a turn to the job (Leader / workers / per agent) and, for a worker turn, to its card.
+function chargeUsage(run, agent, t, d) {
+  if (!run || !d) return;
+  const add = (o) => { o.in += d.in; o.out += d.out; o.cache += d.cache; o.turns++; return o; };
+  const z = () => ({ in: 0, out: 0, cache: 0, turns: 0 });
+  const u = (run.usage ||= { lead: z(), work: z(), agents: {} });
+  add(t ? u.work : u.lead); add(u.agents[agent] ||= z());
+  if (t) add(t.usage ||= z());
+}
+
+// ---------- Automatic fallback when a worker's quota is gone ----------
+const QUOTA_RE = /usage limit|hit your (?:usage )?limit|rate.?limit|quota|RESOURCE_EXHAUSTED|\b429\b|too many requests|insufficient_quota|credit balance|額度/i;
 
 const SUBTASK_RULES = `- Each subtask goes to exactly one worker id from the list above.
 - Workers run in parallel, one task at a time each. Spread independent parts across different workers.
@@ -605,6 +635,7 @@ STATUS: DONE   (the goal of this task is fully reached; nothing more to do for i
 STATUS: WAITING_EXTERNAL: <what you wait for; include the PR URL if there is one>   (GitHub CI, a build, a deploy...)
 STATUS: WAITING_AGENT: <agent id>: <what you need from them>   (ids: ${Object.keys(AGENTS).join(', ')})
 STATUS: NEEDS_USER: <question to the user, in the user's language>   (only for a real decision: choose between options, a destructive action, a login)
+Never use NEEDS_USER for a technical problem (your tools are blocked, a program is missing, a command keeps failing): the user is not a programmer. Stop retrying, describe the problem in your summary and end with STATUS: DONE; the leader will retry the task another way.
 With NEEDS_USER and choices, add one more line: OPTIONS: <choice 1> | <choice 2>
 Never say DONE while you still wait for something. Do not wait or poll inside your turn: report the status and end the turn; Studio wakes you with the result.`;
 
@@ -692,6 +723,14 @@ function setDelivery(w, mode) {
 
 // 收尾者: who takes a card over when the CI it waited for is done ('' = the card's own agent). A cheap agent can do
 // the merge / sync main / cleanup chain so the strong model's quota is not spent on it.
+// 備援: a worker whose quota is gone (or that is rate limited) hands all its cards here automatically.
+function setFallback(w, agent) {
+  if (agent && !AGENTS[agent]) throw new Error('未知的 Agent');
+  if (agent && agent === w.leader) throw new Error('工頭不能當備援成員');
+  w.fallback = agent || '';
+  saveSettings();
+}
+
 function setFinisher(w, agent) {
   if (agent && !AGENTS[agent]) throw new Error('未知的 Agent');
   if (agent && agent === w.leader) throw new Error('工頭不能當收尾者（工頭不修改檔案）');
@@ -1407,7 +1446,7 @@ ${STATUS_RULES}`;
           if (t.interrupted) return '';
           if (run.stopped || run.paused) throw new Halt(run.stopped ? '已停止' : '已暫停');
         }
-        return await turn(t.agent, cid, text, { w, allowStart: () => t.agent === startAgent && !t.hold && run.active });
+        return await turn(t.agent, cid, text, { w, bill: t, allowStart: () => t.agent === startAgent && !t.hold && run.active });
       } catch (e) { if (t.interrupted && !(e instanceof Halt)) return ''; throw e; } finally { cardStep.delete(cid); t.stepEndAt = Date.now(); }
     };
     const park = () => {
@@ -1447,6 +1486,15 @@ ${STATUS_RULES}`;
       delete run.convs[workKey(t)];
       Object.assign(t, { convReset: true, briefed: '', status: 'WAITING', resumed: true, detail: e.message });
       log(w, 'studio', 'system', `${agentName(t.agent)} 的對話卡住停不下來，改開一個新的對話重做「${t.title}」。`, e.message);
+      return;
+    }
+    const fb = w.fallback;
+    if (!(e instanceof Halt) && QUOTA_RE.test(e.message) && fb && fb !== t.agent && fb !== run.leader && available(fb)) {
+      const from = t.agent;
+      Object.assign(t, { status: 'WAITING', hold: true, resumed: true, detail: e.message }); // held until the hand-over below runs
+      log(w, 'studio', 'system', `${agentName(from)} 的額度用完或被限流：依「備援」設定，它在這個專案的卡改由 ${agentName(fb)} 接手。`, e.message);
+      notify(`${label(w)}：${agentName(from)} 額度用完，已改由 ${agentName(fb)} 接手`, t.title, 'done', w.project);
+      setTimeout(() => withdrawAgent(w, from, fb).catch((err) => { t.hold = false; log(w, 'studio', 'system', '自動改派給備援成員失敗：' + err.message); pump(w); }), 0);
       return;
     }
     if (!(e instanceof Halt) && !e.timeout && !e.stuck && !t.hard && JSON.stringify(tierCfg(w, t.agent, true)) !== JSON.stringify(tierCfg(w, t.agent, false))) {
@@ -1571,7 +1619,7 @@ async function deliverAsk(w, t, cid, q) {
   askBusy.set(cid, new Promise((r) => { done = r; }));
   try {
     q.state = 'sent';
-    const reply = await turn(t.agent, cid, askPrompt(q.text, t.title), { w, check: true, ask: true, timeout: 5 * 60e3 });
+    const reply = await turn(t.agent, cid, askPrompt(q.text, t.title), { w, check: true, ask: true, timeout: 5 * 60e3, bill: t });
     if (run.stopped || run.paused) Object.assign(q, { state: 'failed', answer: '工作被' + (run.stopped ? '停止' : '暫停') + '，這個問題沒有得到回答。' });
     else Object.assign(q, { state: 'answered', answer: answerText(reply.toUpperCase().includes(ASK_MARK) ? reply.slice(reply.toUpperCase().indexOf(ASK_MARK)) : reply) || '（沒有文字回覆）', answeredAt: nowIso() });
   } catch (e) { Object.assign(q, { state: 'failed', answer: '沒有得到回覆：' + clip(e.message, 200) }); }
@@ -1623,7 +1671,7 @@ async function cardDetail(w, id) {
   const acts = mine.filter((m) => m.type === 'tool_call' || say(m)).slice(-12).reverse()
     .map((m) => ({ at: m.created_at, kind: m.type === 'tool_call' ? 'tool' : 'say', text: clip(m.type === 'tool_call' ? itemText(m) : answerText(itemText(m)).split('\n')[0], 160), running: m.type === 'tool_call' && m.status !== 'finish' }));
   const last = [...mine].reverse().find(say);
-  return { id: t.id, title: t.title, agent: t.agent, status: t.status, workingSince: t.workingSince, firstStartedAt: t.firstStartedAt, wait: t.wait, result: t.result,
+  return { id: t.id, title: t.title, agent: t.agent, status: t.status, usage: t.usage || null, workingSince: t.workingSince, firstStartedAt: t.firstStartedAt, wait: t.wait, result: t.result,
     activity: convActivity.get(cid) || null, acts, lastSay: last ? clip(answerText(itemText(last)), 800) : '', asks: t.asks || [],
     log: mine.slice(-50).map((m) => ({ at: m.created_at, who: m.position === 'right' ? 'Studio' : 'AI', kind: m.type, text: clip(itemText(m), 600) })) };
 }
@@ -2060,7 +2108,7 @@ function loadRun(w, r) {
   w.tasks = r.tasks;
   w.activity = r.activity;
   w.run = { id: r.id, startedAt: r.startedAt, project: r.project, leader: r.leader, request: r.request, convs: r.convs || {}, phase: r.phase || 'working', leaderGen: 0, rounds: r.rounds || 0, ask: r.ask || null, notes: r.notes || [], goal: r.goal, refs: r.refs, context: r.context, continues: r.continues, active: false, paused: true, stopped: false, summarizing: false };
-  Object.assign(w.run, { treeStamps: r.treeStamps || {}, treeStamp: r.treeStamp, leftAt: r.leftAt, extMod: r.extMod, claimedBy: r.claimedBy });
+  Object.assign(w.run, { usage: r.usage, treeStamps: r.treeStamps || {}, treeStamp: r.treeStamp, leftAt: r.leftAt, extMod: r.extMod, claimedBy: r.claimedBy });
   for (const [k, cid] of Object.entries(w.run.convs)) convAgent.set(cid, k.split(':')[0]);
 }
 
@@ -2151,12 +2199,29 @@ async function withdrawAgent(w, agent, to) {
     try {
       if (isWriter(t)) await handoffWriter(w, to, t.id);
       else if (t.status === 'WORKING') continue; // a read-only step finishes by itself
-      else { t.agent = to; t.status = w.run.paused ? 'PAUSED' : 'WAITING'; }
+      else { t.agent = to; t.hold = false; t.status = w.run.paused ? 'PAUSED' : 'WAITING'; }
       moved.push(t.title);
     } catch (e) { log(w, 'studio', 'system', `「${t.title}」改派給 ${agentName(to)} 失敗：${e.message}`); }
   }
   log(w, 'studio', 'system', `已撤出 ${agentName(agent)}：這個專案不再派工給它${moved.length ? `；${moved.length} 張卡改由 ${agentName(to)} 接手：${moved.join('、')}` : ''}。`);
   if (w.run) { saveRun(w, w.run.paused ? 'paused' : 'running'); if (w.run.active) pump(w); }
+}
+
+// 交給 X 處理: the user does not understand a question (often a technical one). The card goes to another agent
+// (or back to the same one) with the question, and that agent must solve it itself. No taskId = the Leader's question.
+async function delegateAsk(w, taskId, agent) {
+  if (!AGENTS[agent]) throw new Error('未知的 Agent');
+  if (!available(agent)) throw new Error(`${agentName(agent)} 目前不可用`);
+  if (!taskId) return answer(w, '', `我不是工程師，看不懂這個問題。請派 ${agentName(agent)}（id: ${agent}）自己查清楚並處理好，處理完再繼續；不要再問我技術問題。`);
+  const t = w.tasks.find((x) => x.id === taskId);
+  if (t?.status !== 'NEEDS_USER' || t.takeover) throw new Error('這張工作卡沒有在等你回覆');
+  const note = `${agentName(t.agent)} stopped this task and asked the user: "${t.ask?.question || ''}". The user is not a programmer and cannot answer technical questions, so they handed it to you. Investigate and solve it yourself (fix the cause or find another way), then finish the task. Ask the user only for a real product decision, in plain words.`;
+  log(w, 'user', 'user', `「${t.title}」交給 ${agentName(agent)} 處理`);
+  if (agent === t.agent) return wake(w, t, note);
+  if (isWriter(t)) { await handoffWriter(w, agent, t.id, note); t.ask = null; return; }
+  Object.assign(t, { agent, status: w.run.paused ? 'PAUSED' : 'WAITING', ask: null, wakeNote: note, resumed: true });
+  saveRun(w, w.run.paused ? 'paused' : 'running');
+  if (w.run.active) pump(w);
 }
 
 // Changing the Leader mid-run hands the same job over; Workers keep their cards.
@@ -2404,8 +2469,8 @@ const routes = {
         const blocked_reason = why ? 'Blocked：' + String(why).trim().replace(/^Blocked\s*[:：]?\s*/i, '') : null;
         return { ...t, blocked_reason, ...(t.status === 'WORKING' ? { activity: convActivity.get(convOf(w, t)) || null } : {}) };
       });
-      return { wsInfo: w.wsInfo, lease, workspace_summary, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, backendPort: w.backendPort, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
-        run: r && { extMod: r.extMod, claimedBy: r.claimedBy, id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
+      return { wsInfo: w.wsInfo, lease, workspace_summary, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
+        run: r && { usage: r.usage || null, extMod: r.extMod, claimedBy: r.claimedBy, id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
     });
     return { ...S, runtimes: S.runtimes, ...teamStats(), agents: Object.values(S.agents), workspaces };
   },
@@ -2439,12 +2504,14 @@ const routes = {
   'POST /api/continue-card': (b) => continueCard(wsOf(b.ws), b.taskId),
   'POST /api/card/detail': (b) => cardDetail(wsOf(b.ws), b.taskId),
   'POST /api/card/ask': (b) => askAgent(wsOf(b.ws), b.taskId, b.text),
+  'POST /api/card/delegate': (b) => delegateAsk(wsOf(b.ws), b.taskId, b.agent),
   'POST /api/check': () => { checkAll().then(refreshClaudeLimits); },
   'POST /api/recent/remove': (b) => removeRecent(b.path),
   'POST /api/agent-config': (b) => setAgentCfg(wsOf(b.ws), b.agent, b.model, b.effort, b.hardModel, b.hardEffort),
   'POST /api/workers': (b) => setWorker(wsOf(b.ws), b.agent, !!b.on),
   'POST /api/workers/withdraw': (b) => withdrawAgent(wsOf(b.ws), b.agent, b.to),
   'POST /api/finisher': (b) => setFinisher(wsOf(b.ws), b.agent),
+  'POST /api/fallback': (b) => setFallback(wsOf(b.ws), b.agent),
   'POST /api/backend-port': (b) => setBackendPort(wsOf(b.ws), b.port),
   'POST /api/external/save': (b) => saveExternal(b),
   'POST /api/external/delete': (b) => deleteExternal(b.id),

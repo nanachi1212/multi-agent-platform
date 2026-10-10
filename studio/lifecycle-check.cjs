@@ -859,6 +859,60 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     console.log('19 backend recovery only with a project backendPort: PASS');
   }
 
+  // 20) token usage: a new usage frame counts once (an unchanged snapshot = not reported); quota error → the fallback takes the cards
+  {
+    ({ env, api } = makeEnv(() => 'ok'));
+    const f = (i, o) => ({ used: i + o, size: 0, _meta: { input_tokens: i, output_tokens: o } });
+    assert.strictEqual(api.usageDelta(f(5, 1), f(5, 1)), null, 'unchanged snapshot is not a new turn');
+    assert.strictEqual(api.usageDelta(null, null), null);
+    assert.deepStrictEqual(api.usageDelta(f(5, 1), f(900, 40)), { in: 900, out: 40, cache: 0 });
+    const run = {}, t = {};
+    api.chargeUsage(run, 'claude', null, { in: 100, out: 10, cache: 0 });
+    api.chargeUsage(run, 'codex', t, { in: 50, out: 5, cache: 7 });
+    api.chargeUsage(run, 'codex', t, null);
+    assert.deepStrictEqual([run.usage.lead.in, run.usage.work.out, run.usage.agents.codex.cache, t.usage.turns], [100, 5, 7, 1]);
+
+    let fbTurns = 0;
+    ({ env, api } = makeEnv((agent, text) => {
+      if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"impl","agent":"antigravity","instructions":"build it"}]}';
+      if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+      if (agent === 'antigravity') throw new Error('RESOURCE_EXHAUSTED: You have exhausted your capacity (quota)');
+      fbTurns++; return 'built\nSTATUS: DONE';
+    }, { setWorker: (w, agent, on) => { w.workers = on ? [...new Set([...w.workers, agent])] : w.workers.filter((x) => x !== agent); } }));
+    w = newW(); w.workers = ['antigravity', 'codex']; w.fallback = 'codex'; env.S.workspaces.push(w);
+    api.planPhase(w);
+    assert.ok(await waitFor(() => w.run.result === 'done'), 'the fallback finished the job');
+    assert.deepStrictEqual([w.tasks[0].agent, w.tasks[0].status, w.workers, !!w.tasks[0].escalated], ['codex', 'DONE', ['codex'], false], 'moved, not escalated');
+    assert.ok(fbTurns === 1 && env.prompts.filter((p) => p.agent === 'codex').at(-1).text.includes('Task: impl'), 'the fallback got the full brief');
+    assert.ok(env.notices.some((n) => n.title.includes('額度用完')));
+    // without a fallback the card fails as before
+    ({ env, api } = makeEnv((agent, text) => {
+      if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"impl","agent":"antigravity","instructions":"x"}]}';
+      if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+      throw new Error('429 Too Many Requests');
+    }, { tierCfg: () => ({ model: '', effort: '' }) }));
+    w = newW(); w.workers = ['antigravity', 'codex']; env.S.workspaces.push(w);
+    api.planPhase(w);
+    assert.ok(await waitFor(() => w.tasks[0]?.status === 'FAILED'), 'no fallback set: fails as before');
+    console.log('20 token usage accounting + automatic fallback on quota errors: PASS');
+
+    // 21) 交給 X 處理: a question the user does not understand goes to another agent with the question
+    ({ env, api } = makeEnv((agent, text) => {
+      if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"read","agent":"antigravity","instructions":"read hello.txt","writes":false}]}';
+      if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+      if (agent === 'antigravity') return 'tools blocked\nSTATUS: NEEDS_USER: 勾點阻斷工具，要怎麼處理？';
+      return 'fixed and read it\nSTATUS: DONE';
+    }));
+    w = newW(); w.workers = ['antigravity', 'codex']; env.S.workspaces.push(w);
+    api.planPhase(w);
+    assert.ok(await waitFor(() => w.tasks[0]?.status === 'NEEDS_USER'));
+    await api.delegateAsk(w, w.tasks[0].id, 'codex');
+    assert.ok(await waitFor(() => w.run.result === 'done'), 'the delegate finished it');
+    const dp = env.prompts.filter((p) => p.agent === 'codex').at(-1).text;
+    assert.ok(w.tasks[0].agent === 'codex' && dp.includes('Task: read') && dp.includes('勾點阻斷工具') && dp.includes('not a programmer'), 'full brief + the question + solve it yourself');
+    console.log('21 hand a question to another agent (交給 X 處理): PASS');
+  }
+
   await require('./test-workspace-lease.cjs')({ makeEnv, mkTmp, region });
 
   // status-line parser
