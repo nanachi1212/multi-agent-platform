@@ -546,7 +546,12 @@ const SUBTASK_RULES = `- Each subtask goes to exactly one worker id from the lis
 - "instructions" must be complete and self-contained; the worker only sees that text, the results of its "after" subtasks, and the project folder.
 - Mark "writes": true for a subtask that changes files, commits, pushes or switches branches; "writes": false for review, reading code, investigation and analysis. Only ONE writing card runs at a time in a project's working tree (Studio queues the others); read-only cards run alongside it. Put changes that touch the same files in sequence with "after".
 - Claude Code has the smallest quota: give it a subtask only when codex and antigravity cannot do it.
-- Set "hard": true only when a subtask needs deep reasoning (a tricky bug, a design across many files, a security-sensitive change). Most subtasks are not hard; hard ones run on a stronger, more expensive model.`;
+- Set "hard": true only when a subtask needs deep reasoning (a tricky bug, a design across many files, a security-sensitive change). Most subtasks are not hard; hard ones run on a stronger, more expensive model.
+- Give every subtask a "role" by the cost of getting it wrong:
+  "build": implementation with a clear spec (most cards).
+  "check": a mechanical check whose answer can be verified against evidence (do the tests pass, does the output contain X, is the file list right). Give it to the cheapest available worker.
+  "review": an independent review. One in the normal delivery chain; and always one, with "hard": true, before an irreversible step (an architecture change, a migration, deleting data, a release or deploy). Never give a review to the worker who wrote the work it reviews.
+- End every "instructions" with a line "Acceptance: <how the worker proves it is done: which test must pass, what to report>". A card without a checkable acceptance line is not ready to assign.`;
 
 // Delivery policy: how far an agent carries the work without stopping for the user.
 const STOP_CONDITIONS = `a requirement so ambiguous that different readings give different product behavior; a destructive operation that could permanently lose the user's important data; a new paid service, credential, account permission or external publication; a review blocker that cannot be fixed safely inside the original scope; CI that keeps failing after a minimal fix; a merge conflict that touches uncommitted changes of the user or of another agent; anything that cannot reasonably be rolled back`;
@@ -578,7 +583,7 @@ ${run.context}
 
 const FIX_JSON = 'Your last reply was not the JSON object Studio needs. Reply again with ONLY that JSON object: no markdown fences, no other text.';
 
-const SUBTASK_SHAPE = `{"title":"<short title>","agent":"<worker id>","instructions":"<full instructions>","after":[<indexes>],"hard":false,"writes":true}`;
+const SUBTASK_SHAPE = `{"title":"<short title>","agent":"<worker id>","instructions":"<full instructions>","after":[<indexes>],"hard":false,"writes":true,"role":"build"}`;
 
 function planPrompt(run, workers, delivery) {
   return `You are the LEADER (foreman) of a small AI team in "Multi-Agent Studio".
@@ -604,11 +609,18 @@ Reply with ONLY one JSON object, no markdown fences, in exactly this shape:
 
 const parseJson = (reply) => JSON.parse(reply.slice(reply.indexOf('{'), reply.lastIndexOf('}') + 1));
 
+const CARD_ROLES = ['build', 'check', 'review'];
 function parseSubtasks(list, workers) {
   return (list || []).filter((x) => x && (x.instructions || x.title)).slice(0, 6).map((x, i) => {
     const a = String(x.agent || '').toLowerCase();
     const after = (Array.isArray(x.after) ? x.after : []).map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n < i);
-    return { hard: x.hard === true, writes: x.writes !== false, title: String(x.title || x.instructions).slice(0, 120), instructions: String(x.instructions || x.title), agent: workers.find((w) => a.includes(w)) || workers[0], after };
+    const role = CARD_ROLES.includes(x.role) ? x.role : 'build';
+    return { role, hard: x.hard === true, writes: role === 'build' && x.writes !== false, title: String(x.title || x.instructions).slice(0, 120), instructions: String(x.instructions || x.title), agent: workers.find((w) => a.includes(w)) || workers[0], after };
+  }).map((st, i, all) => { // the one who wrote it does not review it
+    if (st.role !== 'review') return st;
+    const authors = st.after.map((n) => all[n]).filter((d) => d.role === 'build').map((d) => d.agent);
+    if (authors.includes(st.agent)) st.agent = workers.find((x) => !authors.includes(x)) || st.agent;
+    return st;
   });
 }
 
@@ -621,7 +633,7 @@ function parsePlan(reply, workers) {
 function addCards(w, subtasks, lead) {
   const ids = subtasks.map(() => crypto.randomUUID().slice(0, 8));
   subtasks.forEach((st, i) => {
-    w.tasks.push({ id: ids[i], hard: st.hard, writes: st.writes, title: st.title, instructions: st.instructions, agent: st.agent, after: st.after.map((n) => ids[n]), status: 'WAITING', result: '' });
+    w.tasks.push({ id: ids[i], role: st.role, hard: st.hard, writes: st.writes, title: st.title, instructions: st.instructions, agent: st.agent, after: st.after.map((n) => ids[n]), status: 'WAITING', result: '' });
     log(w, lead, 'leader', `派工給 ${agentName(st.agent)}：${st.title}${st.after.length ? `（等「${st.after.map((n) => subtasks[n].title).join('」「')}」完成後開始）` : ''}`);
   });
 }
@@ -961,6 +973,15 @@ const sameTree = (a, b) => (a.workdir || '') === (b.workdir || '');
 const holdsWriteLock = (t) => isWriter(t) && ['WORKING', 'WAITING_EXTERNAL', 'NEEDS_USER'].includes(t.status);
 const writerBusy = (w, t) => w.tasks.some((x) => x !== t && sameTree(x, t) && holdsWriteLock(x));
 const nowIso = () => new Date().toISOString();
+
+// What a card's role asks of the worker. Claude Code may hand checks / irreversible reviews to the user's own subagents
+// (~/.claude/agents/checker.md = Haiku, reviewer.md = Fable); if they are missing it does the work itself.
+function roleRules(t) {
+  const sub = (name) => t.agent === 'claude' ? ` Delegate this to your "${name}" subagent (Agent tool, subagent_type "${name}") and report its result; if that subagent is not available, do it yourself.` : '';
+  if (t.role === 'check') return 'ROLE: CHECK. Answer only what can be verified against evidence (test output, file contents). The FIRST line of your summary is PASS, FAIL or UNKNOWN; then one evidence line each. If it needs a judgement call, answer UNKNOWN.' + sub('checker');
+  if (t.role === 'review') return 'ROLE: REVIEW. You did not write this work: verify it yourself against the goal and the acceptance line; do not trust the author\'s summary. The FIRST line of your summary is GO, GO WITH CHANGES or NO-GO; then the findings, worst first, each with file:line and the concrete situation that goes wrong.' + (t.hard ? sub('reviewer') : '');
+  return 'ROLE: BUILD. In your summary list the files you changed and the acceptance check you ran with its result (PASS / FAIL / NOT_TESTED).';
+}
 
 function accessRules(t) {
   if (!isWriter(t)) return 'ACCESS: READ-ONLY card. Another card may be editing this working tree at the same time. Read files and run read-only commands (git log / diff / show, gh pr view / diff, searches). Do NOT modify, create or delete files in the working tree and do not run commands that change it (no commit, checkout, switch, stash, pull, merge, rebase, reset, formatters, installs). You may post review comments with gh. If something must change, say exactly what in your reply; do not change it yourself.';
@@ -1432,6 +1453,7 @@ Task: ${t.title}
 Instructions:
 ${t.instructions}
 ${deps.length ? `\nResults of the earlier cards this task builds on:\n${deps.map((d) => `- ${d.title} (${agentName(d.agent)}): ${d.result}`).join('\n')}\n` : ''}
+${roleRules(t)}
 ${accessRules(t)}
 ${deliveryRules(w.delivery, 'worker')}
 When you end your turn, reply with a short summary of what you did (1-3 sentences).
@@ -1520,6 +1542,12 @@ function applyStatus(w, t, st, reply) {
   if (st.kind === 'BLOCKED') { // not done: the card fails, cards that build on it do not start, the Leader decides the retry
     Object.assign(t, { status: 'FAILED', detail: st.detail || 'technical problem' });
     log(w, 'studio', 'system', `「${t.title}」技術上卡住，沒有完成；後面依賴它的卡先不開始，交給工頭換方法或換人重試。`, st.detail);
+    return wakeWaiters(w, t);
+  }
+  const verdict = (t.result.split('\n').find((l) => l.trim()) || '').replace(/^[^A-Za-z]+/, '');
+  if (st.kind === 'DONE' && (t.role === 'review' && /^NO-GO\b/i.test(verdict) || t.role === 'check' && /^FAIL\b/i.test(verdict))) {
+    Object.assign(t, { status: 'FAILED', detail: verdict });
+    log(w, 'studio', 'system', `「${t.title}」的結論是 ${t.role === 'review' ? 'NO-GO' : 'FAIL'}：後面依賴它的卡先不開始，交給工頭安排修正。`);
     return wakeWaiters(w, t);
   }
   if (st.kind === 'DONE') {
