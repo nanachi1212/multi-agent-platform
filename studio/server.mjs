@@ -107,7 +107,7 @@ function saveRun(w, status) {
   if (!run) return;
   fs.mkdirSync(HISTORY, { recursive: true });
   // phase + convs let a paused run continue in the same agent conversations after a Studio restart.
-  const rec = { usage: run.usage, treeStamps: run.treeStamps, treeStamp: run.treeStamp, leftAt: run.leftAt, extMod: run.extMod, claimedBy: run.claimedBy, id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, notes: run.notes, suggestions: run.suggestions, convs: run.convs, tasks: w.tasks, activity: w.activity };
+  const rec = { leadTier: run.leadTier, usage: run.usage, treeStamps: run.treeStamps, treeStamp: run.treeStamp, leftAt: run.leftAt, extMod: run.extMod, claimedBy: run.claimedBy, id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, notes: run.notes, suggestions: run.suggestions, convs: run.convs, tasks: w.tasks, activity: w.activity };
   fs.writeFileSync(path.join(HISTORY, run.id + '.json'), JSON.stringify(rec, null, 2));
   S.historyRev++;
 }
@@ -612,16 +612,19 @@ Reply with ONLY one JSON object, no markdown fences, in exactly this shape:
 const parseJson = (reply) => JSON.parse(reply.slice(reply.indexOf('{'), reply.lastIndexOf('}') + 1));
 
 const CARD_ROLES = ['build', 'check', 'review'];
+// A card the Leader sent without an acceptance line gets the generic one for its role, so the worker still owes proof.
+const withAcceptance = (role, ins) => /acceptance\s*[:：]/i.test(ins) ? ins : ins + '\nAcceptance: ' + (role === 'check' ? 'report PASS, FAIL or UNKNOWN with the evidence.' : role === 'review' ? 'report GO, GO WITH CHANGES or NO-GO with the findings.' : 'state what you changed and the command you ran to verify it, with its result.');
 function parseSubtasks(list, workers) {
   return (list || []).filter((x) => x && (x.instructions || x.title)).slice(0, 6).map((x, i) => {
     const a = String(x.agent || '').toLowerCase();
     const after = (Array.isArray(x.after) ? x.after : []).map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n < i);
-    const role = CARD_ROLES.includes(x.role) ? x.role : 'build';
-    return { role, hard: x.hard === true, writes: role === 'build' && x.writes !== false, title: String(x.title || x.instructions).slice(0, 120), instructions: String(x.instructions || x.title), agent: workers.find((w) => a.includes(w)) || workers[0], after };
-  }).map((st, i, all) => { // the one who wrote it does not review it
+    const r = String(x.role || '').trim().toLowerCase(), role = CARD_ROLES.includes(r) ? r : 'build';
+    return { role, hard: x.hard === true, writes: role === 'build' && x.writes !== false, title: String(x.title || x.instructions).slice(0, 120), instructions: withAcceptance(role, String(x.instructions || x.title)), agent: workers.find((w) => a.includes(w)) || workers[0], after };
+  }).map((st, i, all) => { // nobody reviews their own work: authors are every build card upstream, not only the one right before
     if (st.role !== 'review') return st;
-    const authors = st.after.map((n) => all[n]).filter((d) => d.role === 'build').map((d) => d.agent);
-    if (authors.includes(st.agent)) st.agent = workers.find((x) => !authors.includes(x)) || st.agent;
+    const authors = new Set(), seen = new Set(), walk = (n) => { if (seen.has(n)) return; seen.add(n); if (all[n].role === 'build') authors.add(all[n].agent); all[n].after.forEach(walk); };
+    st.after.forEach(walk);
+    if (authors.has(st.agent)) st.agent = workers.find((x) => !authors.has(x)) || st.agent;
     return st;
   });
 }
@@ -908,7 +911,7 @@ async function start(w, request, cont = false, inherit = false) {
   const now = new Date();
   const id = now.toISOString().slice(0, 19).replace(/[-:T]/g, '') + '-' + crypto.randomUUID().slice(0, 4);
   // Auto-continue inherits the fingerprint of the tree the last job left, so changes made in between are noticed.
-  w.run = { treeStamp: inherit ? prev?.run?.treeStamp : undefined, leftAt: inherit ? prev?.run?.leftAt : undefined, id, startedAt: now.toISOString(), project: w.project, leader: lead, request, convs: {}, phase: 'planning', leaderGen: 0, rounds: 0, ask: null, continues, context, goal: continues ? prev.run.goal || prev.run.request : request, refs: continues ? knownRefs(prev) : [], active: true, paused: false, stopped: false, summarizing: false };
+  w.run = { leadTier: 'hard', treeStamp: inherit ? prev?.run?.treeStamp : undefined, leftAt: inherit ? prev?.run?.leftAt : undefined, id, startedAt: now.toISOString(), project: w.project, leader: lead, request, convs: {}, phase: 'planning', leaderGen: 0, rounds: 0, ask: null, continues, context, goal: continues ? prev.run.goal || prev.run.request : request, refs: continues ? knownRefs(prev) : [], active: true, paused: false, stopped: false, summarizing: false };
   log(w, 'user', 'user', request);
   if (continues) log(w, 'studio', 'system', '接續上次的工作：工頭會拿到目前的進度摘要，不用重講。', context);
   log(w, 'studio', 'system', `Leader：${agentName(lead)}；Workers：${workersFor(w, lead).map((x) => agentName(x)).join('、')}`);
@@ -989,6 +992,23 @@ const nowIso = () => new Date().toISOString();
 // What a card's role asks of the worker. Claude Code and Codex may hand checks / irreversible reviews to their own subagents:
 // Claude ~/.claude/agents/checker.md (Haiku) / reviewer.md (Fable); Studio's Codex runtime/studio/codex-home/agents/
 // checker.toml / reviewer.toml. If a subagent is missing the worker does the work itself.
+const VERDICT_RE = { check: /^(PASS|FAIL|UNKNOWN)\b/i, review: /^(GO WITH CHANGES|GO|NO-GO)\b/i };
+// The verdict a check / review card opened its summary with, or '' when it gave none.
+function verdictOf(t, text) {
+  const re = VERDICT_RE[t.role];
+  if (!re) return '';
+  const line = (String(text || '').split('\n').find((l) => l.trim()) || '').replace(/^[^A-Za-z]+/, '');
+  return (line.match(re)?.[1] || '').toUpperCase();
+}
+const verdictOk = (t, v) => t.role === 'check' ? v === 'PASS' : t.role === 'review' ? v === 'GO' || v === 'GO WITH CHANGES' : true;
+// Everyone who wrote what a review card reviews: every build card upstream of it, including agents it was handed off from.
+function reviewAuthors(w, t) {
+  const authors = new Set(), seen = new Set();
+  const walk = (id) => { if (seen.has(id)) return; seen.add(id); const d = w.tasks.find((x) => x.id === id); if (!d) return; if (d.role === 'build') { authors.add(d.agent); for (const h of d.handoffs || []) authors.add(h.from); } (d.after || []).forEach(walk); };
+  if (t.role === 'review') (t.after || []).forEach(walk);
+  return authors;
+}
+
 function roleRules(t) {
   const sub = (name) => t.agent === 'claude' ? ` Delegate this to your "${name}" subagent (Agent tool, subagent_type "${name}") and report its result; if that subagent is not available, do it yourself.`
     : t.agent === 'codex' ? ` Delegate this to your custom agent "${name}" (spawn it by that name) and report its result; if that agent is not available, do it yourself.` : '';
@@ -1469,14 +1489,15 @@ ${t.instructions}
 ${deps.length ? `\nResults of the earlier cards this task builds on:\n${deps.map((d) => `- ${d.title} (${agentName(d.agent)}): ${d.result}`).join('\n')}\n` : ''}
 ${roleRules(t)}
 ${accessRules(t)}
-${deliveryRules(w.delivery, 'worker')}
+${isWriter(t) ? deliveryRules(w.delivery, 'worker') : ''}
 When you end your turn, reply with a short summary of what you did (1-3 sentences).
 ${STATUS_RULES}`;
     if (!(note && knowsTask)) t.briefed = workKey(t);
     const cid = await conv(w, t.agent, false, t.hard, t.workdir, !isWriter(t));
     // A step stopped by 立刻打斷 ends early (maybe with an error): park the card until the Leader has read the note.
+    const capErr = () => Object.assign(new Error(`這張卡已用 ${cardTokens(t)} tokens，超過上限 ${w.tokenCap}`), { cap: true });
     const step = async (text) => {
-      if (overCap(w, t)) throw Object.assign(new Error(`這張卡已用 ${cardTokens(t)} tokens，超過上限 ${w.tokenCap}`), { cap: true });
+      if (overCap(w, t)) throw capErr(); // no further step for a card over its budget
       cardStep.add(cid);
       try {
         if (askBusy.has(cid)) { // a progress question is being answered: Stop / Pause / 打斷 / handoff meanwhile cancelled that turn, not this step
@@ -1503,6 +1524,12 @@ ${STATUS_RULES}`;
       if (st) st.text = reply.trim();
     }
     st ||= { kind: 'DONE', detail: '', options: [], text: reply.trim() + '\n（沒有回報狀態，先當作完成，由工頭確認整體結果）' };
+    if (VERDICT_RE[t.role] && st.kind === 'DONE' && !verdictOf(t, st.text)) { // a check / review must open with its verdict: ask once instead of guessing
+      const v = await step(`Your summary did not start with your verdict. Reply with ONLY one line: ${t.role === 'check' ? 'PASS, FAIL or UNKNOWN' : 'GO, GO WITH CHANGES or NO-GO'}.`);
+      if (t.interrupted) { park(); return; }
+      const got = verdictOf(t, v);
+      if (got) st.text = got + '\n' + st.text;
+    }
     let last = reply;
     while (t.notes?.length) {
       const note = t.notes.splice(0).join('\n');
@@ -1511,7 +1538,13 @@ ${STATUS_RULES}`;
       if (t.interrupted) { park(); return; }
       st = parseStatus(last) || { kind: 'DONE', detail: '', options: [], text: last.trim() };
     }
+    if (st.kind !== 'DONE' && overCap(w, t)) throw capErr(); // the step that just ended blew the budget and the card is not finished: stop it now, not at the next wake-up
     applyStatus(w, t, st, last);
+    if (t.status === 'DONE' && overCap(w, t)) { // finished, but the last step went over: the work stays, the user hears about it
+      t.overCap = true;
+      log(w, 'studio', 'system', `「${t.title}」已完成，但用了 ${cardTokens(t)} tokens，超過上限 ${w.tokenCap}。`);
+      notify(`${label(w)}：「${t.title}」超過 token 上限`, `${agentName(t.agent)} 做完了，但用了 ${cardTokens(t)} tokens`, 'ask', w.project);
+    }
   } catch (e) {
     if (e.stopUnconfirmed) {
       t.stopUnconfirmed = true; t.status = 'PAUSED'; t.result = 'Agent 尚未確認停止，保留租約';
@@ -1565,10 +1598,10 @@ function applyStatus(w, t, st, reply) {
     log(w, 'studio', 'system', `「${t.title}」技術上卡住，沒有完成；後面依賴它的卡先不開始，交給工頭換方法或換人重試。`, st.detail);
     return wakeWaiters(w, t);
   }
-  const verdict = (t.result.split('\n').find((l) => l.trim()) || '').replace(/^[^A-Za-z]+/, '');
-  if (st.kind === 'DONE' && (t.role === 'review' && /^NO-GO\b/i.test(verdict) || t.role === 'check' && /^FAIL\b/i.test(verdict))) {
-    Object.assign(t, { status: 'FAILED', detail: verdict });
-    log(w, 'studio', 'system', `「${t.title}」的結論是 ${t.role === 'review' ? 'NO-GO' : 'FAIL'}：後面依賴它的卡先不開始，交給工頭安排修正。`);
+  const verdict = verdictOf(t, t.result);
+  if (st.kind === 'DONE' && VERDICT_RE[t.role] && !verdictOk(t, verdict)) { // anything but a clear pass keeps the cards after it from starting
+    Object.assign(t, { status: 'FAILED', detail: verdict || '沒有明確的結論' });
+    log(w, 'studio', 'system', `「${t.title}」的結論是 ${verdict || '不明'}（${t.role === 'check' ? '只有 PASS' : '只有 GO／GO WITH CHANGES'} 算通過）：後面依賴它的卡先不開始，交給工頭安排。`);
     return wakeWaiters(w, t);
   }
   if (st.kind === 'DONE') {
@@ -2164,6 +2197,8 @@ function loadRun(w, r) {
   w.activity = r.activity;
   w.run = { id: r.id, startedAt: r.startedAt, project: r.project, leader: r.leader, request: r.request, convs: r.convs || {}, phase: r.phase || 'working', leaderGen: 0, rounds: r.rounds || 0, ask: r.ask || null, notes: r.notes || [], goal: r.goal, refs: r.refs, context: r.context, continues: r.continues, active: false, paused: true, stopped: false, summarizing: false };
   Object.assign(w.run, { usage: r.usage, treeStamps: r.treeStamps || {}, treeStamp: r.treeStamp, leftAt: r.leftAt, extMod: r.extMod, claimedBy: r.claimedBy });
+  if (r.leadTier !== 'hard') { for (const k of Object.keys(w.run.convs)) if (k.endsWith(':lead')) delete w.run.convs[k]; } // created on the normal tier by an older Studio: a fresh one gets the hard tier (its context is in run.context)
+  w.run.leadTier = 'hard';
   for (const [k, cid] of Object.entries(w.run.convs)) convAgent.set(cid, k.split(':')[0]);
 }
 
@@ -2236,6 +2271,7 @@ async function reassign(w, taskId, agent) {
   if (w.executingSteps?.has(t.id) || t.status === 'WORKING' || t.stopUnconfirmed) throw new Error('Agent 還在停下中，請先完成暫停');
   if (isWriter(t)) return handoffWriter(w, agent, taskId);
   if (!available(agent)) throw new Error('Agent 目前不可用');
+  if (reviewAuthors(w, t).has(agent)) throw new Error(`${agentName(agent)} 寫了這張卡要審的東西，審查不能交給它`);
   t.agent = agent; t.status = w.run.paused ? 'PAUSED' : 'WAITING';
   saveRun(w, w.run.paused ? 'paused' : 'running');
   if (w.run.active) pump(w);
@@ -2254,7 +2290,11 @@ async function withdrawAgent(w, agent, to) {
     try {
       if (isWriter(t)) await handoffWriter(w, to, t.id);
       else if (t.status === 'WORKING') continue; // a read-only step finishes by itself
-      else { t.agent = to; t.hold = false; t.status = w.run.paused ? 'PAUSED' : 'WAITING'; }
+      else {
+        const authors = reviewAuthors(w, t), dest = authors.has(to) ? w.workers.find((x) => x !== agent && x !== w.leader && available(x) && !authors.has(x)) : to;
+        if (!dest) { Object.assign(t, { status: 'FAILED', hold: false, result: `審查不能交給寫程式的 ${agentName(to)}，也沒有其他可用的成員；交給工頭安排。` }); wakeWaiters(w, t); continue; }
+        t.agent = dest; t.hold = false; t.status = w.run.paused ? 'PAUSED' : 'WAITING';
+      }
       moved.push(t.title);
     } catch (e) { log(w, 'studio', 'system', `「${t.title}」改派給 ${agentName(to)} 失敗：${e.message}`); }
   }
@@ -2274,6 +2314,7 @@ async function delegateAsk(w, taskId, agent) {
   log(w, 'user', 'user', `「${t.title}」交給 ${agentName(agent)} 處理`);
   if (agent === t.agent) return wake(w, t, note);
   if (isWriter(t)) { await handoffWriter(w, agent, t.id, note); t.ask = null; return; }
+  if (reviewAuthors(w, t).has(agent)) throw new Error(`${agentName(agent)} 寫了這張卡要審的東西，審查不能交給它`);
   Object.assign(t, { agent, status: w.run.paused ? 'PAUSED' : 'WAITING', ask: null, wakeNote: note, resumed: true });
   saveRun(w, w.run.paused ? 'paused' : 'running');
   if (w.run.active) pump(w);
