@@ -1025,6 +1025,23 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     assert.deepStrictEqual([...api.reviewAuthors(w, w.tasks[4])], ['codex'], 'authors are found through the check card');
     await assert.rejects(api.reassign(w, 'rv', 'codex'), /審查不能交給它/);
     console.log('25 verdicts (PASS/GO only), verdict asked once, transitive authors, no delivery chain for readers: PASS');
+
+    // 26) a CHECK card runs tests (own conversation, not the read-only sandbox, told to actually run); a REVIEW card stays read-only;
+    //     card steps use the 15 min stall limit
+    assert.ok(/const roOf = \(t\) => \(isWriter\(t\) \? false : t\.role === 'check' \? 'chk' : true\)/.test(src), 'check cards are not in the read-only sandbox');
+    assert.ok(/lead \|\| \(ro === true && RO_MODE\(agent\)\)/.test(src), 'only a review (ro === true) card gets the non-writing sandbox');
+    assert.ok(/timeout: CARD_STALL_MS/.test(src) && /CARD_STALL_MS = 15 \* 60e3/.test(src), 'card steps stop after 15 min without progress');
+    ({ env, api } = makeEnv((agent, text) => {
+      if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"run the suite","agent":"codex","role":"check","instructions":"run ci"}]}';
+      if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+      return 'PASS\nran it\nSTATUS: DONE';
+    }));
+    w = newW(); env.S.workspaces.push(w);
+    api.planPhase(w);
+    assert.ok(await waitFor(() => w.run.result === 'done'));
+    const cp = env.prompts.find((p) => p.text.includes('Task: run the suite')).text;
+    assert.ok(cp.includes('MUST actually RUN') && !cp.includes('ACCESS: READ-ONLY card'), 'a check card is told to run the tests, not just read');
+    console.log('26 check cards run tests, reviews stay read-only, card stall limit 15 min: PASS');
   }
 
   await require('./test-workspace-lease.cjs')({ makeEnv, mkTmp, region });

@@ -346,6 +346,7 @@ async function progressMark(convId) {
 const convActivity = new Map();
 
 const HARD_CAP_MS = 3 * 3600e3; // no single step may run longer than this
+const CARD_STALL_MS = 15 * 60e3; // a card step with no new message for this long is stopped (a hung tool call); the Leader decides the retry
 // timeout = how long the agent may show NO progress (new messages); a long job that keeps working is never cut off.
 // bill = where this turn's tokens go: a card, 'lead' (default for Leader turns), or nothing (availability checks).
 async function turn(agent, convId, text, { w, lead = false, check = false, allowStart, ask = false, timeout = 25 * 60e3, progressEvery = 30000, bill = lead && !check ? 'lead' : null } = {}) {
@@ -499,10 +500,14 @@ const available = (id) => S.agents[id]?.status === 'available';
 // which fails on a non-ASCII install path and blocks every tool (even reading). Its read-only cards keep the prompt fence.
 const RO_MODE = (agent) => agent !== 'antigravity';
 const dirTag = (d) => (d ? '@' + crypto.createHash('sha1').update(String(d)).digest('hex').slice(0, 6) : '');
-const workKey = (t) => t.agent + ':work' + (t.hard ? ':hard' : '') + (isWriter(t) ? '' : ':ro') + dirTag(t.workdir);
+// ro: false = a writing card; true = REVIEW card in the non-writing sandbox (it reads and judges); 'chk' = CHECK card: it does not
+// write the project's files but must RUN tests / lint / builds (they write caches and build output), so it is not sandboxed and
+// has its own conversation (an independent check must not share the author's context).
+const roOf = (t) => (isWriter(t) ? false : t.role === 'check' ? 'chk' : true);
+const workKey = (t) => t.agent + ':work' + (t.hard ? ':hard' : '') + (roOf(t) ? ':' + (roOf(t) === true ? 'ro' : roOf(t)) : '') + dirTag(t.workdir);
 async function conv(w, agent, lead, hard = false, workdir = '', ro = false) {
-  const key = agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : '') + (ro ? ':ro' : '') + dirTag(workdir);
-  return (w.run.convs[key] ??= await createConv(agent, workdir || w.run.project, lead || (ro && RO_MODE(agent)), tierCfg(w, agent, hard || lead)));
+  const key = agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : '') + (ro ? ':' + (ro === true ? 'ro' : ro) : '') + dirTag(workdir);
+  return (w.run.convs[key] ??= await createConv(agent, workdir || w.run.project, lead || (ro === true && RO_MODE(agent)), tierCfg(w, agent, hard || lead)));
 }
 // This run's conversations that have a turn in progress (other projects keep working).
 const busyConvs = (run) => Object.values(run.convs).filter((c) => active.has(c));
@@ -1018,6 +1023,7 @@ function roleRules(t) {
 }
 
 function accessRules(t) {
+  if (!isWriter(t) && t.role === 'check') return 'ACCESS: CHECK card. Another card may be editing this working tree at the same time, so do NOT modify, create or delete the project\'s source files and do not run commands that change history or the tree (no commit, checkout, switch, stash, pull, merge, rebase, reset, formatters). You MUST actually RUN the tests / lint / build / CI script the card asks for (they may write caches, temp files and build output; that is fine) and report their real output; reading the code is not a substitute for running it. If a run is impossible, answer UNKNOWN and say exactly what blocked it. If something must change, say exactly what in your reply; do not change it yourself.';
   if (!isWriter(t)) return 'ACCESS: READ-ONLY card. Another card may be editing this working tree at the same time. Read files and run read-only commands (git log / diff / show, gh pr view / diff, searches). Do NOT modify, create or delete files in the working tree and do not run commands that change it (no commit, checkout, switch, stash, pull, merge, rebase, reset, formatters, installs). You may post review comments with gh. If something must change, say exactly what in your reply; do not change it yourself.';
   if (t.worktree) return `ACCESS: you work in your own git worktree ${t.workdir} on branch ${t.worktree.branch}. Commit and push from there; never touch the main working tree. Do not leave it half changed when you finish or wait.`;
   return 'ACCESS: you are the only one allowed to modify this working tree right now; other cards only read. Do not leave it half changed when you finish or wait: commit, or say clearly what is uncommitted. All file changes must happen inside your own turn: never leave a background process that changes files after your turn ends (Studio treats changes made while you are not running as changes by another party).';
@@ -1493,7 +1499,7 @@ ${isWriter(t) ? deliveryRules(w.delivery, 'worker') : ''}
 When you end your turn, reply with a short summary of what you did (1-3 sentences).
 ${STATUS_RULES}`;
     if (!(note && knowsTask)) t.briefed = workKey(t);
-    const cid = await conv(w, t.agent, false, t.hard, t.workdir, !isWriter(t));
+    const cid = await conv(w, t.agent, false, t.hard, t.workdir, roOf(t));
     // A step stopped by 立刻打斷 ends early (maybe with an error): park the card until the Leader has read the note.
     const capErr = () => Object.assign(new Error(`這張卡已用 ${cardTokens(t)} tokens，超過上限 ${w.tokenCap}`), { cap: true });
     const step = async (text) => {
@@ -1505,7 +1511,7 @@ ${STATUS_RULES}`;
           if (t.interrupted) return '';
           if (run.stopped || run.paused) throw new Halt(run.stopped ? '已停止' : '已暫停');
         }
-        return await turn(t.agent, cid, text, { w, bill: t, allowStart: () => t.agent === startAgent && !t.hold && run.active });
+        return await turn(t.agent, cid, text, { w, bill: t, timeout: CARD_STALL_MS, allowStart: () => t.agent === startAgent && !t.hold && run.active });
       } catch (e) { if (t.interrupted && !(e instanceof Halt)) return ''; throw e; } finally { cardStep.delete(cid); t.stepEndAt = Date.now(); }
     };
     const park = () => {
