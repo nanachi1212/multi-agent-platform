@@ -500,10 +500,11 @@ const available = (id) => S.agents[id]?.status === 'available';
 // which fails on a non-ASCII install path and blocks every tool (even reading). Its read-only cards keep the prompt fence.
 const RO_MODE = (agent) => agent !== 'antigravity';
 const dirTag = (d) => (d ? '@' + crypto.createHash('sha1').update(String(d)).digest('hex').slice(0, 6) : '');
-// ro: false = a writing card; true = REVIEW card in the non-writing sandbox (it reads and judges); 'chk' = CHECK card: it does not
-// write the project's files but must RUN tests / lint / builds (they write caches and build output), so it is not sandboxed and
-// has its own conversation (an independent check must not share the author's context).
-const roOf = (t) => (isWriter(t) ? false : t.role === 'check' ? 'chk' : true);
+// ro: false = a writing card; true = REVIEW card in the non-writing sandbox (it reads and judges); 'chk' = CHECK card: it must RUN
+// tests / lint / builds (they write caches and build output), so it is not sandboxed, has its own conversation (an independent
+// check must not share the author's context) and takes the write lease like a writer (no other card edits the tree meanwhile,
+// and what its commands leave behind is stamped as its own, not blamed on someone else).
+const roOf = (t) => (t.role === 'check' ? 'chk' : isWriter(t) ? false : true);
 const workKey = (t) => t.agent + ':work' + (t.hard ? ':hard' : '') + (roOf(t) ? ':' + (roOf(t) === true ? 'ro' : roOf(t)) : '') + dirTag(t.workdir);
 async function conv(w, agent, lead, hard = false, workdir = '', ro = false) {
   const key = agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : '') + (ro ? ':' + (ro === true ? 'ro' : ro) : '') + dirTag(workdir);
@@ -551,7 +552,7 @@ const SUBTASK_RULES = `- Each subtask goes to exactly one worker id from the lis
 - When the request needs it, include review, verification and delivery (PR / merge) steps as their own subtasks.
 - Never let two subtasks edit the same file at the same time. A trivial request may stay a single subtask.
 - "instructions" must be complete and self-contained; the worker only sees that text, the results of its "after" subtasks, and the project folder.
-- Mark "writes": true for a subtask that changes files, commits, pushes or switches branches; "writes": false for review, reading code, investigation and analysis. Only ONE writing card runs at a time in a project's working tree (Studio queues the others); read-only cards run alongside it. Put changes that touch the same files in sequence with "after".
+- Mark "writes": true for a subtask that changes files, commits, pushes or switches branches; "writes": false for review, reading code, investigation and analysis. Only ONE writing card runs at a time in a project's working tree (Studio queues the others; a "check" card also takes this turn because it runs commands that write build output); read-only cards run alongside it. Put changes that touch the same files in sequence with "after".
 - Claude Code has the smallest quota: give it a subtask only when codex and antigravity cannot do it.
 - Set "hard": true only when a subtask needs deep reasoning (a tricky bug, a design across many files, a security-sensitive change). Most subtasks are not hard; hard ones run on a stronger, more expensive model.
 - Give every subtask a "role" by the cost of getting it wrong:
@@ -624,7 +625,7 @@ function parseSubtasks(list, workers) {
     const a = String(x.agent || '').toLowerCase();
     const after = (Array.isArray(x.after) ? x.after : []).map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n < i);
     const r = String(x.role || '').trim().toLowerCase(), role = CARD_ROLES.includes(r) ? r : 'build';
-    return { role, hard: x.hard === true, writes: role === 'build' && x.writes !== false, title: String(x.title || x.instructions).slice(0, 120), instructions: withAcceptance(role, String(x.instructions || x.title)), agent: workers.find((w) => a.includes(w)) || workers[0], after };
+    return { role, hard: x.hard === true, writes: role === 'check' || (role === 'build' && x.writes !== false), title: String(x.title || x.instructions).slice(0, 120), instructions: withAcceptance(role, String(x.instructions || x.title)), agent: workers.find((w) => a.includes(w)) || workers[0], after };
   }).map((st, i, all) => { // nobody reviews their own work: authors are every build card upstream, not only the one right before
     if (st.role !== 'review') return st;
     const authors = new Set(), seen = new Set(), walk = (n) => { if (seen.has(n)) return; seen.add(n); if (all[n].role === 'build') authors.add(all[n].agent); all[n].after.forEach(walk); };
@@ -1023,7 +1024,7 @@ function roleRules(t) {
 }
 
 function accessRules(t) {
-  if (!isWriter(t) && t.role === 'check') return 'ACCESS: CHECK card. Another card may be editing this working tree at the same time, so do NOT modify, create or delete the project\'s source files and do not run commands that change history or the tree (no commit, checkout, switch, stash, pull, merge, rebase, reset, formatters). You MUST actually RUN the tests / lint / build / CI script the card asks for (they may write caches, temp files and build output; that is fine) and report their real output; reading the code is not a substitute for running it. If a run is impossible, answer UNKNOWN and say exactly what blocked it. If something must change, say exactly what in your reply; do not change it yourself.';
+  if (t.role === 'check') return 'ACCESS: CHECK card. No other card edits this working tree while you run, but you are the checker, not the author: do NOT modify, create or delete the project\'s source files and do not run commands that change history or the tree (no commit, checkout, switch, stash, pull, merge, rebase, reset, formatters). You MUST actually RUN the tests / lint / build / CI script the card asks for (they may write caches, temp files and build output; that is fine) and report their real output; reading the code is not a substitute for running it. If a run is impossible, answer UNKNOWN and say exactly what blocked it. If something must change, say exactly what in your reply; do not change it yourself.';
   if (!isWriter(t)) return 'ACCESS: READ-ONLY card. Another card may be editing this working tree at the same time. Read files and run read-only commands (git log / diff / show, gh pr view / diff, searches). Do NOT modify, create or delete files in the working tree and do not run commands that change it (no commit, checkout, switch, stash, pull, merge, rebase, reset, formatters, installs). You may post review comments with gh. If something must change, say exactly what in your reply; do not change it yourself.';
   if (t.worktree) return `ACCESS: you work in your own git worktree ${t.workdir} on branch ${t.worktree.branch}. Commit and push from there; never touch the main working tree. Do not leave it half changed when you finish or wait.`;
   return 'ACCESS: you are the only one allowed to modify this working tree right now; other cards only read. Do not leave it half changed when you finish or wait: commit, or say clearly what is uncommitted. All file changes must happen inside your own turn: never leave a background process that changes files after your turn ends (Studio treats changes made while you are not running as changes by another party).';
@@ -1495,7 +1496,7 @@ ${t.instructions}
 ${deps.length ? `\nResults of the earlier cards this task builds on:\n${deps.map((d) => `- ${d.title} (${agentName(d.agent)}): ${d.result}`).join('\n')}\n` : ''}
 ${roleRules(t)}
 ${accessRules(t)}
-${isWriter(t) ? deliveryRules(w.delivery, 'worker') : ''}
+${isWriter(t) && t.role !== 'check' ? deliveryRules(w.delivery, 'worker') : ''}
 When you end your turn, reply with a short summary of what you did (1-3 sentences).
 ${STATUS_RULES}`;
     if (!(note && knowsTask)) t.briefed = workKey(t);

@@ -1028,7 +1028,7 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
 
     // 26) a CHECK card runs tests (own conversation, not the read-only sandbox, told to actually run); a REVIEW card stays read-only;
     //     card steps use the 15 min stall limit
-    assert.ok(/const roOf = \(t\) => \(isWriter\(t\) \? false : t\.role === 'check' \? 'chk' : true\)/.test(src), 'check cards are not in the read-only sandbox');
+    assert.ok(/const roOf = \(t\) => \(t\.role === 'check' \? 'chk' : isWriter\(t\) \? false : true\)/.test(src), 'check cards are not in the read-only sandbox');
     assert.ok(/lead \|\| \(ro === true && RO_MODE\(agent\)\)/.test(src), 'only a review (ro === true) card gets the non-writing sandbox');
     assert.ok(/timeout: CARD_STALL_MS/.test(src) && /CARD_STALL_MS = 15 \* 60e3/.test(src), 'card steps stop after 15 min without progress');
     ({ env, api } = makeEnv((agent, text) => {
@@ -1041,6 +1041,7 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     assert.ok(await waitFor(() => w.run.result === 'done'));
     const cp = env.prompts.find((p) => p.text.includes('Task: run the suite')).text;
     assert.ok(cp.includes('MUST actually RUN') && !cp.includes('ACCESS: READ-ONLY card'), 'a check card is told to run the tests, not just read');
+    assert.ok(!cp.includes('Delivery policy') && w.tasks[0].writes === true, 'a check card takes the write lease but gets no delivery chain');
     console.log('26 check cards run tests, reviews stay read-only, card stall limit 15 min: PASS');
   }
 
