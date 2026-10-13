@@ -45,7 +45,7 @@ const AFTER_DONE = ['stop', 'suggest', 'auto'];
 const STRATEGY_IDS = ['save', 'balanced', 'quality', 'custom']; // model strategies (see STRATEGIES)
 const DELIVERY_IDS = ['auto', 'pr']; // delivery: auto = all the way to merge (default), pr = stop at the pull request
 const AUTO_MAX = 5; // auto-started jobs in a row before Studio stops and waits for the user
-const TOKEN_CAP_DEFAULT = 300000; // tokens one card may spend before Studio stops it (0 = no cap); checked between steps, not inside one
+const TOKEN_CAP_DEFAULT = 0; // tokens one card may spend before Studio stops it (0 = no cap); checked between steps, not inside one
 // S.leader is the default Leader for newly opened projects.
 const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [], leases: [], external: [],
   limits: {}, notify: true, notices: [], noticeSeq: 0, runtimes: [] };
