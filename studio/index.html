@@ -80,6 +80,11 @@
   .desk.clickable:hover .plate { outline:2px solid var(--c); }
   .desk .bubble { position:absolute; left:4px; right:4px; top:0; z-index:3; padding:3px 8px; border-radius:10px; background:var(--panel); border:1px solid var(--line); font-size:11px; line-height:1.35; text-align:center;
     overflow:hidden; text-overflow:ellipsis; white-space:nowrap; box-shadow:var(--shadow); }
+  /* 詢問進度：頭頂的氣泡（等回覆會脈動，回覆後常亮）；點了直接開工作詳情 */
+  .ask-bubble { position:absolute; left:50%; top:24px; transform:translateX(-50%); z-index:4; max-width:200px; padding:3px 9px; border-radius:12px; cursor:pointer;
+    background:var(--panel); border:2px solid var(--c); box-shadow:var(--shadow); font-size:11.5px; font-weight:600; line-height:1.35; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .ask-bubble.wait { border-color:var(--pause); animation:askPulse 1.6s ease-in-out infinite; }
+  @keyframes askPulse { 50% { box-shadow:0 0 0 5px var(--pause-soft); } }
   .desk .bubble::after { content:""; position:absolute; left:50%; bottom:-5px; width:8px; height:8px; background:var(--panel); border-right:1px solid var(--line); border-bottom:1px solid var(--line); transform:translateX(-50%) rotate(45deg); }
   .desk .monitor { position:absolute; left:50%; top:28px; width:58px; height:38px; margin-left:-29px; border-radius:5px; background:#2d3036; border:3px solid #4a4e57; overflow:hidden; }
   .desk .monitor::after { content:""; position:absolute; left:50%; bottom:-11px; width:6px; height:8px; margin-left:-3px; background:#4a4e57; }
@@ -236,8 +241,15 @@
   .tbar i { display:block; height:100%; background:var(--muted); opacity:.45; }
   .lim-f { display:flex; align-items:center; gap:8px; font-size:11.5px; color:var(--muted); }
 
-  .board { display:grid; grid-template-columns:repeat(5,minmax(240px,1fr)); gap:12px; overflow-x:auto; }
+  .board { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }
+  @media (max-width:1100px) { .board { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  @media (max-width:700px) { .board { grid-template-columns:minmax(0,1fr); } }
   .lane { background:var(--panel2); border-radius:12px; padding:10px; min-height:110px; }
+  .lane-h[data-fold] { cursor:pointer; user-select:none; }
+  .lane-h[data-fold]::before { content:"▾"; color:var(--muted); }
+  .lane.folded { min-height:0; }
+  .lane.folded .lane-h::before { content:"▸"; }
+  .lane.folded .card { display:none; }
   .lane-h { display:flex; align-items:center; gap:6px; font-size:12px; font-weight:700; color:var(--muted); margin-bottom:8px; }
   .lane-h .n { margin-left:auto; background:var(--panel); border-radius:999px; padding:0 8px; }
   .card { background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--c); border-radius:10px; padding:10px; margin-bottom:8px; }
@@ -247,6 +259,11 @@
   .card .res { color:var(--muted); font-size:12px; margin-top:6px; white-space:pre-wrap; word-break:break-word; max-height:110px; overflow:auto; }
   .card .re { display:flex; gap:6px; margin-top:8px; }
   .card select { padding:4px 6px; font-size:12px; border-radius:8px; }
+  .card.has-ask { box-shadow:0 0 0 2px var(--pause); }
+  .ask-flag { margin:0 0 8px; padding:8px 10px; border-radius:10px; border:2px solid var(--pause); background:var(--pause-soft); font-size:13px; line-height:1.45; white-space:pre-wrap; word-break:break-word; max-height:160px; overflow:auto; }
+  .ask-flag b { color:var(--pause); }
+  .ask-flag.done { border-color:var(--ok); background:var(--ok-soft); } .ask-flag.done b { color:var(--ok); }
+  .ask-flag.bad { border-color:var(--bad); background:var(--bad-soft); } .ask-flag.bad b { color:var(--bad); }
 
   .cols { display:grid; grid-template-columns:minmax(0,2fr) minmax(0,1fr); gap:20px; }
   @media (max-width:1100px) { .cols { grid-template-columns:1fr; } }
@@ -411,6 +428,15 @@ const LOOK = { claude: { c:'#d97757', ab:'CC' }, codex: { c:'#10a37f', ab:'CX' }
 const look = (id) => LOOK[id] || { c:'#8d8678', ab:String(id).slice(0, 2).toUpperCase() };
 // Board lanes; a lane can hold several card states.
 const LANES = [[['WAITING','PAUSED','INTERRUPTED'],'待做'], [['WORKING'],'工作中'], [['WAITING_EXTERNAL','WAITING_AGENT','NEEDS_USER'],'在等'], [['DONE'],'已完成'], [['FAILED'],'失敗 / 停止']];
+// 工作卡的每一欄可以收起來；收起的狀態記在這個瀏覽器（localStorage 失敗就只在本次開著有效）
+const FOLD_KEY = 'studio.laneFolded';
+let laneFold = {};
+try { laneFold = JSON.parse(localStorage.getItem(FOLD_KEY) || '{}'); } catch { /* not remembered */ }
+const laneFolded = (key) => !!laneFold[key];
+function toggleLane(key) {
+  laneFold[key] = !laneFold[key];
+  try { localStorage.setItem(FOLD_KEY, JSON.stringify(laneFold)); } catch { /* not remembered */ }
+}
 const PARKED = ['WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'];
 const OPEN = ['WAITING', 'WORKING', 'PAUSED', 'INTERRUPTED', ...PARKED];
 const STATUS = { done:'完成', failed:'有失敗', stopped:'已停止', paused:'暫停中', running:'進行中', interrupted:'中斷（可繼續）' };
@@ -646,21 +672,30 @@ function usageLine(u) {
   return u ? `${fmtTok(u.in + u.out)} tokens（輸入 ${fmtTok(u.in)}／輸出 ${fmtTok(u.out)}${u.cache ? '，快取讀取 ' + fmtTok(u.cache) : ''}）` : '';
 }
 
+// The card shows its newest progress question and the answer, so nobody has to open the card to see it.
+function askFlag(t) {
+  const q = t.asks?.at(-1);
+  if (!q) return '';
+  if (ASK_PENDING.includes(q.state)) return `<div class="ask-flag"><b>💬 進度詢問</b>\n你問：${esc(q.text)}\n等 AI 回覆…</div>`;
+  if (q.state === 'answered') return `<div class="ask-flag done"><b>💬 AI 已回覆</b>（${hhmm(q.answeredAt)}）\n${esc(q.answer)}</div>`;
+  return `<div class="ask-flag bad"><b>💬 詢問沒送達</b>${q.answer ? '\n' + esc(q.answer) : ''}</div>`;
+}
 function boardHtml(tasks, agents, editable) {
   if (!tasks.length) return '<div class="empty">還沒有工作卡。在上面說你要什麼、按「交給團隊」，工頭會拆成工作卡派給成員。</div>';
   const avail = agents.filter((a) => a.status === 'available');
   const w = S.workspaces.find((x) => x.project === curPath()) || {};
   return `<div class="board">${LANES.map(([st, label]) => {
     const list = tasks.filter((t) => st.includes(t.status));
-    return `<div class="lane"><div class="lane-h">${label}<span class="n">${list.length}</span></div>${list.map((t) => {
+    return `<div class="lane${laneFolded(st.join(',')) ? ' folded' : ''}"><div class="lane-h" data-fold="${st.join(',')}" title="點一下收起／展開這一欄">${label}<span class="n">${list.length}</span></div>${list.map((t) => {
       const blk = cardBlockedReason(t);
       const ws = formatWorkspace(w, t);
       const rts = runtimesOf(w, t);
       const tagHtml = blk ? '<span class="tag bad">Blocked</span>' : (t.status === 'PAUSED' || t.status === 'INTERRUPTED' || PARKED.includes(t.status) ? `<span class="tag ${t.status === 'NEEDS_USER' ? 'bad' : 'pz'}">${STEP_WORD[t.status]}</span>` : '');
       return `
-      <div class="card" style="--c:${look(t.agent).c}">
+      <div class="card${t.asks?.length ? ' has-ask' : ''}" style="--c:${look(t.agent).c}">
         <div class="t">${esc(t.title)} ${t.role === 'check' ? '<span class="tag" title="能用證據對照的檢查：PASS / FAIL">🔍 檢查</span> ' : t.role === 'review' ? '<span class="tag" title="獨立審查：GO / NO-GO，寫程式的人不審自己">🛡 審查</span> ' : ''}${t.writes === false ? '<span class="tag" title="只讀程式、審查或調查，不會修改檔案">唯讀</span> ' : ''}${t.escalated ? '<span class="tag">已升級強模型</span>' : t.hard ? '<span class="tag">困難</span>' : ''}${tagHtml}</div>
         <span class="who"><i></i>${esc(agents.find((a) => a.id === t.agent)?.name || t.agent)}</span>
+        ${askFlag(t)}
         ${blk ? `<div class="res" style="color:var(--bad);font-weight:700">🚫 ${esc(blk)}</div>` : ''}
         ${t.result && t.status !== 'PAUSED' ? `<div class="res">${esc(t.result)}</div>` : ''}
         ${PARKED.includes(t.status) && !blk ? `<div class="res"><b>${esc(waitLine(t))}</b></div>` : ''}
@@ -1126,15 +1161,23 @@ function roomState(a, w) {
   const [kind, , text] = SLACK[Math.abs(h + Math.floor(Date.now() / 240e3)) % SLACK.length];
   return { kind, text };
 }
+// The newest question someone asked about this agent's live card (shown on its desk).
+function latestAsk(a, w) {
+  let best = null;
+  for (const x of (w ? [w] : S.workspaces)) for (const t of x.tasks) if (t.agent === a.id && ASKABLE.includes(t.status)) for (const q of t.asks || []) if (!best || q.at > best.q.at) best = { q, t, ws: x.project };
+  return best;
+}
+const ASK_PENDING = ['queued', 'sent'];
 function roomHtml(w) {
   const ids = w ? [w.leader, ...S.agents.map((a) => a.id).filter((id) => id !== w.leader && (w.workers.includes(id)))] : S.agents.map((a) => a.id);
   const leads = new Set(w ? [w.leader] : S.workspaces.map((x) => x.leader));
   const desks = ids.map((id) => S.agents.find((a) => a.id === id)).filter(Boolean).map((a) => {
-    const st = roomState(a, w), l = look(a.id);
+    const st = roomState(a, w), l = look(a.id), ask = latestAsk(a, w);
     const prop = { wait:'⏳', need:'!', coffee:'☕', phone:'📱' }[st.kind] || '';
     const open = st.task ? ` clickable" data-detail="${st.task.id}" data-ws="${esc(st.ws)}" title="查看 ${esc(a.name)} 的工作詳情` : '';
     return `<div class="desk ${st.kind}${open}" style="--c:${l.c}">
       <div class="bubble" title="${esc(st.text)}">${esc(st.text)}</div>
+      ${ask ? `<div class="ask-bubble ${ASK_PENDING.includes(ask.q.state) ? 'wait' : ''}" style="--c:${l.c}" data-detail="${ask.t.id}" data-ws="${esc(ask.ws)}" title="${esc(ask.q.state === 'answered' ? 'AI 回覆：' + ask.q.answer : '你問：' + ask.q.text)}">${ASK_PENDING.includes(ask.q.state) ? '💬 你問：' + esc(ask.q.text) : ask.q.state === 'answered' ? '💬 ' + esc(ask.q.answer) : ''}</div>` : ''}
       <div class="monitor"><i></i><i></i><i></i><i></i></div>
       <div class="guy">${leads.has(a.id) ? '<span class="crown">👑</span>' : ''}<b class="head"></b><b class="body"></b><b class="arm l"></b><b class="arm r"></b><span class="prop">${prop}</span><span class="z">z</span><span class="z">Z</span></div>
       <div class="table"></div>
@@ -1333,6 +1376,8 @@ document.addEventListener('change', (e) => {
   post('/api/agent-config', { ws: p, agent: id, model: pick('model'), effort: pick('effort'), hardModel: pick('hardModel'), hardEffort: pick('hardEffort') }).catch(() => {});
 });
 document.addEventListener('click', (e) => {
+  const fold = e.target.closest('[data-fold]');
+  if (fold) { toggleLane(fold.dataset.fold); fold.parentElement.classList.toggle('folded', laneFolded(fold.dataset.fold)); return; }
   if (doneOpen && !e.target.closest('#doneDrop')) { doneOpen = false; $('doneDrop')?.removeAttribute('open'); }
   const pzb = e.target.closest('[data-pz]');
   if (pzb) { // inside a project card link: act, don't open the tab

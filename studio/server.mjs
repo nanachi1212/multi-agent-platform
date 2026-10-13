@@ -1586,6 +1586,7 @@ ${STATUS_RULES}`;
       log(w, 'studio', 'system', `「${t.title}」用平常的模型沒做成，自動改用強模型重試一次。`, e.message);
       return;
     }
+    if (!(e instanceof Halt) && handToLeader(w, t, e.message)) return;
     t.status = 'FAILED';
     t.result = e.timeout ? '沒有完成：' + e.message.replace(/^逾時：/, '')
       : e.stuck ? '沒有完成：這位 AI 員工的對話卡在上一步（可能在等權限確認），Studio 試著停止但沒有成功。'
@@ -1596,11 +1597,24 @@ ${STATUS_RULES}`;
   }
 }
 
+// 工人做不到（失敗、卡住）：整張卡交給工頭接手完成。每張卡只交一次；檢查／審查卡不交（工頭不審自己的工作）。
+function handToLeader(w, t, why) {
+  const leader = w.run.leader;
+  if (t.ledByLeader || t.agent === leader || ['check', 'review'].includes(t.role) || !available(leader)) return false;
+  const from = t.agent;
+  Object.assign(t, { status: 'WAITING', hold: true, ledByLeader: true, resumed: true, detail: why });
+  log(w, 'studio', 'system', `${agentName(from)} 沒有完成「${t.title}」，依設定交給工頭 ${agentName(leader)} 接手完成。`, why);
+  // hold keeps the card off the old worker until the hand-over (reassign) is done; reassign's own pump is skipped by the hold, so pump after it
+  setTimeout(() => reassign(w, t.id, leader).then(() => { t.hold = false; if (w.run?.active) pump(w); }, (err) => { t.hold = false; log(w, 'studio', 'system', '交給工頭失敗：' + err.message); pump(w); }), 0);
+  return true;
+}
+
 function applyStatus(w, t, st, reply) {
   const who = agentName(t.agent);
   t.result = st.text || '(沒有文字回覆)';
   log(w, t.agent, 'worker', t.result);
   if (st.kind === 'BLOCKED') { // not done: the card fails, cards that build on it do not start, the Leader decides the retry
+    if (handToLeader(w, t, st.detail || 'technical problem')) return;
     Object.assign(t, { status: 'FAILED', detail: st.detail || 'technical problem' });
     log(w, 'studio', 'system', `「${t.title}」技術上卡住，沒有完成；後面依賴它的卡先不開始，交給工頭換方法或換人重試。`, st.detail);
     return wakeWaiters(w, t);
