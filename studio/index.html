@@ -48,20 +48,20 @@
   .kpi .v { font-size:26px; font-weight:700; line-height:1.2; }
   .kpi .l { color:var(--muted); font-size:12px; font-weight:600; }
 
-  .layout { display:grid; grid-template-columns:280px minmax(0,1fr) 400px; gap:20px; padding:20px 24px; max-width:1960px; margin:0 auto; }
-  .layout.room-off { grid-template-columns:280px minmax(0,1fr) 44px; }
-  @media (max-width:1280px) { .layout, .layout.room-off { grid-template-columns:280px minmax(0,1fr); } .room { grid-column:1 / -1; grid-row:auto; } }
-  @media (max-width:980px) { .layout, .layout.room-off { grid-template-columns:1fr; padding:16px; } }
+  /* 左欄：開啟專案／歷史 + 辦公室；右邊整片給工作內容 */
+  .layout { display:grid; grid-template-columns:340px minmax(0,1fr); grid-template-rows:auto 1fr; gap:20px; padding:20px 24px; max-width:2200px; margin:0 auto; }
+  .layout > .sidebar { grid-column:1; grid-row:1; }
+  .layout > .stage { grid-column:2; grid-row:1 / span 2; }
+  @media (max-width:980px) { .layout { grid-template-columns:1fr; grid-template-rows:none; padding:16px; } .layout > .sidebar, .layout > .stage, .layout > .room { grid-column:auto; grid-row:auto; } }
 
-  /* ---- 辦公室：右側的動畫面板。有工作的 AI 在打字，沒工作的在摸魚 ---- */
-  .room { grid-column:3; grid-row:1; position:sticky; top:72px; align-self:start; display:flex; flex-direction:column; gap:10px; min-width:0; }
-  @media (max-width:1280px) { .room { position:static; } }
+  /* ---- 辦公室：左欄的動畫面板。有工作的 AI 在打字，沒工作的在摸魚 ---- */
+  .room { grid-column:1; grid-row:2; position:sticky; top:72px; align-self:start; display:flex; flex-direction:column; gap:10px; min-width:0; }
+  @media (max-width:980px) { .room { position:static; } }
   .room-h { display:flex; align-items:center; gap:8px; font-weight:700; }
   .room-h .sub { margin:0; font-weight:400; }
   .room-toggle { padding:2px 10px; }
   .layout.room-off .room-h > :not(.room-toggle), .layout.room-off .scene { display:none; }
-  .layout.room-off .room-toggle { writing-mode:vertical-rl; padding:10px 4px; }
-  .scene { --wall:#efe8dc; --wall2:#e4dccd; --floor1:#e9dfcf; --floor2:#e2d6c3; --wood:#c9a57a; --wood2:#a9845a; --skin:#f1c9a5; --hair:#3b2f2a;
+    .scene { --wall:#efe8dc; --wall2:#e4dccd; --floor1:#e9dfcf; --floor2:#e2d6c3; --wood:#c9a57a; --wood2:#a9845a; --skin:#f1c9a5; --hair:#3b2f2a;
     position:relative; border-radius:16px; overflow:hidden; border:1px solid var(--line); box-shadow:var(--shadow);
     background:linear-gradient(var(--wall) 0 92px, var(--wall2) 92px 98px, transparent 98px),
       repeating-linear-gradient(90deg, var(--floor1) 0 46px, var(--floor2) 46px 48px); }
@@ -236,8 +236,7 @@
   .tbar i { display:block; height:100%; background:var(--muted); opacity:.45; }
   .lim-f { display:flex; align-items:center; gap:8px; font-size:11.5px; color:var(--muted); }
 
-  .board { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; }
-  @media (max-width:1100px) { .board { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  .board { display:grid; grid-template-columns:repeat(5,minmax(240px,1fr)); gap:12px; overflow-x:auto; }
   .lane { background:var(--panel2); border-radius:12px; padding:10px; min-height:110px; }
   .lane-h { display:flex; align-items:center; gap:6px; font-size:12px; font-weight:700; color:var(--muted); margin-bottom:8px; }
   .lane-h .n { margin-left:auto; background:var(--panel); border-radius:999px; padding:0 8px; }
@@ -320,7 +319,7 @@
   </aside>
 
   <aside class="room" id="room" aria-label="AI 辦公室">
-    <div class="room-h"><span>🏢 AI 辦公室</span><span class="sub" id="roomSub"></span><span class="spacer"></span><button class="btn small ghost room-toggle" id="roomToggle" title="收起／展開辦公室動畫">⟩ 收起</button></div>
+    <div class="room-h"><span>🏢 AI 辦公室</span><span class="sub" id="roomSub"></span><span class="spacer"></span><button class="btn small ghost room-toggle" id="roomToggle" title="收起／展開辦公室動畫">▾ 收起</button></div>
     <div class="scene" id="roomScene"></div>
   </aside>
 
@@ -1402,7 +1401,7 @@ document.addEventListener('click', (e) => {
 // 辦公室動畫收起／展開: remembered per browser.
 (function () {
   const lay = document.querySelector('.layout'), btn = $('roomToggle');
-  const apply = (off) => { lay.classList.toggle('room-off', off); btn.textContent = off ? '⟨ 辦公室' : '⟩ 收起'; };
+  const apply = (off) => { lay.classList.toggle('room-off', off); btn.textContent = off ? '▸ 展開辦公室' : '▾ 收起'; };
   let off = false;
   try { off = localStorage.getItem('studio.roomOff') === '1'; } catch { /* storage blocked: shown */ }
   apply(off);
