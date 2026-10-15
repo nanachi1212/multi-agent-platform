@@ -995,9 +995,10 @@ const holdsWriteLock = (t) => isWriter(t) && ['WORKING', 'WAITING_EXTERNAL', 'NE
 const writerBusy = (w, t) => w.tasks.some((x) => x !== t && sameTree(x, t) && holdsWriteLock(x));
 const nowIso = () => new Date().toISOString();
 
-// What a card's role asks of the worker. Claude Code and Codex may hand checks / irreversible reviews to their own subagents:
-// Claude ~/.claude/agents/checker.md (Haiku) / reviewer.md (Fable); Studio's Codex runtime/studio/codex-home/agents/
-// checker.toml / reviewer.toml. If a subagent is missing the worker does the work itself.
+// What a card's role asks of the worker. Claude Code may hand checks / irreversible reviews to its own subagents
+// (~/.claude/agents/checker.md (Haiku) / reviewer.md (Fable)); if a subagent is missing it does the work itself.
+// Codex does them itself: its spawned agents run out of Studio's sight (no new messages), the "do not wait" status rule
+// made it end the turn before the agent answered, and the resumed turn then hung until the 15-min stall cut it off.
 const VERDICT_RE = { check: /^(PASS|FAIL|UNKNOWN)\b/i, review: /^(GO WITH CHANGES|GO|NO-GO)\b/i };
 // The verdict a check / review card opened its summary with, or '' when it gave none.
 function verdictOf(t, text) {
@@ -1016,8 +1017,7 @@ function reviewAuthors(w, t) {
 }
 
 function roleRules(t) {
-  const sub = (name) => t.agent === 'claude' ? ` Delegate this to your "${name}" subagent (Agent tool, subagent_type "${name}") and report its result; if that subagent is not available, do it yourself.`
-    : t.agent === 'codex' ? ` Delegate this to your custom agent "${name}" (spawn it by that name) and report its result; if that agent is not available, do it yourself.` : '';
+  const sub = (name) => t.agent === 'claude' ? ` Delegate this to your "${name}" subagent (Agent tool, subagent_type "${name}") and report its result; if that subagent is not available, do it yourself.` : '';
   if (t.role === 'check') return 'ROLE: CHECK. Answer only what can be verified against evidence (test output, file contents). The FIRST line of your summary is PASS, FAIL or UNKNOWN; then one evidence line each. If it needs a judgement call, answer UNKNOWN.' + sub('checker');
   if (t.role === 'review') return 'ROLE: REVIEW. You did not write this work: verify it yourself against the goal and the acceptance line; do not trust the author\'s summary. The FIRST line of your summary is GO, GO WITH CHANGES or NO-GO; then the findings, worst first, each with file:line and the concrete situation that goes wrong.' + (t.hard ? sub('reviewer') : '');
   return 'ROLE: BUILD. In your summary list the files you changed and the acceptance check you ran with its result (PASS / FAIL / NOT_TESTED).';
