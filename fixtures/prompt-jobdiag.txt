@@ -1,0 +1,2 @@
+Run exactly this one shell command, then reply with only its output:
+pwsh -NoProfile -NonInteractive -File "E:\CodexProject\multi-agent-platform\spikes\job-diag.ps1"

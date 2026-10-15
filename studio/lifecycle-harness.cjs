@@ -19,7 +19,7 @@ function makeEnv(script, overrides = {}) {
     S: { workspaces: [], leases: [] }, RT: mkTmp('studio-rt-'), PORT: 4848, api: async () => ({ items: [] }), stopTurn: async () => true, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 20))), crypto: nodeCrypto, logs, notices, prompts,
     log: (w, who, role, text, detail) => logs.push({ who, role, text, detail }),
     notify: (title, body, kind) => notices.push({ title, body, kind }),
-    label: () => 'TestProj', refreshClaudeLimits() {}, saveRun() {}, saveSettings() {}, latestJob: () => null, clip: (x, n) => String(x ?? '').slice(0, n), AUTO_MAX: 5, AFTER_DONE: ['stop', 'suggest', 'auto'],
+    label: () => 'TestProj', refreshClaudeLimits() {}, saveRun() {}, saveSettings() {}, latestJob: () => null, clip: (x, n) => String(x ?? '').slice(0, n), AFTER_DONE: ['stop', 'suggest', 'auto'],
     started: [], start: async (w, request, cont) => { env.started.push({ request, cont }); }, setTimeout: (fn, ms) => (ms === 5000 ? queueMicrotask(fn) : globalThis.setTimeout(fn, ms)), // only the 5 s auto-continue delay is skipped
     Halt: class extends Error {}, active: new Map(), convActivity: new Map(), HARD_CAP_MS: 3 * 3600e3, CARD_STALL_MS: 15 * 60e3, busyConvs: () => [], cancelTurn() {}, convAgent: new Map(),
     available: () => true, workersFor: (w, lead) => w.workers.filter((x) => x !== lead),

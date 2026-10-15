@@ -924,7 +924,8 @@ function officeHtml(w) {
     <div class="row" style="gap:6px;font-size:13px"><span class="hint" style="font-size:13px">做完之後：</span>
       <select data-after-done style="width:auto;padding:4px 8px;font-size:13px" title="只影響這個專案">
         ${[['stop', '① 完成就停（報告後等我）'], ['suggest', '② 完成後建議下一步（等我按）'], ['auto', '③ 自動持續開發（自動做下一個小目標）']].map(([k, t]) => `<option value="${k}" ${(w.afterDone || 'stop') === k ? 'selected' : ''}>${t}</option>`).join('')}
-      </select><span class="hint" style="font-size:13px;margin-left:8px">交付：</span>
+      </select>${w.afterDone === 'auto' ? `<span class="hint" style="font-size:13px;margin-left:6px">連續最多</span>
+      <input data-auto-max type="number" min="0" step="1" value="${w.autoMax ?? 5}" style="width:56px;padding:4px 8px;font-size:13px" title="自動連續做幾件後停下等你；0＝不限，一直做到工頭沒有下一步、失敗、需要你決定，或你按暫停／Stop／改回「完成就停」"><span class="hint" style="font-size:13px">件（0＝不限）</span>` : ''}<span class="hint" style="font-size:13px;margin-left:8px">交付：</span>
       <select data-delivery style="width:auto;padding:4px 8px;font-size:13px" title="需求清楚、沒有高風險時，AI 要做到哪裡才停">${[['auto', '🚚 自動做到 merge'], ['pr', '✋ 做到 PR 就停（merge 等我）']].map(([k, t]) => `<option value="${k}" ${(w.delivery || 'auto') === k ? 'selected' : ''}>${t}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">模型策略：</span>
       <select data-strategy style="width:auto;padding:4px 8px;font-size:13px" title="工頭自己判斷普通卡／困難卡；普通卡失敗會自動改用強模型重試一次">${STRATEGY.map(([k, t]) => `<option value="${k}" ${(w.strategy || 'save') === k ? 'selected' : ''}>${t}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">收尾者：</span>
       <span class="hint" style="font-size:13px;margin-left:8px">備援：</span>
@@ -932,7 +933,7 @@ function officeHtml(w) {
       <select data-finisher style="width:auto;padding:4px 8px;font-size:13px" title="CI 跑完後，merge／同步 main／清分支改由這位接手，省下強模型的額度（等 CI 本身不花額度，Studio 自己查）"><option value="">原成員自己收尾</option>${S.agents.filter((a) => a.id !== w.leader && w.workers.includes(a.id)).map((a) => `<option value="${a.id}" ${w.finisher === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><label class="hint" style="font-size:13px;margin-left:8px;display:inline-flex;align-items:center;gap:4px" title="打勾＝每張卡用多少 token 都不會被 Studio 停下來（沒有煞車，用量自己留意）；取消打勾可以設定上限"><input type="checkbox" data-token-unlimited ${w.tokenCap ? '' : 'checked'}> 不限制 token</label>
       <input data-token-cap type="number" min="1" step="10000" value="${w.tokenCap || ''}" ${w.tokenCap ? '' : 'disabled'} placeholder="每張卡上限" style="width:104px;padding:4px 8px;font-size:13px" title="一張卡用超過這個數就停下來交給工頭（在每一步之間檢查，正在跑的那一步不會中斷；AI 沒回報用量就無法計算）">
       <span class="hint" style="font-size:13px;margin-left:8px">驗證用後端 port：</span>
-      <input data-backend-port type="number" min="1" max="65535" value="${w.backendPort || ''}" placeholder="無" style="width:72px;padding:4px 8px;font-size:13px" title="專案有自己的後端服務時填它的 port（例如 3018）：成員會請 Studio 代管啟動，卡片在等它時 Studio 會自動檢查 health 並安全恢復；留空＝不用">${w.afterDone === 'auto' ? `<span class="tag pz">🔁 自動中 ${w.autoRounds || 0}/5</span>` : ''}</div>
+      <input data-backend-port type="number" min="1" max="65535" value="${w.backendPort || ''}" placeholder="無" style="width:72px;padding:4px 8px;font-size:13px" title="專案有自己的後端服務時填它的 port（例如 3018）：成員會請 Studio 代管啟動，卡片在等它時 Studio 會自動檢查 health 並安全恢復；留空＝不用">${w.afterDone === 'auto' ? `<span class="tag pz">🔁 自動中 ${w.autoRounds || 0}${w.autoMax ? '/' + w.autoMax : ''}</span>` : ''}</div>
     ${leaseHtml(w)}
     ${workspaceLine(w)}
     ${runtimeHtml(w)}
@@ -1063,7 +1064,7 @@ function projCardHtml(w) {
     <div class="att ${attention(w).cls}">${attention(w).ic} ${esc(attention(w).text)}</div>
     ${w.lease?.writer ? `<div class="lim-f">✍️ ${esc(w.lease.writer.owner)} ${esc(LEASE_WORD[w.lease.writer.state] || w.lease.writer.state)}${w.lease.writer.card ? '：「' + esc(w.lease.writer.card) + '」' : ''}</div>` : ''}
     ${workspaceLine(w)}${runtimeHtml(w)}
-    ${w.afterDone === 'auto' ? `<div class="lim-f"><span class="tag pz">🔁 自動持續開發 ${w.autoRounds || 0}/5</span></div>` : w.afterDone === 'suggest' && !w.run?.active && w.pstate?.suggestions?.length ? `<div class="lim-f"><b>建議</b> ${esc(w.pstate.suggestions.map((x) => x.title).join('、'))}</div>` : ''}
+    ${w.afterDone === 'auto' ? `<div class="lim-f"><span class="tag pz">🔁 自動持續開發 ${w.autoRounds || 0}${w.autoMax ? '/' + w.autoMax : ''}</span></div>` : w.afterDone === 'suggest' && !w.run?.active && w.pstate?.suggestions?.length ? `<div class="lim-f"><b>建議</b> ${esc(w.pstate.suggestions.map((x) => x.title).join('、'))}</div>` : ''}
     ${attention(w).state && attention(w).state.level !== 'idle' ? `<div class="lim-f"><b>下一步</b> ${esc(attention(w).state.next)}</div><div class="lim-f"><b>Nana</b> ${esc(attention(w).state.you)}</div>` : ''}
     <div class="pc-req">${r?.active || r?.paused ? esc(r.request) : w.pstate?.goal ? '上次目標：' + esc(w.pstate.goal) : r ? esc(r.request) : '<span class="empty">還沒有工作，點進來交給團隊。</span>'}</div>
     ${total ? `<div class="sbar">${seg(done, 'ok')}${seg(working, 'work')}${seg(failed, 'bad')}</div>
@@ -1345,6 +1346,8 @@ document.addEventListener('change', (e) => {
   }
   const tc = e.target.closest('input[data-token-cap]');
   if (tc) return post('/api/token-cap', { ws: ws(), cap: tc.value }).catch(() => {});
+  const am = e.target.closest('input[data-auto-max]');
+  if (am) return post('/api/auto-max', { ws: ws(), max: am.value }).catch(() => {});
   const bp = e.target.closest('input[data-backend-port]');
   if (bp) return post('/api/backend-port', { ws: ws(), port: bp.value }).catch(() => {});
   const fb = e.target.closest('select[data-fallback]');
@@ -1365,7 +1368,7 @@ document.addEventListener('change', (e) => {
   const ad = e.target.closest('select[data-after-done]');
   if (ad) {
     const mode = ad.value;
-    if (mode === 'auto' && !confirm('開啟「自動持續開發」？\n\n每次工作完成後，工頭會自己選下一個小目標並自動派工，不會等你按。\n• 最多連續自動做 5 件，之後停下等你\n• 需要你決定的事、失敗、暫停或 Stop 都會讓它停下\n• 隨時可以改回「完成就停」')) { ad.value = W()?.afterDone || 'stop'; return; }
+    if (mode === 'auto' && !confirm('開啟「自動持續開發」？\n\n每次工作完成後，工頭會自己選下一個小目標並自動派工，不會等你按。\n• 預設最多連續自動做 5 件，之後停下等你（可在旁邊改，0＝不限）\n• 需要你決定的事、失敗、暫停或 Stop 都會讓它停下\n• 隨時可以改回「完成就停」')) { ad.value = W()?.afterDone || 'stop'; return; }
     return post('/api/after-done', { ws: ws(), mode }).catch(() => {});
   }
   const sw = e.target.closest('select[data-swap-leader]');

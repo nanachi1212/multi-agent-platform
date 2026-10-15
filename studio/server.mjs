@@ -44,7 +44,7 @@ function registerExternal(e) {
 const AFTER_DONE = ['stop', 'suggest', 'auto'];
 const STRATEGY_IDS = ['save', 'balanced', 'quality', 'custom']; // model strategies (see STRATEGIES)
 const DELIVERY_IDS = ['auto', 'pr']; // delivery: auto = all the way to merge (default), pr = stop at the pull request
-const AUTO_MAX = 5; // auto-started jobs in a row before Studio stops and waits for the user
+const AUTO_MAX_DEFAULT = 5; // auto-started jobs in a row before Studio stops and waits for the user (per project; 0 = no limit)
 const TOKEN_CAP_DEFAULT = 0; // tokens one card may spend before Studio stops it (0 = no cap); checked between steps, not inside one
 // S.leader is the default Leader for newly opened projects.
 const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [], leases: [], external: [],
@@ -54,7 +54,7 @@ const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}
 // agentCfg = this project's model / effort per agent; workers = agents allowed to work here.
 // New projects start from S.agentCfg (the last choices).
 const newWs = (project, leader = S.leader, name = '', agentCfg = S.agentCfg, workers = Object.keys(AGENTS)) => ({
-  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, strategy: 'save', delivery: 'auto', finisher: '', fallback: '', backendPort: 0, tokenCap: TOKEN_CAP_DEFAULT,
+  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, autoMax: AUTO_MAX_DEFAULT, strategy: 'save', delivery: 'auto', finisher: '', fallback: '', backendPort: 0, tokenCap: TOKEN_CAP_DEFAULT,
   agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...agentCfg?.[id] }])),
   workers: workers.filter((id) => AGENTS[id]),
 });
@@ -86,7 +86,7 @@ try {
   // Older settings had one `project` and global models; it becomes the first open workspace with those models.
   S.workspaces = (saved.workspaces || (saved.project ? [{ project: saved.project }] : []))
     .filter((x) => isDir(x.project))
-    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto', finisher: AGENTS[x.finisher] ? x.finisher : '', fallback: AGENTS[x.fallback] ? x.fallback : '', backendPort: Number(x.backendPort) || 0, tokenCap: x.tokenCap == null ? TOKEN_CAP_DEFAULT : Number(x.tokenCap) || 0 }));
+    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', autoMax: x.autoMax == null ? AUTO_MAX_DEFAULT : Number(x.autoMax) || 0, strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto', finisher: AGENTS[x.finisher] ? x.finisher : '', fallback: AGENTS[x.fallback] ? x.fallback : '', backendPort: Number(x.backendPort) || 0, tokenCap: x.tokenCap == null ? TOKEN_CAP_DEFAULT : Number(x.tokenCap) || 0 }));
   S.recent = (saved.recent || []).filter(isDir);
   if (saved.notify === false) S.notify = false;
 } catch (e) {
@@ -98,7 +98,7 @@ try {
 
 function saveSettings() {
   fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
-  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tokenCap: w.tokenCap }));
+  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tokenCap: w.tokenCap }));
   fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external }, null, 2));
 }
 
@@ -725,17 +725,18 @@ function finish(w, status) {
   if (status === 'done' && w.afterDone === 'auto') setTimeout(() => autoNext(w, run), 5000);
 }
 
-// 自動持續開發: only when the user switched it on for this project, only after a done job, at most AUTO_MAX in a row.
+// 自動持續開發: only when the user switched it on for this project, only after a done job, at most w.autoMax in a row
+// (0 = no limit: it keeps going until the Leader has no next step, a job fails or needs the user, or the user stops it).
 function autoNext(w, run) {
   const next = run.suggestions?.[0];
   if (w.afterDone !== 'auto' || w.run !== run || !next) return;
-  if (w.autoRounds >= AUTO_MAX) {
-    log(w, 'studio', 'system', `已自動連續做了 ${AUTO_MAX} 件，先停下來等你。`);
-    return notify(`${label(w)}：自動持續開發先停下`, `已連續自動做了 ${AUTO_MAX} 件，等你看過再繼續`, 'ask', w.project);
+  if (w.autoMax && w.autoRounds >= w.autoMax) {
+    log(w, 'studio', 'system', `已自動連續做了 ${w.autoMax} 件，先停下來等你。`);
+    return notify(`${label(w)}：自動持續開發先停下`, `已連續自動做了 ${w.autoMax} 件，等你看過再繼續`, 'ask', w.project);
   }
   w.autoRounds++;
   notify(`${label(w)}：自動開始下一步`, next.title, 'done', w.project);
-  start(w, next.request, true, true).then(() => log(w, 'studio', 'system', `自動持續開發（第 ${w.autoRounds}/${AUTO_MAX} 件）：工頭選了「${next.title}」`))
+  start(w, next.request, true, true).then(() => log(w, 'studio', 'system', `自動持續開發（第 ${w.autoRounds}${w.autoMax ? '/' + w.autoMax : ''} 件）：工頭選了「${next.title}」`))
     .catch((e) => log(w, 'studio', 'system', '自動開始下一步失敗：' + e.message));
 }
 
@@ -785,6 +786,13 @@ function setAfterDone(w, mode) {
   if (!AFTER_DONE.includes(mode)) throw new Error('未知的完成後模式');
   w.afterDone = mode;
   w.autoRounds = 0;
+  saveSettings();
+}
+
+function setAutoMax(w, max) {
+  max = Number(max) || 0;
+  if (max < 0 || !Number.isInteger(max)) throw new Error('連續上限必須是 0（不限）或正整數');
+  w.autoMax = max;
   saveSettings();
 }
 
@@ -2586,7 +2594,7 @@ const routes = {
         const blocked_reason = why ? 'Blocked：' + String(why).trim().replace(/^Blocked\s*[:：]?\s*/i, '') : null;
         return { ...t, blocked_reason, ...(t.status === 'WORKING' ? { activity: convActivity.get(convOf(w, t)) || null } : {}) };
       });
-      return { wsInfo: w.wsInfo, lease, workspace_summary, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tokenCap: w.tokenCap, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
+      return { wsInfo: w.wsInfo, lease, workspace_summary, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tokenCap: w.tokenCap, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
         run: r && { usage: r.usage || null, extMod: r.extMod, claimedBy: r.claimedBy, id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
     });
     return { ...S, runtimes: S.runtimes, ...teamStats(), agents: Object.values(S.agents), workspaces };
@@ -2610,6 +2618,7 @@ const routes = {
   'POST /api/leader': (b) => setLeader(wsOf(b.ws), b.agent),
   'POST /api/start': (b) => { const w = wsOf(b.ws); w.autoRounds = 0; return start(w, String(b.request || ''), !!b.continue); },
   'POST /api/after-done': (b) => setAfterDone(wsOf(b.ws), b.mode),
+  'POST /api/auto-max': (b) => setAutoMax(wsOf(b.ws), b.max),
   'POST /api/delivery': (b) => setDelivery(wsOf(b.ws), b.mode),
   'POST /api/stop': (b) => stopAndDrain(wsOf(b.ws)),
   'POST /api/reassign': (b) => reassign(wsOf(b.ws), b.taskId, b.agent),

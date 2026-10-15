@@ -101,7 +101,7 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
   };
   for (const mode of ['stop', 'suggest', 'auto']) {
     ({ env, api } = makeEnv(modeScript));
-    w = Object.assign(newW(), { afterDone: mode, autoRounds: 0 }); env.S.workspaces.push(w);
+    w = Object.assign(newW(), { afterDone: mode, autoRounds: 0, autoMax: 5 }); env.S.workspaces.push(w);
     await api.planPhase(w); await settle();
     const check = env.prompts.find((p) => p.text.includes('Every current card has ended')).text;
     assert.strictEqual(check.includes('"next"'), mode !== 'stop', mode + ': next steps asked only when wanted');
@@ -112,9 +112,11 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
       w.autoRounds = 5; api.autoNext(w, w.run);
       assert.strictEqual(env.started.length, 1, 'stops after 5 in a row');
       assert.ok(env.notices.some((n) => n.title.includes('自動持續開發先停下')));
+      w.autoMax = 0; w.autoRounds = 99; api.autoNext(w, w.run); await settle();
+      assert.strictEqual(env.started.length, 2, 'autoMax 0 = no limit');
     }
   }
-  console.log('7 after-done modes (stop / suggest / auto + limit): PASS');
+  console.log('7 after-done modes (stop / suggest / auto + limit / no limit): PASS');
 
   // 8) instructions mid-job: the Leader tells the working card, cancels a waiting card and adds one
   let implTurn = 0;
