@@ -66,27 +66,50 @@ export async function getChildPids(parentPid, snapshot = processSnapshot) {
   return root ? processTree(rows, root).slice(1).map((p) => p.pid) : [];
 }
 
+// A saved identity is the same process only while PID, creation time and executable all still match.
+const sameIdentity = (a, b) => a.pid === b.pid && String(a.creationDate) === String(b.creationDate)
+  && String(a.executable || '').toLowerCase() === String(b.executable || '').toLowerCase();
+
+/**
+ * Kill each saved identity that a fresh snapshot still shows unchanged; a reused PID is never touched.
+ * Returns every verified PID, including ones whose kill failed, so callers keep waiting on (and reporting) them.
+ */
+export async function killIdentities(list, snapshot = processSnapshot) {
+  const verified = [];
+  for (const old of list) {
+    // ponytail: one snapshot per kill (~1 s each) so an earlier kill cannot free a PID this loop then reuses; batch if trees get large
+    if (!(await snapshot()).some((p) => sameIdentity(p, old))) continue;
+    verified.push(old.pid);
+    try { process.kill(old.pid, 'SIGKILL'); } catch (e) {} // already exited, or still alive and reported by the caller
+  }
+  return verified;
+}
+
 /**
  * Terminate a process tree.
  * CRITICAL RULE: Kills only the root and its verified descendants, one PID at a time (no taskkill /T: it walks ParentProcessId again).
+ * Children are killed only if a fresh snapshot, taken after the root died, still shows the same creation time and executable.
  * NEVER kills by process name (no Stop-Process -Name python).
  */
-export async function killProcessTree(rootPid) {
+export async function killProcessTree(rootPid, snapshot = processSnapshot) {
   if (!rootPid || !isPidAlive(rootPid)) return { ok: true, killed: false };
   let children;
-  try { children = await getChildPids(rootPid); }
-  catch (e) { return { ok: false, killed: false, rootPid, children: [], remaining: [rootPid] }; } // unknown tree: kill nothing
+  try {
+    const rows = await snapshot(), root = rows.find((p) => p.pid === rootPid);
+    children = root ? processTree(rows, root).slice(1) : [];
+  } catch (e) { return { ok: false, killed: false, rootPid, children: [], remaining: [rootPid] }; } // unknown tree: kill nothing
 
-  for (const pid of [rootPid, ...children]) {
-    try { process.kill(pid, 'SIGKILL'); } catch (e) {} // already exited
-  }
+  try { process.kill(rootPid, 'SIGKILL'); } catch (e) {} // already exited
+  let victims = [];
+  try { victims = await killIdentities(children, snapshot); }
+  catch (e) { return { ok: false, killed: true, rootPid, children: [], remaining: [rootPid, ...children.map((p) => p.pid)].filter(isPidAlive) }; }
 
-  // Do not kill detached/reused child PIDs after the parent tree has exited.
-  for (let i = 0; i < 20 && [rootPid, ...children].some(isPidAlive); i++) {
+  const pids = [rootPid, ...victims];
+  for (let i = 0; i < 20 && pids.some(isPidAlive); i++) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  const remaining = [rootPid, ...children].filter(isPidAlive);
-  return { ok: remaining.length === 0, killed: true, rootPid, children, remaining };
+  const remaining = pids.filter(isPidAlive);
+  return { ok: remaining.length === 0, killed: true, rootPid, children: victims, remaining };
 }
 
 export async function getPortOccupant(port) {
@@ -169,6 +192,9 @@ export async function cleanupRuntime(runtime, { rtDir = null, customRuntimes = n
   return { ok: true };
 }
 
+// Unique per Studio start: a PID or timestamp can repeat after a quick restart, this cannot.
+const STUDIO_INSTANCE = crypto.randomUUID();
+
 // ---------- Runtime Registry Persistence & Operations ----------
 
 export function runtimesFile(rtDir) {
@@ -245,6 +271,7 @@ export function registerRuntime({
     created_by: String(created_by || 'unknown'),
     restart_safe: restart_safe === true,
     studio_pid,
+    studio_instance: STUDIO_INSTANCE,
     process_identity: process_identity?.creationDate && process_identity?.executable
       ? { creationDate: process_identity.creationDate, executable: process_identity.executable } : null
   };
@@ -289,10 +316,23 @@ export async function cleanupJobRuntimes(jobId, { rtDir = null, customRuntimes =
   return { cleaned, blocked };
 }
 
-export async function cleanupStaleRuntimes({ rtDir = null, customRuntimes = null } = {}) {
+export async function cleanupStaleRuntimes({ rtDir = null, customRuntimes = null, snapshot = processSnapshot } = {}) {
   const runtimes = listRuntimes({ rtDir, customRuntimes });
   let cleanedCount = 0, staleCount = 0;
   for (const runtime of runtimes) {
+    // A Codex record left 'stopping' by an earlier Studio: its saved process identities are the only proof of what to stop.
+    // Only this Studio start's own in-flight stop is skipped; a record without this start's instance id is an earlier Studio's. It stays 'stopping' (retryable) until clean.
+    if (runtime.status === 'stopping' && Array.isArray(runtime.process_tree) && runtime.studio_instance !== STUDIO_INSTANCE) {
+      try {
+        await killIdentities(runtime.process_tree, snapshot);
+        const rows = await snapshot();
+        if (runtime.process_tree.some((old) => rows.some((p) => sameIdentity(p, old)))) throw new Error('Codex tool processes have not stopped');
+        updateRuntime(runtime.runtime_id, { status: 'cleaned' }, { rtDir, customRuntimes }); cleanedCount++;
+      } catch (e) {
+        updateRuntime(runtime.runtime_id, { blocked_reason: e.message }, { rtDir, customRuntimes }); staleCount++;
+      }
+      continue;
+    }
     if (!['running', 'exited', 'stale'].includes(runtime.status)) continue;
     // Another live Studio owns its running processes. Never steal its runtime.
     if (isPidAlive(runtime.root_pid) && runtime.studio_pid && isPidAlive(runtime.studio_pid)) continue;

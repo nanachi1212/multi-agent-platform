@@ -94,15 +94,15 @@ export function createCodexRuntimeGuard({ rtDir, api, owner, snapshot = processS
       remember(cid, before, after);
       entries = records(cid).filter((r) => r.status === 'stopping');
       let rows = after;
-      for (let i = 0; i < 5; i++) {
+      for (let i = 0; ; i++) {
         if (entries.every((r) => r.process_tree.every((p) => !stillPresent(rows, p)))) {
           for (const r of entries) save(r, { status: 'cleaned' });
           return true;
         }
+        if (i === 5) return false;
         await new Promise((resolve) => setTimeout(resolve, 200));
         rows = await snapshot();
       }
-      return false;
     })
   };
 }

@@ -26,18 +26,25 @@ const { region } = require('./lifecycle-harness.cjs');
     saveSettings(); saveRun(w, 'running');
     assert.strictEqual(JSON.parse(fs.readFileSync(SETTINGS, 'utf8')).leader, 'claude');
     assert.ok(!fs.readdirSync(path.dirname(SETTINGS)).some((f) => f.endsWith('.tmp')));
-    const release = claimRuntime(rt), lock = path.join(rt, 'studio', 'instance.lock');
-    assert.throws(() => claimRuntime(rt), /重複啟動/);
+    const release = await claimRuntime(rt), lock = path.join(rt, 'studio', 'instance.lock');
+    await assert.rejects(claimRuntime(rt), /重複啟動/);
     const child = spawnSync(process.execPath, [path.join(__dirname, 'server.mjs')], {
       env: { ...process.env, STUDIO_RUNTIME: rt, STUDIO_NO_OPEN: '1' }, encoding: 'utf8', windowsHide: true, timeout: 10000 });
     assert.strictEqual(child.status, 1); assert.match(child.stderr, /重複啟動/);
     assert.ok(!fs.existsSync(path.join(rt, 'studio', 'runtimes.json')), 'duplicate fails before launching AionCore');
-    const separate = claimRuntime(path.join(rt, 'independent')); separate();
+    const separate = await claimRuntime(path.join(rt, 'independent')); separate();
     release(); assert.ok(!fs.existsSync(lock));
     fs.writeFileSync(lock, JSON.stringify({ pid: 2147483000, token: 'dead' }));
-    const reclaimed = claimRuntime(rt); reclaimed();
+    const reclaimed = await claimRuntime(rt); reclaimed();
+    const { getProcessInfo } = await import('./runtime-registry.mjs'), me = await getProcessInfo(process.pid), reclaimLock = lock + '.reclaim';
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'reused', creationDate: 'old', executable: me.executable }));
+    (await claimRuntime(rt))(); // live PID, different creation time: a reused PID is not the old Studio
+    fs.writeFileSync(lock, JSON.stringify({ pid: 2147483000, token: 'dead' })); fs.writeFileSync(reclaimLock, JSON.stringify({ pid: 2147483000 }));
+    (await claimRuntime(rt))(); assert.ok(!fs.existsSync(reclaimLock), 'abandoned reclaim lock is recovered');
+    fs.writeFileSync(lock, JSON.stringify({ pid: 2147483000, token: 'dead' })); fs.writeFileSync(reclaimLock, JSON.stringify({ pid: process.pid, creationDate: me.creationDate, executable: me.executable }));
+    await assert.rejects(claimRuntime(rt), /接手/); fs.unlinkSync(reclaimLock); fs.unlinkSync(lock);
     for (const text of ['{', '{}', '{"pid":null}']) {
-      fs.writeFileSync(lock, text); assert.throws(() => claimRuntime(rt)); assert.strictEqual(fs.readFileSync(lock, 'utf8'), text);
+      fs.writeFileSync(lock, text); await assert.rejects(claimRuntime(rt)); assert.strictEqual(fs.readFileSync(lock, 'utf8'), text);
     }
     console.log('state files: atomic settings/history, failed replacement preserves data, runtime exclusion before startup, dead/unknown owner handling: PASS');
   } finally { fs.rmSync(rt, { recursive: true, force: true }); }

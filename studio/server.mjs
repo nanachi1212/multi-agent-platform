@@ -16,7 +16,7 @@ const ROOT = path.resolve(import.meta.dirname, '..');
 // STUDIO_RUNTIME = a separate runtime folder (settings, history, leases, events, AionCore data), so a test Studio can run
 // next to the user's own without touching it. The AionCore program itself stays shared (read-only, 95 MB).
 const RT = process.env.STUDIO_RUNTIME ? path.resolve(process.env.STUDIO_RUNTIME) : path.join(ROOT, 'runtime');
-const releaseInstance = claimRuntime(RT); // before reading or writing shared state or launching any child
+const releaseInstance = await claimRuntime(RT); // before reading or writing shared state or launching any child
 process.on('exit', () => { try { releaseInstance(); } catch (e) { console.error('Studio runtime 解鎖失敗：' + e.message); } });
 const AION = path.join(ROOT, 'runtime', 'aioncore', 'aioncore.exe');
 const AION_URL = 'https://github.com/iOfficeAI/AionCore/releases/download/v0.2.2/aioncore-v0.2.2-x86_64-pc-windows-msvc.zip';
