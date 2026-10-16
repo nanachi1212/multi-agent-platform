@@ -14,7 +14,6 @@ module.exports = async function () {
   const sandbox = {
     console,
     S: { workspaces: [], agents: [], runtimes: [] },
-    LANES: [['WAITING', '待做'], ['WORKING', '進行中'], ['DONE', '已完成']],
     STEP_WORD: { WAITING: '待做', WORKING: '工作中', DONE: '已完成', PAUSED: '已暫停', INTERRUPTED: '已中斷', FAILED: '失敗', WAITING_EXTERNAL: '等待外部結果', WAITING_AGENT: '等待其他 AI', NEEDS_USER: '需要 Nana' },
     PARKED: ['WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'],
     ICON: { DONE: '✅', WORKING: '⏳', WAITING: '🕒', PAUSED: '⏸️' },
@@ -27,6 +26,7 @@ module.exports = async function () {
     STATE_LOOK: { need: ['🔴', 'bad'], open: ['🟡', 'on'], wait: ['🟡', 'on'], done: ['✅', 'ok'], idle: ['⚪', ''] },
     wsStatus: () => ['ok', '正常', 'ok'],
     when: () => '剛剛',
+    laneFolded: () => false, // board lane fold state (localStorage in the page)
     workState: () => null, workButtons: () => '', ASKABLE: ['WORKING', 'WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'], // work-progress helpers (own tests in lifecycle-check 17)
   };
 
@@ -44,10 +44,12 @@ module.exports = async function () {
     'blockedHtml',
     'waitLine',
     'attention',
+    'askFlag',
     'boardHtml',
     'projCardHtml'
   ];
 
+  vm.runInNewContext(html.match(/^const LANES = .*$/m)[0].replace('const ', 'globalThis.'), sandbox); // the page's own lanes, not a copy
   for (const fn of fnNames) {
     const m = html.match(new RegExp(`function ${fn}\\s*\\([\\s\\S]*?\\r?\\n\\}`));
     assert.ok(m, `Function ${fn} should exist in index.html`);
