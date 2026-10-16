@@ -1,5 +1,5 @@
 // Durable workspace ownership. Agent execution and scheduling stay in server.mjs.
-export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, AGENTS, nowIso, pidAlive, LEASE_HUNG_MS, LEASE_RESERVED_TTL_MS }) {
+export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, AGENTS, nowIso, pidAlive, LEASE_RESERVED_TTL_MS }) {
   // ----- persistence -----
   const leasesFile = () => path.join(RT, 'studio', 'leases.json');
   // Another Studio sharing this folder may have added or changed leases: take its records in (ours stay the truth for our own).
@@ -86,13 +86,15 @@ export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, A
     const age = Date.now() - (Date.parse(l.heartbeatAt || l.acquiredAt) || 0);
     if (l.owner.kind === 'external') return 'EXTERNAL'; // explicit ownership survives process exits and restarts
     if (l.instance === INSTANCE) return l.status; // this Studio: its own memory is the truth
-    if (l.status === 'RESERVED') return pidAlive(l.pid) || age < LEASE_RESERVED_TTL_MS ? 'RESERVED' : 'STALE';
-    return pidAlive(l.pid) && age < LEASE_HUNG_MS ? 'ACTIVE' : 'STALE'; // another Studio: alive and beating, or it is not
+    if (!Number.isInteger(l.pid) || l.pid <= 0 || pidAlive(l.pid)) return l.status === 'RESERVED' ? 'RESERVED' : 'ACTIVE'; // silence is not proof that a writer stopped
+    if (l.status === 'RESERVED') return age < LEASE_RESERVED_TTL_MS ? 'RESERVED' : 'STALE';
+    return 'STALE';
   }
   const writerOf = (key) => S.leases.find((l) => l.key === key && l.mode === 'write' && ['ACTIVE', 'RESERVED', 'EXTERNAL'].includes(leaseState(l))) || null;
   const retire = (l, reason) => Object.assign(l, { status: 'RELEASED', releasedAt: nowIso(), reason });
   const ownerName = (l) => (l.owner.kind === 'external' ? '外部：' + (l.owner.label || 'external') : AGENTS[l.owner.agent]?.name || l.owner.agent);
-  const sameCard = (l, w, t) => l.owner.kind === 'studio' && l.jobId === w.run?.id && l.cardId === t.id && l.owner.agent === t.agent && (l.generation || 0) === (t.leaseGeneration || 0);
+  const sameCard = (l, w, t) => l.owner.kind === 'studio' && l.jobId === w.run?.id && l.cardId === t.id && l.owner.agent === t.agent && (l.generation || 0) === (t.leaseGeneration || 0)
+    && (l.instance === INSTANCE || Number.isInteger(l.pid) && l.pid > 0 && !pidAlive(l.pid));
   const leaseView = (l) => ({ id: l.id, mode: l.mode, state: leaseState(l), kind: l.owner.kind, agent: l.owner.agent || '', owner: ownerName(l), card: l.cardTitle || '', cardId: l.cardId || '', jobId: l.jobId || '',
     branch: l.branch || '', path: l.path, repo: l.repo || '', since: l.acquiredAt, beat: l.heartbeatAt, reason: l.reason || '', flag: l.flag || '', worktree: l.worktree || l.path, provider: l.provider || l.owner.agent || 'external', session: l.session || '' });
 

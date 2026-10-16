@@ -6,19 +6,24 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, execFile } from 'node:child_process';
-import { cleanupRuntime, verifyRuntimeProcess, cleanupJobRuntimes, cleanupStaleRuntimes, checkPortOwnership, getProcessInfo, isPidAlive, killProcessTree, listRuntimes, registerRuntime, updateRuntime } from './runtime-registry.mjs';
+import { cleanupRuntime, verifyRuntimeProcess, cleanupJobRuntimes, cleanupStaleRuntimes, checkPortOwnership, getProcessInfo, isPidAlive, killProcessTree, listRuntimes, registerRuntime, updateRuntime, isSafeTempDir } from './runtime-registry.mjs';
 import { checkBackendReadiness, recoverOwnedRuntime } from './runtime-readiness.mjs';
+import { createSmokeEnvironment, cleanupIsolatedDir } from './isolated-env.mjs';
+import { writeJson, claimRuntime } from './state-files.mjs';
+import { createCodexRuntimeGuard } from './codex-runtime.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 // STUDIO_RUNTIME = a separate runtime folder (settings, history, leases, events, AionCore data), so a test Studio can run
 // next to the user's own without touching it. The AionCore program itself stays shared (read-only, 95 MB).
 const RT = process.env.STUDIO_RUNTIME ? path.resolve(process.env.STUDIO_RUNTIME) : path.join(ROOT, 'runtime');
+const releaseInstance = claimRuntime(RT); // before reading or writing shared state or launching any child
+process.on('exit', () => { try { releaseInstance(); } catch (e) { console.error('Studio runtime 解鎖失敗：' + e.message); } });
 const AION = path.join(ROOT, 'runtime', 'aioncore', 'aioncore.exe');
 const AION_URL = 'https://github.com/iOfficeAI/AionCore/releases/download/v0.2.2/aioncore-v0.2.2-x86_64-pc-windows-msvc.zip';
 const AION_ZIP_SHA256 = 'd1ed8d1da869230c18701747d07e8f068db5b8c9442e65261304aeb4c27eacf6';
 let PORT = Number(process.env.STUDIO_PORT || 4848); // moves up when the port is taken (see server.listen)
 // Studio's Codex gets its own home so its sessions never show up in the user's own Codex history.
-const CODEX_HOME = path.join(RT, 'studio', 'codex-home');
+const CODEX_HOME = process.env.STUDIO_CODEX_HOME ? path.resolve(process.env.STUDIO_CODEX_HOME) : path.join(RT, 'studio', 'codex-home');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Agents are just a catalog; any of them can be Leader or Worker.
@@ -99,18 +104,16 @@ try {
 }
 
 function saveSettings() {
-  fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
   const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tokenCap: w.tokenCap, mission: w.mission, routines: w.routines }));
-  fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external }, null, 2));
+  writeJson(SETTINGS, { leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external });
 }
 
 function saveRun(w, status) {
   const run = w.run;
   if (!run) return;
-  fs.mkdirSync(HISTORY, { recursive: true });
   // phase + convs let a paused run continue in the same agent conversations after a Studio restart.
   const rec = { leadTier: run.leadTier, usage: run.usage, treeStamps: run.treeStamps, treeStamp: run.treeStamp, leftAt: run.leftAt, extMod: run.extMod, claimedBy: run.claimedBy, id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, notes: run.notes, suggestions: run.suggestions, convs: run.convs, tasks: w.tasks, activity: w.activity };
-  fs.writeFileSync(path.join(HISTORY, run.id + '.json'), JSON.stringify(rec, null, 2));
+  writeJson(path.join(HISTORY, run.id + '.json'), rec);
   S.historyRev++;
 }
 
@@ -185,6 +188,8 @@ async function ensureAion() {
   await new Promise((res, rej) => execFile('tar', ['-xf', zip, '-C', path.dirname(AION)], (e) => (e ? rej(e) : res())));
 }
 
+let aionProcess;
+const codexRuntime = createCodexRuntimeGuard({ rtDir: RT, api, owner: () => aionProcess });
 async function startAion() {
   await ensureAion();
   const data = path.join(RT, 'studio', 'data');
@@ -195,12 +200,13 @@ async function startAion() {
   const p = spawn(AION, ['--local', '--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)],
     { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, CODEX_HOME } });
   if (p.pid) {
+    aionProcess = await getProcessInfo(p.pid);
     const args = ['--local', '--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)];
     registerRuntime({
       job_id: 'studio_core',
       purpose: 'helper',
       root_pid: p.pid,
-      process_identity: await getProcessInfo(p.pid),
+      process_identity: aionProcess,
       executable: AION,
       command: `${AION} ${args.join(' ')}`,
       args,
@@ -222,9 +228,15 @@ async function startAion() {
   });
 }
 
+// Every AionCore call answers promptly (turns are polled, not awaited); the slowest seen in the spikes was ~8 s (create).
+const API_TIMEOUT_MS = 30e3;
 async function api(method, p, body) {
-  const r = await fetch(BASE + p, { method, headers: { 'content-type': 'application/json' }, body: body && JSON.stringify(body) });
-  const j = await r.json().catch(() => ({}));
+  const signal = AbortSignal.timeout(API_TIMEOUT_MS);
+  // AionCore may still act on a request it never answered: the stop is unconfirmed, so the write lease stays.
+  const timedOut = () => Object.assign(new Error(`AionCore ${method} ${p} 逾時：${API_TIMEOUT_MS / 1000} 秒沒有回應`), { stopUnconfirmed: true });
+  const r = await fetch(BASE + p, { method, headers: { 'content-type': 'application/json' }, body: body && JSON.stringify(body), signal })
+    .catch((e) => { throw signal.aborted ? timedOut() : e; });
+  const j = await r.json().catch(() => { if (signal.aborted) throw timedOut(); return {}; });
   if (!r.ok || j.success === false) throw new Error(`AionCore ${method} ${p} → ${r.status} ${JSON.stringify(j).slice(0, 300)}`);
   return j.data;
 }
@@ -233,6 +245,10 @@ const convAgent = new Map(); // conversationId -> agent id (to route catalog eve
 
 // cfg = the project's { model, effort } for this agent; none = agent defaults.
 async function createConv(agent, ws, lead, cfg) {
+  const create = () => createAgentConv(agent, ws, lead, cfg);
+  return agent === 'codex' ? codexRuntime.create(create) : create();
+}
+async function createAgentConv(agent, ws, lead, cfg) {
   const body = AGENTS[agent].create(ws, lead);
   if (cfg?.model && !AGENTS[agent].external) body.extra.current_model_id = cfg.model;
   if (cfg?.effort) body.extra.thought_level = cfg.effort;
@@ -326,13 +342,23 @@ async function answerConfirmations(w, convId, allow) {
 // Send one message and wait until the agent's turn is over. Returns the agent's reply text.
 // Stops whatever the conversation is doing (a step still waiting for a permission answer, a runaway command)
 // and waits until it is idle. Returns false when it will not stop.
+const stoppingTurns = new Map();
+function isCodexConv(cid) {
+  return convAgent.get(cid) === 'codex' || S.workspaces.some((w) => Object.entries(w.run?.convs || {}).some(([key, id]) => id === cid && key.startsWith('codex:')));
+}
 async function stopTurn(convId) {
+  if (stoppingTurns.has(convId)) return stoppingTurns.get(convId);
+  const pending = stopConversation(convId).catch(() => false);
+  stoppingTurns.set(convId, pending);
+  try { return await pending; } finally { stoppingTurns.delete(convId); }
+}
+async function stopConversation(convId) {
   // An orphan turn (e.g. left by a timed-out step) is not in `active`: ask the conversation which turn is running.
   const turnId = active.get(convId) ?? (await api('GET', `/api/conversations/${convId}`).catch(() => ({}))).runtime?.turn_id;
   await api('POST', `/api/conversations/${convId}/cancel`, { turn_id: turnId }).catch(() => {});
   for (let k = 0; k < 10; k++) {
     const rt = (await api('GET', `/api/conversations/${convId}`).catch(() => ({}))).runtime || {};
-    if (rt.state === 'idle' && !rt.is_processing) return true;
+    if (rt.state === 'idle' && !rt.is_processing) return !isCodexConv(convId) || await codexRuntime.stop(convId);
     await sleep(2000);
   }
   return false;
@@ -344,6 +370,10 @@ async function sendMessage(convId, text) {
   catch (e) {
     if (!/already running|CONFLICT/i.test(e.message)) throw e;
     if (!(await stopTurn(convId))) throw Object.assign(e, { stuck: true, stopUnconfirmed: true });
+    if (isCodexConv(convId)) {
+      try { await codexRuntime.prepare(convId); }
+      catch (error) { throw Object.assign(error, { stopUnconfirmed: true }); }
+    }
     return api('POST', `/api/conversations/${convId}/messages`, { content: text });
   }
 }
@@ -367,6 +397,10 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
   if (!check && (run?.stopped || run?.paused || allowStart && !allowStart())) throw new Halt('執行已停止');
   if (!run) bill = null;
   const usage0 = bill ? await usageOf(convId) : null;
+  if (agent === 'codex') {
+    try { await codexRuntime.prepare(convId); }
+    catch (e) { throw Object.assign(e, { stopUnconfirmed: true }); }
+  }
   const sent = await sendMessage(convId, text);
   active.set(convId, sent.turn_id);
   convActivity.set(convId, { at: Date.now(), tool: '', confirm: false }); // a fresh turn starts with fresh activity
@@ -403,6 +437,7 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
     if (!check) S.agents[agent].working--;
     if (agent === 'codex') refreshCodexLimits();
     if (bill) chargeUsage(run, agent, bill === 'lead' ? null : bill, usageDelta(usage0, await usageOf(convId)));
+    if (agent === 'codex' && !(await codexRuntime.stop(convId).catch(() => false))) throw Object.assign(new Error('Codex 工具程序尚未確認停止，保留寫入租約'), { stopUnconfirmed: true });
   }
   if (!check && (run?.stopped || run?.paused)) throw new Halt(run.stopped ? '已停止' : '已暫停');
   const items = (await api('GET', `/api/conversations/${convId}/messages`)).items || [];
@@ -484,6 +519,16 @@ async function extModels(b) {
 }
 
 // ---------- Team ----------
+async function codexFailureNote(message) {
+  if (!/provider rejected|401|unauthorized/i.test(message)) return message;
+  return new Promise((resolve) => execFile(process.platform === 'win32' ? 'cmd.exe' : 'codex',
+    process.platform === 'win32' ? ['/d', '/s', '/c', 'codex login status'] : ['login', 'status'],
+    { env: { ...process.env, CODEX_HOME }, windowsHide: true, timeout: 15000 }, (error, stdout, stderr) => {
+      resolve(error && /(?:^|\r?\n)Not logged in\s*$/m.test(String(stdout) + '\n' + String(stderr))
+        ? 'Codex 尚未登入目前的 Studio 專用 home。請按「登入 Codex（Studio 專用）」後重新檢查；隔離測試可用 STUDIO_CODEX_HOME 指定已登入的 Studio 專用目錄。'
+        : message);
+    }));
+}
 async function checkAgent(id) {
   const a = S.agents[id], tok = (a.checkTok = {}); // a newer check (after an edit or re-test) wins over this one
   a.status = 'checking';
@@ -497,9 +542,10 @@ async function checkAgent(id) {
     if (!/OK/i.test(reply)) throw new Error('沒有正常回覆：' + (reply || '(空白)'));
     if (a.checkTok === tok) a.status = 'available';
   } catch (e) {
+    const note = id === 'codex' ? await codexFailureNote(e.message) : e.message;
     if (a.checkTok !== tok) return;
     a.status = 'unavailable';
-    a.note = e.message.slice(0, 200);
+    a.note = note.slice(0, 200);
   }
 }
 const checkAll = () => Promise.all(Object.keys(AGENTS).map(checkAgent));
@@ -517,7 +563,7 @@ const dirTag = (d) => (d ? '@' + crypto.createHash('sha1').update(String(d)).dig
 // tests / lint / builds (they write caches and build output), so it is not sandboxed, has its own conversation (an independent
 // check must not share the author's context) and takes the write lease like a writer (no other card edits the tree meanwhile,
 // and what its commands leave behind is stamped as its own, not blamed on someone else).
-const roOf = (t) => (t.role === 'check' ? 'chk' : isWriter(t) ? false : true);
+const roOf = (t) => (!isWriter(t) ? true : t.role === 'check' ? 'chk' : false);
 const workKey = (t) => t.agent + ':work' + (t.hard ? ':hard' : '') + (roOf(t) ? ':' + (roOf(t) === true ? 'ro' : roOf(t)) : '') + dirTag(t.workdir);
 async function conv(w, agent, lead, hard = false, workdir = '', ro = false) {
   const key = agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : '') + (ro ? ':' + (ro === true ? 'ro' : ro) : '') + dirTag(workdir);
@@ -563,6 +609,7 @@ const SUBTASK_RULES = `- Each subtask goes to exactly one worker id from the lis
 - Workers run in parallel, one task at a time each. Spread independent parts across different workers.
 - Use "after" (0-based indexes of EARLIER subtasks in this list) when a subtask needs their results first, e.g. a review after the implementation, a fix after the review, a merge after the fix. Independent subtasks have no "after".
 - When the request needs it, include review, verification and delivery (PR / merge) steps as their own subtasks.
+- If a review depends on implementation, the implementation ends DONE after its own acceptance checks; it must not wait for that downstream review. Put delivery after the review in a separate card.
 - Never let two subtasks edit the same file at the same time. A trivial request may stay a single subtask.
 - "instructions" must be complete and self-contained; the worker only sees that text, the results of its "after" subtasks, and the project folder.
 - Mark "writes": true for a subtask that changes files, commits, pushes or switches branches; "writes": false for review, reading code, investigation and analysis. Only ONE writing card runs at a time in a project's working tree (Studio queues the others; a "check" card also takes this turn because it runs commands that write build output); read-only cards run alongside it. Put changes that touch the same files in sequence with "after".
@@ -584,9 +631,9 @@ function deliveryRules(mode, role, afterDone = 'stop') {
     return `Delivery policy (stop at the pull request): when the request is clear and nothing high-risk is involved, carry the work through change -> targeted validation -> commit -> push -> pull request -> CI without stopping, then report. Do NOT merge: the user merges. ${role === 'leader' ? 'Give the whole chain to ONE worker card (it parks on CI with STATUS: WAITING_EXTERNAL and the PR URL, and continues when woken).' : ''} ${stops}`;
   }
   const chain = 'change -> targeted validation -> commit -> push -> pull request -> CI -> one review (the repository\'s own review bot if it has one, otherwise one independent review by a different worker) -> fix by the review triage below -> CI again -> squash merge -> sync main -> clean up: delete this PR\'s branch (and its worktree, if Studio made one) now that it is merged -> next card';
-  const how = role === 'leader' ? `Plan the whole chain, not just the code: give it to ONE worker card (that worker parks the card on CI with STATUS: WAITING_EXTERNAL and the PR URL, and continues when woken); add a review card for a different worker only when the repository has no review bot.`
+  const how = role === 'leader' ? `Plan the whole chain, not just the code: with a repository review bot, give it to ONE worker card (it parks on CI with STATUS: WAITING_EXTERNAL and the PR URL). Without a review bot, use implementation -> independent review -> delivery cards with "after" dependencies; implementation ends after changes, validation and PR/CI, before review and merge.`
     : role === 'check' ? 'A request that changes a repository is complete only when the work is delivered (merged, main synced, branch deleted); if it is not, add cards for the missing steps instead of reporting it done or asking the user. Findings that were recorded as not fixed (other P2, P3) are NOT a reason to add cards or to ask for another review: list them briefly in your report under "Recorded, not fixed"' + (afterDone === 'stop' ? '.' : ', and use the worthwhile ones as candidates for the next steps.')
-    : 'Carry YOUR card through this chain; when CI is pending report STATUS: WAITING_EXTERNAL with the PR URL instead of waiting inside your turn. In your final reply list the findings you did not fix under "Recorded, not fixed".';
+    : 'Carry YOUR assigned part through this chain. When later review or delivery cards are planned, report DONE once your own acceptance checks are met; never wait for a card that depends on yours. When CI is pending report STATUS: WAITING_EXTERNAL with the PR URL instead of waiting inside your turn. In your final reply list the findings you did not fix under "Recorded, not fixed".';
   return `Delivery policy (autonomous): when the request is clear and nothing high-risk is involved, carry the work all the way to delivery: ${chain}. Do NOT stop because of a commit, a push, opening a PR, green CI or a normal merge. Never bypass required checks (no --admin); merge only when checks are green (a repository without checks: after validation and review). If the folder is not a Git repository or has no GitHub remote, skip the steps that need one and never create a remote. ${how} ${triage} ${stops}`;
 }
 
@@ -720,7 +767,7 @@ function finish(w, status) {
   markRuntimeStops(w);
   releaseJobLeases(w, 'job ended');
   {
-    run.runtimeCleanup = Promise.all([...w.recoverySteps?.values() || [], ...w.runtimeStarts?.values() || []].map((step) => step.catch(() => {}))).then(() => cleanupCardRuntimes(w, finishedCards, run.id)).then(() => {
+    run.runtimeCleanup = Promise.all([...w.recoverySteps?.values() || [], ...w.runtimeStarts?.values() || []].map((step) => step.catch(() => {}))).then(() => cleanupCardRuntimes(w, finishedCards, run.id, run.convs)).then(() => {
       if (w.run === run) { releaseJobLeases(w, 'runtime stopped'); saveRun(w, status); }
     }).catch((error) => log(w, 'studio', 'system', error.message));
   }
@@ -1015,7 +1062,7 @@ async function start(w, request, cont = false, inherit = false) {
   const now = new Date();
   const id = now.toISOString().slice(0, 19).replace(/[-:T]/g, '') + '-' + crypto.randomUUID().slice(0, 4);
   // Auto-continue inherits the fingerprint of the tree the last job left, so changes made in between are noticed.
-  w.run = { leadTier: 'hard', treeStamp: inherit ? prev?.run?.treeStamp : undefined, leftAt: inherit ? prev?.run?.leftAt : undefined, id, startedAt: now.toISOString(), project: w.project, leader: lead, request, convs: {}, phase: 'planning', leaderGen: 0, rounds: 0, ask: null, continues, context, goal: continues ? prev.run.goal || prev.run.request : request, refs: continues ? knownRefs(prev) : [], active: true, paused: false, stopped: false, summarizing: false };
+  w.run = { leadTier: 'hard', treeStamp: inherit ? prev?.run?.treeStamp : undefined, leftAt: inherit ? prev?.run?.leftAt : undefined, id, startedAt: now.toISOString(), project: w.project, leader: lead, request, convs: {}, phase: 'planning', leaderGen: 0, rounds: 0, ask: null, continues, context, goal: continues ? prev?.run?.goal || prev?.run?.request || request : request, refs: continues && prev ? knownRefs(prev) : [], active: true, paused: false, stopped: false, summarizing: false };
   event('job.start', { project: w.project, job: id, leader: lead, continues });
   log(w, 'user', 'user', request);
   if (continues) log(w, 'studio', 'system', '接續上次的工作：工頭會拿到目前的進度摘要，不用重講。', context);
@@ -1069,10 +1116,28 @@ function pump(w) {
     if (deps.some((d) => d.status !== 'DONE')) continue;
     if (!t.hold && !w.executingSteps?.has(t.id) && !w.tasks.some((x) => x.status === 'WORKING' && x.agent === t.agent) && !(isWriter(t) && writerBusy(w, t))) runTask(w, t);
   }
-  // Cards that only wait on each other would wait forever.
+  // Follow both dependency and agent waits; a runnable/external/user-held card can still make progress.
   const onAgents = w.tasks.filter((t) => t.status === 'WAITING_AGENT');
+  const canProgress = (t, seen = new Set()) => {
+    if (seen.has(t.id)) return false;
+    if (t.hold || !['WAITING', 'WAITING_AGENT'].includes(t.status)) return true;
+    const next = new Set(seen).add(t.id);
+    if (t.status === 'WAITING_AGENT') {
+      const targets = w.tasks.filter((x) => x !== t && x.agent === t.wait?.agent && OPEN.includes(x.status));
+      return !targets.length || targets.some((x) => canProgress(x, next));
+    }
+    return (t.after || []).map(byId).filter(Boolean).every((x) => canProgress(x, next));
+  };
+  const deadlocked = onAgents.filter((t) => !canProgress(t));
+  if (deadlocked.length) {
+    for (const t of deadlocked) {
+      Object.assign(t, { status: 'FAILED', wait: null, result: '工作卡互等，無法繼續；請工頭重新安排實作、審查與交付的先後順序。' });
+      log(w, 'studio', 'system', `「${t.title}」${t.result}`);
+    }
+    return pump(w); // propagate failure to dependents; never bypass a review to break the cycle
+  }
   if (onAgents.length && !w.tasks.some((t) => ['WORKING', 'WAITING', 'WAITING_EXTERNAL', 'NEEDS_USER'].includes(t.status))) {
-    for (const t of onAgents) wake(w, t, 'Everyone you could wait for is waiting too or has finished, so nothing more will arrive. Continue with what you have, or report NEEDS_USER.');
+    for (const t of onAgents) wake(w, t, 'The agent you were waiting for has no open card. Continue with its recorded results, or report NEEDS_USER.');
   }
   if (!run.summarizing && w.tasks.length && w.tasks.every((t) => t.status === 'DONE' || t.status === 'FAILED')) summarize(w);
 }
@@ -1083,11 +1148,11 @@ function pump(w) {
 // tree. One working tree has at most ONE write lease; any number of read leases. Different worktrees of one repository
 // are different trees and can each have a writer.
 //   write lease status: ACTIVE (the owner is executing) / RESERVED (paused or waiting, still the owner's) /
-//   STALE (the owner is gone: crashed Studio, dead pid, silent too long) / RELEASED.
+//   STALE (the Studio owner is confirmed gone; silence alone is insufficient) / RELEASED.
 // Studio never takes a lease from a live owner; a STALE lease is retired when somebody reclaims it.
 const INSTANCE = crypto.randomUUID().slice(0, 8);
-const LOCK_STALE_MS = 3 * 60e3, RECENT_EDIT_MS = 90e3, LOCK_BEAT_MS = 30e3;
-const LEASE_BEAT_MS = 20e3, LEASE_HUNG_MS = 30 * 60e3, LEASE_RESERVED_TTL_MS = 12 * 3600e3;
+const RECENT_EDIT_MS = 90e3, LOCK_BEAT_MS = 30e3;
+const LEASE_BEAT_MS = 20e3, LEASE_RESERVED_TTL_MS = 12 * 3600e3;
 const isWriter = (t) => t.writes !== false;
 const sameTree = (a, b) => (a.workdir || '') === (b.workdir || '');
 const holdsWriteLock = (t) => isWriter(t) && ['WORKING', 'WAITING_EXTERNAL', 'NEEDS_USER'].includes(t.status);
@@ -1130,7 +1195,7 @@ function accessRules(t) {
 }
 
 // ----- identity of a working tree -----
-const pidAlive = (pid) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+const pidAlive = (pid) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; } };
 const canonPath = (p) => { let r = String(p || ''); try { r = fs.realpathSync.native(r); } catch { r = path.resolve(r); } return r.replace(/[\\/]+$/, ''); };
 const treeKey = (p) => { const c = canonPath(p).split('/').join('\\'); return process.platform === 'win32' ? c.toLowerCase() : c; };
 
@@ -1142,7 +1207,16 @@ async function workspaceOf(dir) {
     branch: top ? (await git(dir, 'rev-parse', '--abbrev-ref', 'HEAD')).out?.trim() || '' : '', repo: top ? await originRepo(dir) || canonPath((await git(dir, 'rev-parse', '--path-format=absolute', '--git-common-dir')).out?.trim() || top) : '' };
 }
 
-const { mergeLeasesFromDisk, saveLeases, loadLeases, withLeaseTransaction, leaseState, writerOf, retire, ownerName, sameCard, leaseView, newLease, acquireWrite, acquireRead, cardLeases, releaseCardLeases, reserveCardLeases, releaseJobLeases, reserveJobLeases, beatLeases } = createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, AGENTS, nowIso, pidAlive, LEASE_HUNG_MS, LEASE_RESERVED_TTL_MS });
+const { mergeLeasesFromDisk, saveLeases, loadLeases, withLeaseTransaction, leaseState, writerOf, retire, ownerName, sameCard, leaseView, newLease, acquireWrite, acquireRead, cardLeases, releaseCardLeases, reserveCardLeases, releaseJobLeases, reserveJobLeases, beatLeases } = createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, AGENTS, nowIso, pidAlive, LEASE_RESERVED_TTL_MS });
+
+function releaseLease(id) {
+  return withLeaseTransaction(() => {
+    const l = S.leases.find((x) => x.id === id);
+    if (!l) throw new Error('找不到這個租約');
+    if (!['STALE', 'RELEASED'].includes(leaseState(l))) throw new Error('租約仍由原持有者保留，不能強制釋放；請先停止或交接');
+    retire(l, '使用者手動釋放'); saveLeases();
+  });
+}
 
 // ----- file mirror in the git dir (so programs that know nothing about Studio can see a writer) -----
 async function lockFile(w, dir = w.project) {
@@ -1154,12 +1228,10 @@ async function foreignLock(w, dir = w.project) {
   const f = await lockFile(w, dir);
   if (!f) return null;
   let l;
-  try { l = JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; }
+  try { l = JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { if (e.code === 'ENOENT') return null; throw new Error('無法確認工作區寫入鎖，保留原持有者'); }
   if (l.status === 'EXTERNAL') return l;
   if (l.instance === INSTANCE) return null;
-  let alive = true;
-  try { process.kill(l.pid, 0); } catch (e) { alive = e.code === 'EPERM'; }
-  return alive && Date.now() - Date.parse(l.beat || 0) < LOCK_STALE_MS ? l : null;
+  return !Number.isInteger(l.pid) || l.pid <= 0 || pidAlive(l.pid) ? l : null;
 }
 async function acquireLock(w, t) {
   const dir = (await workspaceOf(t.workdir || w.project)).path, f = await lockFile(w, dir);
@@ -1171,13 +1243,13 @@ async function acquireLock(w, t) {
   catch (e) {
     if (e.code !== 'EEXIST') throw e;
     const old = JSON.parse(fs.readFileSync(f, 'utf8'));
-    if (old.status === 'EXTERNAL' || old.instance !== INSTANCE && pidAlive(old.pid) && Date.now() - Date.parse(old.beat || 0) < LOCK_STALE_MS)
+    if (old.status === 'EXTERNAL' || old.instance !== INSTANCE && (!Number.isInteger(old.pid) || old.pid <= 0 || pidAlive(old.pid)))
       throw new Error('Workspace writer lock is held by another owner');
     // Same-directory installers also serialize stale mirror recovery via an exclusive recovery marker.
     const recovery = fs.openSync(f + '.reclaim', 'wx');
     try {
       const current = JSON.parse(fs.readFileSync(f, 'utf8'));
-      if (current.status === 'EXTERNAL' || current.instance !== INSTANCE && pidAlive(current.pid) && Date.now() - Date.parse(current.beat || 0) < LOCK_STALE_MS)
+      if (current.status === 'EXTERNAL' || current.instance !== INSTANCE && (!Number.isInteger(current.pid) || current.pid <= 0 || pidAlive(current.pid)))
         throw new Error('Workspace writer lock is held by another owner');
       fs.unlinkSync(f); fd = fs.openSync(f, 'wx');
     } finally { fs.closeSync(recovery); fs.unlinkSync(f + '.reclaim'); }
@@ -1350,13 +1422,21 @@ async function leaseBlocker(w) {
 
 // Runtime ownership hook: stopTurn must confirm cancellation, then all card cleanup must finish.
 function markRuntimeStops(w) {
+  for (const t of w.tasks) if (t.agent === 'codex' && w.run?.convs?.[workKey(t)]) t.runtimeStopPending = true;
   for (const task of w.tasks) if (w.recoverySteps?.has(task.id) || w.runtimeStarts?.has(task.id)) task.runtimeStopPending = true;
   for (const runtime of listRuntimes({ rtDir: RT })) if (runtime.job_id === w.run?.id && ['running', 'exited', 'stale'].includes(runtime.status)) {
     const task = w.tasks.find((t) => t.id === runtime.card_id);
     if (task) task.runtimeStopPending = true;
   }
 }
-async function cleanupCardRuntimes(w, cards, jobId = w.run.id) {
+async function cleanupCardRuntimes(w, cards, jobId = w.run.id, convs = w.run?.convs || {}) {
+  for (const t of cards) {
+    const cid = t.agent === 'codex' && convs[workKey(t)];
+    if (cid && !(await stopTurn(cid))) {
+      t.stopUnconfirmed = true;
+      throw new Error('Codex 工具程序尚未確認停止；保留租約');
+    }
+  }
   const result = await cleanupJobRuntimes(jobId, { rtDir: RT, cardIds: cards.map((t) => t.id) });
   if (result.blocked?.length) {
     for (const t of cards) t.runtimeStopPending = true;
@@ -1418,7 +1498,7 @@ async function claimWorkspace(dir, who = {}) {
     let current;
     try { current = JSON.parse(fs.readFileSync(mirror, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
     if (current?.status === 'EXTERNAL' && current.leaseId !== ext.id) throw new Error('工作區已由另一個 external claim 持有');
-    if (current && current.status !== 'EXTERNAL' && current.instance !== INSTANCE && pidAlive(current.pid) && Date.now() - Date.parse(current.beat || 0) < LOCK_STALE_MS)
+    if (current && current.status !== 'EXTERNAL' && current.instance !== INSTANCE && (!Number.isInteger(current.pid) || current.pid <= 0 || pidAlive(current.pid)))
       throw new Error('另一個 Studio 仍持有寫入鎖');
     fs.writeFileSync(mirror, JSON.stringify({ owner: labelText, status: 'EXTERNAL', leaseId: ext.id, branch: info.branch, beat: nowIso() }));
   }
@@ -1514,29 +1594,57 @@ async function useWorktree(w, taskId) {
   pump(w);
   return { path: dir, branch };
 }
-function useReadOnly(w, taskId) {
+async function useReadOnly(w, taskId) {
   const t = w.tasks.find((x) => x.id === taskId);
   if (!t) throw new Error('找不到這張工作卡');
-  if (['WORKING', 'DONE'].includes(t.status)) throw new Error('這張卡已經開始或已完成');
-  Object.assign(t, { writes: false, forcedReadOnly: true, blocked: null, blockReason: '', blockLogged: '',
-    instructions: t.instructions + '\n\nNOTE: the working tree is being edited by someone else right now, so do this card READ-ONLY: review / analysis / report only. Do not modify files.' });
+  if (['WORKING', 'DONE'].includes(t.status) || w.executingSteps?.has(t.id) || t.hold) throw new Error('這張卡已經開始、正在交接或已完成；請先完成暫停');
+  if (w.tasks.some((x) => x !== t && workKey(x) === workKey(t) && (x.status === 'WORKING' || w.executingSteps?.has(x.id)))) throw new Error('這位成員正在用同一個對話執行另一張卡；請先完成暫停');
+  const run = w.run;
+  if (!run || run.stopped) throw new Error('這件工作已經停止，不能切換唯讀');
+  t.hold = true;
+  try {
+    await drainExecution(w, [t]);
+    if (w.run !== run || run.stopped) throw new Error('工作已變更，取消唯讀切換');
+    releaseCardLeases(w, t, 'switched to read-only');
+    await releaseLock(w, t);
+    Object.assign(t, { role: 'review', writes: false, forcedReadOnly: true, briefed: '', blocked: null, blockReason: '', blockLogged: '',
+      instructions: t.instructions + '\n\nNOTE: this card is now READ-ONLY. Review / analysis / report only; do not perform earlier instructions that require writes or test/build commands. Report GO, GO WITH CHANGES or NO-GO with evidence from reading.' });
+  } finally { t.hold = false; }
   log(w, 'studio', 'system', `「${t.title}」改成唯讀 Review：只讀、不修改，可以和寫入者同時進行。`);
+  saveRun(w, run.paused ? 'paused' : 'running');
   pump(w);
 }
 // The PR is merged (or, without a remote, the branch is part of the base): the worktree and its branch can go.
 async function cleanupWorktree(w, t) {
   const wt = t.worktree;
   if (!wt || wt.cleaned) return;
-  let merged = false;
-  const pr = await sh('gh', ['pr', 'list', '--head', wt.branch, '--state', 'merged', '--json', 'number'], wt.repoPath);
-  try { merged = JSON.parse(pr.out || '[]').length > 0; } catch { /* no gh answer */ }
-  if (!merged && !(await originRepo(wt.repoPath))) merged = !(await git(wt.repoPath, 'merge-base', '--is-ancestor', wt.branch, 'HEAD')).err;
-  if (!merged) { log(w, 'studio', 'system', `worktree「${wt.branch}」先保留：它的 PR 還沒 merge。`); return; }
-  if ((await git(wt.path, 'status', '--porcelain')).out?.trim()) { log(w, 'studio', 'system', `worktree「${wt.branch}」先保留：裡面還有沒提交的檔案。`); return; }
-  await git(wt.repoPath, 'worktree', 'remove', '--force', wt.path);
-  await git(wt.repoPath, 'branch', '-D', wt.branch);
-  wt.cleaned = true;
-  log(w, 'studio', 'system', `已 merge：清掉本次建立的 worktree 和 branch「${wt.branch}」。`);
+  const checked = async (cwd, ...args) => { const r = await git(cwd, ...args); if (r.err || typeof r.out !== 'string') throw new Error(r.err || 'Git 沒有回傳結果'); return r.out.trim(); };
+  try {
+    if (treeKey(path.dirname(canonPath(wt.path))) !== treeKey(path.join(RT, 'studio', 'worktrees')) || !path.basename(wt.path).endsWith('-' + t.id)
+      || treeKey(wt.repoPath) !== treeKey(w.project) || !wt.branch.startsWith(`studio/${t.id}-`)) throw new Error('無法確認這是本卡建立的 worktree');
+    const trees = await checked(wt.repoPath, 'worktree', 'list', '--porcelain', '-z');
+    const entry = trees.split('\0\0').find((s) => s.split('\0').some((l) => l.startsWith('worktree ') && treeKey(l.slice(9)) === treeKey(wt.path)));
+    if (!entry?.split('\0').includes('branch refs/heads/' + wt.branch)) throw new Error('worktree 與登記分支不符');
+    const head = await checked(wt.path, 'rev-parse', 'HEAD');
+    if (head !== await checked(wt.repoPath, 'rev-parse', '--verify', `refs/heads/${wt.branch}`)) throw new Error('worktree HEAD 與分支不符');
+    if (await checked(wt.path, 'status', '--porcelain', '--untracked-files=all', '--ignored')) throw new Error('仍有修改、未追蹤或忽略的檔案');
+    if (await checked(wt.repoPath, 'remote')) {
+      const pr = await sh('gh', ['pr', 'list', '--head', wt.branch, '--state', 'merged', '--json', 'number,headRefOid'], wt.repoPath);
+      if (pr.err || !JSON.parse(pr.out).some((p) => p.headRefOid === head)) throw new Error('無法確認當前 HEAD 已由 PR 交付');
+    } else await checked(wt.repoPath, 'merge-base', '--is-ancestor', head, 'HEAD');
+    if (head !== await checked(wt.path, 'rev-parse', 'HEAD')) throw new Error('查核期間 HEAD 已改變');
+    await checked(wt.repoPath, 'worktree', 'remove', wt.path);
+    wt.removed = true;
+    const remaining = await checked(wt.repoPath, 'worktree', 'list', '--porcelain', '-z');
+    if (remaining.split('\0').includes('branch refs/heads/' + wt.branch)) throw new Error('分支仍有其他 worktree 使用');
+    // Compare-and-delete also supports squash merges, without deleting a branch that moved after verification.
+    await checked(wt.repoPath, 'update-ref', '-d', 'refs/heads/' + wt.branch, head);
+    wt.cleaned = true; wt.cleanupError = '';
+    log(w, 'studio', 'system', `已驗證交付：清掉本次建立的 worktree 和 branch「${wt.branch}」。`);
+  } catch (e) {
+    wt.cleanupError = e.message;
+    log(w, 'studio', 'system', `worktree「${wt.branch}」清理未完成${wt.removed ? '（worktree 已移除，分支保留）' : '，保留現況'}：${e.message}`);
+  }
 }
 
 // ----- unknown changes: never reset / stash / overwrite; stop writing and ask -----
@@ -1572,6 +1680,11 @@ async function checkWorkspaces() {
 
 async function runCard(w, t) {
   const run = w.run;
+  if (reviewAuthors(w, t).has(t.agent)) {
+    Object.assign(t, { status: 'FAILED', result: `沒有獨立審查者：${agentName(t.agent)} 寫了這張卡要審的東西，不能自審；請工頭安排其他成員。` });
+    log(w, 'studio', 'system', `「${t.title}」${t.result}`);
+    return wakeWaiters(w, t);
+  }
   const note = t.wakeNote;
   const startAgent = t.agent;
   t.status = 'WORKING';
@@ -1588,7 +1701,7 @@ ${note}
 Continue the task. End your reply with a short summary (1-3 sentences).
 ${STATUS_RULES}` : `You are a WORKER in "Multi-Agent Studio". Your leader (${agentName(run.leader)}) assigned you this task.
 Work only inside this folder: ${t.workdir || run.project}
-${w.backendPort ? `If you must run this project's backend on port ${w.backendPort} for validation, let Studio own the process so it can verify and recover it: POST JSON to http://127.0.0.1:${PORT}/api/runtime/start with ws (project path), cardId (${t.id}), executable (absolute path), args (string array), cwd (inside this workspace), dataDir (an existing directory inside this workspace), port (${w.backendPort}), smokePath, and noCredentialsConfirmed:true only when restart needs no account credentials. Never register or stop an unknown process. A listener is not ready until Studio confirms process alive + reachable port + GET /health HTTP 200 + application ready.\n` : ''}${note ? `\nNOTE FROM STUDIO:\n${note}\n` : ''}${t.resumed ? '\nYou were interrupted while doing this task earlier. First check the current state of the project folder, then finish the task without redoing work that is already done.\n' : ''}
+${w.backendPort ? `If you must run this project's backend on port ${w.backendPort} for validation, let Studio own the process so it can verify and recover it: POST JSON to http://127.0.0.1:${PORT}/api/runtime/start with ws (project path), cardId (${t.id}), executable (absolute path), args (string array), cwd (inside this workspace), dataDir (an existing directory inside this workspace), port (${w.backendPort}), smokePath, and noCredentialsConfirmed:true only when restart needs no account credentials. For isolated smoke/test runs, set purpose to "smoke" or "test"; Studio allocates DATA_DIR and PORT, ignores dataDir and treats port as a preference. The command must honor those environment variables; use the returned runtime.port. Never register or stop an unknown process. A listener is not ready until Studio confirms process alive + reachable port + GET /health HTTP 200 + application ready.\n` : ''}${note ? `\nNOTE FROM STUDIO:\n${note}\n` : ''}${t.resumed ? '\nYou were interrupted while doing this task earlier. First check the current state of the project folder, then finish the task without redoing work that is already done.\n' : ''}
 Task: ${t.title}
 Instructions:
 ${t.instructions}
@@ -1611,7 +1724,7 @@ ${STATUS_RULES}`;
           if (t.interrupted) return '';
           if (run.stopped || run.paused) throw new Halt(run.stopped ? '已停止' : '已暫停');
         }
-        return await turn(t.agent, cid, text, { w, bill: t, timeout: CARD_STALL_MS, allowStart: () => t.agent === startAgent && !t.hold && run.active });
+        return await turn(t.agent, cid, text, { w, lead: !isWriter(t), bill: t, timeout: CARD_STALL_MS, allowStart: () => t.agent === startAgent && !t.hold && run.active });
       } catch (e) { if (t.interrupted && !(e instanceof Halt)) return ''; throw e; } finally { cardStep.delete(cid); t.stepEndAt = Date.now(); }
     };
     const park = () => {
@@ -1629,7 +1742,7 @@ ${STATUS_RULES}`;
       st = parseStatus(again);
       if (st) st.text = reply.trim();
     }
-    st ||= { kind: 'DONE', detail: '', options: [], text: reply.trim() + '\n（沒有回報狀態，先當作完成，由工頭確認整體結果）' };
+    st ||= { kind: 'BLOCKED', detail: '沒有有效的 STATUS，無法確認工作已完成', options: [], text: reply.trim() };
     if (VERDICT_RE[t.role] && st.kind === 'DONE' && !verdictOf(t, st.text)) { // a check / review must open with its verdict: ask once instead of guessing
       const v = await step(`Your summary did not start with your verdict. Reply with ONLY one line: ${t.role === 'check' ? 'PASS, FAIL or UNKNOWN' : 'GO, GO WITH CHANGES or NO-GO'}.`);
       if (t.interrupted) { park(); return; }
@@ -1642,7 +1755,7 @@ ${STATUS_RULES}`;
       log(w, 'studio', 'system', `把你的指示交給 ${agentName(t.agent)}，接著調整「${t.title}」。`);
       last = await step(`New instruction from the user (via the leader) for your task "${t.title}":\n${note}\n\nApply it to this task now. End your reply with a short summary (1-3 sentences).\n${STATUS_RULES}`);
       if (t.interrupted) { park(); return; }
-      st = parseStatus(last) || { kind: 'DONE', detail: '', options: [], text: last.trim() };
+      st = parseStatus(last) || { kind: 'BLOCKED', detail: '沒有有效的 STATUS，無法確認工作已完成', options: [], text: last.trim() };
     }
     if (st.kind !== 'DONE' && overCap(w, t)) throw capErr(); // the step that just ended blew the budget and the card is not finished: stop it now, not at the next wake-up
     applyStatus(w, t, st, last);
@@ -1827,7 +1940,7 @@ async function deliverAsk(w, t, cid, q) {
   askBusy.set(cid, new Promise((r) => { done = r; }));
   try {
     q.state = 'sent';
-    const reply = await turn(t.agent, cid, askPrompt(q.text, t.title), { w, check: true, ask: true, timeout: 5 * 60e3, bill: t });
+    const reply = await turn(t.agent, cid, askPrompt(q.text, t.title), { w, lead: !isWriter(t), check: true, ask: true, timeout: 5 * 60e3, bill: t });
     if (run.stopped || run.paused) Object.assign(q, { state: 'failed', answer: '工作被' + (run.stopped ? '停止' : '暫停') + '，這個問題沒有得到回答。' });
     else Object.assign(q, { state: 'answered', answer: answerText(reply.toUpperCase().includes(ASK_MARK) ? reply.slice(reply.toUpperCase().indexOf(ASK_MARK)) : reply) || '（沒有文字回覆）', answeredAt: nowIso() });
   } catch (e) { Object.assign(q, { state: 'failed', answer: '沒有得到回覆：' + clip(e.message, 200) }); }
@@ -2203,12 +2316,19 @@ When done, also give 1 to 3 small, valuable next steps for this project in "next
 Rules for new subtasks:
 ${SUBTASK_RULES}`, { w, lead: true });
     if (run.leaderGen !== gen) return;
+    const parseSummary = (text) => {
+      const d = parseJson(text);
+      if (!d || Array.isArray(d) || !(typeof d.needs_user === 'string' && d.needs_user.trim()
+        || d.done === true && typeof d.report === 'string' && d.report.trim()
+        || d.done === false && Array.isArray(d.subtasks))) throw new Error('無效的整體結果欄位');
+      return d;
+    };
     let d = null;
-    try { d = parseJson(reply); } catch {
+    try { d = parseSummary(reply); } catch {
       log(w, 'studio', 'system', '工頭的回覆格式不對，正在請它重新整理…', reply);
       const again = await turn(lead, await conv(w, lead, true), FIX_JSON, { w, lead: true });
       if (run.leaderGen !== gen) return;
-      try { d = parseJson(again); } catch { log(w, 'studio', 'system', '工頭這次沒有成功確認整體結果。', again); }
+      try { d = parseSummary(again); } catch { log(w, 'studio', 'system', '工頭這次沒有成功確認整體結果。', again); }
     }
     run.summarizing = false;
     if (run.notes?.length) { run.phase = 'working'; return processNotes(w); } // new instructions beat "done"
@@ -2299,7 +2419,7 @@ function pause(w) {
   busyConvs(run).forEach(cancelTurn);
   for (const t of w.tasks) if (t.status === 'WORKING') { t.status = 'PAUSED'; t.result = '已暫停'; t.resumed = true; }
   reserveJobLeases(w, 'paused'); // PAUSE: the work still belongs to its owner
-  log(w, 'studio', 'system', '已暫停：成員已停下（手上那一步可能做到一半），工作卡和進度都保留，不會自己恢復；關掉 Studio 也沒關係，要你按「繼續」才會接著做。');
+  log(w, 'studio', 'system', '已暫停派工，正在確認成員與工具程序停止；確認前保留寫入權。工作卡和進度都保留，要你按「繼續」才會接著做。');
   saveRun(w, 'paused');
 }
 
@@ -2311,7 +2431,7 @@ function loadRun(w, r) {
   // (goal / refs / context / continues come back too: the work memory survives a restart)
   // Cards that were mid-work when the Studio closed are interrupted; waiting cards keep waiting.
   for (const t of r.tasks) if (t.status === 'WORKING') Object.assign(t, { status: 'INTERRUPTED', result: '已中斷', resumed: true });
-  for (const t of r.tasks) Object.assign(t, { hold: false, interrupted: false });
+  for (const t of r.tasks) Object.assign(t, { hold: false, interrupted: false }, t.forcedReadOnly ? { role: 'review', writes: false, briefed: '' } : {});
   w.tasks = r.tasks;
   w.activity = r.activity;
   w.run = { id: r.id, startedAt: r.startedAt, project: r.project, leader: r.leader, request: r.request, convs: r.convs || {}, phase: r.phase || 'working', leaderGen: 0, rounds: r.rounds || 0, ask: r.ask || null, notes: r.notes || [], goal: r.goal, refs: r.refs, context: r.context, continues: r.continues, active: false, paused: true, stopped: false, summarizing: false };
@@ -2548,7 +2668,11 @@ async function recoverBackendWaitStep(w, t) {
     }
     const workspace = canonPath(t.workdir || w.project);
     const dataDir = runtime.data_dir;
-    if (!dataDir || runtime.env?.DATA_DIR !== dataDir || !within(workspace, canonPath(dataDir))) {
+    const isolated = ['smoke', 'test'].includes(runtime.purpose);
+    const dataOwned = dataDir && (isolated
+      ? isSafeTempDir(runtime.temp_dir) && isSafeTempDir(dataDir) && path.resolve(dataDir) === path.join(path.resolve(runtime.temp_dir), 'data')
+      : within(workspace, canonPath(dataDir)));
+    if (runtime.workspace !== workspace || !dataOwned || runtime.env?.DATA_DIR !== dataDir) {
       block(`PID ${runtime.root_pid} (${runtime.command}): DATA_DIR owner 與 workspace 不符`); return;
     }
     const occupant = await checkPortOwnership(runtime.port, { desiredJobId: run.id, desiredDataDir: dataDir, rtDir: RT });
@@ -2576,7 +2700,13 @@ async function recoverBackendWaitStep(w, t) {
       cleanup: (old) => cleanupRuntime(old, { rtDir: RT }),
       restart: async (old) => {
         if (!canProceed()) throw new Error('job is no longer authorized to start a backend');
-        const replacement = await spawnManagedProcess({ ...old, studio_pid: process.pid });
+        if (isolated) {
+          if (!isSafeTempDir(old.temp_dir) || !isSafeTempDir(old.data_dir)) throw new Error('smoke data owner changed during cleanup');
+          fs.mkdirSync(old.data_dir, { recursive: true });
+        }
+        let replacement;
+        try { replacement = await spawnManagedProcess({ ...old, studio_pid: process.pid }); }
+        catch (error) { if (isolated) cleanupIsolatedDir(old.temp_dir); throw error; }
         wait.replacementId = replacement.runtime_id;
         saveRun(w, 'running');
         return replacement;
@@ -2643,26 +2773,34 @@ async function startManagedRuntimeStep(body) {
   if (!authorized()) throw new Error('Workspace write lease 未確認');
   const workspace = canonPath(task.workdir || w.project);
   const cwd = canonPath(body.cwd || workspace);
-  if (!body.dataDir) throw new Error('runtime dataDir 必須明確指定');
-  const dataDir = path.resolve(String(body.dataDir));
+  const isolated = ['smoke', 'test'].includes(body.purpose);
+  if (!isolated && !body.dataDir) throw new Error('runtime dataDir 必須明確指定');
+  let dataDir = isolated ? null : path.resolve(String(body.dataDir));
   const executable = path.resolve(String(body.executable || ''));
   const args = body.args;
-  const port = Number(body.port);
+  let port = Number(body.port ?? (isolated ? 3020 : 0));
   if (!path.isAbsolute(String(body.executable || '')) || !Array.isArray(args) || args.some((x) => typeof x !== 'string')) throw new Error('runtime executable 必須為絕對路徑，args 必須是字串陣列');
-  if (!within(workspace, cwd) || !fs.existsSync(dataDir) || !within(workspace, canonPath(dataDir))) throw new Error('runtime cwd 與既有 data_dir 必須位於該卡的工作區內');
+  if (!within(workspace, cwd) || !isolated && (!fs.existsSync(dataDir) || !within(workspace, canonPath(dataDir)))) throw new Error('runtime cwd 與既有 data_dir 必須位於該卡的工作區內');
   if (!Number.isInteger(port) || port < 1 || port > 65535 || !fs.existsSync(executable)) throw new Error('runtime executable 或 port 不合法');
-  const occupied = await checkPortOwnership(port, { desiredJobId: run.id, desiredDataDir: dataDir, rtDir: RT });
-  if (occupied.status !== 'free') throw new Error(occupied.reason || `port ${port} 已被佔用 (PID ${occupied.pid})`);
-  if (!authorized()) throw new Error('runtime start cancelled: workspace ownership changed');
-  const appEnv = { DATA_DIR: dataDir, PORT: String(port) };
-  const restartSafe = body.noCredentialsConfirmed === true && !args.some((arg) => /--?(?:token|password|secret|api[-_]?key)(?:\s|=|$)/i.test(arg));
-  const runtime = await spawnManagedProcess({
-    job_id: run.id, card_id: task.id, workspace, purpose: body.purpose || 'dev_backend',
-    executable, command: restartSafe ? [executable, ...args].join(' ') : path.basename(executable), args: restartSafe ? args : [], launchArgs: args, cwd, env: appEnv, port, data_dir: dataDir,
-    smoke_path: body.smokePath || '/health', restart_safe: restartSafe
-  });
-  if (!authorized()) { await cleanupRuntime(runtime, { rtDir: RT }); throw new Error('runtime start cancelled: workspace ownership changed'); }
-  return { runtime, readiness: await checkBackendReadiness({ ...runtime, rtDir: RT }, { isPidAlive }) };
+  let smoke, runtime;
+  try {
+    if (isolated) {
+      smoke = await createSmokeEnvironment({ project: workspace, runId: run.id, cardId: task.id, preferredPort: port, baseEnv: {} });
+      dataDir = smoke.dataDir; port = smoke.port;
+    }
+    const occupied = await checkPortOwnership(port, { desiredJobId: run.id, desiredDataDir: dataDir, rtDir: RT });
+    if (occupied.status !== 'free') throw new Error(occupied.reason || `port ${port} 已被佔用 (PID ${occupied.pid})`);
+    if (!authorized()) throw new Error('runtime start cancelled: workspace ownership changed');
+    const appEnv = smoke?.env || { DATA_DIR: dataDir, PORT: String(port) };
+    const restartSafe = body.noCredentialsConfirmed === true && !args.some((arg) => /--?(?:token|password|secret|api[-_]?key)(?:\s|=|$)/i.test(arg));
+    runtime = await spawnManagedProcess({
+      job_id: run.id, card_id: task.id, workspace, purpose: body.purpose || 'dev_backend',
+      executable, command: restartSafe ? [executable, ...args].join(' ') : path.basename(executable), args: restartSafe ? args : [], launchArgs: args, cwd, env: appEnv, port, data_dir: dataDir,
+      temp_dir: smoke?.tempRoot, smoke_path: body.smokePath || '/health', restart_safe: restartSafe
+    });
+    if (!authorized()) { await cleanupRuntime(runtime, { rtDir: RT }); throw new Error('runtime start cancelled: workspace ownership changed'); }
+    return { runtime, readiness: await checkBackendReadiness({ ...runtime, rtDir: RT }, { isPidAlive }) };
+  } catch (error) { if (!runtime) smoke?.cleanup(); throw error; }
 }
 
 const routes = {
@@ -2699,7 +2837,7 @@ const routes = {
   'POST /api/handoff': (b) => handoffWriter(wsOf(b.ws), b.agent, b.taskId),
   'POST /api/card/readonly': (b) => useReadOnly(wsOf(b.ws), b.taskId),
   'POST /api/card/worktree': (b) => useWorktree(wsOf(b.ws), b.taskId),
-  'POST /api/lease/release': (b) => { const l = S.leases.find((x) => x.id === b.id); if (!l) throw new Error('找不到這個租約'); if (['ACTIVE', 'EXTERNAL'].includes(leaseState(l))) throw new Error('這個租約的持有者還活著，不能強制釋放；請先暫停或交接'); retire(l, '使用者手動釋放'); saveLeases(); },
+  'POST /api/lease/release': (b) => releaseLease(b.id),
   'POST /api/workspace/open': (b) => openWorkspace(b.path),
   'POST /api/workspace/close': (b) => closeWorkspace(wsOf(b.ws)),
   'POST /api/workspace/rename': (b) => renameWorkspace(wsOf(b.ws), b.name),

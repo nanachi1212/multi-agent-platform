@@ -320,6 +320,20 @@ async function runRuntimeTests() {
     console.log('Case L: 只清理該 job process tree 不影響其他 python/node: PASS');
   }
 
+  // PID reuse: a process whose ParentProcessId matches but that is older than the parent is not a descendant.
+  {
+    const at = (s) => new Date(s * 1000).toISOString();
+    const rows = [
+      { pid: process.pid, parent: 1, creationDate: at(100) },
+      { pid: 900001, parent: process.pid, creationDate: at(200) }, // real child
+      { pid: 900002, parent: process.pid, creationDate: at(50) }, // older: its parent PID was reused (e.g. a user's Vite server)
+      { pid: 900003, parent: 900002, creationDate: at(300) } // child of the unrelated process
+    ];
+    assert.deepStrictEqual(await registry.getChildPids(process.pid, async () => rows), [900001]);
+    await assert.rejects(registry.getChildPids(process.pid, async () => { throw new Error('CIM denied'); }), /CIM denied/, 'a failed query is not an empty tree');
+    console.log('PID reuse: older process with a matching parent PID is not selected for kill: PASS');
+  }
+
   // =========================================================================
   // Case K: Listener alone is not ready; application startup failure is surfaced.
   // =========================================================================

@@ -201,14 +201,15 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
   // 11) a worker that keeps working is never timed out; a stuck step is stopped; "already running" recovers or resets
   const turnCode = region('// Stops whatever the conversation is doing', '// ---------- Team ----------');
   const makeTurn = (script) => {
-    const state = { running: false, cancels: 0, posts: 0 };
+    const state = { running: false, cancels: 0, posts: 0, prepares: 0 };
     const api = async (method, path, body) => {
       if (method === 'POST' && path.endsWith('/messages')) { state.posts++; return script.post(state); }
       if (method === 'POST' && path.endsWith('/cancel')) { state.cancels++; state.cancelTurnId = body.turn_id; script.cancel(state); return {}; }
       if (path.endsWith('/messages')) return { items: [{ id: 'm1', type: 'text', position: 'left', status: 'finish', created_at: script.mark(state), content: { content: 'done' } }] };
       return { runtime: { turn_id: 'turn_orphan', ...script.runtime(state) } };
     };
-    const env = { api, sleep: () => new Promise((r) => setTimeout(r, 1)), active: new Map(), S: { agents: { codex: { working: 0 } } },
+    const env = { api, sleep: () => new Promise((r) => setTimeout(r, 1)), active: new Map(), S: { workspaces: [], agents: { codex: { working: 0 } } },
+      convAgent: new Map([['c1', 'codex']]), codexRuntime: { prepare: async () => { state.prepares++; }, stop: async () => true },
       answerConfirmations: async () => {}, refreshCodexLimits() {}, Halt: class extends Error {},
       isAskAnswer: (m) => String(m.content?.content || '').toUpperCase().includes('PROGRESS ANSWER:'), clip: (x) => String(x ?? ''), toolText: (c) => String(c?.name || '') };
     const fn = new Function(...Object.keys(env), turnCode + String.fromCharCode(10) + 'return { turn, sendMessage };')(...Object.values(env)); // test harness: our own code
@@ -230,6 +231,7 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     cancel: (st) => { st.running = false; }, mark: () => 'x', runtime: (st) => (st.running ? busyRt : idleRt) });
   assert.strictEqual(await T.turn('codex', 'c1', 'x', { timeout: 60, progressEvery: 5 }), 'done');
   assert.deepStrictEqual([T.state.posts, T.state.cancels], [2, 1]);
+  assert.strictEqual(T.state.prepares, 2, 'a retried message re-arms tool ownership after runtime replacement');
   assert.strictEqual(T.state.cancelTurnId, 'turn_orphan', 'an orphan turn is cancelled by the turn id the conversation reports');
   // D: it will not stop -> error marked stuck (the card then gets a fresh conversation)
   T = makeTurn({ post: () => { throw new Error('AionCore POST /api/conversations/c1/messages → 409 {"code":"CONFLICT"}'); },
@@ -295,7 +297,7 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
 
   // 14) one writer per working tree; read-only cards run alongside it
   const nfs = require('fs'), nos = require('os'), npath = require('path'), { execFileSync } = require('child_process');
-  const waitFor = async (cond, ms = 12000) => { for (let t0 = Date.now(); Date.now() - t0 < ms;) { if (await cond()) return true; await new Promise((r) => setTimeout(r, 25)); } return false; };
+  const waitFor = async (cond, ms = 30000) => { for (let t0 = Date.now(); Date.now() - t0 < ms;) { if (await cond()) return true; await new Promise((r) => setTimeout(r, 25)); } return false; }; // real Git/process checks can exceed 12 s on a busy Windows host
   const planOf = (subtasks) => JSON.stringify({ message: 'ok', subtasks });
   for (const readerB of [false, true]) {
     const running = new Set(); let maxRunning = 0;
@@ -356,9 +358,9 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
   assert.strictEqual(w.tasks[0].status, 'WAITING'); assert.ok(env.logs.some((l) => l.text.includes('先不動')));
   nfs.rmSync(repo.lock); api.pump(w);
   assert.ok(await waitFor(() => w.run.result === 'done'), 'goes after the lock is gone');
-  // a stale lock (owner dead / old heartbeat) does not block
+  // a stale lock with a confirmed dead owner does not block (silence alone is covered by the lease regressions)
   repo = mkRepo();
-  nfs.writeFileSync(repo.lock, JSON.stringify({ owner: 'Gone', instance: 'zzzz', pid: process.pid, card: 'old', beat: new Date(Date.now() - 10 * 60e3).toISOString() }));
+  nfs.writeFileSync(repo.lock, JSON.stringify({ owner: 'Gone', instance: 'zzzz', pid: 2147483000, card: 'old', beat: new Date(Date.now() - 10 * 60e3).toISOString() }));
   ({ env, api } = repoEnv(repo, stdScript('ship')));
   w = mkW(repo); env.S.workspaces.push(w);
   await api.planPhase(w);
@@ -403,7 +405,7 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
   await new Promise((r) => setTimeout(r, 150)); assert.strictEqual(turns5, 1, 'nothing runs while paused');
   repo.g('commit', '-q', '--allow-empty', '-m', 'edited while paused');
   await api.resume(w);
-  assert.ok(await waitFor(() => w.run.result === 'done'), '繼續 continues without asking');
+  assert.ok(await waitFor(() => w.run.result === 'done'), '繼續 continues without asking: ' + JSON.stringify({ tasks: w.tasks, logs: env.logs.slice(-5) }));
   assert.ok(!w.tasks.some((t) => t.takeover));
 
   // f) STOP ends the job for good: no 繼續, nothing wakes
@@ -647,12 +649,12 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     g1.open(); assert.ok(await waitFor(() => c1.status === 'DONE'));
     // read-only switch
     const rt3 = mkTmp('lease-rt-'), repo3 = mkRepo(), g3 = mkGate();
-    const E3 = leaseEnv(async (agent, text) => { if (agent === 'codex') await g3.p; return DONE; }, rt3);
+    const E3 = leaseEnv(async (agent, text) => { if (agent === 'codex') await g3.p; return 'GO\n' + DONE; }, rt3);
     const a1 = jobOf(repo3), a2 = jobOf(repo3, 'antigravity'); E3.env.S.workspaces.push(a1, a2);
     const h1 = mkCard(a1, 'codex', 'holder2'), b2 = mkCard(a2, 'claude', 'review me');
     startJob(E3.api, a1, 'jk3'); assert.ok(await waitFor(() => h1.status === 'WORKING' && writeLeases(E3.env).length === 1));
     startJob(E3.api, a2, 'jk4'); assert.ok(await waitFor(() => b2.status === 'WAITING' && b2.blocked));
-    E3.api.useReadOnly(a2, b2.id); assert.ok(await waitFor(() => b2.status === 'DONE'), 'switched to read-only, it runs next to the writer'); g3.open();
+    await E3.api.useReadOnly(a2, b2.id); assert.ok(await waitFor(() => b2.status === 'DONE'), 'switched to read-only, it runs next to the writer'); g3.open();
   }
   console.log('15 workspace lease A-K: same tree blocked, reader allowed, handoff, restart safety, stop, pause, stale, worktrees, external takeover, unknown changes: PASS');
 
@@ -1029,8 +1031,6 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
 
     // 26) a CHECK card runs tests (own conversation, not the read-only sandbox, told to actually run); a REVIEW card stays read-only;
     //     card steps use the 15 min stall limit
-    assert.ok(/const roOf = \(t\) => \(t\.role === 'check' \? 'chk' : isWriter\(t\) \? false : true\)/.test(src), 'check cards are not in the read-only sandbox');
-    assert.ok(/lead \|\| \(ro === true && RO_MODE\(agent\)\)/.test(src), 'only a review (ro === true) card gets the non-writing sandbox');
     assert.ok(/timeout: CARD_STALL_MS/.test(src) && /CARD_STALL_MS = 15 \* 60e3/.test(src), 'card steps stop after 15 min without progress');
     ({ env, api } = makeEnv((agent, text) => {
       if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"run the suite","agent":"codex","role":"check","instructions":"run ci"}]}';
@@ -1120,6 +1120,143 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     assert.ok(env.logs.at(-1).text.includes('又收到一則消息'), 'the merge is logged (log() saves the run, so a restart keeps it)');
     t.status = 'DONE'; api.wake(w, t, 'late'); assert.ok(!t.wakeNote.includes('late'), 'a finished card is not woken');
     console.log('29 wake merges into a pending wake: PASS');
+  }
+
+  { // 30) missing STATUS never completes a card, including a reply to a mid-card instruction
+    for (const hasNote of [false, true]) {
+      const E = makeEnv((agent, text) => text.includes('Task: unfinished') && hasNote ? 'Original work done.\nSTATUS: DONE' : 'Still checking.');
+      const wk = newW(); E.env.S.workspaces.push(wk);
+      const t = mkCard(wk, 'codex', 'unfinished', { ledByLeader: true, notes: hasNote ? ['Also fix the edge case'] : [] });
+      const next = mkCard(wk, 'antigravity', 'delivery', { after: [t.id] });
+      await E.api.runTask(wk, t);
+      assert.strictEqual(t.status, 'FAILED');
+      assert.ok(t.detail.includes('沒有有效的 STATUS'));
+      assert.strictEqual(next.status, 'WAITING', 'unconfirmed work cannot release delivery');
+      assert.strictEqual(E.env.prompts.length, 2, 'one status retry or one user instruction, no guessing');
+    }
+    // Invalid but parseable JSON must not complete the run or trigger auto-continue.
+    for (const bad of ['{}', '{"done":"false","report":"ok"}', '{"done":"true","report":"ok"}', '{"done":true}', '{"done":true,"report":42}']) {
+      const E = makeEnv(() => bad), wk = newW(); wk.afterDone = 'auto'; E.env.S.workspaces.push(wk);
+      await E.api.summarize(wk);
+      assert.ok(wk.run.ask && !wk.run.result, bad);
+      assert.strictEqual(E.env.prompts.length, 2, 'summary format is retried once');
+      assert.strictEqual(E.env.started.length, 0, 'invalid summary cannot start the next job');
+      assert.ok(!E.env.events.some((e) => e.type === 'job.end'));
+    }
+    let replies = 0;
+    const E = makeEnv(() => ++replies === 1 ? '{}' : '{"done":true,"report":"Verified."}'), wk = newW();
+    await E.api.summarize(wk);
+    assert.strictEqual(wk.run.result, 'done', 'a valid repaired summary still completes');
+    console.log('30 missing status and invalid summary fail closed; valid repair completes: PASS');
+  }
+
+  { // 31) mixed agent/dependency cycles fail without starting review or delivery; an independent path stays runnable
+    for (const mutual of [false, true]) {
+      const E = makeEnv(() => '{"needs_user":"Replan the blocked cards"}'), wk = newW(); E.env.S.workspaces.push(wk);
+      const build = mkCard(wk, 'codex', 'implementation', { role: 'build', status: 'WAITING_AGENT', wait: { agent: 'antigravity' } });
+      const review = mkCard(wk, 'antigravity', 'review', { role: 'review', writes: false,
+        ...(mutual ? { status: 'WAITING_AGENT', wait: { agent: 'codex' } } : { after: [build.id] }) });
+      const delivery = mkCard(wk, 'codex', 'delivery', { after: [review.id] });
+      wk.run.phase = 'working'; E.api.pump(wk);
+      assert.ok(await waitFor(() => wk.run.ask));
+      assert.deepStrictEqual(wk.tasks.map((t) => t.status), ['FAILED', 'FAILED', 'FAILED']);
+      assert.ok(build.result.includes('互等'));
+      assert.ok(!E.env.prompts.some((p) => p.text.includes('Task: ')), 'no review or merge bypass');
+      assert.strictEqual(delivery.status, 'FAILED');
+    }
+    for (const status of ['WAITING_EXTERNAL', 'NEEDS_USER', 'WAITING']) {
+      const E = makeEnv(() => 'GO\nSTATUS: DONE'), wk = newW();
+      const build = mkCard(wk, 'codex', 'implementation', { status: 'WAITING_AGENT', wait: { agent: 'antigravity' } });
+      mkCard(wk, 'antigravity', 'downstream review', { writes: false, after: [build.id] });
+      mkCard(wk, 'antigravity', 'independent work', { status, hold: status === 'WAITING' });
+      wk.run.phase = 'working'; E.api.pump(wk);
+      assert.strictEqual(build.status, 'WAITING_AGENT', 'external, user and held work may still unblock the agent');
+      assert.strictEqual(E.env.prompts.length, 0);
+    }
+    console.log('31 mixed dependency/agent cycles block delivery; independent progress is preserved: PASS');
+  }
+
+  { // 32) use the real conversation modes: a CHECK conversion must stop its old turn before releasing ownership
+    const created = [], turns = [], stopped = []; let mayStop = false;
+    const modes = new Function('isWriter', 'crypto', 'createConv', 'tierCfg',
+      region('const RO_MODE =', "// This run's conversations") + '\nreturn { roOf, workKey, conv };')(
+        (t) => t.writes !== false, nodeCrypto,
+        async (agent, dir, lead) => { const cid = 'conv-' + created.length; created.push({ agent, lead, cid }); return cid; }, () => ({}));
+    const E = makeEnv(() => '', { ...modes,
+      stopTurn: async (cid) => { stopped.push(cid); return mayStop; },
+      turn: async (agent, cid, text, opts) => { turns.push({ cid, text, opts }); return 'GO\nRead the diff.\nSTATUS: DONE'; } });
+    const wk = newW(); E.env.S.workspaces.push(wk);
+    const t = mkCard(wk, 'codex', 'run ci', { role: 'check', status: 'PAUSED' });
+    const oldCid = await modes.conv(wk, t.agent, false, false, '', modes.roOf(t)); t.briefed = modes.workKey(t);
+    assert.strictEqual(created[0].lead, false, 'normal CHECK still runs tests in its writable conversation');
+    assert.strictEqual(E.api.acquireWrite(wk, t, await E.api.workspaceOf(wk.project)).ok, true);
+    await assert.rejects(E.api.useReadOnly(wk, t.id), /保留寫入租約/);
+    assert.deepStrictEqual([t.role, t.writes, t.hold], ['check', true, false]);
+    assert.strictEqual(writeLeases(E.env).length, 1, 'an unconfirmed stop keeps its write lease');
+    mayStop = true; await E.api.useReadOnly(wk, t.id);
+    assert.deepStrictEqual([t.role, t.writes, t.briefed], ['review', false, '']);
+    assert.strictEqual(writeLeases(E.env).length, 0, 'confirmed stop releases the old write lease');
+    await E.api.runTask(wk, t);
+    assert.strictEqual(t.status, 'DONE');
+    assert.ok(stopped.length >= 2 && stopped.every((cid) => cid === oldCid), 'only the original writable conversation is drained');
+    assert.strictEqual(created.at(-1).lead, true, 'converted card opens a non-writing conversation');
+    assert.notStrictEqual(turns[0].cid, oldCid);
+    assert.ok(turns[0].opts.lead && turns[0].opts.bill === t, 'read-only permission policy keeps card accounting');
+    assert.ok(turns[0].text.includes('ACCESS: READ-ONLY card') && !turns[0].text.includes('MUST actually RUN'));
+    assert.strictEqual(modes.roOf({ role: 'check', writes: false }), true, 'writes:false overrides stale CHECK roles');
+    const restored = newW();
+    E.api.loadRun(restored, { status: 'paused', tasks: [{ ...t, role: 'check', writes: true, briefed: 'old' }], activity: [] });
+    assert.deepStrictEqual([restored.tasks[0].role, restored.tasks[0].writes, restored.tasks[0].briefed], ['review', false, '']);
+    const pending = mkCard(wk, 'codex', 'pending', { role: 'check' });
+    const stopsBeforePending = stopped.length;
+    mkCard(wk, 'codex', 'other running check', { role: 'check', status: 'WORKING' });
+    await assert.rejects(E.api.useReadOnly(wk, pending.id), /另一張卡/);
+    assert.strictEqual(stopped.length, stopsBeforePending, 'switching a pending card must not stop another card sharing its conversation');
+    console.log('32 read-only conversion: confirmed stop, lease release, new sandbox, restart, shared conversation: PASS');
+  }
+
+  { // 33) one available worker cannot review its own implementation; historical authors count after a handoff
+    const E = makeEnv((agent, text) => {
+      if (text.includes('LEADER (foreman)')) return JSON.stringify({ subtasks: [
+        { title: 'implement', agent: 'codex', role: 'build', instructions: 'build' },
+        { title: 'review', agent: 'codex', role: 'review', instructions: 'review', after: [0] },
+        { title: 'deliver', agent: 'codex', instructions: 'deliver', after: [1] } ] });
+      if (text.includes('Every current card has ended')) return '{"needs_user":"No independent reviewer available"}';
+      return 'GO\nSTATUS: DONE';
+    }), wk = newW(); wk.workers = ['codex']; E.env.S.workspaces.push(wk);
+    await E.api.planPhase(wk); assert.ok(await waitFor(() => wk.run.ask));
+    assert.deepStrictEqual(wk.tasks.map((t) => t.status), ['DONE', 'FAILED', 'FAILED']);
+    assert.ok(wk.tasks[1].result.includes('不能自審'));
+    assert.ok(!E.env.prompts.some((p) => /Task: (review|deliver)/.test(p.text)));
+    // An author handed its build to another agent; it is still an author when reviewing through a CHECK dependency.
+    const E2 = makeEnv(() => 'GO\nSTATUS: DONE'), w2 = newW();
+    const b = mkCard(w2, 'antigravity', 'build', { role: 'build', status: 'DONE', handoffs: [{ from: 'codex' }] });
+    const c = mkCard(w2, 'antigravity', 'check', { role: 'check', status: 'DONE', after: [b.id] });
+    const r = mkCard(w2, 'codex', 'review', { role: 'review', writes: false, after: [c.id] });
+    await E2.api.runTask(w2, r);
+    assert.strictEqual(r.status, 'FAILED'); assert.strictEqual(E2.env.prompts.length, 0);
+    console.log('33 self-review blocked with one worker and through handoff/transitive authors: PASS');
+  }
+
+  { // 34) the real start path can continue an open project without any previous Studio job
+    for (const previous of [null, { run: { goal: 'Original goal', request: 'old request' }, refs: ['#7'] }]) {
+      for (const level of ['open', 'wait', 'need', 'done']) {
+        const E = makeEnv(() => ''), wk = newW(); wk.run = null; wk.pstate = { level };
+        let planned = 0;
+        const deps = { ...E.env, stillStopping: () => false, latestJob: () => previous,
+          projectContext: () => 'Verified project state', knownRefs: (job) => job.refs,
+          planPhase: () => { planned++; } };
+        const names = Object.keys(deps);
+        const start = new Function(...names, region('const CONTINUE_RE =', 'async function planPhase(w)') + '\nreturn start;')(...names.map((k) => deps[k]));
+        await start(wk, '接著處理上一件工作', true);
+        assert.strictEqual(planned, 1);
+        assert.strictEqual(wk.run.goal, previous ? 'Original goal' : '接著處理上一件工作');
+        assert.deepStrictEqual(wk.run.refs, previous ? ['#7'] : []);
+        assert.strictEqual(wk.run.continues, !!previous || level !== 'done');
+        assert.strictEqual(wk.run.context, 'Verified project state');
+      }
+    }
+    console.log('34 first continuation without history and existing goal/reference inheritance: PASS');
   }
 
   await require('./test-workspace-lease.cjs')({ makeEnv, mkTmp, region });

@@ -8,6 +8,8 @@ const { makeEnv, TMP_DIRS } = require('./lifecycle-harness.cjs');
 
 module.exports = async function () {
   const readiness = await import('./runtime-readiness.mjs');
+  const isolated = await import('./isolated-env.mjs');
+  const registry = await import('./runtime-registry.mjs');
   const roots = [], environments = [], baseline = TMP_DIRS.length;
   function setup(overrides = {}) {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-server-runtime-'));
@@ -18,6 +20,9 @@ module.exports = async function () {
     let E, nextPid = 71000;
     E = makeEnv(() => 'STATUS: DONE', {
       RT: rtDir,
+      createSmokeEnvironment: isolated.createSmokeEnvironment,
+      cleanupIsolatedDir: isolated.cleanupIsolatedDir,
+      isSafeTempDir: registry.isSafeTempDir,
       wsOf: () => E.w,
       listRuntimes: () => runtimes,
       checkPortOwnership: async () => ({ status: 'free', available: true }),
@@ -32,7 +37,7 @@ module.exports = async function () {
       },
       spawn: () => { events.push('restart'); const p = new EventEmitter(); p.pid = nextPid++; queueMicrotask(() => p.emit('spawn')); return p; },
       getProcessInfo: async () => ({ creationDate: 'fixture', executable: process.execPath }),
-      registerRuntime: (r) => { const replacement = { ...r, runtime_id: 'replacement' }; runtimes.push(replacement); return replacement; },
+      registerRuntime: (r) => { const replacement = { ...r, created_by: 'studio', runtime_id: 'replacement' }; runtimes.push(replacement); return replacement; },
       updateRuntime: (id, updates) => Object.assign(runtimes.find(r => r.runtime_id === id), updates),
       isPidAlive: () => true,
       killProcessTree: async () => ({ ok: true }),
@@ -113,6 +118,27 @@ module.exports = async function () {
     assert.ok(moved.events.includes('drain'), 'OS runtimes drained before acquiring replacement lease');
     assert.equal(moved.runtimes[0].status, 'cleaned');
 
+    // Aion idle alone cannot authorize a lease transfer or terminal release.
+    const codexBlocked = setup({ stopTurn: async () => false });
+    await acquire(codexBlocked); codexBlocked.w.run.convs = { 'codex:work': 'codex-session' };
+    await assert.rejects(codexBlocked.api.handoffWriter(codexBlocked.w, 'claude', codexBlocked.t.id), /保留寫入租約/);
+    assert.equal(codexBlocked.t.agent, 'codex');
+    codexBlocked.t.status = 'DONE';
+    await codexBlocked.api.endWriteStep(codexBlocked.w, codexBlocked.t);
+    assert.equal(codexBlocked.t.stopUnconfirmed, true);
+    assert.equal(codexBlocked.api.writerOf(codexBlocked.api.treeKey(codexBlocked.w.project))?.status, 'RESERVED');
+
+    let acknowledgeStop;
+    const codexGate = new Promise(resolve => { acknowledgeStop = resolve; });
+    const codexMoving = setup({ stopTurn: () => codexGate });
+    await acquire(codexMoving); codexMoving.w.run.convs = { 'codex:work': 'codex-session' };
+    const transfer = codexMoving.api.handoffWriter(codexMoving.w, 'claude', codexMoving.t.id);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(codexMoving.t.agent, 'codex', 'writer stays assigned while tool exit verification is pending');
+    assert.ok(codexMoving.api.writerOf(codexMoving.api.treeKey(codexMoving.w.project)));
+    acknowledgeStop(true); await transfer;
+    assert.equal(codexMoving.t.agent, 'claude', 'handoff proceeds only after tool exit confirmation');
+
     // A completed card must stop only its own backend before its workspace lease is released.
     let releaseCardCleanup, cardCleanupStarted;
     const cardCleanupGate = new Promise(resolve => { releaseCardCleanup = resolve; });
@@ -154,7 +180,71 @@ module.exports = async function () {
     const noLease = setup(); noLease.t.status = 'WORKING';
     await assert.rejects(noLease.api.startManagedRuntime({ ws: noLease.w.project, cardId: noLease.t.id }), /lease/);
     assert.ok(!noLease.events.includes('restart'));
-    console.log('Server runtime integration: latest owner, unknown PID, startup failure polling, STOP race, handoff drain, card cleanup before lease release, lease admission: PASS');
+
+    // The production entry point must allocate isolation, not just label a shared DATA_DIR as smoke.
+    for (const purpose of ['smoke', 'test']) {
+      let launched;
+      const smoke = setup({
+        spawn: (exe, args, options) => {
+          launched = options;
+          assert.ok(fs.existsSync(options.env.DATA_DIR), 'recovery recreates the allocated data directory before spawn');
+          const child = new EventEmitter(); child.pid = 71001;
+          queueMicrotask(() => child.emit('spawn')); return child;
+        },
+        cleanupRuntime: async (r) => { isolated.cleanupIsolatedDir(r.temp_dir); r.status = 'cleaned'; return { ok: true }; }
+      });
+      await acquire(smoke); smoke.t.status = 'WORKING';
+      fs.writeFileSync(path.join(smoke.dataDir, 'sentinel'), 'preserve');
+      const { runtime } = await smoke.api.startManagedRuntime({ ws: smoke.w.project, cardId: smoke.t.id,
+        purpose, executable: process.execPath, args: [], cwd: smoke.w.project, dataDir: smoke.dataDir,
+        port: 3018, noCredentialsConfirmed: true });
+      assert.ok(registry.isSafeTempDir(runtime.temp_dir));
+      roots.push(runtime.temp_dir);
+      assert.notEqual(runtime.data_dir, smoke.dataDir);
+      assert.equal(runtime.data_dir, path.join(runtime.temp_dir, 'data'));
+      assert.equal(launched.env.DATA_DIR, runtime.data_dir);
+      assert.equal(launched.env.STUDIO_ISOLATED, '1');
+      assert.equal(launched.env.PORT, String(runtime.port));
+      assert.ok(![3018, 3011].includes(runtime.port));
+      assert.equal(fs.readFileSync(path.join(smoke.dataDir, 'sentinel'), 'utf8'), 'preserve');
+
+      // Healthy isolated backends must remain eligible to wake their original card.
+      smoke.t.status = 'WAITING_EXTERNAL'; smoke.t.wait = { backendPort: runtime.port, manual: false };
+      await smoke.api.recoverBackendWait(smoke.w, smoke.t);
+      assert.equal(smoke.t.status, 'WAITING', 'healthy isolated runtime can wake its card');
+
+      runtime.runtime_id = 'original';
+      smoke.t.status = 'WAITING_EXTERNAL'; smoke.t.wait = { backendPort: runtime.port, manual: false };
+      await smoke.api.recoverBackendWait(smoke.w, smoke.t);
+      assert.equal(smoke.t.status, 'WAITING', 'stale smoke runtime is cleaned and safely recreated: ' + smoke.t.wait?.recoveryReason);
+      assert.equal(runtime.status, 'cleaned');
+      assert.equal(smoke.runtimes.at(-1).data_dir, runtime.data_dir);
+      assert.ok(fs.existsSync(runtime.data_dir));
+
+      smoke.runtimes.at(-1).data_dir = smoke.dataDir;
+      smoke.runtimes.at(-1).env.DATA_DIR = smoke.dataDir;
+      smoke.t.status = 'WAITING_EXTERNAL'; smoke.t.wait = { backendPort: runtime.port, manual: false };
+      await smoke.api.recoverBackendWait(smoke.w, smoke.t);
+      assert.equal(smoke.t.wait.manual, true, 'a forged smoke owner cannot recover against project data');
+      assert.match(smoke.t.wait.recoveryReason, /DATA_DIR owner/);
+    }
+
+    for (const failure of ['spawn', 'ownership']) {
+      let allocated;
+      const failedSmoke = setup({
+        createSmokeEnvironment: async (options) => {
+          allocated = await isolated.createSmokeEnvironment(options); roots.push(allocated.tempRoot);
+          if (failure === 'ownership') failedSmoke.w.run.paused = true;
+          return allocated;
+        },
+        spawn: () => { throw new Error('fixture spawn failed'); }
+      });
+      await acquire(failedSmoke); failedSmoke.t.status = 'WORKING';
+      await assert.rejects(failedSmoke.api.startManagedRuntime({ ws: failedSmoke.w.project, cardId: failedSmoke.t.id,
+        purpose: 'smoke', executable: process.execPath, args: [], port: 3011 }), /spawn failed|ownership changed/);
+      assert.ok(allocated && !fs.existsSync(allocated.tempRoot), 'failed start removes only its allocated temp data');
+    }
+    console.log('Server runtime integration: owner recovery, STOP/handoff drain, lease admission, smoke/test isolation and failed-start cleanup: PASS');
   } finally {
     for (const w of environments) for (const timer of w.lockTimers?.values() || []) clearInterval(timer);
     for (const root of [...roots, ...TMP_DIRS.splice(baseline)]) fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });

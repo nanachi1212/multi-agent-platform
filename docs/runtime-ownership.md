@@ -10,7 +10,7 @@ Multi-Agent Studio 管理多個 Agent、背景進程與測試執行。為確保�
 
 - **`studio/runtime-registry.mjs`**：
   - 持久化記錄 Studio 啟動的所有長時間程序（`runtimes.json`）。
-  - 提供作業系統層級（Windows PID Tree）的進程管理與清理（嚴格使用 `taskkill /F /T /PID` 或 PID 樹遞迴，**禁止依名稱 `Stop-Process -Name python/node` 殺程序**）。
+  - 提供作業系統層級（Windows PID Tree）的進程管理與清理（只逐一終止已驗證的 PID，不用 `taskkill /T`，**禁止依名稱 `Stop-Process -Name python/node` 殺程序**）。
   - 啟動與掃描時自動清理確認 stale 的程序與殘留暫存目錄（具備 PID 重複使用安全防護）。
   - 連接埠所有權檢查：**未知 process 絕不 kill**，精確回報 PID、指令、連接埠與鎖狀態。
 
@@ -63,7 +63,7 @@ Multi-Agent Studio 管理多個 Agent、背景進程與測試執行。為確保�
 
 ## 3. Readiness 與恢復 API
 
-- `POST /api/runtime/start` 只接受進行中工作卡、絕對 executable、字串 args、工作區內的 cwd 與既有 data directory；Studio 直接啟動並登記 PID。
+- `POST /api/runtime/start` 只接受持有 write lease 的進行中工作卡、絕對 executable、字串 args 與工作區內的 cwd；Studio 直接啟動並登記 PID。一般 runtime 須明確指定工作區內既有的 `dataDir` 與 `port`；`purpose: "smoke"`／`"test"` 改由 Studio 配置隔離資料與連接埠。
 - `POST /api/runtime/readiness` 以 `runtimeId` 查詢 readiness；`GET /api/runtimes` 與 `/api/state` 也提供 runtime readiness。
 - 只有專案頁設定了「驗證用後端 port」（例如 3018）時才啟用：一般 `WAITING_EXTERNAL` 若明確提到 backend 該 port／`MiningProcessLockError`，Studio 會尋找該卡建立的 runtime。已確認可安全重啟時會自動清理、重啟、檢查 `/health`、執行 smoke path 並繼續原卡；否則 UI 顯示 `Blocked` 原因，要求人工處理。
 - listener 存在但 FastAPI startup 失敗時仍是 `BLOCKED`，health response 的啟動錯誤會顯示給使用者。
@@ -73,7 +73,7 @@ Multi-Agent Studio 管理多個 Agent、背景進程與測試執行。為確保�
 ## 4. 程序清理原則（Windows Process Tree）
 
 1. **嚴格針對目標 Job PID 樹**：
-   - 終止程序時使用 `taskkill /F /T /PID <root_pid>`。
+   - 一次讀取全部程序後建樹：子程序的建立時間必須不早於父程序才算後代（Windows 會重用 PID，只看 ParentProcessId 曾誤殺無關的 Vite dev server）。只逐一終止根程序與這些後代，不用 `taskkill /T`；程序清單讀取失敗時不終止任何程序，回報未停止並保留租約。
    - 只有登記於該 Job 下的進程才會被終止，絕不會影響其他 Job 或系統中執行的其他 python/node 程序。
 2. **PID 重複利用（Recycling）防護**：
    - 當判定過期的 Runtime 紀錄時，若該 PID 存在但啟動指令或執行檔不相符，代表該 PID 已被作業系統指派給無關的程式；**絕對不殺此程序**，僅將紀錄標記為 `stale` 並保留其暫存目錄，等待 ownership 確認。
@@ -96,8 +96,9 @@ Multi-Agent Studio 管理多個 Agent、背景進程與測試執行。為確保�
 
 ## 6. 測試／煙霧測試環境隔離（Smoke Isolation）
 
-- 煙霧測試後端啟動時，自動建立 `%TEMP%\MultiAgentStudio\<project>\<run-id>\data`，並設定 `DATA_DIR` 環境變數。
-- 測試連接埠自動在 3020–3099 間配置，保證不佔用正式環境 3018（後端）與 3011（前端）。
+- 正式 `/api/runtime/start` 的 `smoke`／`test` 會忽略呼叫者的 `dataDir`，建立 `%TEMP%\MultiAgentStudio\<project>\<run-id>\data`，並登記 `temp_dir`、設定 `DATA_DIR`、`PORT` 與 `STUDIO_ISOLATED=1`。啟動前失敗或租約變更時清理本次配置；啟動後沿用 runtime 的程序身分確認與清理流程。
+- `port` 是偏好值，未指定時從 3020 開始；若不可用則搜尋 3020–3099，最後由 OS 配置，排除 3018（後端）與 3011（前端）。呼叫端須使用回傳的 `runtime.port`。
+- 執行的程式必須遵守 `DATA_DIR` 與 `PORT` 環境變數；這是啟動設定的隔離，並非禁止程式自行讀寫其他目錄的 OS sandbox。不要在 args 中覆蓋這兩個值。
 - 由於檔案鎖（`.mining_process.lock`）位於各自的 `DATA_DIR` 內，即便煙霧測試（例如 3028 埠）正在執行並持鎖，正式環境 3018 仍可順利取得正式環境的資料庫與進程鎖，兩者互不干擾。
 - 測試結束後由 `cleanupIsolatedDir` 清理；若發生異常崩潰，則在下次 Studio 啟動時由 `cleanupStaleRuntimes` 自動掃描清除。
 
@@ -111,6 +112,10 @@ Multi-Agent Studio 管理多個 Agent、背景進程與測試執行。為確保�
 
 ## 驗證範圍
 
+Codex 的 Windows 工具程序由 `codex-runtime.mjs` 接到既有 registry（`purpose: codex_session`）。初始化與重建序列化，在本 Studio 的 AionCore 程序下辨識唯一新增的 Codex app-server，保存 PID、OS 建立時間與 executable；候選不唯一或 CIM 查詢失敗時拒絕開始執行。程序名稱只用來辨識 CLI，不是刪除或終止程序的依據。
+
+回合結束、暫停、停止與交接會使用 AionCore v0.2.2 的單一對話 `runtime/restart`，讓原生 Windows Job Object 結束舊 session 工具程序；原對話與歷史保留。Studio 先保存含建立時間檢查的程序樹，再確認原程序身分均已退出，才放行寫入權；HTTP 200 或 idle 本身不算通過。確認失敗的 `stopping` 紀錄及子 PID 保留，供再次確認及重啟後清理使用；另一個 conversation 不會被一起停止。每次 Codex 回合結束會多一次 CLI 重建；這項護欄目前限定 Windows 與專案固定的 AionCore v0.2.2。
+
 `test-runtime.cjs` 除 H/I/J/L、readiness predicate 與恢復階段的取消外，亦啟動 OS 配置埠的真實 HTTP fixture：程序存活且 listener 可連線時，`MiningProcessLockError` 的 503 仍須 BLOCKED；同一程序改回既有 `status: "ok"` 契約後才 BACKEND_READY。`test-runtime-server.cjs` 執行 production server hooks，涵蓋最新 replacement、未知 PID／command、已知 startup failure 自動輪詢、不重複 restart、STOP 在 cleanup 期間的租約保留、handoff 前 OS drain，以及 write lease admission。延遲清理會固定原 job／card 範圍；前一輪 runtime 未停妥時禁止啟動新一輪。Auto CI 與 lifecycle-check 會執行上述回歸及 A–M 情境。
 
-本次測試使用隔離資料與子程序 fixture，未啟動真實 AionCore 或使用正式 TWstock DATA_DIR。Agent 直接在 shell 啟動的服務必須改由 `/api/runtime/start` 管理，才能使用此 registry 的 ownership 與自動恢復；本卡沒有新增 AionCore 內部程序追蹤 API。
+自動化 CI 使用隔離資料與子程序 fixture；2026-10-16 的真實 AionCore／Agent 驗證另見 `docs/audit-batches.md`，未使用正式 TWstock DATA_DIR。需要跨回合保留或 health／自動恢復的服務必須由 `/api/runtime/start` 管理；Codex 直接在 shell 啟動的工具隨該回合的 runtime 一起結束。沒有新增 AionCore 內部程序追蹤 API。
