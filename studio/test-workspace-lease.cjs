@@ -10,7 +10,7 @@ async function store(rt, instance, fileSystem = fs) {
   const S = { leases: [] };
   const api = createWorkspaceLeaseStore({ fs: fileSystem, path, crypto, S, RT: rt, INSTANCE: instance,
     AGENTS: { codex: { name: 'Codex' }, claude: { name: 'Claude Code' } }, nowIso: () => new Date().toISOString(),
-    pidAlive: (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } }, LEASE_HUNG_MS: 1800000, LEASE_RESERVED_TTL_MS: 43200000 });
+    pidAlive: (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; } }, LEASE_RESERVED_TTL_MS: 43200000 });
   return { S, api };
 }
 module.exports = async function run({ makeEnv, mkTmp, region }) {
@@ -48,6 +48,28 @@ module.exports = async function run({ makeEnv, mkTmp, region }) {
     assert.equal(E.api.acquireWrite(E.w, other, wi).ok, true, 'F linked worktree gets own writer');
     assert.equal(first.lease.worktree, info.path); assert.equal(first.lease.provider, 'codex');
     console.log('lease A/B/F canonical identity, writer/read leases, independent worktrees: PASS');
+    assert.throws(() => E.api.releaseLease(first.lease.id), /不能強制釋放/);
+    E.env.S.leases.find((l) => l.id === first.lease.id).status = 'RESERVED'; E.api.saveLeases();
+    assert.throws(() => E.api.releaseLease(first.lease.id), /不能強制釋放/, 'manual release cannot bypass a pending stop');
+
+    // A silent live Studio is not stale, even when another instance loaded the same job/card snapshot.
+    const silent = await store(tmp('lease-silent-'), 'current');
+    const silentLease = { ...first.lease, id: 'silent', instance: 'other', heartbeatAt: '2000-01-01T00:00:00Z', acquiredAt: '2000-01-01T00:00:00Z' };
+    for (const pid of [process.pid, null]) for (const status of ['ACTIVE', 'RESERVED']) {
+      Object.assign(silentLease, { pid, status }); silent.S.leases = [silentLease]; silent.api.saveLeases();
+      assert.equal(silent.api.leaseState(silentLease), status);
+      assert.equal(silent.api.acquireWrite(E.w, E.t, info).ok, false, 'same-card snapshot cannot steal a live or unknown holder');
+    }
+    const mirrorRepo = repo(), blocked = setup(mirrorRepo.d);
+    const mirrorPath = path.join(mirrorRepo.d, '.git', 'studio-writer.lock');
+    for (const pid of [process.pid, null]) {
+      const contents = JSON.stringify({ owner: 'other Studio', instance: 'other', pid, beat: '2000-01-01T00:00:00Z' });
+      fs.writeFileSync(mirrorPath, contents);
+      assert.equal(await blocked.api.takeWriteSlot(blocked.w, blocked.t), false, 'old live/unknown mirror blocks writing');
+      await assert.rejects(blocked.api.claimWorkspace(mirrorRepo.d), /held by another owner/);
+      assert.equal(fs.readFileSync(mirrorPath, 'utf8'), contents);
+    }
+    console.log('lease silent live/unknown owners and same-card snapshots cannot be taken over: PASS');
 
     // C/D: revocation survives replacement release, restart, stale pre-handoff records.
     const H = setup(repo().d), hi = await H.api.workspaceOf(H.w.project);
@@ -177,7 +199,7 @@ module.exports = async function run({ makeEnv, mkTmp, region }) {
     const failedState = { leases: [] };
     const failStore = createWorkspaceLeaseStore({ fs: { ...fs, renameSync() { throw new Error('simulated disk failure'); } }, path, crypto,
       S: failedState, RT: Failed.rt, INSTANCE: 'failed-write', AGENTS: Failed.env.AGENTS,
-      nowIso: () => new Date().toISOString(), pidAlive: () => true, LEASE_HUNG_MS: 1800000, LEASE_RESERVED_TTL_MS: 43200000 });
+      nowIso: () => new Date().toISOString(), pidAlive: () => true, LEASE_RESERVED_TTL_MS: 43200000 });
     const awaitInfo = await Failed.api.workspaceOf(Failed.w.project);
     assert.throws(() => failStore.acquireWrite(Failed.w, Failed.t, awaitInfo), /simulated disk failure/);
     assert.equal(failedState.leases.length, 0);
@@ -198,10 +220,10 @@ module.exports = async function run({ makeEnv, mkTmp, region }) {
 
     // Failed orphan cancellation forbids replacing its conversation with another writer.
     const orphanCode = region('async function stopTurn(convId)', '// Changes whenever');
-    const send = new Function('active', 'api', 'sleep', orphanCode + '\nreturn sendMessage;')(new Map(), async (method, endpoint) => {
+    const send = new Function('active', 'api', 'sleep', 'stoppingTurns', 'isCodexConv', orphanCode + '\nreturn sendMessage;')(new Map(), async (method, endpoint) => {
       if (method === 'POST' && endpoint.endsWith('/messages')) throw new Error('CONFLICT already running');
       return method === 'GET' ? { runtime: { state: 'running', is_processing: true, turn_id: 'orphan' } } : {};
-    }, async () => {});
+    }, async () => {}, new Map(), () => false);
     await assert.rejects(send('conv', 'resume'), (e) => e.stuck && e.stopUnconfirmed);
     const Unconfirmed = setup(repo().d, { turn: async () => { throw Object.assign(new Error('orphan still running'), { stopUnconfirmed: true }); } });
     Unconfirmed.w.run.active = true; Unconfirmed.w.run.paused = false; Unconfirmed.t.status = 'WAITING';
@@ -217,7 +239,9 @@ module.exports = async function run({ makeEnv, mkTmp, region }) {
       let out = '', err = ''; child.stdout.on('data', (b) => { out += b; }); child.stderr.on('data', (b) => { err += b; });
       child.on('error', reject); child.on('close', (code) => code === 0 ? resolve(out.trim()) : reject(new Error(err)));
     });
-    const result = await Promise.all([runChild('A'), runChild('B')]);
+    const children = await Promise.allSettled([runChild('A'), runChild('B')]);
+    for (const child of children) if (child.status === 'rejected') throw child.reason;
+    const result = children.map((child) => child.value);
     assert.equal(result.filter((x) => x === 'acquired').length, 1, 'exactly one OS process wins');
     assert.equal(JSON.parse(fs.readFileSync(path.join(raceRt, 'studio', 'leases.json'), 'utf8')).filter((l) => l.status === 'RESERVED').length, 1);
     console.log('lease A two OS processes: exactly one writer acquired: PASS');
@@ -236,7 +260,7 @@ if (require.main === module) {
           const got = api.acquireWrite({ project: 'repo', run: { id: process.argv[4] } }, { id: 'card', agent: 'codex', title: 'child' }, { key: 'one-tree', path: 'repo', repo: '', branch: 'main' });
           if (got.ok) { got.lease.status = 'RESERVED'; api.saveLeases(); }
           console.log(got.ok ? 'acquired' : 'blocked'); break;
-        } catch (e) { if (!/locked/.test(e.message) || attempt > 200) throw e; await new Promise((r) => setTimeout(r, 10)); }
+        } catch (e) { if ((!/locked/.test(e.message) && !['EPERM', 'EBUSY'].includes(e.code)) || attempt > 200) throw e; await new Promise((r) => setTimeout(r, 10)); } // Windows may report a concurrently deleted lock as EPERM
       }
     })().catch((e) => { console.error(e); process.exitCode = 1; });
   } else module.exports(require('./lifecycle-harness.cjs')).catch((e) => { console.error(e); process.exitCode = 1; });

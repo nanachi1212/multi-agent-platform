@@ -4,6 +4,12 @@
 
 A tree can have multiple read leases and one active or reserved write lease. Linked Git worktrees have independent keys and writers. Admission takes an exclusive persistence lock, merges disk state, then atomically renames the updated JSON. Corrupt stores, unverified locks, and failed writes prevent agent startup. A Git-directory mirror also coordinates installations with different runtime directories; mirror timers are per physical tree.
 
+Heartbeat age alone never authorizes takeover. Live or unknown Studio owners keep their leases and Git mirrors; even an identical job/card snapshot cannot claim a live instance's ownership. A confirmed dead Studio's active lease is stale; its reservation retains the existing 12-hour grace period. This is controller liveness, not proof that an unregistered tool subprocess stopped.
+
+Each runtime directory now has one controller lock acquired before settings are read or AionCore starts. Settings and job history use a flushed temporary JSON file and atomic replacement; a failed replacement preserves the previous file. When upgrading an already-running older Studio without this lock, stop it normally before launching the new version.
+
+Automatic worktree cleanup requires Studio-owned path/branch registration, clean status (including ignored files), and delivery evidence for the current HEAD. Any failed query preserves the tree. Removal uses no force; branch deletion compares the verified commit so a moved branch survives. A partial cleanup is recorded as an error, never `cleaned: true`.
+
 ## Public actions
 
 - `GET /api/leases`: current leases, including `EXTERNAL` owners.
@@ -14,7 +20,7 @@ A tree can have multiple read leases and one active or reserved write lease. Lin
 - `POST /api/workspace/claim` with `path` or `ws`: external ownership, optional `label`, `pid`, `description` (legacy `note`), `session`. Studio writers stop before acknowledgment. The persistent `EXTERNAL` claim and mirror require explicit release, including after PID exit/restart. Readers remain permitted.
 - `POST /api/workspace/release-claim`: explicitly return external ownership; a paused job still needs manual resume.
 
-`drainExecution` is the runtime integration point: `stopTurn` must return true only after cancellation is confirmed; the lease cannot move before card cleanup settles. The current AionCore adapter checks conversation idle state. OS process-tree supervision belongs to the runtime workstream; this lease workstream does not introduce a second process runner.
+`drainExecution` is the runtime integration point: `stopTurn` must return true only after cancellation is confirmed; the lease cannot move before card cleanup settles. For Codex on Windows, idle is followed by the existing AionCore conversation runtime restart and an OS check of the recorded process tree. Pending or failed confirmation retains the write lease and blocks handoff, external claims and read-only conversion. Terminal card cleanup uses the same gate.
 
 ## External modifications
 

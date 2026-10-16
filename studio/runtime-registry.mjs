@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
+import { processSnapshot, processTree } from './codex-runtime.mjs';
 
 // ---------- System Process & Port Helpers (Windows-first) ----------
 
@@ -56,45 +57,28 @@ export async function getProcessInfo(pid) {
   return { pid, exists: isPidAlive(pid), command: '', executable: '' };
 }
 
-export async function getChildPids(parentPid) {
+// Windows reuses PIDs, so ParentProcessId alone can adopt an unrelated process (reports/evidence/INCIDENT-w1-pid-reuse.md).
+// processTree follows only children created at or after their parent. A failed snapshot throws: it is not an empty tree.
+export async function getChildPids(parentPid, snapshot = processSnapshot) {
   if (!parentPid || !isPidAlive(parentPid)) return [];
-  if (process.platform === 'win32') {
-    try {
-      const psCmd = `Get-CimInstance Win32_Process -Filter "ParentProcessId = ${parentPid}" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ProcessId`;
-      const out = await execPowerShell(psCmd);
-      if (out && out.trim()) {
-        const lines = out.trim().split(/\r?\n/).map((l) => parseInt(l.trim(), 10)).filter(Boolean);
-        const allDescendants = [...lines];
-        for (const childPid of lines) {
-          const subChildren = await getChildPids(childPid);
-          allDescendants.push(...subChildren);
-        }
-        return [...new Set(allDescendants)];
-      }
-    } catch (e) {}
-  }
-  return [];
+  const rows = await snapshot();
+  const root = rows.find((p) => p.pid === parentPid);
+  return root ? processTree(rows, root).slice(1).map((p) => p.pid) : [];
 }
 
 /**
  * Terminate a process tree.
- * CRITICAL RULE: Kills strictly by PID tree (taskkill /F /T /PID <pid>).
+ * CRITICAL RULE: Kills only the root and its verified descendants, one PID at a time (no taskkill /T: it walks ParentProcessId again).
  * NEVER kills by process name (no Stop-Process -Name python).
  */
 export async function killProcessTree(rootPid) {
   if (!rootPid || !isPidAlive(rootPid)) return { ok: true, killed: false };
-  const children = await getChildPids(rootPid).catch(() => []);
+  let children;
+  try { children = await getChildPids(rootPid); }
+  catch (e) { return { ok: false, killed: false, rootPid, children: [], remaining: [rootPid] }; } // unknown tree: kill nothing
 
-  if (process.platform === 'win32') {
-    try {
-      await execCmd('taskkill', ['/F', '/T', '/PID', String(rootPid)]);
-    } catch (e) {
-      // taskkill may return code 128 if process already exited
-    }
-  }
-
-  if (isPidAlive(rootPid)) {
-    try { process.kill(rootPid, 'SIGKILL'); } catch (e) {}
+  for (const pid of [rootPid, ...children]) {
+    try { process.kill(pid, 'SIGKILL'); } catch (e) {} // already exited
   }
 
   // Do not kill detached/reused child PIDs after the parent tree has exited.
@@ -333,7 +317,7 @@ export async function checkPortOwnership(port, { desiredJobId, desiredDataDir, r
     && (r.root_pid === occupantPid || (r.child_pids && r.child_pids.includes(occupantPid))));
   if (matched) {
     const verified = await verifyRuntimeProcess(matched);
-    const descendants = matched.root_pid === occupantPid ? [] : await getChildPids(matched.root_pid);
+    const descendants = matched.root_pid === occupantPid ? [] : await getChildPids(matched.root_pid).catch(() => []);
     if (!verified.ok || !verified.alive || matched.root_pid !== occupantPid && !descendants.includes(occupantPid)) matched = null;
   }
 
