@@ -192,6 +192,9 @@ export async function cleanupRuntime(runtime, { rtDir = null, customRuntimes = n
   return { ok: true };
 }
 
+// Unique per Studio start: a PID or timestamp can repeat after a quick restart, this cannot.
+const STUDIO_INSTANCE = crypto.randomUUID();
+
 // ---------- Runtime Registry Persistence & Operations ----------
 
 export function runtimesFile(rtDir) {
@@ -268,6 +271,7 @@ export function registerRuntime({
     created_by: String(created_by || 'unknown'),
     restart_safe: restart_safe === true,
     studio_pid,
+    studio_instance: STUDIO_INSTANCE,
     process_identity: process_identity?.creationDate && process_identity?.executable
       ? { creationDate: process_identity.creationDate, executable: process_identity.executable } : null
   };
@@ -317,9 +321,8 @@ export async function cleanupStaleRuntimes({ rtDir = null, customRuntimes = null
   let cleanedCount = 0, staleCount = 0;
   for (const runtime of runtimes) {
     // A Codex record left 'stopping' by an earlier Studio: its saved process identities are the only proof of what to stop.
-    // Created before this process started = an earlier Studio, even if Windows reused its PID. It stays 'stopping' (retryable) until clean.
-    if (runtime.status === 'stopping' && Array.isArray(runtime.process_tree)
-        && !(runtime.studio_pid === process.pid && Date.parse(runtime.started_at) >= Date.now() - process.uptime() * 1000 - 5000)) {
+    // Only this Studio start's own in-flight stop is skipped; a record without this start's instance id is an earlier Studio's. It stays 'stopping' (retryable) until clean.
+    if (runtime.status === 'stopping' && Array.isArray(runtime.process_tree) && runtime.studio_instance !== STUDIO_INSTANCE) {
       try {
         await killIdentities(runtime.process_tree, snapshot);
         const rows = await snapshot();

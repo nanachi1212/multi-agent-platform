@@ -359,7 +359,7 @@ async function runRuntimeTests() {
     await new Promise((resolve) => setTimeout(resolve, 500));
     const rows = await processSnapshot(), id = (c) => { const p = rows.find((r) => r.pid === c.pid); return { pid: p.pid, executable: p.executable, creationDate: p.creationDate }; };
     const add = (tree) => { const r = registry.registerRuntime({ rtDir, job_id: 'studio_core', purpose: 'codex_session', root_pid: tree[0].pid, process_identity: tree[0], studio_pid: 2147483000 });
-      registry.updateRuntime(r.runtime_id, { status: 'stopping', process_tree: tree }, { rtDir }); return r.runtime_id; };
+      registry.updateRuntime(r.runtime_id, { status: 'stopping', process_tree: tree, studio_instance: 'previous-start' }, { rtDir }); return r.runtime_id; };
     const a = add([id(orphan)]), b = add([{ ...id(reused), creationDate: 'old' }]);
     await registry.cleanupStaleRuntimes({ rtDir });
     const status = (rid) => registry.listRuntimes({ rtDir }).find((r) => r.runtime_id === rid).status;
@@ -375,8 +375,8 @@ async function runRuntimeTests() {
     const row = (pid, s, exe = 'node.exe') => ({ pid, parent: 1, executable: exe, command: '', creationDate: new Date(s * 1000).toISOString() });
     const realKill = process.kill;
     const rtDir = mkTmp('studio-stopping2-');
-    const add = (tree, extra = {}) => { const r = registry.registerRuntime({ rtDir, job_id: 'studio_core', purpose: 'codex_session', root_pid: tree[0].pid, process_identity: tree[0], studio_pid: 2147483000 });
-      registry.updateRuntime(r.runtime_id, { status: 'stopping', process_tree: tree, ...extra }, { rtDir }); return r.runtime_id; };
+    const add = (tree, extra = {}, own = false) => { const r = registry.registerRuntime({ rtDir, job_id: 'studio_core', purpose: 'codex_session', root_pid: tree[0].pid, process_identity: tree[0], studio_pid: 2147483000 });
+      registry.updateRuntime(r.runtime_id, { status: 'stopping', process_tree: tree, ...(own ? {} : { studio_instance: 'previous-start' }), ...extra }, { rtDir }); return r.runtime_id; };
     const status = (rid) => registry.listRuntimes({ rtDir }).find((r) => r.runtime_id === rid);
 
     // recovery: a child whose PID was reused only after the root died is not killed
@@ -411,8 +411,8 @@ async function runRuntimeTests() {
       // a stopping record from an earlier Studio that got this Studio's PID is still recovered
       process.kill = realKill; alive = [row(victim.pid, 200)];
       process.kill = (pid, sig) => { if (sig === 'SIGKILL') { alive = []; return true; } return realKill(pid, sig); };
-      const c = add([row(victim.pid, 200)], { studio_pid: process.pid, started_at: '2000-01-01T00:00:00.000Z' });
-      const d = add([row(victim.pid, 200)], { studio_pid: process.pid }); // this Studio's own in-flight stop
+      const c = add([row(victim.pid, 200)], { studio_pid: process.pid, studio_instance: 'previous-start' } /* same PID, created seconds ago */);
+      const d = add([row(victim.pid, 200)], { studio_pid: process.pid }, true); // this Studio's own in-flight stop
       await registry.cleanupStaleRuntimes({ rtDir, snapshot: async () => alive });
       assert.strictEqual(status(c).status, 'cleaned'); assert.strictEqual(status(d).status, 'stopping');
     } finally { process.kill = realKill; victim.kill(); }
