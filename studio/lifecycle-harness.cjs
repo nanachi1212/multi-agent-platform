@@ -18,6 +18,7 @@ function makeEnv(script, overrides = {}) {
     AGENTS: { claude: { name: 'Claude Code' }, codex: { name: 'Codex' }, antigravity: { name: 'Antigravity' } },
     S: { workspaces: [], leases: [] }, RT: mkTmp('studio-rt-'), PORT: 4848, api: async () => ({ items: [] }), stopTurn: async () => true, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 20))), crypto: nodeCrypto, logs, notices, prompts,
     log: (w, who, role, text, detail) => logs.push({ who, role, text, detail }),
+    events: [], event: (type, data) => env.events.push({ type, ...data }),
     notify: (title, body, kind) => notices.push({ title, body, kind }),
     label: () => 'TestProj', refreshClaudeLimits() {}, saveRun() {}, saveSettings() {}, latestJob: () => null, clip: (x, n) => String(x ?? '').slice(0, n), AFTER_DONE: ['stop', 'suggest', 'auto'],
     started: [], start: async (w, request, cont) => { env.started.push({ request, cont }); }, setTimeout: (fn, ms) => (ms === 5000 ? queueMicrotask(fn) : globalThis.setTimeout(fn, ms)), // only the 5 s auto-continue delay is skipped
@@ -34,7 +35,7 @@ function makeEnv(script, overrides = {}) {
   env.agentName = (id) => env.AGENTS[id]?.name || id;
   Object.assign(env, overrides);
   const names = Object.keys(env);
-  const api = new Function(...names, code + '\nreturn { planPhase, pump, summarize, answer, continueCard, wake, parseStatus, finish, autoNext, instruct, pause, resume, stop, handoffWriter, claimWorkspace, releaseClaim, useWorktree, useReadOnly, checkWorkspaces, acquireWrite, workspaceOf, loadLeases, saveLeases, leaseState, leaseView, writerOf, retire, beatLeases, cleanupWorktree, runTask, endWriteStep, treeKey, newLease, flagExternalModification, loadRun, reassign, recoverBackendWait, startManagedRuntime, drainExecution, pauseAndDrain, stopAndDrain, takeWriteSlot, treeStamp, INSTANCE, askAgent, cardDetail, workInfo, resolveAsks, cardStep, watchExternal, withdrawAgent, applyStatus, usageDelta, chargeUsage, delegateAsk, parseSubtasks, overCap, verdictOf, reviewAuthors, loadRun };')(...names.map((k) => env[k])); // test harness: our own code
+  const api = new Function(...names, code + '\nreturn { planPhase, pump, summarize, answer, continueCard, wake, parseStatus, finish, autoNext, instruct, pause, resume, stop, handoffWriter, claimWorkspace, releaseClaim, useWorktree, useReadOnly, checkWorkspaces, acquireWrite, workspaceOf, loadLeases, saveLeases, leaseState, leaseView, writerOf, retire, beatLeases, cleanupWorktree, runTask, endWriteStep, treeKey, newLease, flagExternalModification, loadRun, reassign, recoverBackendWait, startManagedRuntime, drainExecution, pauseAndDrain, stopAndDrain, takeWriteSlot, treeStamp, INSTANCE, askAgent, cardDetail, workInfo, resolveAsks, cardStep, watchExternal, withdrawAgent, applyStatus, usageDelta, chargeUsage, delegateAsk, parseSubtasks, overCap, verdictOf, reviewAuthors, loadRun, routineDue, saveRoutine, deleteRoutine, runRoutines, setMission, planPrompt };')(...names.map((k) => env[k])); // test harness: our own code
   return { env, api };
 }
 const newW = () => ({ project: 'P', leader: 'claude', workers: ['claude', 'codex', 'antigravity'], tasks: [], activity: [],

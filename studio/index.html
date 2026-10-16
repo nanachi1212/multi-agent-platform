@@ -172,6 +172,10 @@
   details.rules summary { cursor:pointer; color:var(--accent); font-size:13px; font-weight:600; width:max-content; }
   details.rules .rules-b { margin-top:8px; background:var(--panel2); border-radius:10px; padding:10px 12px; font-size:13px; max-height:320px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
   details.rules .rules-b b { display:block; color:var(--muted); font-size:12px; margin:6px 0 2px; }
+  details.rules .goal-b { margin-top:8px; background:var(--panel2); border-radius:10px; padding:10px 12px; font-size:13px; display:flex; flex-direction:column; gap:6px; }
+  details.rules .goal-b b { color:var(--muted); font-size:12px; }
+  .rt-row { display:flex; gap:6px; align-items:center; font-size:13px; }
+  .rt-row .rt-req { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .ask { margin:4px 0 0; font-size:18px; font-weight:700; }
   .office textarea { min-height:110px; resize:vertical; border-radius:12px; font-size:15px; }
   .hint { color:var(--muted); font-size:12px; }
@@ -904,6 +908,26 @@ function doneDropHtml(w) {
   return `<details class="kpi kpi-drop" id="doneDrop" ${doneOpen ? 'open' : ''}><summary><div class="v">${n}/${w.tasks.length}</div><div class="l">這次完成的工作卡 ▾</div></summary><div class="drop">${rows}</div></details>`;
 }
 
+// 🎯 長期目標 and ⏰ 定時工作 (per project). Kept open across redraws like the done-cards drop-down.
+const DAY_NAMES = ['日', '一', '二', '三', '四', '五', '六'];
+const daysLabel = (d) => d.length === 7 ? '每天' : d.join() === '1,2,3,4,5' ? '平日' : '每週' + d.map((x) => DAY_NAMES[x]).join('、');
+let goalOpen = false;
+function goalHtml(w) {
+  const rts = w.routines || [], on = rts.filter((r) => r.on).length;
+  const row = (r) => `<div class="rt-row"><label style="display:inline-flex;align-items:center;gap:4px;white-space:nowrap" title="打勾＝開啟"><input type="checkbox" data-rt-on="${r.id}" ${r.on ? 'checked' : ''}>${daysLabel(r.days)} ${r.time}</label>
+      <span class="rt-req" title="${esc(r.request)}">${esc(r.request)}</span>
+      <span class="hint" style="font-size:12px;white-space:nowrap" title="${esc(r.lastResult || '')}">${r.lastResult ? '⚠ 上次沒有開始' : r.lastAt ? '上次 ' + fmt(r.lastAt) : '還沒跑過'}</span>
+      <button class="btn small ghost" data-rt-del="${r.id}" title="刪除這個定時工作">🗑</button></div>`;
+  return `<details class="rules" id="goalDrop" ${goalOpen ? 'open' : ''}><summary>🎯 長期目標・⏰ 定時工作${w.mission ? '' : '（還沒寫目標）'}${on ? `・${on} 個定時工作開啟` : ''} ▾</summary><div class="goal-b">
+    <b>長期目標</b><span class="hint" style="font-size:12px">工頭規劃、每張工作卡和最後確認都會帶著這段，讓 AI 知道「為什麼做」。離開輸入框就會儲存。</span>
+    <textarea data-mission placeholder="例如：做一個自己每天會用的台股選股與持股追蹤工具，資料以官方來源為準。" style="min-height:56px">${esc(w.mission || '')}</textarea>
+    <b>定時工作</b><span class="hint" style="font-size:12px">時間到就自動「交給團隊」，照這個專案的交付方式做。專案正在工作或暫停時，等它空下來只跑一次。</span>
+    ${rts.map(row).join('')}
+    <div class="rt-row" style="flex-wrap:wrap"><input data-rt-time type="time" value="09:00" style="width:auto;padding:4px 8px;font-size:13px">${DAY_NAMES.map((n, i) => `<label style="display:inline-flex;align-items:center;gap:2px"><input type="checkbox" data-rt-day="${i}" checked>${n}</label>`).join('')}</div>
+    <div class="rt-row"><input data-rt-request placeholder="時間到要交給團隊的需求，例如：檢查今天的資料抓取有沒有成功，有錯就修好" value="${esc(drafts['rt:' + w.project] || '')}" style="flex:1;padding:4px 8px;font-size:13px"><button class="btn small" data-rt-add>＋ 新增</button></div>
+  </div></details>`;
+}
+
 // The Leader's fixed rules, in plain words (what planPrompt / summarize tell it).
 const RULES = `• 工頭不自己動手改檔案，只負責看懂需求、拆成 1～4 張工作卡、派給成員。
 • 互不相關的工作會同時派給不同成員；同一個檔案不會讓兩位成員同時改。
@@ -939,6 +963,7 @@ function officeHtml(w) {
     ${runtimeHtml(w)}
     <div class="team-line">${esc(lead.name)} 工頭 · ${crew.length ? esc(crew.join(' + ')) + ' 協作' : '目前沒有可用的成員'} · Product First · 自動派工</div>
     <details class="rules"><summary>查看 AI 工作規則 ▾</summary><div class="rules-b">${r && (running || paused) ? `<b>目前交辦的內容</b>${esc(r.request)}` : ''}<b>工頭的工作方式</b>${esc(RULES)}</div></details>
+    ${goalHtml(w)}
     ${!running && !paused && ['open', 'wait', 'need'].includes(w.pstate?.level) ? '<div class="hint" style="border-top:1px dashed var(--line);padding-top:10px;font-weight:700">或者，開始新的工作</div>' : ''}
     ${running || paused ? `<div class="ask">工作進行中，想補充或修改指示？</div>
     <textarea id="instruction" placeholder="例如：按鈕改成藍色。或：先不要 merge，等我看過。\n工頭會決定要轉告哪位成員、取消或追加哪些工作卡。">${esc(drafts['i:' + w.project] || '')}</textarea>
@@ -1328,8 +1353,9 @@ document.addEventListener('keydown', (e) => {
 document.addEventListener('input', (e) => {
   if (e.target.id === 'request' && ws()) drafts[ws()] = e.target.value;
   if (e.target.id === 'instruction' && ws()) drafts['i:' + ws()] = e.target.value;
+  if (e.target.matches('input[data-rt-request]') && ws()) drafts['rt:' + ws()] = e.target.value;
 });
-document.addEventListener('toggle', (e) => { if (e.target.id === 'doneDrop') doneOpen = e.target.open; }, true);
+document.addEventListener('toggle', (e) => { if (e.target.id === 'doneDrop') doneOpen = e.target.open; if (e.target.id === 'goalDrop') goalOpen = e.target.open; }, true);
 document.addEventListener('change', (e) => {
   const ho = e.target.closest('select[data-handoff]');
   if (ho) {
@@ -1344,6 +1370,10 @@ document.addEventListener('change', (e) => {
     num.disabled = tu.checked; num.value = tu.checked ? '' : '300000';
     return post('/api/token-cap', { ws: ws(), cap: tu.checked ? 0 : 300000 }).catch(() => {});
   }
+  const mi = e.target.closest('textarea[data-mission]');
+  if (mi) { const x = W(); if (x) x.mission = mi.value.trim(); return post('/api/mission', { ws: ws(), text: mi.value }).catch(() => {}); }
+  const ro = e.target.closest('input[data-rt-on]');
+  if (ro) return post('/api/routine/save', { ws: ws(), id: ro.dataset.rtOn, on: ro.checked }).catch(() => { ro.checked = !ro.checked; });
   const tc = e.target.closest('input[data-token-cap]');
   if (tc) return post('/api/token-cap', { ws: ws(), cap: tc.value }).catch(() => {});
   const am = e.target.closest('input[data-auto-max]');
@@ -1388,6 +1418,15 @@ document.addEventListener('click', (e) => {
   const fold = e.target.closest('[data-fold]');
   if (fold) { toggleLane(fold.dataset.fold); fold.parentElement.classList.toggle('folded', laneFolded(fold.dataset.fold)); return; }
   if (doneOpen && !e.target.closest('#doneDrop')) { doneOpen = false; $('doneDrop')?.removeAttribute('open'); }
+  const rtAdd = e.target.closest('[data-rt-add]');
+  if (rtAdd) {
+    const box = rtAdd.closest('.goal-b'), p = ws();
+    const days = [...box.querySelectorAll('input[data-rt-day]:checked')].map((x) => Number(x.dataset.rtDay));
+    return post('/api/routine/save', { ws: p, request: box.querySelector('input[data-rt-request]').value, time: box.querySelector('input[data-rt-time]').value, days })
+      .then(() => { drafts['rt:' + p] = ''; $('office')._html = ''; rtAdd.blur(); render(); }).catch(() => {});
+  }
+  const rtDel = e.target.closest('[data-rt-del]');
+  if (rtDel) { if (confirm('刪除這個定時工作？')) post('/api/routine/delete', { ws: ws(), id: rtDel.dataset.rtDel }).then(() => { $('office')._html = ''; rtDel.blur(); }).catch(() => {}); return; }
   const pzb = e.target.closest('[data-pz]');
   if (pzb) { // inside a project card link: act, don't open the tab
     e.preventDefault();
