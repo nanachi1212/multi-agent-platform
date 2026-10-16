@@ -10,8 +10,10 @@ import { cleanupRuntime, verifyRuntimeProcess, cleanupJobRuntimes, cleanupStaleR
 import { checkBackendReadiness, recoverOwnedRuntime } from './runtime-readiness.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
-const RT = path.join(ROOT, 'runtime');
-const AION = path.join(RT, 'aioncore', 'aioncore.exe');
+// STUDIO_RUNTIME = a separate runtime folder (settings, history, leases, events, AionCore data), so a test Studio can run
+// next to the user's own without touching it. The AionCore program itself stays shared (read-only, 95 MB).
+const RT = process.env.STUDIO_RUNTIME ? path.resolve(process.env.STUDIO_RUNTIME) : path.join(ROOT, 'runtime');
+const AION = path.join(ROOT, 'runtime', 'aioncore', 'aioncore.exe');
 const AION_URL = 'https://github.com/iOfficeAI/AionCore/releases/download/v0.2.2/aioncore-v0.2.2-x86_64-pc-windows-msvc.zip';
 const AION_ZIP_SHA256 = 'd1ed8d1da869230c18701747d07e8f068db5b8c9442e65261304aeb4c27eacf6';
 let PORT = Number(process.env.STUDIO_PORT || 4848); // moves up when the port is taken (see server.listen)

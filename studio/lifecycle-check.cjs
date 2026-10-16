@@ -825,8 +825,7 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
       if (agent === 'claude' && text.includes('Task: ship')) return 'Opened PR.\nSTATUS: WAITING_EXTERNAL: CI https://github.com/o/r/pull/7';
       if (agent === 'claude' && text.includes('Task: docs')) return 'draft ready\nSTATUS: NEEDS_USER: publish?';
       return 'merged\nSTATUS: DONE';
-    }, { execFile: (cmd, args, opts, cb) => (cmd === 'gh' ? cb(null, JSON.stringify(pr), '') : cb(new Error('no git in test'), '', '')),
-      setWorker: (w, agent, on) => { w.workers = on ? [...new Set([...w.workers, agent])] : w.workers.filter((x) => x !== agent); } }));
+    }, { execFile: (cmd, args, opts, cb) => (cmd === 'gh' ? cb(null, JSON.stringify(pr), '') : cb(new Error('no git in test'), '', '')) }));
     w = newW(); w.leader = 'antigravity'; w.workers = ['claude', 'codex']; w.finisher = 'codex'; w.run.leader = 'antigravity'; env.S.workspaces.push(w);
     api.planPhase(w);
     assert.ok(await waitFor(() => w.tasks[0]?.status === 'DONE'), 'CI is checked as soon as the card parks; the finisher merged');
@@ -882,7 +881,7 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
       if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
       if (agent === 'antigravity') throw new Error('RESOURCE_EXHAUSTED: You have exhausted your capacity (quota)');
       fbTurns++; return 'built\nSTATUS: DONE';
-    }, { setWorker: (w, agent, on) => { w.workers = on ? [...new Set([...w.workers, agent])] : w.workers.filter((x) => x !== agent); } }));
+    }));
     w = newW(); w.workers = ['antigravity', 'codex']; w.fallback = 'codex'; env.S.workspaces.push(w);
     api.planPhase(w);
     assert.ok(await waitFor(() => w.run.result === 'done'), 'the fallback finished the job');
