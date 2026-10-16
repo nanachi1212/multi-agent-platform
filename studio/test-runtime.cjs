@@ -369,6 +369,56 @@ async function runRuntimeTests() {
     console.log('stopping Codex record recovered at startup: PASS');
   }
 
+  // Review round 2: per-kill revalidation, failed kills stay reported, failed/PID-reused recovery stays retryable.
+  {
+    const spawnIdle = () => { const c = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore', windowsHide: true }); SPAWNED_PROCS.push(c); return c; };
+    const row = (pid, s, exe = 'node.exe') => ({ pid, parent: 1, executable: exe, command: '', creationDate: new Date(s * 1000).toISOString() });
+    const realKill = process.kill;
+    const rtDir = mkTmp('studio-stopping2-');
+    const add = (tree, extra = {}) => { const r = registry.registerRuntime({ rtDir, job_id: 'studio_core', purpose: 'codex_session', root_pid: tree[0].pid, process_identity: tree[0], studio_pid: 2147483000 });
+      registry.updateRuntime(r.runtime_id, { status: 'stopping', process_tree: tree, ...extra }, { rtDir }); return r.runtime_id; };
+    const status = (rid) => registry.listRuntimes({ rtDir }).find((r) => r.runtime_id === rid);
+
+    // recovery: a child whose PID was reused only after the root died is not killed
+    const [root, victim] = [spawnIdle(), spawnIdle()];
+    const tree = [row(root.pid, 100), row(victim.pid, 200)];
+    let alive = [...tree];
+    const killed = [];
+    process.kill = (pid, sig) => { if (sig === 'SIGKILL') { killed.push(pid); if (pid === root.pid) alive = [row(victim.pid, 999)]; return true; } return realKill(pid, sig); };
+    try {
+      const a = add(tree);
+      await registry.cleanupStaleRuntimes({ rtDir, snapshot: async () => alive });
+      assert.deepStrictEqual(killed, [root.pid], 'reused child PID is not killed');
+      assert.strictEqual(status(a).status, 'cleaned');
+
+      // a verified child whose kill fails is reported and keeps the record 'stopping' (retryable), then recovers
+      alive = [row(victim.pid, 200)]; killed.length = 0;
+      process.kill = (pid, sig) => { if (sig === 'SIGKILL') throw Object.assign(new Error('denied'), { code: 'EPERM' }); return realKill(pid, sig); };
+      const b = add([row(victim.pid, 200)]);
+      await registry.cleanupStaleRuntimes({ rtDir, snapshot: async () => alive });
+      assert.strictEqual(status(b).status, 'stopping'); assert.match(status(b).blocked_reason, /have not stopped/);
+      process.kill = (pid, sig) => { if (sig === 'SIGKILL') { alive = []; return true; } return realKill(pid, sig); };
+      await registry.cleanupStaleRuntimes({ rtDir, snapshot: async () => alive });
+      assert.strictEqual(status(b).status, 'cleaned', 'the next startup retries');
+
+      // killProcessTree: a child whose kill fails stays in remaining
+      process.kill = (pid, sig) => { if (sig === 'SIGKILL' && pid === victim.pid) throw new Error('denied'); return realKill(pid, sig); };
+      const r2 = spawnIdle(); await new Promise((resolve) => setTimeout(resolve, 100));
+      const rows = [{ ...row(r2.pid, 100), parent: 1 }, { ...row(victim.pid, 200), parent: r2.pid }];
+      const res = await registry.killProcessTree(r2.pid, async () => rows);
+      assert.strictEqual(res.ok, false); assert.deepStrictEqual(res.remaining, [victim.pid]);
+
+      // a stopping record from an earlier Studio that got this Studio's PID is still recovered
+      process.kill = realKill; alive = [row(victim.pid, 200)];
+      process.kill = (pid, sig) => { if (sig === 'SIGKILL') { alive = []; return true; } return realKill(pid, sig); };
+      const c = add([row(victim.pid, 200)], { studio_pid: process.pid, started_at: '2000-01-01T00:00:00.000Z' });
+      const d = add([row(victim.pid, 200)], { studio_pid: process.pid }); // this Studio's own in-flight stop
+      await registry.cleanupStaleRuntimes({ rtDir, snapshot: async () => alive });
+      assert.strictEqual(status(c).status, 'cleaned'); assert.strictEqual(status(d).status, 'stopping');
+    } finally { process.kill = realKill; victim.kill(); }
+    console.log('recovery: per-kill revalidation, failed kill retryable, reused Studio PID: PASS');
+  }
+
   // =========================================================================
   // Case K: Listener alone is not ready; application startup failure is surfaced.
   // =========================================================================

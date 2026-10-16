@@ -70,14 +70,19 @@ export async function getChildPids(parentPid, snapshot = processSnapshot) {
 const sameIdentity = (a, b) => a.pid === b.pid && String(a.creationDate) === String(b.creationDate)
   && String(a.executable || '').toLowerCase() === String(b.executable || '').toLowerCase();
 
-/** Kill each saved identity that a fresh snapshot still shows unchanged; a reused PID is never touched. Returns the PIDs killed. */
+/**
+ * Kill each saved identity that a fresh snapshot still shows unchanged; a reused PID is never touched.
+ * Returns every verified PID, including ones whose kill failed, so callers keep waiting on (and reporting) them.
+ */
 export async function killIdentities(list, snapshot = processSnapshot) {
-  const rows = await snapshot(), killed = [];
+  const verified = [];
   for (const old of list) {
-    if (!rows.some((p) => sameIdentity(p, old))) continue;
-    try { process.kill(old.pid, 'SIGKILL'); killed.push(old.pid); } catch (e) {} // already exited
+    // ponytail: one snapshot per kill (~1 s each) so an earlier kill cannot free a PID this loop then reuses; batch if trees get large
+    if (!(await snapshot()).some((p) => sameIdentity(p, old))) continue;
+    verified.push(old.pid);
+    try { process.kill(old.pid, 'SIGKILL'); } catch (e) {} // already exited, or still alive and reported by the caller
   }
-  return killed;
+  return verified;
 }
 
 /**
@@ -307,19 +312,21 @@ export async function cleanupJobRuntimes(jobId, { rtDir = null, customRuntimes =
   return { cleaned, blocked };
 }
 
-export async function cleanupStaleRuntimes({ rtDir = null, customRuntimes = null } = {}) {
+export async function cleanupStaleRuntimes({ rtDir = null, customRuntimes = null, snapshot = processSnapshot } = {}) {
   const runtimes = listRuntimes({ rtDir, customRuntimes });
   let cleanedCount = 0, staleCount = 0;
   for (const runtime of runtimes) {
     // A Codex record left 'stopping' by an earlier Studio: its saved process identities are the only proof of what to stop.
-    if (runtime.status === 'stopping' && runtime.studio_pid !== process.pid && Array.isArray(runtime.process_tree)) {
+    // Created before this process started = an earlier Studio, even if Windows reused its PID. It stays 'stopping' (retryable) until clean.
+    if (runtime.status === 'stopping' && Array.isArray(runtime.process_tree)
+        && !(runtime.studio_pid === process.pid && Date.parse(runtime.started_at) >= Date.now() - process.uptime() * 1000 - 5000)) {
       try {
-        await killIdentities(runtime.process_tree);
-        const rows = await processSnapshot();
+        await killIdentities(runtime.process_tree, snapshot);
+        const rows = await snapshot();
         if (runtime.process_tree.some((old) => rows.some((p) => sameIdentity(p, old)))) throw new Error('Codex tool processes have not stopped');
         updateRuntime(runtime.runtime_id, { status: 'cleaned' }, { rtDir, customRuntimes }); cleanedCount++;
       } catch (e) {
-        updateRuntime(runtime.runtime_id, { status: 'stale', blocked_reason: e.message }, { rtDir, customRuntimes }); staleCount++;
+        updateRuntime(runtime.runtime_id, { blocked_reason: e.message }, { rtDir, customRuntimes }); staleCount++;
       }
       continue;
     }
