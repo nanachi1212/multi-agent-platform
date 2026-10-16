@@ -61,7 +61,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 **長期目標與定時工作**（專案頁「🎯 長期目標・⏰ 定時工作」）
 - 長期目標：每個專案一段話，工頭規劃、每張工作卡、最後的整體確認都會帶著它，讓 AI 知道「為什麼做」，但仍只做這次交辦的事。
 - 定時工作：設定「星期幾＋HH:MM」和一段需求，時間到就自動「交給團隊」，照這個專案的交付方式做，並發 Windows 通知。專案正在工作或暫停時不會插隊，等它空下來只跑一次（錯過好幾次也只跑一次）；開始失敗（例如工頭不可用）會通知你，不會每分鐘重試。修改或重新開啟一個定時工作時，從現在起算，不會補跑過去的時間。
-- 事件紀錄：`runtime/studio/events.jsonl` 一行一筆，記錄所有專案的操作（每個 API 操作、工作開始／結束與 token 用量、定時工作與自動持續開發觸發）。只記 id 和設定值，不記需求內容、指示或 API key；每件工作的對話與工作卡仍在 history 裡（`job` 就是 history 檔名）。
+- 事件紀錄：`runtime/studio/events.jsonl` 一行一筆，記錄所有專案的操作（每個 API 操作、工作開始／結束、定時工作與自動持續開發觸發）。只記 id 和設定值，不記需求內容、指示或 API key；每件工作的對話與工作卡仍在 history 裡（`job` 就是 history 檔名）。
 
 **省額度**
 - 工頭不讀檔、不查 repo、不跑指令，只規劃與確認；調查和動手都交給成員。Claude Code 只在 Codex 和 Antigravity 做不了時才拿到工作卡。
@@ -150,7 +150,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 **Long-term goal and routines** (project page, "🎯 長期目標・⏰ 定時工作")
 - Long-term goal: one paragraph per project. The Leader's plan, every card brief and the final check carry it, so agents know why the work matters; they still do only what the request asks.
 - Routines: weekdays + HH:MM + a request. At that time Studio hands the request to the team with the project's delivery mode and sends a Windows notification. A project that is working or paused is never pushed aside: the routine runs once when the project is free (several missed slots run once). A routine that cannot start (e.g. the Leader is unavailable) notifies you and is not retried every minute. Editing or re-enabling a routine counts from now; past slots never run.
-- Event log: `runtime/studio/events.jsonl`, one line per event across all projects: every API action, job start / end with token totals, routine and auto-continue starts. It keeps ids and settings only, never request text, notes or API keys; each job's chat and cards stay in its history file (`job` is the history file name).
+- Event log: `runtime/studio/events.jsonl`, one line per event across all projects: every API action, job start / end, routine and auto-continue starts. It keeps ids and settings only, never request text, notes or API keys; each job's chat and cards stay in its history file (`job` is the history file name).
 
 **Saving quota**
 - The Leader does not read files, search the repo or run commands; it only plans and checks, and sends investigation and work to workers. Claude Code gets a card only when Codex and Antigravity cannot do it.

@@ -1090,6 +1090,9 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     assert.deepStrictEqual([env.started.length, r.lastAt], [0, ''], 'a busy project: the slot waits');
     w.run = { paused: true }; api.runRoutines(at(16, 12));
     assert.strictEqual(env.started.length, 0, 'a paused job is never pushed aside');
+    w.run = { result: 'stopped' }; w.executingSteps = new Set(['old-step']); api.runRoutines(at(16, 12));
+    assert.deepStrictEqual([env.started.length, r.lastAt], [0, ''], 'the last job is still winding down: the slot is not used up');
+    w.executingSteps.clear();
     w.run = null; api.runRoutines(at(16, 12)); api.runRoutines(at(16, 12, 1)); await settle();
     assert.deepStrictEqual(env.started, [{ request: '檢查資料', cont: undefined }], 'missed slots collapse into one run');
     assert.deepStrictEqual([r.lastAt, r.lastResult, w.autoRounds], [at(16, 12).toISOString(), '', 0]);
@@ -1115,6 +1118,7 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     api.wake(w, t, 'The user answered: use blue.');
     assert.strictEqual(t.status, 'WAITING');
     assert.ok(t.wakeNote.includes('CI is green.') && t.wakeNote.includes('use blue.'), t.wakeNote);
+    assert.ok(env.logs.at(-1).text.includes('又收到一則消息'), 'the merge is logged (log() saves the run, so a restart keeps it)');
     t.status = 'DONE'; api.wake(w, t, 'late'); assert.ok(!t.wakeNote.includes('late'), 'a finished card is not woken');
     console.log('29 wake merges into a pending wake: PASS');
   }

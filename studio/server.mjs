@@ -691,7 +691,10 @@ const findPr = (s) => s.match(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d
 // A card that is already woken but has not started yet (its agent is busy, or the tree has another writer) gets the
 // new note added to the pending one: one turn reads both, and nothing that arrived meanwhile is lost.
 function wake(w, t, note, why = '') {
-  if (t.status === 'WAITING' && t.wakeNote) { t.wakeNote += '\n\n' + note; return; }
+  if (t.status === 'WAITING' && t.wakeNote) { // log saves the run, so a restart keeps the merged note
+    t.wakeNote += '\n\n' + note;
+    return log(w, 'studio', 'system', `「${t.title}」又收到一則消息，開始時會一起交給 ${agentName(t.agent)}。`);
+  }
   if (!PARKED.includes(t.status)) return;
   Object.assign(t, { status: 'WAITING', wakeNote: note, wait: null, ask: null });
   log(w, 'studio', 'system', why || `「${t.title}」等待的結果到了，交回 ${agentName(t.agent)} 繼續。`);
@@ -723,7 +726,7 @@ function finish(w, status) {
   run.result = status;
   run.ask = null;
   saveRun(w, status);
-  event('job.end', { project: w.project, job: run.id, status, done: w.tasks.filter((t) => t.status === 'DONE').length, cards: w.tasks.length, tokens: w.tasks.reduce((n, t) => n + cardTokens(t), 0) });
+  event('job.end', { project: w.project, job: run.id, status, done: w.tasks.filter((t) => t.status === 'DONE').length, cards: w.tasks.length });
   if (status === 'done' || status === 'failed') {
     const done = w.tasks.filter((t) => t.status === 'DONE').length;
     // e.g. "股票面板：Codex 已完成 3/3 工作" / "FamilyPDF：Claude Code 需要你處理"
@@ -858,9 +861,12 @@ function deleteRoutine(w, id) {
   saveSettings();
 }
 
+// A job that ended can still be winding down (steps draining, runtimes stopping): no new job starts until that is done.
+const stillStopping = (w) => !!(w.executingSteps?.size || w.recoverySteps?.size || w.runtimeStarts?.size || w.tasks.some((t) => t.stopUnconfirmed || t.runtimeStopPending));
+
 function runRoutines(now = new Date()) {
   for (const w of S.workspaces) for (const r of w.routines) {
-    if (!routineDue(r, now) || w.run?.active || w.run?.paused) continue; // busy: the slot waits until the project is free
+    if (!routineDue(r, now) || w.run?.active || w.run?.paused || stillStopping(w)) continue; // busy or still winding down: the slot waits until the project is free
     r.lastAt = now.toISOString();
     const prev = w.run;
     w.autoRounds = 0; // a fresh chain, like a job the user starts
@@ -991,7 +997,7 @@ async function start(w, request, cont = false, inherit = false) {
   cont = cont || CONTINUE_RE.test(request);
   if (cont && w.run?.paused) return resume(w); // the paused job itself picks up where it stopped
   if (w.run?.active) throw new Error('這個專案的團隊正在工作中，請先等待、暫停或按 Stop');
-  if (w.executingSteps?.size || w.recoverySteps?.size || w.runtimeStarts?.size || w.tasks.some((t) => t.stopUnconfirmed || t.runtimeStopPending)) throw new Error('Agent 還在停下中，不能啟動新工作');
+  if (stillStopping(w)) throw new Error('Agent 還在停下中，不能啟動新工作');
   if (!isDir(w.project)) throw new Error('專案資料夾不存在：' + w.project);
   if (!request.trim()) throw new Error('請輸入需求');
   const lead = w.leader;
@@ -2770,7 +2776,7 @@ const server = http.createServer(async (req, res) => {
     send(200, (await fn(b)) ?? { ok: true });
     if (record) event('api', { route, ...pickEventFields(b) });
   } catch (e) {
-    if (record) event('api', { route, ...pickEventFields(b), error: e.message });
+    if (record) event('api', { route, ...pickEventFields(b), error: e instanceof SyntaxError ? 'invalid JSON body' : e.message }); // a parser message can quote the raw body (secrets)
     send(400, { error: e.message });
   }
 });
