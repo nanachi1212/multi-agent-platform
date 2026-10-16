@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { getProcessInfo, isPidAlive } from './runtime-registry.mjs';
 
 export function writeJson(file, value) {
   const text = JSON.stringify(value, null, 2);
@@ -13,27 +14,46 @@ export function writeJson(file, value) {
 }
 
 // One controller owns settings, history and schedules for each runtime directory.
-export function claimRuntime(rt) {
+// A lock owner is live only while its PID still has the creation time and executable recorded in the lock (Windows reuses PIDs).
+export async function claimRuntime(rt) {
   const file = path.join(rt, 'studio', 'instance.lock');
   const token = crypto.randomUUID();
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const alive = (pid) => { if (!Number.isInteger(pid) || pid <= 0) return true; try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; } };
-  const owner = () => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { throw new Error('無法確認 Studio runtime 持有者，保留鎖定'); } };
+  const self = await getProcessInfo(process.pid);
+  const identity = { pid: process.pid, creationDate: self.creationDate, executable: self.executable };
+  const read = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { throw new Error('無法確認 Studio runtime 持有者，保留鎖定'); } };
+  const alive = async (o) => {
+    if (!Number.isInteger(o?.pid) || o.pid <= 0) return true;
+    if (!isPidAlive(o.pid)) return false;
+    const now = await getProcessInfo(o.pid);
+    if (!o.creationDate || !o.executable || !now.creationDate) return true; // identity unknown: keep the lock
+    return String(now.creationDate) === String(o.creationDate) && now.executable.toLowerCase() === o.executable.toLowerCase();
+  };
+  const reclaim = file + '.reclaim';
+  const openReclaim = async () => {
+    try { return fs.openSync(reclaim, 'wx'); }
+    catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      if (await alive(read(reclaim))) throw new Error('另一個 Studio 正在接手 runtime，拒絕重複啟動');
+      fs.unlinkSync(reclaim); return fs.openSync(reclaim, 'wx'); // the previous reclaimer died
+    }
+  };
   let fd;
   try { fd = fs.openSync(file, 'wx'); }
   catch (e) {
     if (e.code !== 'EEXIST') throw e;
-    if (alive(owner()?.pid)) throw new Error('同一 runtime 的 Studio 已在執行，拒絕重複啟動');
-    const recovery = fs.openSync(file + '.reclaim', 'wx');
+    if (await alive(read(file))) throw new Error('同一 runtime 的 Studio 已在執行，拒絕重複啟動');
+    const recovery = await openReclaim();
     try {
-      if (alive(owner()?.pid)) throw new Error('Studio runtime 已由另一個實例接手');
+      fs.writeFileSync(recovery, JSON.stringify(identity));
+      if (await alive(read(file))) throw new Error('Studio runtime 已由另一個實例接手');
       fs.unlinkSync(file); fd = fs.openSync(file, 'wx');
-    } finally { fs.closeSync(recovery); fs.unlinkSync(file + '.reclaim'); }
+    } finally { fs.closeSync(recovery); fs.unlinkSync(reclaim); }
   }
-  try { fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, token })); }
+  try { fs.writeFileSync(fd, JSON.stringify({ ...identity, token })); }
   finally { fs.closeSync(fd); }
   return () => {
     if (!fs.existsSync(file)) return;
-    if (owner()?.token === token) fs.unlinkSync(file);
+    if (read(file)?.token === token) fs.unlinkSync(file);
   };
 }

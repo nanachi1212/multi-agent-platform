@@ -334,6 +334,41 @@ async function runRuntimeTests() {
     console.log('PID reuse: older process with a matching parent PID is not selected for kill: PASS');
   }
 
+  // Reviewer P1: a child PID reused after the root died must not be killed; only an unchanged identity is.
+  {
+    const spawnIdle = () => { const c = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore', windowsHide: true }); SPAWNED_PROCS.push(c); return c; };
+    const [root, reused, same] = [spawnIdle(), spawnIdle(), spawnIdle()];
+    const row = (pid, parent, s, exe = 'node.exe') => ({ pid, parent, executable: exe, command: '', creationDate: new Date(s * 1000).toISOString() });
+    const before = [row(root.pid, 1, 100), row(reused.pid, root.pid, 200), row(same.pid, root.pid, 200)];
+    let calls = 0;
+    const result = await registry.killProcessTree(root.pid, async () => ++calls === 1 ? before
+      : [row(reused.pid, 1, 999), row(same.pid, 1, 200, 'NODE.EXE')]); // reused PID: new creation time
+    assert.deepStrictEqual(result.children, [same.pid]);
+    assert.ok(registry.isPidAlive(reused.pid), 'a reused child PID is never killed');
+    assert.ok(!registry.isPidAlive(same.pid) && !registry.isPidAlive(root.pid));
+    reused.kill();
+    console.log('killProcessTree: child identity revalidated before kill: PASS');
+  }
+
+  // Reviewer P1: a Codex record left 'stopping' is cleaned from its saved identities on the next Studio start.
+  {
+    const rtDir = mkTmp('studio-stopping-');
+    const { processSnapshot } = await import('./codex-runtime.mjs');
+    const spawnIdle = () => { const c = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore', windowsHide: true }); SPAWNED_PROCS.push(c); return c; };
+    const [orphan, reused] = [spawnIdle(), spawnIdle()];
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const rows = await processSnapshot(), id = (c) => { const p = rows.find((r) => r.pid === c.pid); return { pid: p.pid, executable: p.executable, creationDate: p.creationDate }; };
+    const add = (tree) => { const r = registry.registerRuntime({ rtDir, job_id: 'studio_core', purpose: 'codex_session', root_pid: tree[0].pid, process_identity: tree[0], studio_pid: 2147483000 });
+      registry.updateRuntime(r.runtime_id, { status: 'stopping', process_tree: tree }, { rtDir }); return r.runtime_id; };
+    const a = add([id(orphan)]), b = add([{ ...id(reused), creationDate: 'old' }]);
+    await registry.cleanupStaleRuntimes({ rtDir });
+    const status = (rid) => registry.listRuntimes({ rtDir }).find((r) => r.runtime_id === rid).status;
+    assert.strictEqual(status(a), 'cleaned'); assert.ok(!registry.isPidAlive(orphan.pid), 'stopping orphan killed by saved identity');
+    assert.strictEqual(status(b), 'cleaned'); assert.ok(registry.isPidAlive(reused.pid), 'a reused PID is not killed');
+    reused.kill();
+    console.log('stopping Codex record recovered at startup: PASS');
+  }
+
   // =========================================================================
   // Case K: Listener alone is not ready; application startup failure is surfaced.
   // =========================================================================

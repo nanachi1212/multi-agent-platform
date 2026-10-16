@@ -10,8 +10,8 @@ const path = require('node:path');
   function setup() {
     const rtDir = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-codex-stop-')); dirs.push(rtDir);
     const p = (pid, parent = 1, when = pid) => ({ pid, parent, creationDate: new Date(when * 1000).toISOString(), executable: 'cmd.exe', command: 'cmd /c codex.cmd app-server' });
-    const core = p(1, 0), other = p(10), context = { rows: [core, other], next: 20, restarts: 0, fail: false, orphan: false, queryError: false };
-    const snapshot = async () => { if (context.queryError) throw new Error('CIM denied'); return structuredClone(context.rows); };
+    const core = p(1, 0), other = p(10), context = { rows: [core, other], next: 20, restarts: 0, fail: false, orphan: false, queryError: false, calls: 0, dropAt: 0 };
+    const snapshot = async () => { if (context.queryError) throw new Error('CIM denied'); if (++context.calls === context.dropAt) context.rows = context.rows.filter((x) => x.pid !== 99); return structuredClone(context.rows); };
     const guard = createCodexRuntimeGuard({ rtDir, owner: () => core, snapshot, api: async (method, route) => {
       if (route.endsWith('/restart')) {
         context.restarts++;
@@ -37,6 +37,10 @@ const path = require('node:path');
     assert.ok(listRuntimes({ rtDir: survivor.rtDir }).some((r) => r.status === 'stopping' && r.process_tree.some((p) => p.pid === 99)));
     assert.ok(listRuntimes({ rtDir: survivor.rtDir }).some((r) => r.child_pids.includes(99)), 'startup cleanup also retains an orphan after its root exits');
     await assert.rejects(survivor.guard.prepare('c'), /have not stopped/);
+
+    const late = setup(); await late.create(); await late.guard.prepare('c');
+    late.context.rows.push(late.p(99, 20)); late.context.orphan = true; late.context.calls = 0; late.context.dropAt = 7; // before, after, then 5 polls: the orphan leaves at the last poll
+    assert.equal(await late.guard.stop('c'), true, 'the final snapshot is checked');
 
     const failed = setup(); await failed.create(); await failed.guard.prepare('c'); failed.context.fail = true;
     await assert.rejects(failed.guard.stop('c'), /restart failed/);
