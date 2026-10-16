@@ -58,6 +58,11 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 - 工作進行中可以「📣 告訴工頭」補充或修改指示：工頭決定轉告哪位成員、取消或追加工作卡。勾「⚡ 立刻打斷」會讓正在做的成員馬上停下，看完指示再接著做。
 - 「做完之後」：① 完成就停（預設）、② 完成後建議 1–3 個下一步、③ 自動持續開發（需自己開啟並確認；預設最多連續 5 件，可改，0＝不限，一直做到工頭沒有下一步、失敗、需要你決定或你停下）。
 
+**長期目標與定時工作**（專案頁「🎯 長期目標・⏰ 定時工作」）
+- 長期目標：每個專案一段話，工頭規劃、每張工作卡、最後的整體確認都會帶著它，讓 AI 知道「為什麼做」，但仍只做這次交辦的事。
+- 定時工作：設定「星期幾＋HH:MM」和一段需求，時間到就自動「交給團隊」，照這個專案的交付方式做，並發 Windows 通知。專案正在工作或暫停時不會插隊，等它空下來只跑一次（錯過好幾次也只跑一次）；開始失敗（例如工頭不可用）會通知你，不會每分鐘重試。修改或重新開啟一個定時工作時，從現在起算，不會補跑過去的時間。
+- 事件紀錄：`runtime/studio/events.jsonl` 一行一筆，記錄所有專案的操作（每個 API 操作、工作開始／結束、定時工作與自動持續開發觸發）。只記 id 和設定值，不記需求內容、指示或 API key；每件工作的對話與工作卡仍在 history 裡（`job` 就是 history 檔名）。
+
 **省額度**
 - 工頭不讀檔、不查 repo、不跑指令，只規劃與確認；調查和動手都交給成員。Claude Code 只在 Codex 和 Antigravity 做不了時才拿到工作卡。
 - 模型策略（每個專案）：💰 省額度（預設，普通卡 Sonnet／Luna，困難卡自動升級 Opus／Sol）、⚖️ 均衡、🚀 品質優先、🛠️ 自訂。工頭固定用強的那檔（它負責規劃和拍板，回合少但錯了最貴）；成員的普通卡用便宜的，工頭自己判斷普通或困難，普通卡失敗會自動改用強模型重試一次。
@@ -72,6 +77,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 
 - 「模型策略」搭配真的 Codex、以及困難卡實際自動升級，目前只用模擬回覆驗證過；其餘功能已在真實專案（PDF 編輯器、股票面板）上使用。
 - 本機 CI：`.\scripts\ci.ps1 -Mode Auto`（語法與模擬 AI lifecycle／租約測試）；真實 provider 操作另行驗證。
+- 測試用 Studio：設定 `STUDIO_RUNTIME` 指向另一個資料夾，就會用自己的設定、歷史、租約和 AionCore 資料，不碰你平常的 `runtime/`（AionCore 程式共用）。例如 PowerShell：`$env:STUDIO_RUNTIME="$env:TEMP\studio-test"; $env:STUDIO_PORT=4859; node studio/server.mjs`。只拿拋棄式專案測：兩個 Studio 的租約互相看不到。
 - 成員正在進行的那一步不會被「告訴工頭」中途打斷，要用「立刻打斷」。
 - AionCore 在 Antigravity 工作時，會在專案裡寫一個 `.agents/` 資料夾。
 - 目前只支援 Windows。
@@ -142,6 +148,11 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 - "📣 告訴工頭" sends new instructions while a job runs: the Leader decides which worker to tell, which cards to cancel or add. "⚡ 立刻打斷" stops the working workers at once; they continue after reading the instruction.
 - After a job is done: ① stop (default), ② suggest 1–3 next steps, ③ auto-continue (opt-in with a confirmation, max 5 in a row).
 
+**Long-term goal and routines** (project page, "🎯 長期目標・⏰ 定時工作")
+- Long-term goal: one paragraph per project. The Leader's plan, every card brief and the final check carry it, so agents know why the work matters; they still do only what the request asks.
+- Routines: weekdays + HH:MM + a request. At that time Studio hands the request to the team with the project's delivery mode and sends a Windows notification. A project that is working or paused is never pushed aside: the routine runs once when the project is free (several missed slots run once). A routine that cannot start (e.g. the Leader is unavailable) notifies you and is not retried every minute. Editing or re-enabling a routine counts from now; past slots never run.
+- Event log: `runtime/studio/events.jsonl`, one line per event across all projects: every API action, job start / end, routine and auto-continue starts. It keeps ids and settings only, never request text, notes or API keys; each job's chat and cards stay in its history file (`job` is the history file name).
+
 **Saving quota**
 - The Leader does not read files, search the repo or run commands; it only plans and checks, and sends investigation and work to workers. Claude Code gets a card only when Codex and Antigravity cannot do it.
 - Model strategy per project: 💰 save (default; normal cards Sonnet / Luna, hard cards auto-upgrade to Opus / Sol), ⚖️ balanced, 🚀 quality, 🛠️ custom. The Leader always runs on the strong tier (it plans and signs off: few turns, costly mistakes); worker cards use the normal tier unless the Leader marks them hard, and a failed normal card is retried once on the strong model.
@@ -156,6 +167,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 
 - The model strategy with real Codex, and a hard card actually auto-upgrading, were verified with scripted replies only; everything else has been used on real projects (a PDF editor, a stock panel).
 - Local CI: `.\scripts\ci.ps1 -Mode Auto` (syntax and scripted lifecycle/lease checks). Live providers are verified separately.
+- Test Studio: set `STUDIO_RUNTIME` to another folder and Studio uses its own settings, history, leases and AionCore data there, never your normal `runtime/` (the AionCore program is shared). PowerShell example: `$env:STUDIO_RUNTIME="$env:TEMP\studio-test"; $env:STUDIO_PORT=4859; node studio/server.mjs`. Use disposable projects only: the two Studios cannot see each other's leases.
 - "告訴工頭" does not cut into a worker's current step; use "立刻打斷" for that.
 - AionCore writes an `.agents/` folder into the project when Antigravity works there.
 - Windows only.

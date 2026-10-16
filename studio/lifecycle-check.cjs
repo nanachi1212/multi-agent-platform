@@ -825,8 +825,7 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
       if (agent === 'claude' && text.includes('Task: ship')) return 'Opened PR.\nSTATUS: WAITING_EXTERNAL: CI https://github.com/o/r/pull/7';
       if (agent === 'claude' && text.includes('Task: docs')) return 'draft ready\nSTATUS: NEEDS_USER: publish?';
       return 'merged\nSTATUS: DONE';
-    }, { execFile: (cmd, args, opts, cb) => (cmd === 'gh' ? cb(null, JSON.stringify(pr), '') : cb(new Error('no git in test'), '', '')),
-      setWorker: (w, agent, on) => { w.workers = on ? [...new Set([...w.workers, agent])] : w.workers.filter((x) => x !== agent); } }));
+    }, { execFile: (cmd, args, opts, cb) => (cmd === 'gh' ? cb(null, JSON.stringify(pr), '') : cb(new Error('no git in test'), '', '')) }));
     w = newW(); w.leader = 'antigravity'; w.workers = ['claude', 'codex']; w.finisher = 'codex'; w.run.leader = 'antigravity'; env.S.workspaces.push(w);
     api.planPhase(w);
     assert.ok(await waitFor(() => w.tasks[0]?.status === 'DONE'), 'CI is checked as soon as the card parks; the finisher merged');
@@ -882,7 +881,7 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
       if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
       if (agent === 'antigravity') throw new Error('RESOURCE_EXHAUSTED: You have exhausted your capacity (quota)');
       fbTurns++; return 'built\nSTATUS: DONE';
-    }, { setWorker: (w, agent, on) => { w.workers = on ? [...new Set([...w.workers, agent])] : w.workers.filter((x) => x !== agent); } }));
+    }));
     w = newW(); w.workers = ['antigravity', 'codex']; w.fallback = 'codex'; env.S.workspaces.push(w);
     api.planPhase(w);
     assert.ok(await waitFor(() => w.run.result === 'done'), 'the fallback finished the job');
@@ -1045,6 +1044,82 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     assert.ok(cp.includes('MUST actually RUN') && !cp.includes('ACCESS: READ-ONLY card'), 'a check card is told to run the tests, not just read');
     assert.ok(!cp.includes('Delivery policy') && w.tasks[0].writes === true, 'a check card takes the write lease but gets no delivery chain');
     console.log('26 check cards run tests, reviews stay read-only, card stall limit 15 min: PASS');
+  }
+
+  { // 27) the long-term goal reaches the plan, every worker brief and the final check; job end is in the event log
+    ({ env, api } = makeEnv((agent, text) => {
+      if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"impl","agent":"codex","instructions":"x"}]}';
+      if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+      return 'did it\nSTATUS: DONE';
+    }));
+    w = newW(); env.S.workspaces.push(w);
+    api.setMission(w, '  做台股最好用的選股工具  ');
+    assert.strictEqual(w.mission, '做台股最好用的選股工具');
+    api.planPhase(w);
+    assert.ok(await waitFor(() => w.run.result === 'done'));
+    for (const key of ['LEADER (foreman)', 'Task: impl', 'Every current card has ended']) {
+      assert.ok(env.prompts.find((p) => p.text.includes(key)).text.includes('long-term goal (written by the user') && env.prompts.find((p) => p.text.includes(key)).text.includes('做台股最好用的選股工具'), key + ' carries the goal');
+    }
+    assert.ok(!api.planPrompt(w.run, ['codex'], 'auto').includes('long-term goal'), 'no goal → no goal text');
+    const end = env.events.find((e) => e.type === 'job.end');
+    assert.deepStrictEqual([end.job, end.status, end.done, end.cards], ['r', 'done', 1, 1]);
+    console.log('27 long-term goal in plan / brief / final check, job.end event: PASS');
+  }
+
+  { // 28) routines: schedule math, busy project waits, missed slots run once, failures are reported
+    ({ env, api } = makeEnv(() => 'STATUS: DONE'));
+    w = { ...newW(), run: null, routines: [], autoRounds: 3 }; env.S.workspaces.push(w);
+    assert.throws(() => api.saveRoutine(w, { request: 'x', time: '9:00' }), /HH:MM/);
+    assert.throws(() => api.saveRoutine(w, { request: 'x', time: '09:00', days: [] }), /至少選一天/);
+    assert.throws(() => api.saveRoutine(w, { request: ' ', time: '09:00' }), /需求/);
+    const r = api.saveRoutine(w, { request: '檢查資料', time: '09:00' });
+    assert.deepStrictEqual([r.days, r.on, w.routines.length], [[0, 1, 2, 3, 4, 5, 6], true, 1]);
+    const at = (d, h, m = 0) => new Date(2026, 9, d, h, m);
+    Object.assign(r, { since: at(16, 8).toISOString(), lastAt: '' });
+    assert.deepStrictEqual([api.routineDue(r, at(16, 8, 59)), api.routineDue(r, at(16, 9)), api.routineDue(r, at(16, 23))], [false, true, true]);
+    r.lastAt = at(16, 9).toISOString();
+    assert.deepStrictEqual([api.routineDue(r, at(16, 23)), api.routineDue(r, at(17, 9))], [false, true]);
+    const weekly = { ...r, lastAt: '', days: [at(19, 0).getDay()] };
+    assert.deepStrictEqual([api.routineDue(weekly, at(18, 9)), api.routineDue(weekly, at(19, 9))], [false, true], 'a weekly slot runs only on its day');
+    r.since = at(16, 10).toISOString(); r.lastAt = '';
+    assert.strictEqual(api.routineDue(r, at(16, 12)), false, 'a slot before the schedule changed never runs');
+    assert.strictEqual(api.routineDue({ ...r, on: false }, at(17, 9)), false, 'off = never');
+    r.since = at(13, 8).toISOString(); // three missed days
+    w.run = { active: true }; api.runRoutines(at(16, 12));
+    assert.deepStrictEqual([env.started.length, r.lastAt], [0, ''], 'a busy project: the slot waits');
+    w.run = { paused: true }; api.runRoutines(at(16, 12));
+    assert.strictEqual(env.started.length, 0, 'a paused job is never pushed aside');
+    w.run = { result: 'stopped' }; w.executingSteps = new Set(['old-step']); api.runRoutines(at(16, 12));
+    assert.deepStrictEqual([env.started.length, r.lastAt], [0, ''], 'the last job is still winding down: the slot is not used up');
+    w.executingSteps.clear();
+    w.run = null; api.runRoutines(at(16, 12)); api.runRoutines(at(16, 12, 1)); await settle();
+    assert.deepStrictEqual(env.started, [{ request: '檢查資料', cont: undefined }], 'missed slots collapse into one run');
+    assert.deepStrictEqual([r.lastAt, r.lastResult, w.autoRounds], [at(16, 12).toISOString(), '', 0]);
+    assert.ok(env.events.some((e) => e.type === 'routine.start' && e.routine === r.id) && env.notices.some((n) => n.title.includes('定時工作開始')));
+    ({ env, api } = makeEnv(() => 'STATUS: DONE', { start: async () => { throw new Error('Leader Codex 目前不可用'); } }));
+    w = { ...newW(), run: null, routines: [{ ...r, lastAt: '', lastResult: '' }] }; env.S.workspaces.push(w);
+    api.runRoutines(at(16, 12)); await settle();
+    assert.strictEqual(w.routines[0].lastResult, 'Leader Codex 目前不可用');
+    assert.ok(env.notices.some((n) => n.title.includes('定時工作沒有開始')) && env.events.some((e) => e.type === 'routine.error'));
+    api.runRoutines(at(16, 13)); await settle();
+    assert.strictEqual(env.notices.filter((n) => n.title.includes('定時工作沒有開始')).length, 1, 'a failed slot is not retried every minute');
+    api.deleteRoutine(w, r.id);
+    assert.strictEqual(w.routines.length, 0);
+    console.log('28 routines: schedule, busy waits, missed slots once, failure reported once: PASS');
+  }
+
+  { // 29) a second wake for a card that was woken but has not started yet is merged, not dropped
+    ({ env, api } = makeEnv(() => 'STATUS: DONE'));
+    w = newW(); env.S.workspaces.push(w); w.run.phase = 'working';
+    const t = { id: 'a', title: 'ship', agent: 'codex', status: 'WAITING_EXTERNAL', wait: { what: 'CI', pr: '7' }, hold: true, after: [], result: '' };
+    w.tasks.push(t);
+    api.wake(w, t, 'CI is green.');
+    api.wake(w, t, 'The user answered: use blue.');
+    assert.strictEqual(t.status, 'WAITING');
+    assert.ok(t.wakeNote.includes('CI is green.') && t.wakeNote.includes('use blue.'), t.wakeNote);
+    assert.ok(env.logs.at(-1).text.includes('又收到一則消息'), 'the merge is logged (log() saves the run, so a restart keeps it)');
+    t.status = 'DONE'; api.wake(w, t, 'late'); assert.ok(!t.wakeNote.includes('late'), 'a finished card is not woken');
+    console.log('29 wake merges into a pending wake: PASS');
   }
 
   await require('./test-workspace-lease.cjs')({ makeEnv, mkTmp, region });

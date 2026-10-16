@@ -10,8 +10,10 @@ import { cleanupRuntime, verifyRuntimeProcess, cleanupJobRuntimes, cleanupStaleR
 import { checkBackendReadiness, recoverOwnedRuntime } from './runtime-readiness.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
-const RT = path.join(ROOT, 'runtime');
-const AION = path.join(RT, 'aioncore', 'aioncore.exe');
+// STUDIO_RUNTIME = a separate runtime folder (settings, history, leases, events, AionCore data), so a test Studio can run
+// next to the user's own without touching it. The AionCore program itself stays shared (read-only, 95 MB).
+const RT = process.env.STUDIO_RUNTIME ? path.resolve(process.env.STUDIO_RUNTIME) : path.join(ROOT, 'runtime');
+const AION = path.join(ROOT, 'runtime', 'aioncore', 'aioncore.exe');
 const AION_URL = 'https://github.com/iOfficeAI/AionCore/releases/download/v0.2.2/aioncore-v0.2.2-x86_64-pc-windows-msvc.zip';
 const AION_ZIP_SHA256 = 'd1ed8d1da869230c18701747d07e8f068db5b8c9442e65261304aeb4c27eacf6';
 let PORT = Number(process.env.STUDIO_PORT || 4848); // moves up when the port is taken (see server.listen)
@@ -54,7 +56,7 @@ const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}
 // agentCfg = this project's model / effort per agent; workers = agents allowed to work here.
 // New projects start from S.agentCfg (the last choices).
 const newWs = (project, leader = S.leader, name = '', agentCfg = S.agentCfg, workers = Object.keys(AGENTS)) => ({
-  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, autoMax: AUTO_MAX_DEFAULT, strategy: 'save', delivery: 'auto', finisher: '', fallback: '', backendPort: 0, tokenCap: TOKEN_CAP_DEFAULT,
+  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, autoMax: AUTO_MAX_DEFAULT, strategy: 'save', delivery: 'auto', finisher: '', fallback: '', backendPort: 0, tokenCap: TOKEN_CAP_DEFAULT, mission: '', routines: [],
   agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...agentCfg?.[id] }])),
   workers: workers.filter((id) => AGENTS[id]),
 });
@@ -86,7 +88,7 @@ try {
   // Older settings had one `project` and global models; it becomes the first open workspace with those models.
   S.workspaces = (saved.workspaces || (saved.project ? [{ project: saved.project }] : []))
     .filter((x) => isDir(x.project))
-    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', autoMax: x.autoMax == null ? AUTO_MAX_DEFAULT : Number(x.autoMax) || 0, strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto', finisher: AGENTS[x.finisher] ? x.finisher : '', fallback: AGENTS[x.fallback] ? x.fallback : '', backendPort: Number(x.backendPort) || 0, tokenCap: x.tokenCap == null ? TOKEN_CAP_DEFAULT : Number(x.tokenCap) || 0 }));
+    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', autoMax: x.autoMax == null ? AUTO_MAX_DEFAULT : Number(x.autoMax) || 0, strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto', finisher: AGENTS[x.finisher] ? x.finisher : '', fallback: AGENTS[x.fallback] ? x.fallback : '', backendPort: Number(x.backendPort) || 0, tokenCap: x.tokenCap == null ? TOKEN_CAP_DEFAULT : Number(x.tokenCap) || 0, mission: String(x.mission || ''), routines: (x.routines || []).filter(validRoutine) }));
   S.recent = (saved.recent || []).filter(isDir);
   if (saved.notify === false) S.notify = false;
 } catch (e) {
@@ -98,7 +100,7 @@ try {
 
 function saveSettings() {
   fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
-  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tokenCap: w.tokenCap }));
+  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tokenCap: w.tokenCap, mission: w.mission, routines: w.routines }));
   fs.writeFileSync(SETTINGS, JSON.stringify({ leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external }, null, 2));
 }
 
@@ -155,6 +157,17 @@ function readHistory(id) {
 function log(w, who, role, text, detail) {
   w?.activity.push({ time: new Date().toLocaleTimeString('zh-TW', { hour12: false }), who, role, text: String(text), ...(detail ? { detail: String(detail).slice(0, 4000) } : {}) });
   if (w?.run?.active) saveRun(w, 'running');
+}
+
+// Append-only record of who started or changed what, across all projects and jobs: API calls, job start / end,
+// routine and auto-continue starts. The chat and cards of a job stay in its history file (job = history file id).
+// ponytail: one file that only grows; rotate it by month if it gets large.
+const EVENTS = path.join(RT, 'studio', 'events.jsonl');
+function event(type, data = {}) {
+  try {
+    fs.mkdirSync(path.dirname(EVENTS), { recursive: true });
+    fs.appendFileSync(EVENTS, JSON.stringify({ at: new Date().toISOString(), type, ...data }) + '\n');
+  } catch (e) { console.error('事件紀錄寫入失敗：' + e.message); }
 }
 
 // ---------- AionCore ----------
@@ -593,7 +606,7 @@ const FIX_JSON = 'Your last reply was not the JSON object Studio needs. Reply ag
 
 const SUBTASK_SHAPE = `{"title":"<short title>","agent":"<worker id>","instructions":"<full instructions>","after":[<indexes>],"hard":false,"writes":true,"role":"build"}`;
 
-function planPrompt(run, workers, delivery) {
+function planPrompt(run, workers, delivery, mission = '') {
   return `You are the LEADER (foreman) of a small AI team in "Multi-Agent Studio".
 Project folder: ${run.project}
 Workers you can assign: ${workers.map((w) => `${w} (${agentName(w)})`).join(', ')}
@@ -602,7 +615,7 @@ User request:
 """
 ${run.request}
 """
-${memoryNote(run)}
+${mission}${memoryNote(run)}
 Rules:
 - Do NOT do the work yourself. Do NOT create or modify any files. Only plan and delegate.
 - Do not read files, search the repository or run commands yourself (your quota is precious): plan from the request and the work context. When facts are missing, make a short investigation subtask for a worker.
@@ -677,7 +690,13 @@ const OPEN = ['WAITING', 'WORKING', 'PAUSED', 'INTERRUPTED', ...PARKED];
 const findPr = (s) => s.match(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/)?.[0] || s.match(/\bPR\s*#(\d+)/i)?.[1] || '';
 
 // A parked card goes back to the queue with a note; the worker continues in the same conversation.
+// A card that is already woken but has not started yet (its agent is busy, or the tree has another writer) gets the
+// new note added to the pending one: one turn reads both, and nothing that arrived meanwhile is lost.
 function wake(w, t, note, why = '') {
+  if (t.status === 'WAITING' && t.wakeNote) { // log saves the run, so a restart keeps the merged note
+    t.wakeNote += '\n\n' + note;
+    return log(w, 'studio', 'system', `「${t.title}」又收到一則消息，開始時會一起交給 ${agentName(t.agent)}。`);
+  }
   if (!PARKED.includes(t.status)) return;
   Object.assign(t, { status: 'WAITING', wakeNote: note, wait: null, ask: null });
   log(w, 'studio', 'system', why || `「${t.title}」等待的結果到了，交回 ${agentName(t.agent)} 繼續。`);
@@ -709,6 +728,7 @@ function finish(w, status) {
   run.result = status;
   run.ask = null;
   saveRun(w, status);
+  event('job.end', { project: w.project, job: run.id, status, done: w.tasks.filter((t) => t.status === 'DONE').length, cards: w.tasks.length });
   if (status === 'done' || status === 'failed') {
     const done = w.tasks.filter((t) => t.status === 'DONE').length;
     // e.g. "股票面板：Codex 已完成 3/3 工作" / "FamilyPDF：Claude Code 需要你處理"
@@ -736,7 +756,9 @@ function autoNext(w, run) {
   }
   w.autoRounds++;
   notify(`${label(w)}：自動開始下一步`, next.title, 'done', w.project);
-  start(w, next.request, true, true).then(() => log(w, 'studio', 'system', `自動持續開發（第 ${w.autoRounds}${w.autoMax ? '/' + w.autoMax : ''} 件）：工頭選了「${next.title}」`))
+  const started = start(w, next.request, true, true);
+  event('auto.start', { project: w.project, after: run.id, job: w.run !== run ? w.run?.id : null, round: w.autoRounds });
+  started.then(() => log(w, 'studio', 'system', `自動持續開發（第 ${w.autoRounds}${w.autoMax ? '/' + w.autoMax : ''} 件）：工頭選了「${next.title}」`))
     .catch((e) => log(w, 'studio', 'system', '自動開始下一步失敗：' + e.message));
 }
 
@@ -794,6 +816,74 @@ function setAutoMax(w, max) {
   if (max < 0 || !Number.isInteger(max)) throw new Error('連續上限必須是 0（不限）或正整數');
   w.autoMax = max;
   saveSettings();
+}
+
+// 長期目標: one paragraph the user writes for the project. The Leader plans with it, every worker brief carries it,
+// and the final check judges against it, so agents know why the work matters, not only the card title.
+function setMission(w, text) {
+  w.mission = String(text || '').trim().slice(0, 2000);
+  saveSettings();
+}
+const missionNote = (w) => w.mission ? `\nThe project's long-term goal (written by the user; keep the work aligned with it, but do only what the request asks):\n"""\n${w.mission}\n"""\n` : '';
+
+// ---------- Routines: a request handed to the team on a schedule ----------
+// Per project: { id, request, time 'HH:MM', days (0 = Sunday ... 6), on, since, lastAt, lastResult }.
+// A slot that comes while the project is busy (working or paused) runs once when the project is free: missed slots
+// collapse into one run, and a routine never pushes a paused job aside. `since` is when the schedule last changed;
+// slots before it never run.
+function validRoutine(r) {
+  return !!r?.id && !!String(r.request || '').trim() && /^([01]\d|2[0-3]):[0-5]\d$/.test(r.time) && Array.isArray(r.days) && r.days.length > 0 && r.days.every((d) => Number.isInteger(d) && d >= 0 && d <= 6) && !isNaN(Date.parse(r.since));
+}
+function routineSlot(r, now) { // the latest scheduled time at or before now
+  const [h, m] = r.time.split(':').map(Number);
+  for (let d = 0; d < 8; d++) {
+    const at = new Date(now.getFullYear(), now.getMonth(), now.getDate() - d, h, m);
+    if (at <= now && r.days.includes(at.getDay())) return at;
+  }
+  return null;
+}
+const routineDue = (r, now) => { const slot = r.on && routineSlot(r, now); return !!slot && slot.getTime() > Math.max(Date.parse(r.since), Date.parse(r.lastAt || 0) || 0); };
+
+function saveRoutine(w, b) {
+  const old = b.id ? w.routines.find((r) => r.id === b.id) : null;
+  if (b.id && !old) throw new Error('找不到這個定時工作');
+  const r = { ...(old || { id: crypto.randomUUID().slice(0, 8), lastAt: '', lastResult: '' }),
+    request: String(b.request ?? old?.request ?? '').trim().slice(0, 4000), time: String(b.time ?? old?.time ?? ''),
+    days: [...new Set((b.days ?? old?.days ?? [0, 1, 2, 3, 4, 5, 6]).map(Number))].sort(), on: !!(b.on ?? old?.on ?? true), since: new Date().toISOString() };
+  if (!r.request) throw new Error('請輸入要交給團隊的需求');
+  if (!validRoutine(r)) throw new Error(/^([01]\d|2[0-3]):[0-5]\d$/.test(r.time) ? '至少選一天（星期日到星期六）' : '時間格式要是 HH:MM（例如 09:00）');
+  if (old) Object.assign(old, r); else w.routines.push(r);
+  saveSettings();
+  return r;
+}
+
+function deleteRoutine(w, id) {
+  if (!w.routines.some((r) => r.id === id)) throw new Error('找不到這個定時工作');
+  w.routines = w.routines.filter((r) => r.id !== id);
+  saveSettings();
+}
+
+// A job that ended can still be winding down (steps draining, runtimes stopping): no new job starts until that is done.
+const stillStopping = (w) => !!(w.executingSteps?.size || w.recoverySteps?.size || w.runtimeStarts?.size || w.tasks.some((t) => t.stopUnconfirmed || t.runtimeStopPending));
+
+function runRoutines(now = new Date()) {
+  for (const w of S.workspaces) for (const r of w.routines) {
+    if (!routineDue(r, now) || w.run?.active || w.run?.paused || stillStopping(w)) continue; // busy or still winding down: the slot waits until the project is free
+    r.lastAt = now.toISOString();
+    const prev = w.run;
+    w.autoRounds = 0; // a fresh chain, like a job the user starts
+    const started = start(w, r.request);
+    event('routine.start', { project: w.project, routine: r.id, job: w.run !== prev ? w.run?.id : null });
+    started.then(() => {
+      r.lastResult = '';
+      log(w, 'studio', 'system', `⏰ 這件工作由定時工作（${r.time}）自動開始。`);
+      notify(`${label(w)}：定時工作開始`, clip(r.request, 100), 'done', w.project);
+    }, (e) => {
+      r.lastResult = e.message;
+      event('routine.error', { project: w.project, routine: r.id, error: e.message });
+      notify(`${label(w)}：定時工作沒有開始`, e.message, 'ask', w.project);
+    }).finally(saveSettings);
+  }
 }
 
 // ---------- Plan limits (5-hour / weekly) ----------
@@ -909,7 +999,7 @@ async function start(w, request, cont = false, inherit = false) {
   cont = cont || CONTINUE_RE.test(request);
   if (cont && w.run?.paused) return resume(w); // the paused job itself picks up where it stopped
   if (w.run?.active) throw new Error('這個專案的團隊正在工作中，請先等待、暫停或按 Stop');
-  if (w.executingSteps?.size || w.recoverySteps?.size || w.runtimeStarts?.size || w.tasks.some((t) => t.stopUnconfirmed || t.runtimeStopPending)) throw new Error('Agent 還在停下中，不能啟動新工作');
+  if (stillStopping(w)) throw new Error('Agent 還在停下中，不能啟動新工作');
   if (!isDir(w.project)) throw new Error('專案資料夾不存在：' + w.project);
   if (!request.trim()) throw new Error('請輸入需求');
   const lead = w.leader;
@@ -926,6 +1016,7 @@ async function start(w, request, cont = false, inherit = false) {
   const id = now.toISOString().slice(0, 19).replace(/[-:T]/g, '') + '-' + crypto.randomUUID().slice(0, 4);
   // Auto-continue inherits the fingerprint of the tree the last job left, so changes made in between are noticed.
   w.run = { leadTier: 'hard', treeStamp: inherit ? prev?.run?.treeStamp : undefined, leftAt: inherit ? prev?.run?.leftAt : undefined, id, startedAt: now.toISOString(), project: w.project, leader: lead, request, convs: {}, phase: 'planning', leaderGen: 0, rounds: 0, ask: null, continues, context, goal: continues ? prev.run.goal || prev.run.request : request, refs: continues ? knownRefs(prev) : [], active: true, paused: false, stopped: false, summarizing: false };
+  event('job.start', { project: w.project, job: id, leader: lead, continues });
   log(w, 'user', 'user', request);
   if (continues) log(w, 'studio', 'system', '接續上次的工作：工頭會拿到目前的進度摘要，不用重講。', context);
   log(w, 'studio', 'system', `Leader：${agentName(lead)}；Workers：${workersFor(w, lead).map((x) => agentName(x)).join('、')}`);
@@ -941,7 +1032,7 @@ async function planPhase(w) {
     if (!workers.length) throw new Error('至少需要一位可用的 Worker');
     const cid = await conv(w, lead, true);
     const tryPlan = (x) => { try { const p = parsePlan(x, workers); return p.subtasks.length ? p : null; } catch { return null; } };
-    let reply = await turn(lead, cid, planPrompt(run, workers, w.delivery), { w, lead: true });
+    let reply = await turn(lead, cid, planPrompt(run, workers, w.delivery, missionNote(w)), { w, lead: true });
     if (run.leaderGen !== gen) return; // a new Leader took over and plans again
     let plan = tryPlan(reply);
     if (!plan) {
@@ -1501,7 +1592,7 @@ ${w.backendPort ? `If you must run this project's backend on port ${w.backendPor
 Task: ${t.title}
 Instructions:
 ${t.instructions}
-${deps.length ? `\nResults of the earlier cards this task builds on:\n${deps.map((d) => `- ${d.title} (${agentName(d.agent)}): ${d.result}`).join('\n')}\n` : ''}
+${missionNote(w)}${deps.length ? `\nResults of the earlier cards this task builds on:\n${deps.map((d) => `- ${d.title} (${agentName(d.agent)}): ${d.result}`).join('\n')}\n` : ''}
 ${roleRules(t)}
 ${accessRules(t)}
 ${isWriter(t) && t.role !== 'check' ? deliveryRules(w.delivery, 'worker') : ''}
@@ -1861,8 +1952,7 @@ ${SUBTASK_RULES}`;
       const t = w.tasks.find((y) => y.id === String(x?.card)), note = String(x?.note || '').trim();
       if (!t || !note) continue;
       if (t.status === 'WORKING') (t.notes ??= []).push(note);
-      else if (PARKED.includes(t.status)) wake(w, t, 'New instruction from the user (via the leader): ' + note);
-      else if (t.status === 'WAITING' && t.wakeNote) t.wakeNote += '\nNew instruction from the user (via the leader): ' + note; // an interrupted card
+      else if (PARKED.includes(t.status) || (t.status === 'WAITING' && t.wakeNote)) wake(w, t, 'New instruction from the user (via the leader): ' + note); // a pending wake (e.g. an interrupted card) gets it added
       else if (['WAITING', 'PAUSED', 'INTERRUPTED'].includes(t.status)) t.instructions += '\n\nInstruction added by the user during the job: ' + note;
       else continue;
       log(w, 'studio', 'system', `已把指示轉給 ${agentName(t.agent)}（「${t.title}」）。`);
@@ -2095,7 +2185,7 @@ Original user request:
 """
 ${run.request}
 """
-Cards so far:
+${missionNote(w)}Cards so far:
 ${results}
 ${memoryNote(run)}${userAnswer ? `\nThe user answered your question:\n"""\n${userAnswer}\n"""\n` : ''}
 Decide whether the user's WHOLE request is complete: built, reviewed, verified, and delivered or merged when the request asks for it. Do not modify files, open files or run commands: judge from the card results (add a verification subtask if they are not enough).
@@ -2594,7 +2684,7 @@ const routes = {
         const blocked_reason = why ? 'Blocked：' + String(why).trim().replace(/^Blocked\s*[:：]?\s*/i, '') : null;
         return { ...t, blocked_reason, ...(t.status === 'WORKING' ? { activity: convActivity.get(convOf(w, t)) || null } : {}) };
       });
-      return { wsInfo: w.wsInfo, lease, workspace_summary, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tokenCap: w.tokenCap, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
+      return { wsInfo: w.wsInfo, lease, workspace_summary, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tokenCap: w.tokenCap, mission: w.mission, routines: w.routines, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
         run: r && { usage: r.usage || null, extMod: r.extMod, claimedBy: r.claimedBy, id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
     });
     return { ...S, runtimes: S.runtimes, ...teamStats(), agents: Object.values(S.agents), workspaces };
@@ -2640,6 +2730,9 @@ const routes = {
   'POST /api/fallback': (b) => setFallback(wsOf(b.ws), b.agent),
   'POST /api/backend-port': (b) => setBackendPort(wsOf(b.ws), b.port),
   'POST /api/token-cap': (b) => setTokenCap(wsOf(b.ws), b.cap),
+  'POST /api/mission': (b) => setMission(wsOf(b.ws), b.text),
+  'POST /api/routine/save': (b) => saveRoutine(wsOf(b.ws), b),
+  'POST /api/routine/delete': (b) => deleteRoutine(wsOf(b.ws), b.id),
   'POST /api/external/save': (b) => saveExternal(b),
   'POST /api/external/delete': (b) => deleteExternal(b.id),
   'POST /api/external/models': (b) => extModels(b),
@@ -2660,6 +2753,11 @@ const routes = {
   'POST /api/runtime/cleanup-stale': () => cleanupStaleRuntimes({ rtDir: RT }),
 };
 
+// The event log keeps only ids and settings from a request body: never free text (requests, notes) or secrets (API keys).
+const READ_POSTS = new Set(['POST /api/limits/refresh', 'POST /api/check', 'POST /api/card/detail', 'POST /api/external/models', 'POST /api/runtime/readiness', 'POST /api/runtime/check-port']);
+const EVENT_FIELDS = ['ws', 'path', 'taskId', 'agent', 'to', 'id', 'mode', 'strategy', 'max', 'cap', 'port', 'on', 'interrupt', 'time', 'days'];
+const pickEventFields = (b) => Object.fromEntries(EVENT_FIELDS.map((k) => [k, b?.[k]]).filter(([, v]) => v != null && (typeof v !== 'object' || Array.isArray(v))));
+
 const server = http.createServer(async (req, res) => {
   const send = (code, body, type = 'application/json; charset=utf-8') => { res.writeHead(code, { 'content-type': type }); res.end(type.startsWith('application/json') ? JSON.stringify(body ?? {}) : body); };
   // Local-only: reject other hosts (DNS rebinding) and non-JSON POSTs (cross-site form posts).
@@ -2670,11 +2768,17 @@ const server = http.createServer(async (req, res) => {
   const fn = hist ? () => readHistory(hist[1]) : routes[`${req.method} ${req.url}`];
   if (!fn) return send(404, { error: 'not found' });
   if (req.method === 'POST' && !String(req.headers['content-type']).startsWith('application/json')) return send(415, { error: 'json only' });
+  const route = `${req.method} ${req.url}`;
+  const record = req.method === 'POST' && !READ_POSTS.has(route);
+  let b = {};
   try {
     let raw = '';
     for await (const c of req) raw += c;
-    send(200, (await fn(raw ? JSON.parse(raw) : {})) ?? { ok: true });
+    b = raw ? JSON.parse(raw) : {};
+    send(200, (await fn(b)) ?? { ok: true });
+    if (record) event('api', { route, ...pickEventFields(b) });
   } catch (e) {
+    if (record) event('api', { route, ...pickEventFields(b), error: e instanceof SyntaxError ? 'invalid JSON body' : e.message }); // a parser message can quote the raw body (secrets)
     send(400, { error: e.message });
   }
 });
@@ -2691,6 +2795,7 @@ for (const w of S.workspaces) {
 await startAion();
 watchCatalogs();
 setInterval(watchExternal, 60000); // GitHub PR / CI waits
+setInterval(runRoutines, 30000); // routines: checked twice a minute so an HH:MM slot starts within that minute
 await refreshRuntimeReadiness();
 setInterval(() => refreshRuntimeReadiness().catch(() => {}), 10000);
 setInterval(watchBackendWaits, 5000); // owned backend recovery is readiness-gated

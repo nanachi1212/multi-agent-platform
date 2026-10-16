@@ -5,6 +5,14 @@ const nodeCrypto = require('crypto');
 const src = require('fs').readFileSync(require('path').join(__dirname, 'server.mjs'), 'utf8').replace(/\r\n/g, '\n');
 const region = (a, b) => { const i = src.indexOf(a), j = src.indexOf(b, i); if (i < 0 || j < 0) throw new Error('region ' + a); return src.slice(i, j); };
 const code = region('function handoffNote(run)', '// ---------- Plan limits') + region('async function planPhase(w)', '// Changing the Leader mid-run') + region('// ---------- HTTP ----------', 'const routes =');
+// Only the regions above are loaded. A server.mjs function the tested code calls but that lives outside them would
+// fail only when a test happens to reach it (a ReferenceError deep inside a run), so name it before any test runs.
+const topNames = (s) => new Set([...s.matchAll(/^(?:async\s+)?function\s+(\w+)|^(?:const|let)\s+(\w+)\s*=/gm)].map((m) => m[1] || m[2]));
+const inCode = topNames(code), outside = [...topNames(src)].filter((n) => !inCode.has(n));
+function checkOutside(envNames) {
+  const missing = outside.filter((n) => !envNames.includes(n) && new RegExp(`(?<![.\\w$])${n}\\s*\\(`).test(code));
+  if (missing.length) throw new Error(`lifecycle-harness: server.mjs ${missing.join(', ')} ${missing.length > 1 ? 'are' : 'is'} called by the tested code but defined outside the extracted regions. Stub ${missing.length > 1 ? 'them' : 'it'} in makeEnv, or move the definition into a region.`);
+}
 
 const storeSource = require('fs').readFileSync(require('path').join(__dirname, 'workspace-lease.mjs'), 'utf8').replace('export function', 'function');
 const createWorkspaceLeaseStore = new Function(storeSource + '\nreturn createWorkspaceLeaseStore;')();
@@ -18,6 +26,9 @@ function makeEnv(script, overrides = {}) {
     AGENTS: { claude: { name: 'Claude Code' }, codex: { name: 'Codex' }, antigravity: { name: 'Antigravity' } },
     S: { workspaces: [], leases: [] }, RT: mkTmp('studio-rt-'), PORT: 4848, api: async () => ({ items: [] }), stopTurn: async () => true, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 20))), crypto: nodeCrypto, logs, notices, prompts,
     log: (w, who, role, text, detail) => logs.push({ who, role, text, detail }),
+    events: [], event: (type, data) => env.events.push({ type, ...data }),
+    setWorker: (w, agent, on) => { w.workers = on ? [...new Set([...w.workers, agent])] : w.workers.filter((x) => x !== agent); },
+    knownRefs: () => [], workContext: () => '',
     notify: (title, body, kind) => notices.push({ title, body, kind }),
     label: () => 'TestProj', refreshClaudeLimits() {}, saveRun() {}, saveSettings() {}, latestJob: () => null, clip: (x, n) => String(x ?? '').slice(0, n), AFTER_DONE: ['stop', 'suggest', 'auto'],
     started: [], start: async (w, request, cont) => { env.started.push({ request, cont }); }, setTimeout: (fn, ms) => (ms === 5000 ? queueMicrotask(fn) : globalThis.setTimeout(fn, ms)), // only the 5 s auto-continue delay is skipped
@@ -34,7 +45,8 @@ function makeEnv(script, overrides = {}) {
   env.agentName = (id) => env.AGENTS[id]?.name || id;
   Object.assign(env, overrides);
   const names = Object.keys(env);
-  const api = new Function(...names, code + '\nreturn { planPhase, pump, summarize, answer, continueCard, wake, parseStatus, finish, autoNext, instruct, pause, resume, stop, handoffWriter, claimWorkspace, releaseClaim, useWorktree, useReadOnly, checkWorkspaces, acquireWrite, workspaceOf, loadLeases, saveLeases, leaseState, leaseView, writerOf, retire, beatLeases, cleanupWorktree, runTask, endWriteStep, treeKey, newLease, flagExternalModification, loadRun, reassign, recoverBackendWait, startManagedRuntime, drainExecution, pauseAndDrain, stopAndDrain, takeWriteSlot, treeStamp, INSTANCE, askAgent, cardDetail, workInfo, resolveAsks, cardStep, watchExternal, withdrawAgent, applyStatus, usageDelta, chargeUsage, delegateAsk, parseSubtasks, overCap, verdictOf, reviewAuthors, loadRun };')(...names.map((k) => env[k])); // test harness: our own code
+  checkOutside(names);
+  const api = new Function(...names, code + '\nreturn { planPhase, pump, summarize, answer, continueCard, wake, parseStatus, finish, autoNext, instruct, pause, resume, stop, handoffWriter, claimWorkspace, releaseClaim, useWorktree, useReadOnly, checkWorkspaces, acquireWrite, workspaceOf, loadLeases, saveLeases, leaseState, leaseView, writerOf, retire, beatLeases, cleanupWorktree, runTask, endWriteStep, treeKey, newLease, flagExternalModification, loadRun, reassign, recoverBackendWait, startManagedRuntime, drainExecution, pauseAndDrain, stopAndDrain, takeWriteSlot, treeStamp, INSTANCE, askAgent, cardDetail, workInfo, resolveAsks, cardStep, watchExternal, withdrawAgent, applyStatus, usageDelta, chargeUsage, delegateAsk, parseSubtasks, overCap, verdictOf, reviewAuthors, loadRun, routineDue, saveRoutine, deleteRoutine, runRoutines, setMission, planPrompt };')(...names.map((k) => env[k])); // test harness: our own code
   return { env, api };
 }
 const newW = () => ({ project: 'P', leader: 'claude', workers: ['claude', 'codex', 'antigravity'], tasks: [], activity: [],
