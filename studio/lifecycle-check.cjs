@@ -1,5 +1,7 @@
 // All scripted lifecycle regressions; no agents or network.
 const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle } = require('./lifecycle-harness.cjs');
+// A slow CI runner can take longer than one settle() to finish a scripted job: wait for the state instead of a fixed time.
+const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms / 25 && !f(); i++) await new Promise((r) => setTimeout(r, 25)); assert.ok(f(), 'timed out waiting for ' + what); };
 
 (async () => {
   // 1) dependency chain + waiting on another agent + auto wake + Leader confirms
@@ -102,7 +104,7 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
   for (const mode of ['stop', 'suggest', 'auto']) {
     ({ env, api } = makeEnv(modeScript));
     w = Object.assign(newW(), { afterDone: mode, autoRounds: 0, autoMax: 5 }); env.S.workspaces.push(w);
-    await api.planPhase(w); await settle();
+    await api.planPhase(w); await until(() => w.run.suggestions, mode + ' summary');
     const check = env.prompts.find((p) => p.text.includes('Every current card has ended')).text;
     assert.strictEqual(check.includes('"next"'), mode !== 'stop', mode + ': next steps asked only when wanted');
     assert.strictEqual(w.run.suggestions.length, mode === 'stop' ? 0 : 2, mode + ': suggestions kept');
