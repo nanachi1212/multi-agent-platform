@@ -1329,8 +1329,10 @@ function changedFiles(before, after) {
 async function reportFiles(w, t, dir, before, reported) {
   const after = await treeFiles(dir).catch(() => null);
   if (!after) return;
+  // An absolute path the worker wrote may spell the folder differently (8.3 short name, case): resolve it like dir was.
+  const real = (p) => { if (!/^(?:[a-z]:|\/\/)/i.test(p)) return p; try { return fs.realpathSync.native(p).replace(/\\/g, '/'); } catch { return p; } };
   const root = dir.replace(/\\/g, '/').toLowerCase() + '/';
-  const listed = new Set([...reported].map((p) => p.toLowerCase().startsWith(root) ? p.slice(root.length) : p).map((p) => p.toLowerCase()));
+  const listed = new Set([...reported].map(real).map((p) => p.toLowerCase().startsWith(root) ? p.slice(root.length) : p).map((p) => p.toLowerCase()));
   const missing = changedFiles(before, after).filter((p) => !listed.has(p.toLowerCase()));
   t.files = [...reported];
   if (!missing.length) return;
