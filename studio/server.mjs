@@ -721,14 +721,18 @@ STATUS: NEEDS_USER: <question to the user, in the user's language>   (only for a
 STATUS: BLOCKED: <the technical reason>   (your tools are blocked, a program is missing, a command keeps failing: the task could NOT be done)
 Never use NEEDS_USER for a technical problem: the user is not a programmer. Stop retrying and report STATUS: BLOCKED; the leader retries the task another way. Never report DONE for work that was not done.
 With NEEDS_USER and choices, add one more line: OPTIONS: <choice 1> | <choice 2>
+If you created, changed or deleted files, add one more line listing every one of them (paths relative to the folder, comma-separated): FILES: src/a.js, docs/b.md
 Never say DONE while you still wait for something. Do not wait or poll inside your turn: report the status and end the turn; Studio wakes you with the result.`;
 
+// A path as the worker wrote it, in the form git ls-files prints (relative, forward slashes), so the two lists compare.
+const relPath = (s) => String(s).trim().replace(/^[`'"*_]+|[`'"*_]+$/g, '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
 function parseStatus(reply) {
   const m = [...reply.matchAll(/^\s*[*_`]*STATUS[*_`]*\s*[:：]\s*[*_`]*\s*(DONE|WAITING_EXTERNAL|WAITING_AGENT|NEEDS_USER|BLOCKED)\b[*_`]*\s*[:：]?\s*(.*)$/gim)].at(-1);
   if (!m) return null;
   const options = (reply.match(/^\s*[*_`]*OPTIONS[*_`]*\s*[:：]\s*[*_`]*\s*(.+)$/im)?.[1] || '').split('|').map((x) => x.trim()).filter(Boolean).slice(0, 4);
-  const text = reply.replace(m[0], '').replace(/^\s*[*_`]*OPTIONS[*_`]*\s*[:：].*$/im, '').trim();
-  return { kind: m[1].toUpperCase(), detail: m[2].trim(), options, text };
+  const files = (reply.match(/^\s*[*_`]*FILES[*_`]*\s*[:：]\s*[*_`]*\s*(.+)$/im)?.[1] || '').split(/[,，]/).map(relPath).filter(Boolean).slice(0, 200);
+  const text = reply.replace(m[0], '').replace(/^\s*[*_`]*(?:OPTIONS|FILES)[*_`]*\s*[:：].*$/gim, '').trim();
+  return { kind: m[1].toUpperCase(), detail: m[2].trim(), options, files, text };
 }
 
 const PARKED = ['WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'];
@@ -896,7 +900,7 @@ function saveRoutine(w, b) {
   if (b.id && !old) throw new Error('找不到這個定時工作');
   const r = { ...(old || { id: crypto.randomUUID().slice(0, 8), lastAt: '', lastResult: '' }),
     request: String(b.request ?? old?.request ?? '').trim().slice(0, 4000), time: String(b.time ?? old?.time ?? ''),
-    days: [...new Set((b.days ?? old?.days ?? [0, 1, 2, 3, 4, 5, 6]).map(Number))].sort(), on: !!(b.on ?? old?.on ?? true), since: new Date().toISOString() };
+    days: [...new Set((b.days ?? old?.days ?? [0, 1, 2, 3, 4, 5, 6]).map(Number))].sort(), on: !!(b.on ?? old?.on ?? true), precheck: String(b.precheck ?? old?.precheck ?? '').trim().slice(0, 500), since: new Date().toISOString() };
   if (!r.request) throw new Error('請輸入要交給團隊的需求');
   if (!validRoutine(r)) throw new Error(/^([01]\d|2[0-3]):[0-5]\d$/.test(r.time) ? '至少選一天（星期日到星期六）' : '時間格式要是 HH:MM（例如 09:00）');
   if (old) Object.assign(old, r); else w.routines.push(r);
@@ -913,23 +917,43 @@ function deleteRoutine(w, id) {
 // A job that ended can still be winding down (steps draining, runtimes stopping): no new job starts until that is done.
 const stillStopping = (w) => !!(w.executingSteps?.size || w.recoverySteps?.size || w.runtimeStarts?.size || w.tasks.some((t) => t.stopUnconfirmed || t.runtimeStopPending));
 
+// A routine's optional precheck (Orca's --precheck): one command run in the project folder before the routine starts.
+// Exit code 0 = go; anything else, or no answer within 30 s, = this slot is skipped and the team costs nothing.
+// ponytail: the command goes through cmd.exe exactly like Node's exec(); the user typed it into their own Studio.
+const precheck = (w, r) => new Promise((res) => execFile('cmd.exe', ['/d', '/s', '/c', `"${r.precheck}"`], { cwd: w.project, windowsHide: true, windowsVerbatimArguments: true, timeout: 30000, maxBuffer: 1 << 20 },
+  (e, out, err) => { const said = String(err || out || '').trim().slice(0, 200); res(e ? (e.killed ? '前置檢查超過 30 秒沒有結束' : `前置檢查結束碼 ${e.code}`) + (said ? '：' + said : '') : ''); }));
+
 function runRoutines(now = new Date()) {
   for (const w of S.workspaces) for (const r of w.routines) {
     if (!routineDue(r, now) || w.run?.active || w.run?.paused || stillStopping(w)) continue; // busy or still winding down: the slot waits until the project is free
+    const was = r.lastAt;
     r.lastAt = now.toISOString();
-    const prev = w.run;
-    w.autoRounds = 0; // a fresh chain, like a job the user starts
-    const started = start(w, r.request);
-    event('routine.start', { project: w.project, routine: r.id, job: w.run !== prev ? w.run?.id : null });
-    started.then(() => {
-      r.lastResult = '';
-      log(w, 'studio', 'system', `⏰ 這件工作由定時工作（${r.time}）自動開始。`);
-      notify(`${label(w)}：定時工作開始`, clip(r.request, 100), 'done', w.project);
-    }, (e) => {
-      r.lastResult = e.message;
-      event('routine.error', { project: w.project, routine: r.id, error: e.message });
-      notify(`${label(w)}：定時工作沒有開始`, e.message, 'ask', w.project);
-    }).finally(saveSettings);
+    const go = () => {
+      const prev = w.run;
+      w.autoRounds = 0; // a fresh chain, like a job the user starts
+      const started = start(w, r.request);
+      event('routine.start', { project: w.project, routine: r.id, job: w.run !== prev ? w.run?.id : null });
+      return started.then(() => {
+        r.lastResult = '';
+        log(w, 'studio', 'system', `⏰ 這件工作由定時工作（${r.time}）自動開始。`);
+        notify(`${label(w)}：定時工作開始`, clip(r.request, 100), 'done', w.project);
+      }, (e) => {
+        r.lastResult = e.message;
+        event('routine.error', { project: w.project, routine: r.id, error: e.message });
+        notify(`${label(w)}：定時工作沒有開始`, e.message, 'ask', w.project);
+      }).finally(saveSettings);
+    };
+    if (!r.precheck) { go(); continue; }
+    precheck(w, r).then((why) => {
+      if (why) { // the slot is used up (lastAt is set): a skipped routine is not re-checked every 30 s
+        r.lastResult = '略過：' + why;
+        log(w, 'studio', 'system', `⏰ 定時工作（${r.time}）這次略過：${why}。`);
+        event('routine.skip', { project: w.project, routine: r.id, reason: why.split('：')[0] });
+        return saveSettings();
+      }
+      if (w.run?.active || w.run?.paused || stillStopping(w)) { r.lastAt = was; return; } // got busy while the check ran: the slot waits, as without a precheck
+      return go();
+    });
   }
 }
 
@@ -1281,13 +1305,36 @@ async function treeStamp(w, dir = w.project) {
   if (st.err) { if (!(await lockFile(w, dir))) return ''; throw new Error('無法讀取 workspace git status'); }
   const head = (await git(dir, 'rev-parse', 'HEAD')).out?.trim() || '';
   const branch = (await git(dir, 'rev-parse', '--abbrev-ref', 'HEAD')).out?.trim() || '';
+  const metadata = await treeFiles(dir);
+  return crypto.createHash('sha1').update(head + '\n' + branch + '\n' + st.out + JSON.stringify(metadata)).digest('hex');
+}
+// Every tracked or untracked (not ignored) file with its size and times, sorted: the stamp hashes it, a card step compares it.
+async function treeFiles(dir) {
   const files = await git(dir, 'ls-files', '-z', '--cached', '--others', '--exclude-standard');
   if (files.err) throw new Error('無法讀取 workspace snapshot');
-  const metadata = [...new Set(files.out.split('\0').filter(Boolean))].sort().map((p) => {
+  return [...new Set(files.out.split('\0').filter(Boolean))].sort().map((p) => {
     try { const st = fs.lstatSync(path.join(dir, p)); return [p, st.size, st.mtimeMs, st.ctimeMs]; }
     catch (e) { if (e.code === 'ENOENT') return [p, 'deleted']; throw e; }
   });
-  return crypto.createHash('sha1').update(head + '\n' + branch + '\n' + st.out + JSON.stringify(metadata)).digest('hex');
+}
+// Paths whose entry differs between two snapshots: added, changed or deleted.
+function changedFiles(before, after) {
+  const key = (e) => JSON.stringify(e.slice(1));
+  const prev = new Map(before.map((e) => [e[0], key(e)])), next = new Map(after.map((e) => [e[0], key(e)]));
+  return [...new Set([...prev.keys(), ...next.keys()])].filter((p) => prev.get(p) !== next.get(p)).sort();
+}
+// What the step changed versus the worker's FILES line. A difference is recorded, never acted on: the worker may have
+// forgotten a file, or somebody else edited the tree during the step, which snapshots alone cannot tell apart.
+async function reportFiles(w, t, dir, before, reported) {
+  const after = await treeFiles(dir).catch(() => null);
+  if (!after) return;
+  const root = dir.replace(/\\/g, '/').toLowerCase() + '/';
+  const listed = new Set([...reported].map((p) => p.toLowerCase().startsWith(root) ? p.slice(root.length) : p).map((p) => p.toLowerCase()));
+  const missing = changedFiles(before, after).filter((p) => !listed.has(p.toLowerCase()));
+  t.files = [...reported];
+  if (!missing.length) return;
+  log(w, 'studio', 'system', `「${t.title}」這一步有 ${missing.length} 個檔案變動沒有出現在 ${agentName(t.agent)} 回報的 FILES 清單${reported.size ? '' : '（它沒有寫 FILES 行）'}：${missing.slice(0, 10).join('、')}${missing.length > 10 ? ` 等 ${missing.length} 個` : ''}。只記錄，不影響這張卡。`);
+  event('card.files', { project: w.project, job: w.run?.id, card: t.id, reported: reported.size, unreported: missing.length });
 }
 // A file the working tree has changed after Studio last wrote, and only seconds ago: someone is editing now.
 async function recentEdit(w, sinceMs, dir = w.project) {
@@ -1589,8 +1636,9 @@ async function useWorktree(w, taskId) {
   fs.mkdirSync(path.dirname(dir), { recursive: true });
   const r = await git(info.path, 'worktree', 'add', '-b', branch, dir, base);
   if (r.err) throw new Error('建立 worktree 失敗：' + r.err);
-  Object.assign(t, { workdir: dir, worktree: { path: dir, branch, base, repoPath: info.path }, blocked: null, blockReason: '', blockLogged: '' });
-  log(w, 'studio', 'system', `「${t.title}」改在獨立 worktree 做（branch ${branch}）：不會碰到主資料夾的寫入者。`);
+  const inc = await includeIgnored(info.path, dir);
+  Object.assign(t, { workdir: dir, worktree: { path: dir, branch, base, repoPath: info.path, included: inc.entries }, blocked: null, blockReason: '', blockLogged: '' });
+  log(w, 'studio', 'system', `「${t.title}」改在獨立 worktree 做（branch ${branch}）：不會碰到主資料夾的寫入者。${inc.text ? ' .worktreeinclude：' + inc.text + '。' : ''}`);
   pump(w);
   return { path: dir, branch };
 }
@@ -1614,6 +1662,37 @@ async function useReadOnly(w, taskId) {
   saveRun(w, run.paused ? 'paused' : 'running');
   pump(w);
 }
+// Orca's .worktreeinclude: gitignored paths the primary checkout has that a fresh worktree needs (.env, node_modules...).
+// One literal path per line, # comments. A file is copied, a directory is junction-linked; a path that is missing,
+// tracked, not ignored, a glob, or outside the repository is skipped and named in the log.
+async function includeIgnored(repo, dir) {
+  const f = path.join(repo, '.worktreeinclude'), entries = [], done = [], skipped = [];
+  if (!fs.existsSync(f)) return { entries, text: '' };
+  const lines = fs.readFileSync(f, 'utf8').split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#')).slice(0, 50);
+  for (const rel of lines) {
+    const src = path.resolve(repo, rel);
+    if (/[*?[!]/.test(rel) || !src.startsWith(repo + path.sep)) { skipped.push(rel + '（只支援 repo 內的字面路徑）'); continue; }
+    if (!fs.existsSync(src)) { skipped.push(rel + '（主資料夾沒有）'); continue; }
+    if ((await git(repo, 'check-ignore', '-q', rel)).err !== undefined) { skipped.push(rel + '（沒有被 gitignore）'); continue; }
+    const dst = path.join(dir, rel);
+    try {
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      if (fs.statSync(src).isDirectory()) { fs.symlinkSync(src, dst, 'junction'); entries.push({ rel, kind: 'dir' }); done.push(rel + '（連結）'); }
+      else { fs.copyFileSync(src, dst, fs.constants.COPYFILE_EXCL); entries.push({ rel, kind: 'file', sha: crypto.createHash('sha1').update(fs.readFileSync(dst)).digest('hex') }); done.push(rel + '（複製）'); }
+    } catch (e) { skipped.push(`${rel}（${e.code || e.message}）`); }
+  }
+  return { entries, text: [done.length && '補上 ' + done.join('、'), skipped.length && '略過 ' + skipped.join('、')].filter(Boolean).join('；') };
+}
+// Undoes includeIgnored before a verified worktree is removed. All or nothing: a junction is removed (its target is never
+// touched) and a copied file deleted only while every copy is still byte-identical; otherwise nothing is touched and the
+// status check that follows reports the changed copy.
+function removeIncluded(wt) {
+  const sha = (p) => crypto.createHash('sha1').update(fs.readFileSync(p)).digest('hex');
+  const items = (wt.included || []).map((e) => ({ ...e, p: path.join(wt.path, e.rel) })).filter((e) => { try { e.st = fs.lstatSync(e.p); return true; } catch { return false; } });
+  if (items.some((e) => e.kind === 'dir' ? !e.st.isSymbolicLink() : !e.st.isFile() || sha(e.p) !== e.sha)) return false;
+  for (const e of items) if (e.kind === 'dir') fs.rmdirSync(e.p); else fs.unlinkSync(e.p);
+  return true;
+}
 // The PR is merged (or, without a remote, the branch is part of the base): the worktree and its branch can go.
 async function cleanupWorktree(w, t) {
   const wt = t.worktree;
@@ -1627,11 +1706,12 @@ async function cleanupWorktree(w, t) {
     if (!entry?.split('\0').includes('branch refs/heads/' + wt.branch)) throw new Error('worktree 與登記分支不符');
     const head = await checked(wt.path, 'rev-parse', 'HEAD');
     if (head !== await checked(wt.repoPath, 'rev-parse', '--verify', `refs/heads/${wt.branch}`)) throw new Error('worktree HEAD 與分支不符');
-    if (await checked(wt.path, 'status', '--porcelain', '--untracked-files=all', '--ignored')) throw new Error('仍有修改、未追蹤或忽略的檔案');
     if (await checked(wt.repoPath, 'remote')) {
       const pr = await sh('gh', ['pr', 'list', '--head', wt.branch, '--state', 'merged', '--json', 'number,headRefOid'], wt.repoPath);
       if (pr.err || !JSON.parse(pr.out).some((p) => p.headRefOid === head)) throw new Error('無法確認當前 HEAD 已由 PR 交付');
     } else await checked(wt.repoPath, 'merge-base', '--is-ancestor', head, 'HEAD');
+    removeIncluded(wt); // delivered: Studio's own copies and links go first; a changed copy keeps everything and fails the next check
+    if (await checked(wt.path, 'status', '--porcelain', '--untracked-files=all', '--ignored')) throw new Error('仍有修改、未追蹤或忽略的檔案');
     if (head !== await checked(wt.path, 'rev-parse', 'HEAD')) throw new Error('查核期間 HEAD 已改變');
     await checked(wt.repoPath, 'worktree', 'remove', wt.path);
     wt.removed = true;
@@ -1733,13 +1813,15 @@ ${STATUS_RULES}`;
           + (t.notes?.length ? '\nNew instruction from the user (via the leader): ' + t.notes.splice(0).join('\n') : '') }); // the note may arrive before the stop
       log(w, t.agent, 'worker', '已停下，等工頭轉達你的新指示：' + t.title);
     };
+    const dir = isWriter(t) ? (await workspaceOf(t.workdir || w.project)).path : '', before = dir ? await treeFiles(dir).catch(() => null) : null;
+    const reported = new Set(), parsed = (r) => { const st = parseStatus(r); st?.files.forEach((f) => reported.add(f)); return st; };
     const reply = await step(prompt);
     if (t.interrupted) { park(); return; }
-    let st = parseStatus(reply);
+    let st = parsed(reply);
     if (!st) { // ask once instead of guessing
       const again = await step(`Your last reply had no STATUS line. Reply with only the status line now.\n${STATUS_RULES}`);
       if (t.interrupted) { park(); return; }
-      st = parseStatus(again);
+      st = parsed(again);
       if (st) st.text = reply.trim();
     }
     st ||= { kind: 'BLOCKED', detail: '沒有有效的 STATUS，無法確認工作已完成', options: [], text: reply.trim() };
@@ -1755,10 +1837,11 @@ ${STATUS_RULES}`;
       log(w, 'studio', 'system', `把你的指示交給 ${agentName(t.agent)}，接著調整「${t.title}」。`);
       last = await step(`New instruction from the user (via the leader) for your task "${t.title}":\n${note}\n\nApply it to this task now. End your reply with a short summary (1-3 sentences).\n${STATUS_RULES}`);
       if (t.interrupted) { park(); return; }
-      st = parseStatus(last) || { kind: 'BLOCKED', detail: '沒有有效的 STATUS，無法確認工作已完成', options: [], text: last.trim() };
+      st = parsed(last) || { kind: 'BLOCKED', detail: '沒有有效的 STATUS，無法確認工作已完成', options: [], text: last.trim() };
     }
     if (st.kind !== 'DONE' && overCap(w, t)) throw capErr(); // the step that just ended blew the budget and the card is not finished: stop it now, not at the next wake-up
     applyStatus(w, t, st, last);
+    if (before) await reportFiles(w, t, dir, before, reported);
     if (t.status === 'DONE' && overCap(w, t)) { // finished, but the last step went over: the work stays, the user hears about it
       t.overCap = true;
       log(w, 'studio', 'system', `「${t.title}」已完成，但用了 ${cardTokens(t)} tokens，超過上限 ${w.tokenCap}。`);

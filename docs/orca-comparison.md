@@ -30,19 +30,19 @@
 
 ## 值得借鑒（依「對本方案的價值 ÷ 改動成本」排序）
 
-### A. 建議做（改動小、補的是已知缺口）
+### A. 建議做（改動小、補的是已知缺口）— 三項已於 2026-10-17 實作
 
-1. **定時工作加「前置檢查」（Orca `--precheck`）**
+1. **定時工作加「前置檢查」（Orca `--precheck`）** — 已實作：routine 的 `precheck` 欄位、`routine.skip` 事件、UI「上次略過」
    - Orca：一句 shell 指令，exit 非 0 就記一筆 skipped、不啟動 Agent。例：`gh pr list --json number -q .[0].number` 沒有 PR 就不跑「審 PR」。
    - 本方案：`runRoutines` 時間到就 `start(w, r.request)`，工頭至少花一回合才知道沒事做。
    - 改法：routine 多一個選填 `precheck` 欄位；時間到先在工作區內執行它（逾時 30 秒），非 0 就寫 `routine.skip` 事件、`lastResult` 註明「前置檢查未通過」、不開 job。約 20 行 + UI 一個輸入框。
 
-2. **獨立 worktree 補齊被 gitignore 的檔案（Orca `.worktreeinclude` + `sharedDirectories`）**
+2. **獨立 worktree 補齊被 gitignore 的檔案（Orca `.worktreeinclude` + `sharedDirectories`）** — 已實作：`includeIgnored`（檔案複製、資料夾 junction）與清理前的 `removeIncluded`
    - Orca：`.worktreeinclude` 列出要「複製」進新 worktree 的 gitignored 檔（`.env`、`.vscode/settings.json`）；`orca.yaml` 的 `worktree.sharedDirectories` 列出要「連結」的大目錄（`node_modules`、`.cache`）。只處理確實被 gitignore 且存在的路徑。
    - 本方案：選項③「使用獨立 worktree」只做 `git worktree add -b`（`studio/server.mjs` 約 1590 行），新目錄沒有 `.env`、`node_modules`，成員第一件事就是裝依賴或卡在缺設定，燒額度。
    - 改法：worktree 建好後讀專案根的 `.worktreeinclude`（沿用 Orca 的檔名與語法：純字面路徑、`#` 註解），逐一用 `git check-ignore` 確認後複製；目錄用 junction（`fs.symlink(..., 'junction')`，Windows 不需要管理員）。沒有這個檔就維持現狀。約 30 行。
 
-3. **成員完成時回報「改了哪些檔案」（Orca `worker_done --files-modified`）**
+3. **成員完成時回報「改了哪些檔案」（Orca `worker_done --files-modified`）** — 已實作：`STATUS_RULES` 的 `FILES:` 行、`reportFiles` 比對前後快照、`card.files` 事件
    - Orca：`worker_done` 必帶 `--outcome succeeded|failed`，可附 `--files-modified`、`--report-path`；另有 AI 行歸屬（Attribution）記錄哪些行是 Agent 寫的。
    - 本方案：README 明寫「Agent 執行當中的修改，無法分辨是它自己改的還是別人改的」。卡結束時 Studio 有樹指紋（HEAD、branch、檔案 mtime），但沒有成員自己的清單可對照。
    - 改法：`STATUS_RULES` 多一行選填 `FILES: a, b, c`（成員列出自己改過的檔）；卡結束時比對指紋差異，有改動但不在清單的檔記進 activity 與事件（只標記，不阻擋）。在 `EXTERNAL_MODIFICATION_DETECTED` 之外多一個弱證據，約 15 行。

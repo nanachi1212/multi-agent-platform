@@ -1259,6 +1259,30 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     console.log('34 first continuation without history and existing goal/reference inheritance: PASS');
   }
 
+  { // 29) routine precheck: a non-zero exit skips the slot once (with the reason), exit 0 starts, a project that got busy meanwhile keeps the slot
+    ({ env, api } = makeEnv(() => 'STATUS: DONE', { execFile: require('node:child_process').execFile }));
+    w = { ...newW(), run: null, project: mkTmp('studio-precheck-'), routines: [] }; env.S.workspaces.push(w);
+    const at = (d, h, m = 0) => new Date(2026, 9, d, h, m);
+    const until = async (f) => { for (let i = 0; i < 200 && !f(); i++) await new Promise((r) => setTimeout(r, 25)); assert.ok(f(), 'timed out waiting for the precheck'); };
+    const r = api.saveRoutine(w, { request: '審 PR', time: '09:00', precheck: ' echo "no pr" & exit 3 ' });
+    assert.strictEqual(r.precheck, 'echo "no pr" & exit 3');
+    Object.assign(r, { since: at(16, 8).toISOString(), lastAt: '' });
+    api.runRoutines(at(16, 9)); await until(() => r.lastResult);
+    assert.deepStrictEqual([env.started.length, r.lastResult, r.lastAt], [0, '略過：前置檢查結束碼 3："no pr"', at(16, 9).toISOString()]);
+    assert.deepStrictEqual(env.events.filter((e) => e.type === 'routine.skip').map((e) => e.reason), ['前置檢查結束碼 3']);
+    assert.ok(env.logs.some((l) => l.text.includes('這次略過')) && !env.notices.length, 'a skip is logged, not notified');
+    api.runRoutines(at(16, 9, 1)); await settle();
+    assert.strictEqual(env.events.filter((e) => e.type === 'routine.skip').length, 1, 'a skipped slot is not re-checked every 30 s');
+    r.precheck = 'exit 0'; Object.assign(r, { lastAt: '', lastResult: '' });
+    api.runRoutines(at(17, 9)); await until(() => env.started.length === 1);
+    assert.deepStrictEqual([env.started, r.lastResult], [[{ request: '審 PR', cont: undefined }], '']);
+    r.lastAt = ''; api.runRoutines(at(18, 9)); w.run = { active: true }; await settle();
+    assert.deepStrictEqual([env.started.length, r.lastAt], [1, ''], 'busy while the check ran: the slot waits like a routine without a precheck');
+    w.run = null; api.runRoutines(at(18, 9, 1)); await until(() => env.started.length === 2);
+    assert.strictEqual(api.saveRoutine(w, { id: r.id, precheck: '' }).precheck, '', 'the precheck can be cleared');
+    console.log('29 routine precheck: skip once with reason, run on exit 0, busy keeps the slot: PASS');
+  }
+
   await require('./test-workspace-lease.cjs')({ makeEnv, mkTmp, region });
 
   // status-line parser
@@ -1267,6 +1291,8 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
   assert.strictEqual(parseStatus('x\n**STATUS:** WAITING_AGENT: antigravity: review').detail, 'antigravity: review');
   assert.deepStrictEqual(parseStatus('x\nSTATUS：NEEDS_USER：A 還是 B？\nOPTIONS: A | B').options, ['A', 'B']);
   assert.strictEqual(parseStatus('no status here'), null);
+  assert.deepStrictEqual(parseStatus('Edited.\nSTATUS: DONE\nFILES: `src/a.js`, .\\docs\\b.md ，lib/c/ , ').files, ['src/a.js', 'docs/b.md', 'lib/c']);
+  assert.deepStrictEqual([parseStatus('Edited.\nFILES: x.txt\nSTATUS: DONE').text, parseStatus('Built.\nSTATUS: DONE').files], ['Edited.', []]);
   console.log('6 status-line parser: PASS');
   await require('./test-runtime.cjs').runRuntimeTests();
   await new Promise((r) => setTimeout(r, 300));

@@ -1,0 +1,47 @@
+// A writer card's FILES line versus what the step really changed: Studio records the difference and never acts on it.
+// Run: node studio/test-card-files.cjs   (real git in a temp repository, scripted agent replies, no network)
+const { assert, makeEnv, mkTmp, newW } = require('./lifecycle-harness.cjs');
+const fs = require('node:fs'), path = require('node:path');
+const { execFile, execFileSync } = require('node:child_process');
+
+(async () => {
+  const root = mkTmp('studio-files-'), repo = path.join(root, 'repo');
+  fs.mkdirSync(repo);
+  const git = (...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', windowsHide: true }).trim();
+  git('init', '-qb', 'main'); git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.invalid');
+  for (const f of ['a.txt', 'b.txt', 'c.txt']) fs.writeFileSync(path.join(repo, f), f);
+  fs.writeFileSync(path.join(repo, '.gitignore'), 'out/\n'); git('add', '.'); git('commit', '-qm', 'base');
+  const write = (rel, text) => { fs.mkdirSync(path.dirname(path.join(repo, rel)), { recursive: true }); fs.writeFileSync(path.join(repo, rel), text); };
+  const { env, api } = makeEnv((agent, text) => { // the agent edits during its turn, then reports
+    if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+    if (text.includes('Task: listed')) { write('a.txt', 'A'); write('b.txt', 'B'); write('new.txt', 'n'); fs.unlinkSync(path.join(repo, 'c.txt')); write('out/build.log', 'x'); return `Edited.\nSTATUS: DONE\nFILES: a.txt, ./b.txt, ${repo}\\new.txt, c.txt`; }
+    if (text.includes('Task: partial')) { write('a.txt', 'A2'); write('b.txt', 'B2'); return 'Edited.\nSTATUS: DONE\nFILES: a.txt'; }
+    if (text.includes('Task: silent')) { write('a.txt', 'A3'); return 'Edited.\nSTATUS: DONE'; }
+    if (text.includes('Task: reader')) { write('a.txt', 'A4'); return 'Read.\nSTATUS: DONE'; }
+    return 'Nothing to change.\nSTATUS: DONE';
+  }, { execFile });
+  try {
+    const cards = {};
+    // title, writes, files expected to be flagged as changed-but-unreported
+    for (const [title, writes, unreported] of [['listed', true, []], ['partial', true, ['b.txt']], ['silent', true, ['a.txt']], ['none', true, []], ['reader', false, []]]) {
+      await new Promise((r) => setTimeout(r, 30)); // the previous card's edits are older than this job
+      env.logs.length = 0; env.events.length = 0; env.S.workspaces.length = 0;
+      const w = newW(); w.project = repo; w.run.project = repo; w.run.startedAt = new Date().toISOString(); env.S.workspaces.push(w);
+      const t = cards[title] = { id: title, title, agent: 'codex', writes, status: 'WAITING', after: [], instructions: 'x' }; w.tasks.push(t);
+      await api.runTask(w, t);
+      assert.strictEqual(t.status, 'DONE', title + ': ' + t.result);
+      const flagged = env.logs.filter((l) => l.text.includes('沒有出現在')), ev = env.events.filter((e) => e.type === 'card.files');
+      if (!unreported.length) { assert.deepStrictEqual([flagged.length, ev.length], [0, 0], title + ': nothing to flag'); continue; }
+      assert.strictEqual(flagged.length, 1, title);
+      for (const f of unreported) assert.ok(flagged[0].text.includes(f), `${title}: names ${f} in ${flagged[0].text}`);
+      assert.ok(flagged[0].text.includes('只記錄，不影響這張卡'), title + ': recorded only');
+      assert.strictEqual(flagged[0].text.includes('沒有寫 FILES 行'), title === 'silent', title + ': a missing FILES line is said so');
+      assert.deepStrictEqual(ev.map((e) => [e.card, e.reported, e.unreported]), [[title, title === 'silent' ? 0 : 1, unreported.length]]);
+    }
+    assert.ok(!cards.partial.result.includes('FILES:') && cards.partial.result === 'Edited.', 'the FILES line is not part of the card result');
+    assert.deepStrictEqual([cards.listed.files.length, cards.listed.files[0], cards.listed.files[1], cards.listed.files[3]], [4, 'a.txt', 'b.txt', 'c.txt'], 'the reported list stays on the card, paths normalised');
+    assert.deepStrictEqual([cards.partial.files, cards.silent.files, 'files' in cards.reader], [['a.txt'], [], false], 'no snapshot or list for a read-only card');
+    assert.strictEqual(fs.readFileSync(path.join(repo, 'a.txt'), 'utf8'), 'A4', 'nothing in the tree is reverted');
+    console.log('card files: listed vs changed, absolute and ./ paths, deletions, ignored output, missing FILES line, read-only cards: PASS');
+  } finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 }); }
+})().catch((e) => { console.error('FAIL', e); process.exit(1); });
