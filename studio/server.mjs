@@ -717,17 +717,18 @@ const STATUS_RULES = `At the very end of your reply add exactly one status line:
 STATUS: DONE   (the goal of this task is fully reached; nothing more to do for it)
 STATUS: WAITING_EXTERNAL: <what you wait for; include the PR URL if there is one>   (GitHub CI, a build, a deploy...)
 STATUS: WAITING_AGENT: <agent id>: <what you need from them>   (ids: ${Object.keys(AGENTS).join(', ')})
+STATUS: ASK_LEADER: <a question about HOW to do this task that the leader can answer: two reasonable ways and you cannot tell which the team wants, or a detail of the request you need>   (the leader answers and you continue; never ask the user this)
 STATUS: NEEDS_USER: <question to the user, in the user's language>   (only for a real decision: choose between options, a destructive action, a login)
 STATUS: BLOCKED: <the technical reason>   (your tools are blocked, a program is missing, a command keeps failing: the task could NOT be done)
-Never use NEEDS_USER for a technical problem: the user is not a programmer. Stop retrying and report STATUS: BLOCKED; the leader retries the task another way. Never report DONE for work that was not done.
-With NEEDS_USER and choices, add one more line: OPTIONS: <choice 1> | <choice 2>
+Never use NEEDS_USER for a technical problem: the user is not a programmer. A question about the work goes to the leader (ASK_LEADER). When the task cannot be done, stop retrying and report STATUS: BLOCKED; the leader retries the task another way. Never report DONE for work that was not done.
+With NEEDS_USER or ASK_LEADER and choices, add one more line: OPTIONS: <choice 1> | <choice 2>
 If you created, changed or deleted files, add one more line listing every one of them (paths relative to the folder, comma-separated): FILES: src/a.js, docs/b.md
 Never say DONE while you still wait for something. Do not wait or poll inside your turn: report the status and end the turn; Studio wakes you with the result.`;
 
 // A path as the worker wrote it, in the form git ls-files prints (relative, forward slashes), so the two lists compare.
 const relPath = (s) => String(s).replace(/\s*[(（][^()（）]*[)）]\s*$/, '').trim().replace(/^[`'"*]+|[`'"*]+$/g, '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
 function parseStatus(reply) {
-  const m = [...reply.matchAll(/^\s*[*_`]*STATUS[*_`]*\s*[:：]\s*[*_`]*\s*(DONE|WAITING_EXTERNAL|WAITING_AGENT|NEEDS_USER|BLOCKED)\b[*_`]*\s*[:：]?\s*(.*)$/gim)].at(-1);
+  const m = [...reply.matchAll(/^\s*[*_`]*STATUS[*_`]*\s*[:：]\s*[*_`]*\s*(DONE|WAITING_EXTERNAL|WAITING_AGENT|ASK_LEADER|NEEDS_USER|BLOCKED)\b[*_`]*\s*[:：]?\s*(.*)$/gim)].at(-1);
   if (!m) return null;
   const options = (reply.match(/^\s*[*_`]*OPTIONS[*_`]*\s*[:：]\s*[*_`]*\s*(.+)$/im)?.[1] || '').split('|').map((x) => x.trim()).filter(Boolean).slice(0, 4);
   const files = (reply.match(/^\s*[*_`]*FILES[*_`]*\s*[:：]\s*[*_`]*\s*(.+)$/im)?.[1] || '').split(/[,，]/).map(relPath).filter(Boolean).slice(0, 200);
@@ -735,7 +736,7 @@ function parseStatus(reply) {
   return { kind: m[1].toUpperCase(), detail: m[2].trim(), options, files, text };
 }
 
-const PARKED = ['WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'];
+const PARKED = ['WAITING_EXTERNAL', 'WAITING_AGENT', 'ASK_LEADER', 'NEEDS_USER'];
 const POKE_MS = 5 * 60e3, MAX_POKES = 3; // a wait Studio cannot check: the worker looks itself every POKE_MS, MAX_POKES times, then the user is asked
 const OPEN = ['WAITING', 'WORKING', 'PAUSED', 'INTERRUPTED', ...PARKED];
 const findPr = (s) => s.match(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/)?.[0] || s.match(/\bPR\s*#(\d+)/i)?.[1] || '';
@@ -1161,7 +1162,7 @@ function pump(w) {
     }
     return pump(w); // propagate failure to dependents; never bypass a review to break the cycle
   }
-  if (onAgents.length && !w.tasks.some((t) => ['WORKING', 'WAITING', 'WAITING_EXTERNAL', 'NEEDS_USER'].includes(t.status))) {
+  if (onAgents.length && !w.tasks.some((t) => ['WORKING', 'WAITING', 'WAITING_EXTERNAL', 'ASK_LEADER', 'NEEDS_USER'].includes(t.status))) {
     for (const t of onAgents) wake(w, t, 'The agent you were waiting for has no open card. Continue with its recorded results, or report NEEDS_USER.');
   }
   if (!run.summarizing && w.tasks.length && w.tasks.every((t) => t.status === 'DONE' || t.status === 'FAILED')) summarize(w);
@@ -1180,7 +1181,7 @@ const RECENT_EDIT_MS = 90e3, LOCK_BEAT_MS = 30e3;
 const LEASE_BEAT_MS = 20e3, LEASE_RESERVED_TTL_MS = 12 * 3600e3;
 const isWriter = (t) => t.writes !== false;
 const sameTree = (a, b) => (a.workdir || '') === (b.workdir || '');
-const holdsWriteLock = (t) => isWriter(t) && ['WORKING', 'WAITING_EXTERNAL', 'NEEDS_USER'].includes(t.status);
+const holdsWriteLock = (t) => isWriter(t) && ['WORKING', 'WAITING_EXTERNAL', 'ASK_LEADER', 'NEEDS_USER'].includes(t.status);
 const writerBusy = (w, t) => w.tasks.some((x) => x !== t && sameTree(x, t) && holdsWriteLock(x));
 const nowIso = () => new Date().toISOString();
 
@@ -1962,9 +1963,83 @@ function applyStatus(w, t, st, reply) {
     log(w, 'studio', 'system', `「${t.title}」在等 ${agentName(a)}：它做完會自動交回 ${who}。`);
     return;
   }
+  if (st.kind === 'ASK_LEADER') {
+    t.status = 'ASK_LEADER';
+    t.wait = { leader: true, what: st.detail || t.result.slice(-300) };
+    askLeader(w, t, t.wait.what, st.options);
+    return;
+  }
   t.status = 'NEEDS_USER';
   t.ask = { question: st.detail || t.result.slice(-300), options: st.options };
   notify(`${label(w)}：${who} 需要你處理`, t.ask.question.slice(0, 160), 'ask', w.project);
+}
+
+const MAX_LEADER_ASKS = 2; // per card; the next question hands the whole card to the leader (docs/multi-model-principles.md 4: when unsure, go up)
+// A worker's question about HOW to do its task goes to the leader, not the user. The leader answers from the request and
+// the cards (no files, no commands) or turns it into a plain-language question for the user. The card keeps its lease.
+async function askLeader(w, t, question, options = []) {
+  const run = w.run, lead = run.leader, gen = run.leaderGen, who = agentName(t.agent);
+  t.leaderAsks = (t.leaderAsks || 0) + 1;
+  log(w, t.agent, 'worker', `問工頭：${question}${options.length ? '（' + options.join(' / ') + '）' : ''}`);
+  if (t.leaderAsks > MAX_LEADER_ASKS) {
+    log(w, 'studio', 'system', `「${t.title}」已經問了工頭 ${MAX_LEADER_ASKS} 次，改交給工頭自己完成。`);
+    Object.assign(t, { status: 'WAITING', wait: null });
+    if (!handToLeader(w, t, `asked the leader ${MAX_LEADER_ASKS} times; last question: ${question}`)) {
+      Object.assign(t, { status: 'FAILED', detail: question, result: `問了工頭 ${MAX_LEADER_ASKS} 次仍無法決定：${question}` });
+      wakeWaiters(w, t);
+    }
+    return;
+  }
+  const prompt = `You are the LEADER. ${who} is working on the card "${t.title}" and asks YOU (not the user):
+"""
+${question}
+"""
+${options.length ? 'Choices it offers: ' + options.join(' | ') + '\n' : ''}Card instructions:
+${clip(t.instructions, 2000)}
+The user's request:
+"""
+${run.request}
+"""
+${missionNote(w)}Answer from the request, the cards and what the team already decided. Do not modify files, open files or run commands.
+Reply with ONLY one JSON object, no markdown fences, one of:
+{"answer":"<the decision or detail the worker needs, specific enough to act on; pick the option that best serves the request>"}
+{"needs_user":"<only for a real product decision that only the user can make, in the user's language, plain words, no technical terms>","options":["<choice>","<choice>"]}`;
+  let d = null, reply = '';
+  run.asking = true;
+  try {
+    for (let i = 0; run.noting && i < 150; i++) await sleep(2000); // the leader is applying the user's instructions: ask after that
+    const cid = await conv(w, lead, true);
+    for (const text of [prompt, FIX_JSON]) {
+      reply = await turn(lead, cid, text, { w, lead: true });
+      if (run.leaderGen !== gen || w.run !== run) return;
+      try { d = parseJson(reply); } catch { d = null; }
+      if (typeof d?.answer === 'string' && d.answer.trim() || typeof d?.needs_user === 'string' && d.needs_user.trim()) break;
+      d = null;
+      log(w, 'studio', 'system', '工頭的回覆格式不對，正在請它重新整理…', reply);
+    }
+  } catch (e) {
+    if (e instanceof Halt) { // paused or stopped while asking: the worker asks again when the job resumes
+      t.leaderAsks--;
+      if (t.status === 'ASK_LEADER') Object.assign(t, { status: 'WAITING', wait: null, resumed: true, wakeNote: 'Your question to the leader was interrupted (the job was paused). Ask it again if you still need the answer, then continue.' });
+      return;
+    }
+    log(w, 'studio', 'system', `問工頭時出錯：${e.message}`);
+  } finally {
+    run.asking = false;
+    if (run.notes?.length) processNotes(w);
+  }
+  if (t.status !== 'ASK_LEADER') return; // the card moved on meanwhile (stop, handoff, reassign)
+  if (d?.answer) {
+    log(w, lead, 'leader', `回答 ${who}：${d.answer}`);
+    return wake(w, t, `The leader answered your question:\n"""\n${d.answer}\n"""\nContinue the task.`, `工頭回答了 ${who} 的問題，「${t.title}」繼續。`);
+  }
+  if (d?.needs_user) {
+    Object.assign(t, { status: 'NEEDS_USER', wait: null, ask: { question: String(d.needs_user), options: (Array.isArray(d.options) ? d.options : []).map(String).filter(Boolean).slice(0, 4) } });
+    log(w, lead, 'leader', '需要你決定：' + t.ask.question);
+    notify(`${label(w)}：${agentName(lead)} 需要你處理`, t.ask.question.slice(0, 160), 'ask', w.project);
+    return;
+  }
+  wake(w, t, `The leader could not answer your question${reply ? ` (its reply: ${clip(reply, 400)})` : ''}. Decide yourself in the way that is safest for the user's request, say what you chose, or report STATUS: BLOCKED.`, `工頭沒有回答出來，「${t.title}」交回 ${who} 自己決定。`);
 }
 
 // ---------- Work details and progress questions ----------
@@ -2116,7 +2191,7 @@ const NOTE_SHAPE = `{"message":"<one sentence to the user, in the user's languag
 async function processNotes(w) {
   const run = w.run;
   // Planning and the final check read the notes themselves when they end (see planPhase / summarize).
-  if (!run?.active || run.noting || run.phase !== 'working' || run.summarizing || !run.notes?.length) return;
+  if (!run?.active || run.noting || run.asking || run.phase !== 'working' || run.summarizing || !run.notes?.length) return;
   run.noting = true;
   const notes = run.notes.splice(0);
   const gen = run.leaderGen, lead = run.leader;

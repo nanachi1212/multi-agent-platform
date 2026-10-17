@@ -30,7 +30,8 @@ Windows 優先的多 AI 協作平台。**Multi-Agent Studio** 是一個本機網
 - 每個專案完成或需要你處理時發 Windows 通知，點通知會打開該專案分頁。
 
 **工作流程（不用盯著看）**
-- 成員每次回覆都要標明狀態：完成／等外部結果（例如 CI）／等其他 AI／需要你決定。一回合結束不等於完成。
+- 成員每次回覆都要標明狀態：完成／等外部結果（例如 CI）／等其他 AI／問工頭／需要你決定。一回合結束不等於完成。
+- 成員遇到「怎麼做」的問題（兩種合理做法選哪個、需求缺一個細節）先問工頭，不問你：工頭只看需求和工作卡回答（不讀檔、不跑指令），答案送回成員原本的對話接著做；工頭判斷是只有你能決定的產品問題時，才用白話問你。同一張卡最多問 2 次，第 3 次整張卡交給工頭自己完成。
 - 在等的工作卡會自動接續：等的 AI 做完、GitHub PR 的 CI 跑完（用 `gh`，每分鐘檢查）、或你回覆。Studio 無法自己確認的等待（例如 nightly build）：先每 5 分鐘請成員自己看一次、最多 3 次，之後才明說「需要你按繼續」，不會假裝在背景等；查 PR 狀態失敗會先重試兩次。
 - 專案有自己的後端服務時，在專案頁填「驗證用後端 port」：成員會請 Studio 代管啟動它，卡片在等它時 Studio 自動檢查 health 並安全恢復；留空就完全不管。
 - 工作卡分三種：🛠 實作、🔍 檢查（能用證據對照的，給最便宜的成員，結果 PASS／FAIL）、🛡 審查（寫的人不審自己；不可逆的步驟前一定有一張強模型審查）。每張卡都要寫驗收標準。審查是 NO-GO 或檢查是 FAIL 時，後面的卡不會開始，交回工頭安排修正。檢查卡不改專案檔案，但一定要真的執行測試／建置（不放在唯讀沙盒裡，也不和寫的人共用對話）；審查卡才是唯讀。任何一張卡的 AI 超過 15 分鐘沒有任何新訊息（例如一個指令掛住），Studio 會停掉那一步並交給工頭決定重試。派給 Claude 的檢查卡、強模型審查卡，會交給你在 `~/.claude/agents/` 的 checker、reviewer 子 agent（沒有就自己做）。
@@ -138,7 +139,8 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 - **Pause vs stop**: pause = workers stop now (the current step may be half done), card and conversation are kept, the lease becomes `RESERVED` (the work still belongs to its owner), Studio never resumes it by itself (not even after a restart), you press "繼續", and the lease is re-checked first. Stop = this job ends for good: execution is terminated, the lease is released, unfinished cards fail, no "繼續", no revival after a restart; cards, conversations and records are kept, use "▶ 接著處理" to start a new round.
 
 **Project memory and handoff**
-- Every worker reply states a status: done / waiting for something external (e.g. CI) / waiting for another agent / needs your decision. A turn ending is not "done".
+- Every worker reply states a status: done / waiting for something external (e.g. CI) / waiting for another agent / asking the leader / needs your decision. A turn ending is not "done".
+- A worker's question about HOW to do its task (two reasonable ways, a missing detail) goes to the Leader, not to you: the Leader answers from the request and the cards (no files, no commands) and the answer returns to the worker's own conversation; only when the Leader judges it a product decision that only you can make does it ask you, in plain words. At most 2 questions per card; the third hands the whole card to the Leader.
 - Waiting cards continue by themselves when the awaited agent finishes, when a GitHub PR's CI finishes (`gh`, checked every minute), or when you answer. A wait Studio cannot check (e.g. a nightly build): the worker is asked to look itself every 5 minutes, 3 times, before the card says "needs you to press continue"; it is never a fake background wait. A failed PR status query is retried twice first.
 - If the project has its own backend, set "驗證用後端 port" on the project page: workers ask Studio to own that process, and a card waiting on it gets an automatic health check and safe recovery; leave it empty and Studio stays out of it.
 - Cards have a role: 🛠 build, 🔍 check (verifiable against evidence, cheapest worker, PASS / FAIL), 🛡 review (never by the author; a strong-model review before any irreversible step). Every card carries an acceptance line. A NO-GO review or a FAIL check keeps the cards after it from starting and goes back to the Leader. A check card does not edit project files but must really run the tests / build (it is not in the read-only sandbox and does not share the author's conversation); only review cards are read-only. A card step whose agent shows no new message for 15 minutes (e.g. a hung command) is stopped and the Leader decides the retry. Claude hands its check cards and hard reviews to the checker / reviewer subagents in `~/.claude/agents/` when they exist.

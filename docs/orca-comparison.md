@@ -54,7 +54,7 @@
    - 本方案：`CARD_STALL_MS` = 15 分鐘沒有新訊息就切斷那一步，交給工頭重試；8 分鐘顯示「可能卡住」。租約那邊已經是同一哲學（心跳逾時不算死、未知保留所有權），但卡片這邊還是純逾時。
    - 改法：15 分鐘到時先看證據：Codex 已有 `codex-runtime.mjs` 的程序樹（工具子程序還活著、CPU 有動就延長一次再等）；Claude／Antigravity 若 AionCore 仍有進行中的 tool call 事件也延長。真的無任何活體證據才切。要先定義「最多延長幾次」避免無限等；建議先量現在 15 分鐘誤殺的實際頻率再決定。
 
-5. **成員能問工頭、不必問人（Orca `ask` → 協調者 `reply`）**
+5. **成員能問工頭、不必問人（Orca `ask` → 協調者 `reply`）** — 已實作（2026-10-17）：`STATUS: ASK_LEADER`、`askLeader`、每卡最多 2 次
    - Orca：worker 用 `ask --options --timeout` 問協調者，協調者 `reply`；問題有 message id，逾時後可恢復同一題。另有協調者自己的 decision gate 擋住 DAG 任務。
    - 本方案：STATUS 只有 NEEDS_USER（問人）、WAITING_AGENT（等另一位成員）、BLOCKED。規則已禁止拿技術問題問人，所以成員碰到「兩種做法選哪個」時只能自己猜或 BLOCKED。
    - 改法：新增 `STATUS: ASK_LEADER: <問題>` + `OPTIONS:`，Studio 用一回合問工頭（工頭本來就是強模型、只規劃不讀檔，便宜），把答案 wake 回成員。符合 [multi-model-principles.md](multi-model-principles.md) 第 4 條「不確定時往上」。要防循環（同一卡最多問 2 次）。

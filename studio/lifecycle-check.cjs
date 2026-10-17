@@ -1287,6 +1287,58 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     console.log('29 routine precheck: skip once with reason, run on exit 0, busy keeps the slot: PASS');
   }
 
+  { // 33) ASK_LEADER: the worker's question goes to the leader; answer → continue, needs_user → the user, garbage → decide yourself, third time → the leader takes the card
+    const askPrompt = (text) => text.includes('asks YOU (not the user)');
+    let mode = 'answer', implTurns = 0, leaderAsks = 0;
+    ({ env, api } = makeEnv((agent, text) => {
+      if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"impl","agent":"codex","instructions":"build the thing"}]}';
+      if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+      if (askPrompt(text)) { leaderAsks++; return mode === 'answer' ? '{"answer":"Use the shared component"}' : mode === 'user' ? '{"needs_user":"要共用元件還是只改這一頁？","options":["共用","只改這頁"]}' : 'I am not sure.'; }
+      if (text.startsWith('Update from Multi-Agent Studio') && agent === 'codex') return 'Done as told.\nSTATUS: DONE';
+      if (text.includes('Task: impl')) { implTurns++; return agent === 'claude' ? 'Leader did it.\nSTATUS: DONE' : 'Two ways.\nSTATUS: ASK_LEADER: shared component or page-only?\nOPTIONS: shared | page-only'; }
+      return 'STATUS: DONE';
+    }));
+    w = newW(); env.S.workspaces.push(w);
+    await api.planPhase(w); await settle(); await settle();
+    let t = w.tasks[0];
+    assert.deepStrictEqual([t.status, t.leaderAsks, leaderAsks, w.run.result], ['DONE', 1, 1, 'done'], 'answered and continued');
+    const ask = env.prompts.find((p) => askPrompt(p.text));
+    assert.ok(ask.agent === 'claude' && ask.text.includes('shared component or page-only?') && ask.text.includes('shared | page-only') && ask.text.includes('build the thing'), 'the leader sees the question, the choices and the card');
+    const woke = env.prompts.find((p) => p.agent === 'codex' && p.text.startsWith('Update from Multi-Agent Studio'));
+    assert.ok(woke.text.includes('The leader answered') && woke.text.includes('Use the shared component'), 'the worker gets the answer in its own conversation');
+    assert.ok(env.logs.some((l) => l.text.startsWith('問工頭：shared component')) && env.logs.some((l) => l.role === 'leader' && l.text.includes('回答 Codex')), 'both sides logged');
+    assert.ok(!env.notices.some((n) => n.kind === 'ask'), 'the user was not bothered');
+    mode = 'user'; env.prompts.length = 0; env.notices.length = 0;
+    w = newW(); env.S.workspaces.push(w);
+    await api.planPhase(w); await settle(); await settle();
+    t = w.tasks[0];
+    assert.deepStrictEqual([t.status, t.ask], ['NEEDS_USER', { question: '要共用元件還是只改這一頁？', options: ['共用', '只改這頁'] }], 'the leader turned it into a plain question');
+    assert.ok(env.notices.some((n) => n.title.includes('需要你處理')));
+    api.answer(w, t.id, '共用'); await settle(); await settle();
+    assert.deepStrictEqual([t.status, w.run.result], ['DONE', 'done'], 'the user answer reaches the worker');
+    mode = 'garbage'; env.prompts.length = 0;
+    w = newW(); env.S.workspaces.push(w);
+    await api.planPhase(w); await settle(); await settle();
+    t = w.tasks[0];
+    const fallback = env.prompts.find((p) => p.agent === 'codex' && p.text.startsWith('Update from Multi-Agent Studio'));
+    assert.ok(fallback.text.includes('could not answer') && t.status === 'DONE', 'two bad leader replies: the worker decides itself');
+    assert.strictEqual(env.prompts.filter((p) => p.agent === 'claude' && p.text === 'Your last reply was not the JSON object Studio needs. Reply again with ONLY that JSON object: no markdown fences, no other text.').length, 1, 'one repair attempt');
+    mode = 'answer';
+    ({ env, api } = makeEnv((agent, text) => { // the worker never stops asking
+      if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"impl","agent":"codex","instructions":"build"}]}';
+      if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+      if (askPrompt(text)) return '{"answer":"shared"}';
+      if (agent === 'claude' && text.includes('Task: impl')) return 'Leader did it.\nSTATUS: DONE';
+      return 'Hmm.\nSTATUS: ASK_LEADER: and now?';
+    }));
+    w = newW(); env.S.workspaces.push(w);
+    await api.planPhase(w); for (let i = 0; i < 6; i++) await settle();
+    t = w.tasks[0];
+    assert.deepStrictEqual([t.status, t.agent, t.ledByLeader, t.leaderAsks], ['DONE', 'claude', true, 3], 'the third question hands the card to the leader');
+    assert.ok(env.logs.some((l) => l.text.includes('已經問了工頭 2 次')));
+    console.log('33 ASK_LEADER: answer, needs_user, unanswerable, hand-over after two: PASS');
+  }
+
   await require('./test-workspace-lease.cjs')({ makeEnv, mkTmp, region });
 
   // status-line parser
@@ -1295,6 +1347,7 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
   assert.strictEqual(parseStatus('x\n**STATUS:** WAITING_AGENT: antigravity: review').detail, 'antigravity: review');
   assert.deepStrictEqual(parseStatus('x\nSTATUS：NEEDS_USER：A 還是 B？\nOPTIONS: A | B').options, ['A', 'B']);
   assert.strictEqual(parseStatus('no status here'), null);
+  assert.deepStrictEqual([parseStatus('x\nSTATUS: ASK_LEADER: A or B?\nOPTIONS: A | B').kind, parseStatus('x\nSTATUS: ASK_LEADER: A or B?\nOPTIONS: A | B').options], ['ASK_LEADER', ['A', 'B']]);
   assert.deepStrictEqual(parseStatus('Edited.\nSTATUS: DONE\nFILES: `src/a.js`, .\\docs\\b.md ，lib/c/ , pkg/__init__.py (new), **x.txt** （刪除）').files, ['src/a.js', 'docs/b.md', 'lib/c', 'pkg/__init__.py', 'x.txt']);
   assert.deepStrictEqual([parseStatus('Edited.\nFILES: x.txt\nSTATUS: DONE').text, parseStatus('Built.\nSTATUS: DONE').files], ['Edited.', []]);
   console.log('6 status-line parser: PASS');
