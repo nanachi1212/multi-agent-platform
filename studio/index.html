@@ -431,7 +431,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<
 const LOOK = { claude: { c:'#d97757', ab:'CC' }, codex: { c:'#10a37f', ab:'CX' }, antigravity: { c:'#4285f4', ab:'AG' } };
 const look = (id) => LOOK[id] || { c:'#8d8678', ab:String(id).slice(0, 2).toUpperCase() };
 // Board lanes; a lane can hold several card states.
-const LANES = [[['WAITING','PAUSED','INTERRUPTED'],'待做'], [['WORKING'],'工作中'], [['WAITING_EXTERNAL','WAITING_AGENT','NEEDS_USER'],'在等'], [['DONE'],'已完成'], [['FAILED'],'失敗 / 停止']];
+const LANES = [[['WAITING','PAUSED','INTERRUPTED'],'待做'], [['WORKING'],'工作中'], [['WAITING_EXTERNAL','WAITING_AGENT','ASK_LEADER','NEEDS_USER'],'在等'], [['DONE'],'已完成'], [['FAILED'],'失敗 / 停止']];
 // 工作卡的每一欄可以收起來；收起的狀態記在這個瀏覽器（localStorage 失敗就只在本次開著有效）
 const FOLD_KEY = 'studio.laneFolded';
 let laneFold = {};
@@ -441,7 +441,7 @@ function toggleLane(key) {
   laneFold[key] = !laneFold[key];
   try { localStorage.setItem(FOLD_KEY, JSON.stringify(laneFold)); } catch { /* not remembered */ }
 }
-const PARKED = ['WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'];
+const PARKED = ['WAITING_EXTERNAL', 'WAITING_AGENT', 'ASK_LEADER', 'NEEDS_USER'];
 const OPEN = ['WAITING', 'WORKING', 'PAUSED', 'INTERRUPTED', ...PARKED];
 const STATUS = { done:'完成', failed:'有失敗', stopped:'已停止', paused:'暫停中', running:'進行中', interrupted:'中斷（可繼續）' };
 let S = null, last = '', histKey = '', histOpenId = null, histOpenProject = '', shownView = null;
@@ -540,6 +540,7 @@ function duty(a, w) {
   if (r?.active && t('NEEDS_USER').length) return { kind:'bad', text:'需要 Nana：' + t('NEEDS_USER')[0].title };
   if (r?.active && t('WAITING_EXTERNAL').length) return { kind:'wait', text:'等待外部結果：' + t('WAITING_EXTERNAL')[0].title };
   if (r?.active && t('WAITING_AGENT').length) return { kind:'wait', text:'等待其他 AI：' + t('WAITING_AGENT')[0].title };
+  if (r?.active && t('ASK_LEADER').length) return { kind:'wait', text:'在問工頭：' + t('ASK_LEADER')[0].title };
   if (w.leader === a.id && r?.active) return { kind:'work', text:{ planning:'工頭：規劃與派工中', summarizing:'工頭：整理總結中' }[r.phase] || '工頭：監督進度中' };
   if (r?.paused && (t('PAUSED').length || w.leader === a.id)) return { kind:'pz', text:'已暫停' + (t('PAUSED')[0] ? '：' + t('PAUSED')[0].title : '') };
   if (r?.active && t('WAITING').length) return { kind:'wait', text:`排隊中 ${t('WAITING').length} 張` };
@@ -733,8 +734,8 @@ function chatHtml(activity) {
 const setHtml = (el, html) => { if (el._html !== html) { el._html = html; el.innerHTML = html; } };
 let doneOpen = false;
 let histCount = 0; // saved jobs of the open project (for 接著上次的工作) // 這次完成的工作卡 drop-down
-const ICON = { DONE:'✅', WORKING:'⏳', WAITING:'🕒', PAUSED:'⏸️', INTERRUPTED:'⏸️', FAILED:'❌', WAITING_EXTERNAL:'🟡', WAITING_AGENT:'🤝', NEEDS_USER:'🔴' };
-const STEP_WORD = { DONE:'已完成', WORKING:'工作中', WAITING:'待做', PAUSED:'已暫停', INTERRUPTED:'已中斷', FAILED:'失敗', WAITING_EXTERNAL:'等待外部結果', WAITING_AGENT:'等待其他 AI', NEEDS_USER:'需要 Nana' };
+const ICON = { DONE:'✅', WORKING:'⏳', WAITING:'🕒', PAUSED:'⏸️', INTERRUPTED:'⏸️', FAILED:'❌', WAITING_EXTERNAL:'🟡', WAITING_AGENT:'🤝', ASK_LEADER:'🙋', NEEDS_USER:'🔴' };
+const STEP_WORD = { DONE:'已完成', WORKING:'工作中', WAITING:'待做', PAUSED:'已暫停', INTERRUPTED:'已中斷', FAILED:'失敗', WAITING_EXTERNAL:'等待外部結果', WAITING_AGENT:'等待其他 AI', ASK_LEADER:'在問工頭', NEEDS_USER:'需要 Nana' };
 const prShort = (pr) => (/^\d+$/.test(String(pr)) ? '#' + pr : '#' + String(pr).split('/').pop());
 
 // One honest line about what a parked card waits for and what happens next.
@@ -857,13 +858,14 @@ function workState(t) {
   if (idle >= STUCK_MS) return { ic:'🟡', stuck:true, text:`可能卡住 · ${dur(idle)}沒有新進度` };
   return { ic:'🟠', text:'工作中' + (ran ? ' · ' + ran : '') + (a ? ' · 最近活動 ' + (idle < 60e3 ? '剛剛' : dur(idle) + '前') : '') };
 }
-const ASKABLE = ['WORKING', 'WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'];
+const ASKABLE = ['WORKING', 'WAITING_EXTERNAL', 'WAITING_AGENT', 'ASK_LEADER', 'NEEDS_USER'];
 const workButtons = (t, project) => `<div class="row" style="gap:6px;margin-top:6px"><button class="btn small ghost" data-detail="${t.id}" data-ws="${esc(project)}">查看工作詳情</button>${ASKABLE.includes(t.status) ? `<button class="btn small" data-ask="${t.id}" data-ws="${esc(project)}" title="不會中斷它的工作，也不會新增工作卡">💬 詢問進度</button>` : ''}</div>`;
 
 function waitLine(t) {
   const wt = t.wait || {};
   if (t.status === 'NEEDS_USER') return `需要 Nana：${t.ask?.question || ''}`;
   if (t.status === 'WAITING_AGENT') return `在等 ${name(wt.agent)}：${wt.what || ''}（它做完會自動交回 ${name(t.agent)}）`;
+  if (t.status === 'ASK_LEADER') return `在問工頭：${wt.what || ''}（工頭回答後自動繼續；問到第 3 次整張卡交給工頭）`;
   if (wt.backendPort) return wt.recoveryReason || `Studio 正在安全檢查 backend ${wt.backendPort}；health 與 application ready 通過後會自動重啟 smoke 並繼續`;
   if (wt.recoveryReason) return wt.recoveryReason;
   if (wt.pr && !wt.manual) return `在等 GitHub CI（PR ${prShort(wt.pr)}）：${wt.ci || '檢查中'}（Studio 每分鐘檢查，跑完自動交回 ${name(t.agent)}）`;
