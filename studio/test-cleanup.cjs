@@ -20,7 +20,7 @@ const { execFile, execFileSync } = require('node:child_process');
     });
   } });
   try {
-    for (scenario of ['clean', 'dirty', 'ignored', 'status-error', 'remove-error', 'ref-error', 'moved-ref', 'old-pr', 'squash-pr', 'outside', 'include', 'include-edited']) {
+    for (scenario of ['clean', 'dirty', 'ignored', 'status-error', 'remove-error', 'ref-error', 'moved-ref', 'old-pr', 'squash-pr', 'dirty-remote', 'outside', 'include', 'include-edited']) {
       calls = []; const w = newW(); w.project = repo; w.run.project = repo; w.run.active = false;
       const t = { id: scenario, title: scenario, agent: 'codex', writes: true, status: 'PAUSED', after: [] }; w.tasks.push(t);
       if (scenario === 'include') { // once: an ignored file and folder, and the include list itself (tracked, like Orca's)
@@ -39,7 +39,7 @@ const { execFile, execFileSync } = require('node:child_process');
         for (const k of ['補上 ignored.txt（複製）、deps（連結）', '.gitignore（沒有被 gitignore）', 'missing.txt（主資料夾沒有）', '*.log（只支援', '../outside（只支援']) assert.ok(note.includes(k), scenario + ': ' + k + ' in ' + note);
         if (scenario === 'include-edited') fs.writeFileSync(path.join(dir, 'ignored.txt'), 'edited');
       }
-      if (scenario === 'dirty' || scenario === 'ignored') fs.writeFileSync(path.join(dir, scenario === 'dirty' ? 'keep.txt' : 'ignored.txt'), 'must survive');
+      if (['dirty', 'ignored', 'dirty-remote'].includes(scenario)) fs.writeFileSync(path.join(dir, scenario === 'ignored' ? 'ignored.txt' : 'keep.txt'), 'must survive');
       if (scenario === 'moved-ref') { git('commit', '--allow-empty', '-qm', 'advanced'); moved = git('rev-parse', 'HEAD'); }
       if (scenario === 'old-pr' || scenario === 'squash-pr') {
         if (!git('remote')) git('remote', 'add', 'origin', 'https://example.invalid/test/repo.git');
@@ -58,6 +58,7 @@ const { execFile, execFileSync } = require('node:child_process');
         assert.strictEqual(fs.existsSync(dir), !['ref-error', 'moved-ref'].includes(scenario));
         if (scenario === 'moved-ref') assert.strictEqual(git('rev-parse', branch), moved);
         if (scenario === 'ignored') assert.strictEqual(fs.readFileSync(path.join(dir, 'ignored.txt'), 'utf8'), 'must survive');
+        if (scenario === 'dirty-remote') assert.ok(git('remote') && !calls.some((c) => c[0] === 'gh') && t.worktree.cleanupError === '仍有修改或未追蹤的檔案', 'an ordinary dirty tree is refused before GitHub is asked');
         if (scenario === 'include-edited') assert.deepStrictEqual([fs.readFileSync(path.join(dir, 'ignored.txt'), 'utf8'), fs.lstatSync(path.join(dir, 'deps')).isSymbolicLink(), t.worktree.cleanupError], ['edited', true, '仍有修改、未追蹤或忽略的檔案'], 'an edited copy keeps the copy, the link and the worktree');
       }
     }

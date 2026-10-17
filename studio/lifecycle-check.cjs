@@ -1279,6 +1279,10 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
     r.lastAt = ''; api.runRoutines(at(18, 9)); w.run = { active: true }; await settle();
     assert.deepStrictEqual([env.started.length, r.lastAt], [1, ''], 'busy while the check ran: the slot waits like a routine without a precheck');
     w.run = null; api.runRoutines(at(18, 9, 1)); await until(() => env.started.length === 2);
+    r.precheck = 'exit 0'; Object.assign(r, { lastAt: '', lastResult: '' }); api.runRoutines(at(19, 9)); api.deleteRoutine(w, r.id); await settle();
+    assert.strictEqual(env.started.length, 2, 'a routine deleted while its check runs does not start'); w.routines.push(r);
+    Object.assign(r, { lastAt: '', lastResult: '' }); const project = w.project; w.project = require('node:path').join(project, 'gone'); api.runRoutines(at(20, 9)); await until(() => r.lastResult);
+    assert.deepStrictEqual([env.started.length, r.lastResult], [2, '略過：前置檢查無法執行（ENOENT）'], 'a command that cannot start is reported as such'); w.project = project;
     assert.strictEqual(api.saveRoutine(w, { id: r.id, precheck: '' }).precheck, '', 'the precheck can be cleared');
     console.log('29 routine precheck: skip once with reason, run on exit 0, busy keeps the slot: PASS');
   }
@@ -1291,7 +1295,7 @@ const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle 
   assert.strictEqual(parseStatus('x\n**STATUS:** WAITING_AGENT: antigravity: review').detail, 'antigravity: review');
   assert.deepStrictEqual(parseStatus('x\nSTATUS：NEEDS_USER：A 還是 B？\nOPTIONS: A | B').options, ['A', 'B']);
   assert.strictEqual(parseStatus('no status here'), null);
-  assert.deepStrictEqual(parseStatus('Edited.\nSTATUS: DONE\nFILES: `src/a.js`, .\\docs\\b.md ，lib/c/ , ').files, ['src/a.js', 'docs/b.md', 'lib/c']);
+  assert.deepStrictEqual(parseStatus('Edited.\nSTATUS: DONE\nFILES: `src/a.js`, .\\docs\\b.md ，lib/c/ , pkg/__init__.py (new), **x.txt** （刪除）').files, ['src/a.js', 'docs/b.md', 'lib/c', 'pkg/__init__.py', 'x.txt']);
   assert.deepStrictEqual([parseStatus('Edited.\nFILES: x.txt\nSTATUS: DONE').text, parseStatus('Built.\nSTATUS: DONE').files], ['Edited.', []]);
   console.log('6 status-line parser: PASS');
   await require('./test-runtime.cjs').runRuntimeTests();

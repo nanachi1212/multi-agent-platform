@@ -725,7 +725,7 @@ If you created, changed or deleted files, add one more line listing every one of
 Never say DONE while you still wait for something. Do not wait or poll inside your turn: report the status and end the turn; Studio wakes you with the result.`;
 
 // A path as the worker wrote it, in the form git ls-files prints (relative, forward slashes), so the two lists compare.
-const relPath = (s) => String(s).trim().replace(/^[`'"*_]+|[`'"*_]+$/g, '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+const relPath = (s) => String(s).replace(/\s*[(（][^()（）]*[)）]\s*$/, '').trim().replace(/^[`'"*]+|[`'"*]+$/g, '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
 function parseStatus(reply) {
   const m = [...reply.matchAll(/^\s*[*_`]*STATUS[*_`]*\s*[:：]\s*[*_`]*\s*(DONE|WAITING_EXTERNAL|WAITING_AGENT|NEEDS_USER|BLOCKED)\b[*_`]*\s*[:：]?\s*(.*)$/gim)].at(-1);
   if (!m) return null;
@@ -921,7 +921,7 @@ const stillStopping = (w) => !!(w.executingSteps?.size || w.recoverySteps?.size 
 // Exit code 0 = go; anything else, or no answer within 30 s, = this slot is skipped and the team costs nothing.
 // ponytail: the command goes through cmd.exe exactly like Node's exec(); the user typed it into their own Studio.
 const precheck = (w, r) => new Promise((res) => execFile('cmd.exe', ['/d', '/s', '/c', `"${r.precheck}"`], { cwd: w.project, windowsHide: true, windowsVerbatimArguments: true, timeout: 30000, maxBuffer: 1 << 20 },
-  (e, out, err) => { const said = String(err || out || '').trim().slice(0, 200); res(e ? (e.killed ? '前置檢查超過 30 秒沒有結束' : `前置檢查結束碼 ${e.code}`) + (said ? '：' + said : '') : ''); }));
+  (e, out, err) => { const said = String(err || out || '').trim().slice(0, 200); res(e ? (e.killed ? '前置檢查超過 30 秒沒有結束' : typeof e.code === 'number' ? `前置檢查結束碼 ${e.code}` : `前置檢查無法執行（${e.code || e.message}）`) + (said ? '：' + said : '') : ''); }));
 
 function runRoutines(now = new Date()) {
   for (const w of S.workspaces) for (const r of w.routines) {
@@ -945,6 +945,7 @@ function runRoutines(now = new Date()) {
     };
     if (!r.precheck) { go(); continue; }
     precheck(w, r).then((why) => {
+      if (!w.routines.includes(r) || !r.on) return; // deleted or switched off while the check ran
       if (why) { // the slot is used up (lastAt is set): a skipped routine is not re-checked every 30 s
         r.lastResult = '略過：' + why;
         log(w, 'studio', 'system', `⏰ 定時工作（${r.time}）這次略過：${why}。`);
@@ -1636,7 +1637,7 @@ async function useWorktree(w, taskId) {
   fs.mkdirSync(path.dirname(dir), { recursive: true });
   const r = await git(info.path, 'worktree', 'add', '-b', branch, dir, base);
   if (r.err) throw new Error('建立 worktree 失敗：' + r.err);
-  const inc = await includeIgnored(info.path, dir);
+  const inc = await includeIgnored(info.path, dir).catch((e) => ({ entries: [], text: '讀取 .worktreeinclude 失敗，什麼都沒補：' + e.message }));
   Object.assign(t, { workdir: dir, worktree: { path: dir, branch, base, repoPath: info.path, included: inc.entries }, blocked: null, blockReason: '', blockLogged: '' });
   log(w, 'studio', 'system', `「${t.title}」改在獨立 worktree 做（branch ${branch}）：不會碰到主資料夾的寫入者。${inc.text ? ' .worktreeinclude：' + inc.text + '。' : ''}`);
   pump(w);
@@ -1665,20 +1666,22 @@ async function useReadOnly(w, taskId) {
 // Orca's .worktreeinclude: gitignored paths the primary checkout has that a fresh worktree needs (.env, node_modules...).
 // One literal path per line, # comments. A file is copied, a directory is junction-linked; a path that is missing,
 // tracked, not ignored, a glob, or outside the repository is skipped and named in the log.
+const sha1 = (buf) => crypto.createHash('sha1').update(buf).digest('hex');
 async function includeIgnored(repo, dir) {
   const f = path.join(repo, '.worktreeinclude'), entries = [], done = [], skipped = [];
   if (!fs.existsSync(f)) return { entries, text: '' };
-  const lines = fs.readFileSync(f, 'utf8').split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#')).slice(0, 50);
+  const all = fs.readFileSync(f, 'utf8').split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#')), lines = all.slice(0, 50);
+  if (all.length > lines.length) skipped.push(`其餘 ${all.length - lines.length} 行（最多 50 行）`);
   for (const rel of lines) {
     const src = path.resolve(repo, rel);
     if (/[*?[!]/.test(rel) || !src.startsWith(repo + path.sep)) { skipped.push(rel + '（只支援 repo 內的字面路徑）'); continue; }
     if (!fs.existsSync(src)) { skipped.push(rel + '（主資料夾沒有）'); continue; }
-    if ((await git(repo, 'check-ignore', '-q', rel)).err !== undefined) { skipped.push(rel + '（沒有被 gitignore）'); continue; }
+    if ((await git(repo, 'check-ignore', '-q', '--', rel)).err !== undefined) { skipped.push(rel + '（沒有被 gitignore）'); continue; }
     const dst = path.join(dir, rel);
     try {
       fs.mkdirSync(path.dirname(dst), { recursive: true });
       if (fs.statSync(src).isDirectory()) { fs.symlinkSync(src, dst, 'junction'); entries.push({ rel, kind: 'dir' }); done.push(rel + '（連結）'); }
-      else { fs.copyFileSync(src, dst, fs.constants.COPYFILE_EXCL); entries.push({ rel, kind: 'file', sha: crypto.createHash('sha1').update(fs.readFileSync(dst)).digest('hex') }); done.push(rel + '（複製）'); }
+      else { fs.copyFileSync(src, dst, fs.constants.COPYFILE_EXCL); entries.push({ rel, kind: 'file', sha: sha1(fs.readFileSync(dst)) }); done.push(rel + '（複製）'); }
     } catch (e) { skipped.push(`${rel}（${e.code || e.message}）`); }
   }
   return { entries, text: [done.length && '補上 ' + done.join('、'), skipped.length && '略過 ' + skipped.join('、')].filter(Boolean).join('；') };
@@ -1687,7 +1690,7 @@ async function includeIgnored(repo, dir) {
 // touched) and a copied file deleted only while every copy is still byte-identical; otherwise nothing is touched and the
 // status check that follows reports the changed copy.
 function removeIncluded(wt) {
-  const sha = (p) => crypto.createHash('sha1').update(fs.readFileSync(p)).digest('hex');
+  const sha = (p) => sha1(fs.readFileSync(p));
   const items = (wt.included || []).map((e) => ({ ...e, p: path.join(wt.path, e.rel) })).filter((e) => { try { e.st = fs.lstatSync(e.p); return true; } catch { return false; } });
   if (items.some((e) => e.kind === 'dir' ? !e.st.isSymbolicLink() : !e.st.isFile() || sha(e.p) !== e.sha)) return false;
   for (const e of items) if (e.kind === 'dir') fs.rmdirSync(e.p); else fs.unlinkSync(e.p);
@@ -1706,6 +1709,7 @@ async function cleanupWorktree(w, t) {
     if (!entry?.split('\0').includes('branch refs/heads/' + wt.branch)) throw new Error('worktree 與登記分支不符');
     const head = await checked(wt.path, 'rev-parse', 'HEAD');
     if (head !== await checked(wt.repoPath, 'rev-parse', '--verify', `refs/heads/${wt.branch}`)) throw new Error('worktree HEAD 與分支不符');
+    if (await checked(wt.path, 'status', '--porcelain', '--untracked-files=all')) throw new Error('仍有修改或未追蹤的檔案');
     if (await checked(wt.repoPath, 'remote')) {
       const pr = await sh('gh', ['pr', 'list', '--head', wt.branch, '--state', 'merged', '--json', 'number,headRefOid'], wt.repoPath);
       if (pr.err || !JSON.parse(pr.out).some((p) => p.headRefOid === head)) throw new Error('無法確認當前 HEAD 已由 PR 交付');
