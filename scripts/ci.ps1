@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Push-Location -LiteralPath $repoRoot
 try {
-    foreach ($file in @('studio/server.mjs', 'studio/state-files.mjs', 'studio/test-state-files.cjs', 'studio/test-cleanup.cjs', 'studio/test-card-files.cjs', 'studio/test-codex-provider.cjs', 'studio/workspace-lease.mjs', 'studio/lifecycle-harness.cjs', 'studio/test-workspace-lease.cjs', 'studio/runtime-registry.mjs', 'studio/isolated-env.mjs', 'studio/runtime-readiness.mjs', 'studio/test-runtime.cjs', 'studio/test-runtime-server.cjs', 'studio/test-ui-ownership.cjs', 'studio/lifecycle-check.cjs')) {
+    foreach ($file in @('studio/server.mjs', 'studio/state-files.mjs', 'studio/test-state-files.cjs', 'studio/test-cleanup.cjs', 'studio/test-card-files.cjs', 'studio/test-turn-stall.cjs', 'studio/test-codex-provider.cjs', 'studio/workspace-lease.mjs', 'studio/lifecycle-harness.cjs', 'studio/test-workspace-lease.cjs', 'studio/runtime-registry.mjs', 'studio/isolated-env.mjs', 'studio/runtime-readiness.mjs', 'studio/test-runtime.cjs', 'studio/test-runtime-server.cjs', 'studio/test-ui-ownership.cjs', 'studio/lifecycle-check.cjs')) {
         & node --check $file
         if ($LASTEXITCODE -ne 0) { throw "Syntax check failed: $file" }
     }
@@ -19,6 +19,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Studio worktree cleanup checks failed' }
     & node studio/test-card-files.cjs
     if ($LASTEXITCODE -ne 0) { throw 'Studio card file report checks failed' }
+    & node studio/test-turn-stall.cjs
+    if ($LASTEXITCODE -ne 0) { throw 'Studio stall evidence checks failed' }
     & node studio/test-runtime.cjs
     if ($LASTEXITCODE -ne 0) { throw 'Studio runtime checks failed' }
     & node studio/lifecycle-check.cjs
