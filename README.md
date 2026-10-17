@@ -93,6 +93,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 - [Workspace lease API 與生命週期](docs/workspace-lease.md)
 - [Runtime ownership 與後端恢復](docs/runtime-ownership.md)
 - [多模型協作設計原則](docs/multi-model-principles.md)
+- [Orca 對照評估：可借鑒與不需要借的地方](docs/orca-comparison.md)
 
 ### 授權
 
