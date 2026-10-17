@@ -10,7 +10,7 @@ import { cleanupRuntime, verifyRuntimeProcess, cleanupJobRuntimes, cleanupStaleR
 import { checkBackendReadiness, recoverOwnedRuntime } from './runtime-readiness.mjs';
 import { createSmokeEnvironment, cleanupIsolatedDir } from './isolated-env.mjs';
 import { writeJson, claimRuntime } from './state-files.mjs';
-import { createCodexRuntimeGuard } from './codex-runtime.mjs';
+import { createCodexRuntimeGuard, processSnapshot, processTree } from './codex-runtime.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 // STUDIO_RUNTIME = a separate runtime folder (settings, history, leases, events, AionCore data), so a test Studio can run
@@ -390,6 +390,34 @@ const convActivity = new Map();
 
 const HARD_CAP_MS = 3 * 3600e3; // no single step may run longer than this
 const CARD_STALL_MS = 15 * 60e3; // a card step with no new message for this long is stopped (a hung tool call); the Leader decides the retry
+const STALL_EXTENSIONS = 3; // a silent step whose command shows signs of life waits this many more periods before it is stopped
+const EVIDENCE_WAIT_MS = 20e3; // between the two process samples that must differ
+// Positive evidence that a silent step is still working, taken before Studio stops it: its working tree changed seconds
+// ago, or its command's processes gained CPU time or a child between two samples. Codex sessions are known by PID; the
+// other agents are AionCore's remaining descendants, shared between conversations, so this can only extend a wait, never
+// shorten one. No evidence is not proof of death: it is what still ends the step, exactly as before.
+async function stepEvidence(agent, convId, w, dir, { snapshot = processSnapshot, pause = sleep } = {}) {
+  const recent = dir ? await recentEdit(w, 0, dir).catch(() => null) : null;
+  if (recent) return { alive: true, why: `${recent.secs} 秒前還有檔案在變（${recent.file}）` };
+  const sample = async () => {
+    const rows = await snapshot();
+    const codex = codexRuntime.trees(agent === 'codex' ? convId : '', rows).map((p) => p.pid);
+    const mine = agent === 'codex' ? codex : acpTree(rows).filter((pid) => !codex.includes(pid));
+    const pids = new Set(mine);
+    return { pids, cpu: rows.filter((p) => pids.has(p.pid)).reduce((a, p) => a + (p.cpu || 0), 0) };
+  };
+  let a, b;
+  try { a = await sample(); } catch (e) { return { alive: false, why: '無法讀取程序清單（' + e.message + '）' }; }
+  if (!a.pids.size) return { alive: false, why: '找不到還在跑的工具程序' };
+  await pause(EVIDENCE_WAIT_MS);
+  try { b = await sample(); } catch (e) { return { alive: false, why: '無法讀取程序清單（' + e.message + '）' }; }
+  const born = [...b.pids].filter((p) => !a.pids.has(p));
+  if (born.length) return { alive: true, why: `指令又啟動了 ${born.length} 個子程序` };
+  if (b.cpu > a.cpu) return { alive: true, why: `指令的程序在 ${EVIDENCE_WAIT_MS / 1000} 秒內還有用到 CPU` };
+  return { alive: false, why: `指令的程序 ${EVIDENCE_WAIT_MS / 1000} 秒內沒有用到 CPU、沒有新子程序` };
+}
+// Every descendant of this Studio's AionCore except AionCore itself (agent CLIs and the commands they run).
+const acpTree = (rows) => { if (!aionProcess) return []; try { return processTree(rows, aionProcess).map((p) => p.pid).filter((pid) => pid !== aionProcess.pid); } catch { return []; } };
 // timeout = how long the agent may show NO progress (new messages); a long job that keeps working is never cut off.
 // bill = where this turn's tokens go: a card, 'lead' (default for Leader turns), or nothing (availability checks).
 async function turn(agent, convId, text, { w, lead = false, check = false, allowStart, ask = false, timeout = 25 * 60e3, progressEvery = 30000, bill = lead && !check ? 'lead' : null } = {}) {
@@ -408,7 +436,7 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
   let confirmedIdle = false;
   try {
     if (!check && (run?.stopped || run?.paused || allowStart && !allowStart())) throw new Halt('執行已停止');
-    let mark = '', markAt = Date.now(), checkedAt = 0, tool = '';
+    let mark = '', markAt = Date.now(), checkedAt = 0, tool = '', extended = 0, graceUntil = 0;
     for (const t0 = Date.now(); ;) {
       await sleep(1500);
       const rt = (await api('GET', `/api/conversations/${convId}`)).runtime || {};
@@ -422,8 +450,17 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
         if (m) tool = m.tool;
       }
       convActivity.set(convId, { at: markAt, tool, confirm: !!rt.pending_confirmations });
-      if (now - markAt > timeout || now - t0 > HARD_CAP_MS) {
+      if ((now - markAt > timeout && now > graceUntil) || now - t0 > HARD_CAP_MS) {
         const mins = Math.round((now - markAt) / 60e3);
+        if (now - t0 <= HARD_CAP_MS && tool && extended < STALL_EXTENSIONS) { // a command is still running: look for signs of life before giving up on it
+          const ev = await stepEvidence(agent, convId, w, bill?.workdir || w?.project).catch((e) => ({ alive: false, why: '無法確認（' + e.message + '）' }));
+          if (ev.alive) {
+            extended++; graceUntil = Date.now() + timeout;
+            log(w, 'studio', 'system', `「${clip(tool, 80)}」已 ${mins} 分鐘沒有新訊息，但${ev.why}：再等 ${Math.round(timeout / 60e3)} 分鐘（第 ${extended}/${STALL_EXTENSIONS} 次）。`);
+            continue;
+          }
+          log(w, 'studio', 'system', `「${clip(tool, 80)}」已 ${mins} 分鐘沒有新訊息，${ev.why}：停止這一步。`);
+        }
         confirmedIdle = await stopTurn(convId); // never leave the conversation busy: the next card on it would bounce with "already running"
         throw Object.assign(new Error(`逾時：${mins >= 1 ? mins + ' 分鐘' : '一段時間'}沒有任何新進度，Studio 已停止這一步`), { timeout: true });
       }

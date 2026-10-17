@@ -49,7 +49,7 @@
 
 ### B. 可考慮（有價值，但要先想清楚觸發條件）
 
-4. **「沉默不等於死亡」：停止前要正面證據（Orca liveness 三值 `live / unverifiable / exited`）**
+4. **「沉默不等於死亡」：停止前要正面證據（Orca liveness 三值 `live / unverifiable / exited`）** — 已實作（2026-10-17）：`stepEvidence`（檔案變動／程序 CPU／新子程序），最多延長 3 次
    - Orca：協調者只有在「程序已退出」「worker 自己回報退出」「transcript 最後一回合沒送 worker_done」才可以 stop／retry；逾時、空等、聯絡不上一律是 `unverifiable`，只能繼續等或檢查，不可當失敗處理。
    - 本方案：`CARD_STALL_MS` = 15 分鐘沒有新訊息就切斷那一步，交給工頭重試；8 分鐘顯示「可能卡住」。租約那邊已經是同一哲學（心跳逾時不算死、未知保留所有權），但卡片這邊還是純逾時。
    - 改法：15 分鐘到時先看證據：Codex 已有 `codex-runtime.mjs` 的程序樹（工具子程序還活著、CPU 有動就延長一次再等）；Claude／Antigravity 若 AionCore 仍有進行中的 tool call 事件也延長。真的無任何活體證據才切。要先定義「最多延長幾次」避免無限等；建議先量現在 15 分鐘誤殺的實際頻率再決定。
