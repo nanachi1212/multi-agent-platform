@@ -915,15 +915,16 @@ let goalOpen = false;
 function goalHtml(w) {
   const rts = w.routines || [], on = rts.filter((r) => r.on).length;
   const row = (r) => `<div class="rt-row"><label style="display:inline-flex;align-items:center;gap:4px;white-space:nowrap" title="打勾＝開啟"><input type="checkbox" data-rt-on="${r.id}" ${r.on ? 'checked' : ''}>${daysLabel(r.days)} ${r.time}</label>
-      <span class="rt-req" title="${esc(r.request)}">${esc(r.request)}</span>
-      <span class="hint" style="font-size:12px;white-space:nowrap" title="${esc(r.lastResult || '')}">${r.lastResult ? '⚠ 上次沒有開始' : r.lastAt ? '上次 ' + fmt(r.lastAt) : '還沒跑過'}</span>
+      <span class="rt-req" title="${esc(r.request)}">${esc(r.request)}</span>${r.precheck ? `<span class="hint" style="font-size:12px" title="前置檢查：這個指令結束碼 0 才開始">🔎 ${esc(r.precheck)}</span>` : ''}
+      <span class="hint" style="font-size:12px;white-space:nowrap" title="${esc(r.lastResult || '')}">${r.lastResult ? (r.lastResult.startsWith('略過') ? '⏭ 上次略過' : '⚠ 上次沒有開始') : r.lastAt ? '上次 ' + fmt(r.lastAt) : '還沒跑過'}</span>
       <button class="btn small ghost" data-rt-del="${r.id}" title="刪除這個定時工作">🗑</button></div>`;
   return `<details class="rules" id="goalDrop" ${goalOpen ? 'open' : ''}><summary>🎯 長期目標・⏰ 定時工作${w.mission ? '' : '（還沒寫目標）'}${on ? `・${on} 個定時工作開啟` : ''} ▾</summary><div class="goal-b">
     <b>長期目標</b><span class="hint" style="font-size:12px">工頭規劃、每張工作卡和最後確認都會帶著這段，讓 AI 知道「為什麼做」。離開輸入框就會儲存。</span>
     <textarea data-mission placeholder="例如：做一個自己每天會用的台股選股與持股追蹤工具，資料以官方來源為準。" style="min-height:56px">${esc(w.mission || '')}</textarea>
-    <b>定時工作</b><span class="hint" style="font-size:12px">時間到就自動「交給團隊」，照這個專案的交付方式做。專案正在工作或暫停時，等它空下來只跑一次。</span>
+    <b>定時工作</b><span class="hint" style="font-size:12px">時間到就自動「交給團隊」，照這個專案的交付方式做。專案正在工作或暫停時，等它空下來只跑一次。可加「前置檢查」：那個指令結束碼不是 0 就略過這次、不花額度。</span>
     ${rts.map(row).join('')}
     <div class="rt-row" style="flex-wrap:wrap"><input data-rt-time type="time" value="09:00" style="width:auto;padding:4px 8px;font-size:13px">${DAY_NAMES.map((n, i) => `<label style="display:inline-flex;align-items:center;gap:2px"><input type="checkbox" data-rt-day="${i}" checked>${n}</label>`).join('')}</div>
+    <div class="rt-row"><input data-rt-precheck placeholder="前置檢查（選填）：指令結束碼 0 才開始，例如 gh pr list --json number -q .[0].number" value="${esc(drafts['rtp:' + w.project] || '')}" style="flex:1;padding:4px 8px;font-size:13px"></div>
     <div class="rt-row"><input data-rt-request placeholder="時間到要交給團隊的需求，例如：檢查今天的資料抓取有沒有成功，有錯就修好" value="${esc(drafts['rt:' + w.project] || '')}" style="flex:1;padding:4px 8px;font-size:13px"><button class="btn small" data-rt-add>＋ 新增</button></div>
   </div></details>`;
 }
@@ -1354,6 +1355,7 @@ document.addEventListener('input', (e) => {
   if (e.target.id === 'request' && ws()) drafts[ws()] = e.target.value;
   if (e.target.id === 'instruction' && ws()) drafts['i:' + ws()] = e.target.value;
   if (e.target.matches('input[data-rt-request]') && ws()) drafts['rt:' + ws()] = e.target.value;
+  if (e.target.matches('input[data-rt-precheck]') && ws()) drafts['rtp:' + ws()] = e.target.value;
 });
 document.addEventListener('toggle', (e) => { if (e.target.id === 'doneDrop') doneOpen = e.target.open; if (e.target.id === 'goalDrop') goalOpen = e.target.open; }, true);
 document.addEventListener('change', (e) => {
@@ -1422,8 +1424,8 @@ document.addEventListener('click', (e) => {
   if (rtAdd) {
     const box = rtAdd.closest('.goal-b'), p = ws();
     const days = [...box.querySelectorAll('input[data-rt-day]:checked')].map((x) => Number(x.dataset.rtDay));
-    return post('/api/routine/save', { ws: p, request: box.querySelector('input[data-rt-request]').value, time: box.querySelector('input[data-rt-time]').value, days })
-      .then(() => { drafts['rt:' + p] = ''; $('office')._html = ''; rtAdd.blur(); render(); }).catch(() => {});
+    return post('/api/routine/save', { ws: p, request: box.querySelector('input[data-rt-request]').value, precheck: box.querySelector('input[data-rt-precheck]').value, time: box.querySelector('input[data-rt-time]').value, days })
+      .then(() => { drafts['rt:' + p] = ''; drafts['rtp:' + p] = ''; $('office')._html = ''; rtAdd.blur(); render(); }).catch(() => {});
   }
   const rtDel = e.target.closest('[data-rt-del]');
   if (rtDel) { if (confirm('刪除這個定時工作？')) post('/api/routine/delete', { ws: ws(), id: rtDel.dataset.rtDel }).then(() => { $('office')._html = ''; rtDel.blur(); }).catch(() => {}); return; }
