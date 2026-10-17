@@ -1951,7 +1951,7 @@ function handToLeader(w, t, why) {
 function applyStatus(w, t, st, reply) {
   const who = agentName(t.agent);
   t.result = st.text || '(沒有文字回覆)';
-  log(w, t.agent, 'worker', t.result);
+  if (st.kind !== 'ASK_LEADER' || st.text) log(w, t.agent, 'worker', t.result); // a reply that is only a question is logged as the question below
   if (st.kind === 'BLOCKED') { // not done: the card fails, cards that build on it do not start, the Leader decides the retry
     if (handToLeader(w, t, st.detail || 'technical problem')) return;
     Object.assign(t, { status: 'FAILED', detail: st.detail || 'technical problem' });
