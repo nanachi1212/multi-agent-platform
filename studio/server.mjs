@@ -2363,8 +2363,8 @@ function ciOf(rollup = []) {
   return { state, total: rollup.length, done: rollup.length - pending.length, failed, pending };
 }
 
-// Reads the folder's real state. prNums = PR numbers the last job mentioned.
-async function readGitState(project, prNums) {
+// Reads the folder's real state. prRefs = {n, repo|null} PRs the last job mentioned (repo null = bare #N).
+async function readGitState(project, prRefs) {
   const g = { checkedAt: new Date().toISOString(), prs: [] };
   const st = await git(project, 'status', '--porcelain=v1', '-b');
   if (st.err) return { ...g, error: '這個資料夾不是 Git 專案' };
@@ -2376,6 +2376,7 @@ async function readGitState(project, prNums) {
   const repo = await originRepo(project);
   if (!repo) return { ...g, error: '沒有 GitHub origin，只能看本機 Git' };
   g.repo = repo;
+  const prNums = prRefs.filter((r) => !r.repo || r.repo === repo.toLowerCase()).map((r) => r.n); // a PR of another repo is not ours
   try { g.mainSha = String(await ghJson(['api', `repos/${repo}/commits/HEAD`, '--jq', '{sha: .sha}'], project).then((x) => x.sha)).slice(0, 7); } catch { g.mainSha = ''; }
   let list;
   try { list = await ghJson(['pr', 'list', '--repo', repo, '--state', 'all', '--limit', '8', '--json', PR_FIELDS], project); }
@@ -2460,7 +2461,7 @@ function projectContext(w) {
     `- repo ${g.repo || '?'}; main ${g.mainSha || '?'}; local branch ${g.branch || '?'} @ ${g.headSha || '?'} (${g.dirty || 0} uncommitted, ahead ${g.ahead || 0}, behind ${g.behind || 0})`,
     ...(g.prs || []).filter((p) => p.state === 'OPEN' || p.mentioned).map(pr),
   ].join('\n');
-  return [memory, verified, `Done: ${ps.done.join('; ') || 'nothing recorded'}`, `Still open: ${ps.current.join('; ') || 'nothing'}`, `Next action: ${ps.next || 'none'}`].filter(Boolean).join('\n');
+  return [memory, verified, `Done: ${ps.done.map(t).join('; ') || 'nothing recorded'}`, `Still open: ${ps.current.map(t).join('; ') || 'nothing'}`, `Next action: ${ps.next || 'none'}`].filter(Boolean).join('\n');
 }
 
 const refreshing = new Map(); // project -> promise (one refresh at a time per project)
@@ -2468,7 +2469,7 @@ function refreshState(w) {
   if (refreshing.has(w.project)) return refreshing.get(w.project);
   const p = (async () => {
     const job = latestJob(w);
-    const nums = job ? [...new Set(knownRefs(job).map((x) => +(String(x).match(/(?:pull\/|#)(\d+)/)?.[1] || 0)).filter(Boolean))] : [];
+    const nums = job ? knownRefs(job).map((x) => String(x).match(/(?:github\.com\/([^/\s]+\/[^/\s]+)\/pull\/|#)(\d+)/)).filter(Boolean).map((m) => ({ n: +m[2], repo: m[1]?.toLowerCase() || null })).filter((r) => r.n) : [];
     const info = await workspaceOf(w.project);
     Object.assign(w, { wsKey: info.key, wsInfo: { path: info.path, branch: info.branch, repo: info.repo } });
     w.pstate = deriveState(job, await readGitState(w.project, nums));
