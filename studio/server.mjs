@@ -51,8 +51,8 @@ function registerExternal(e) {
 // AionCore runs Claude Code and Codex over ACP and has a catalog of other ACP agents (Gemini CLI, OpenCode, Kimi…).
 // The user adds one from that catalog (backend) or as a custom command (AionCore keeps it; Studio keeps its agentId).
 // Studio does not know their modes: a Worker uses the catalog's "allow everything" mode when there is one, else the
-// default mode, where Studio answers permission requests (allow for Workers, reject for the Leader). Read-only cards
-// keep the prompt fence (RO_MODE), like Antigravity.
+// default mode, where Studio answers permission requests. The Leader and read-only cards use the default mode, where
+// Studio rejects every permission request; an agent whose default mode edits without asking is fenced by the prompt only.
 function registerAcp(e) {
   const who = e.agentId ? { agent_id: e.agentId } : { backend: e.backend };
   AGENTS[e.id] = { name: e.name, acp: true, create: (ws, lead) => ({ type: 'acp', extra: { ...who, workspace: ws, ...(!lead && e.yolo ? { session_mode: e.yolo } : {}) } }) };
@@ -668,7 +668,7 @@ const available = (id) => S.agents[id]?.status === 'available';
 // A read-only card (ro) gets a conversation in the agent's non-writing mode, like the Leader: the prompt alone is not a fence.
 // Not for Antigravity: its non-writing mode makes AionCore install a per-tool permission hook that runs aioncore.exe,
 // which fails on a non-ASCII install path and blocks every tool (even reading). Its read-only cards keep the prompt fence.
-const RO_MODE = (agent) => agent !== 'antigravity' && !AGENTS[agent]?.acp;
+const RO_MODE = (agent) => agent !== 'antigravity';
 const dirTag = (d) => (d ? '@' + crypto.createHash('sha1').update(String(d)).digest('hex').slice(0, 6) : '');
 // ro: false = a writing card; true = REVIEW card in the non-writing sandbox (it reads and judges); 'chk' = CHECK card: it must RUN
 // tests / lint / builds (they write caches and build output), so it is not sandboxed, has its own conversation (an independent
@@ -1433,14 +1433,19 @@ async function treeFiles(dir) {
 // The working tree (tracked and untracked, not ignored) as a git tree object, built in a copy of the index: HEAD, the real
 // index and the files stay as they are. Two of them give the exact diff of one card step. Nothing refers to the objects,
 // so `git gc` drops them after its prune period (two weeks by default); '' = no snapshot.
+// A worker may edit the repo config, and `git add` runs its filter programs outside the worker's sandbox: every
+// filter.<name>.clean / .process is blanked for the snapshot (git skips an empty command; a required filter then fails
+// the add, so there is no snapshot). Config that cannot be read: no snapshot either.
 async function snapTree(dir) {
   const real = (await git(dir, 'rev-parse', '--path-format=absolute', '--git-path', 'index')).out?.trim();
-  if (!real) return '';
+  const cfg = real && (await git(dir, 'config', '--list')).out;
+  if (!real || cfg == null) return '';
+  const noFilters = [...new Set([...cfg.matchAll(/^filter\.(.+)\.(?:clean|process)=/gm)].map((m) => m[1]))].flatMap((n) => ['-c', `filter.${n}.clean=`, '-c', `filter.${n}.process=`]);
   const idx = path.join(RT, 'studio', 'idx-' + crypto.randomBytes(6).toString('hex'));
   try {
     try { fs.copyFileSync(real, idx); } catch { /* no index yet: git hashes every file */ }
     const env = { ...process.env, GIT_INDEX_FILE: idx };
-    if ((await sh('git', [...GIT_SAFE, 'add', '-A'], dir, env)).err) return '';
+    if ((await sh('git', [...GIT_SAFE, ...noFilters, 'add', '-A'], dir, env)).err) return '';
     return (await sh('git', [...GIT_SAFE, 'write-tree'], dir, env)).out?.trim() || '';
   } finally { fs.rmSync(idx, { force: true }); }
 }
@@ -2451,8 +2456,7 @@ const sh = (cmd, args, cwd, env) => new Promise((res) => execFile(cmd, args, { c
   (e, out, err) => res(e ? { err: String(err || e.message).trim().slice(0, 200) } : { out: String(out) })));
 // Folders owned by another Windows account (e.g. the Codex sandbox user) need safe.directory to be readable.
 // Only local reads that run no repo-configured programs go through it: fsmonitor is off, and nothing here talks to a remote.
-// snapTree also writes objects (never refs, the index or files); like `git status`, its `git add` runs clean filters only
-// when the repo's own local config defines them (filter commands are never cloned).
+// snapTree also writes objects (never refs, the index or files), with every filter program blanked.
 const GIT_SAFE = ['-c', 'safe.directory=*', '-c', 'core.fsmonitor=false'];
 const git = (cwd, ...args) => sh('git', [...GIT_SAFE, ...args], cwd);
 const PR_FIELDS = 'number,title,state,headRefName,mergedAt,url,statusCheckRollup,reviewDecision,author';

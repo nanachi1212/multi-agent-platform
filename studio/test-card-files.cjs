@@ -48,6 +48,10 @@ const { execFile, execFileSync } = require('node:child_process');
     for (const s of ['+A', '+++ b/new.txt', '--- a/c.txt']) assert.ok(patch.includes(s), 'step diff has ' + s);
     assert.ok(!patch.includes('build.log'), 'ignored output is not in the step diff');
     assert.strictEqual(git('diff', '--cached', '--name-only'), '', 'snapshots never stage anything');
+    // A worker that can edit the repo config must not get a program run by Studio's own git: snapshots never run filters.
+    git('config', 'filter.trap.clean', 'echo ran > FILTER_RAN; cat'); write('.gitattributes', 'trap.dat filter=trap\n'); write('trap.dat', 'x');
+    assert.ok(await api.snapTree(repo), 'snapshot still taken');
+    assert.ok(!fs.existsSync(path.join(repo, 'FILTER_RAN')), 'repo-configured clean filter did not run');
     console.log('card files: listed vs changed, absolute and ./ paths, deletions, ignored output, missing FILES line, read-only cards, step diffs: PASS');
   } finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 }); }
 })().catch((e) => { console.error('FAIL', e); process.exit(1); });

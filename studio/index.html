@@ -603,7 +603,7 @@ function acpHtml() {
       ${a.status === 'unavailable' ? `<span class="hint" style="color:var(--bad)">${esc(a.note)}</span>` : ''}
       <span class="spacer"></span><button class="btn small ghost" data-acp-check="${e.id}">重新測試</button><button class="btn small ghost" data-acp-del="${e.id}">刪除</button></div>`;
   }).join('');
-  return `<div class="hint">把其他走 ACP 的 coding agent（Gemini CLI、OpenCode、Kimi…）加進團隊：可以當工頭或成員，會讀寫專案檔案。唯讀的審查卡只靠提示約束，和 Antigravity 一樣。</div>${rows}<div class="row" style="margin-top:8px"><button class="btn small" data-acp-add>＋ 新增 ACP Agent</button></div>`;
+  return `<div class="hint">把其他走 ACP 的 coding agent（Gemini CLI、OpenCode、Kimi…）加進團隊：可以當工頭或成員，會讀寫專案檔案。工頭和唯讀的審查卡用它的預設模式，Studio 拒絕所有權限詢問；預設模式不詢問就改檔的 agent，唯讀只靠提示約束。</div>${rows}<div class="row" style="margin-top:8px"><button class="btn small" data-acp-add>＋ 新增 ACP Agent</button></div>`;
 }
 async function acpOpen() {
   $('acpErr').textContent = ''; $('acpName').value = ''; $('acpCmd').value = ''; $('acpArgs').value = ''; $('acpCustom').open = false;
