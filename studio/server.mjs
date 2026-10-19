@@ -47,6 +47,20 @@ function registerExternal(e) {
   for (const w of S.workspaces) w.agentCfg[e.id] ??= { model: '', effort: '' };
 }
 
+// ---------- More ACP agents ----------
+// AionCore runs Claude Code and Codex over ACP and has a catalog of other ACP agents (Gemini CLI, OpenCode, Kimi…).
+// The user adds one from that catalog (backend) or as a custom command (AionCore keeps it; Studio keeps its agentId).
+// Studio does not know their modes: a Worker uses the catalog's "allow everything" mode when there is one, else the
+// default mode, where Studio answers permission requests. The Leader and read-only cards use the default mode, where
+// Studio rejects every permission request; an agent whose default mode edits without asking is fenced by the prompt only.
+function registerAcp(e) {
+  const who = e.agentId ? { agent_id: e.agentId } : { backend: e.backend };
+  AGENTS[e.id] = { name: e.name, acp: true, create: (ws, lead) => ({ type: 'acp', extra: { ...who, workspace: ws, ...(!lead && e.yolo ? { session_mode: e.yolo } : {}) } }) };
+  (S.agents[e.id] ??= { id: e.id, status: 'checking', note: '', working: 0, models: [], efforts: [] }).name = e.name;
+  S.agentCfg[e.id] ??= { model: '', effort: '' };
+  for (const w of S.workspaces) w.agentCfg[e.id] ??= { model: '', effort: '' };
+}
+
 // What a project does when a job is done: stop (default) | suggest next steps | auto-continue (user opts in).
 const AFTER_DONE = ['stop', 'suggest', 'auto'];
 const STRATEGY_IDS = ['save', 'balanced', 'quality', 'custom']; // model strategies (see STRATEGIES)
@@ -54,7 +68,7 @@ const DELIVERY_IDS = ['auto', 'pr']; // delivery: auto = all the way to merge (d
 const AUTO_MAX_DEFAULT = 5; // auto-started jobs in a row before Studio stops and waits for the user (per project; 0 = no limit)
 const TOKEN_CAP_DEFAULT = 0; // tokens one card may spend before Studio stops it (0 = no cap); checked between steps, not inside one
 // S.leader is the default Leader for newly opened projects.
-const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [], leases: [], external: [],
+const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [], leases: [], external: [], acp: [],
   limits: {}, notify: true, notices: [], noticeSeq: 0, runtimes: [] };
 // One workspace per project folder: its own Leader, board, team chat and run, so projects work side by side.
 // name = optional display name (tabs, cards, notifications); the folder name is used when empty.
@@ -88,6 +102,7 @@ const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { retu
 try {
   const saved = JSON.parse(fs.readFileSync(SETTINGS, 'utf8'));
   for (const e of saved.external || []) if (e?.id && e.providerId && e.model) { S.external.push({ id: String(e.id), name: String(e.name || e.model), platform: e.platform, baseUrl: String(e.baseUrl || ''), isFullUrl: !!e.isFullUrl, model: String(e.model), providerId: String(e.providerId) }); registerExternal(S.external.at(-1)); }
+  for (const e of saved.acp || []) if (e?.id && (e.backend || e.agentId)) { S.acp.push({ id: String(e.id), name: String(e.name || e.id), backend: String(e.backend || ''), yolo: String(e.yolo || ''), agentId: String(e.agentId || ''), command: String(e.command || ''), args: (e.args || []).map(String) }); registerAcp(S.acp.at(-1)); }
   if (AGENTS[saved.leader]) S.leader = saved.leader;
   for (const id in S.agentCfg) Object.assign(S.agentCfg[id], saved.agentCfg?.[id]);
   // Older settings had one `project` and global models; it becomes the first open workspace with those models.
@@ -105,7 +120,7 @@ try {
 
 function saveSettings() {
   const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tokenCap: w.tokenCap, mission: w.mission, routines: w.routines }));
-  writeJson(SETTINGS, { leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external });
+  writeJson(SETTINGS, { leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external, acp: S.acp });
 }
 
 function saveRun(w, status) {
@@ -328,14 +343,27 @@ function setWorker(w, agent, on) {
 
 const active = new Map(); // conversationId -> turnId (for Stop)
 
+// The option that allows (allow = true) or rejects a permission request. ACP marks each option with a kind
+// (allow_once / allow_always / reject_once / reject_always); without kinds, a clear word in the option decides.
+// No clear option: a Worker takes the first one (it may write anyway); a rejecting turn gets null and never guesses.
+const ALLOW_WORD = /\b(allow|approve|accept|yes|proceed)\b/i, REJECT_WORD = /\b(reject|deny|cancel|abort|no)\b/i;
+function pickOption(opts, allow) {
+  const kind = (o) => String(o.kind ?? o.data?.kind ?? ''), text = (o) => [o.value, o.option_id, o.optionId, o.label, o.name].filter((x) => x != null).join(' ');
+  const pick = opts.some(kind) ? opts.find((o) => (allow ? /^allow/ : /^reject/).test(kind(o)))
+    : opts.find((o) => (allow ? ALLOW_WORD : REJECT_WORD).test(text(o)) && !(allow ? REJECT_WORD : ALLOW_WORD).test(text(o)));
+  return pick || (allow ? opts[0] || null : null);
+}
 async function answerConfirmations(w, convId, allow) {
-  // Modes are chosen so this should not happen; if it does, never leave a turn hanging.
+  // Modes are chosen so this rarely happens (ACP agents without a known mode rely on it); never leave a turn hanging.
   for (const c of (await api('GET', `/api/conversations/${convId}/confirmations`)) || []) {
-    const opts = c.options || [];
-    const re = allow ? /allow|approve|accept|yes|proceed/i : /reject|deny|cancel|abort|no/i;
-    const pick = opts.find((o) => re.test(String(o.value))) || opts[allow ? 0 : opts.length - 1];
+    const opts = c.options || [], pick = pickOption(opts, allow);
+    if (!pick && opts.length) { // nothing is clearly a rejection: stop the turn instead of answering with a guess
+      log(w, 'studio', 'system', '權限詢問沒有可辨認的「拒絕」選項，Studio 停止這一步，不替它允許。');
+      await cancelTurn(convId);
+      continue;
+    }
     await api('POST', `/api/conversations/${convId}/confirmations/${encodeURIComponent(c.callId ?? c.id)}/confirm`,
-      { msg_id: c.msgId ?? c.id, data: pick ? pick.value : allow ? 'allow' : 'reject' }).catch((e) => log(w, 'studio', 'system', '自動回應確認失敗：' + e.message));
+      { msg_id: c.msgId ?? c.id, data: pick ? pick.value ?? pick.option_id ?? pick.optionId : allow ? 'allow' : 'reject' }).catch((e) => log(w, 'studio', 'system', '自動回應確認失敗：' + e.message));
   }
 }
 
@@ -530,17 +558,75 @@ async function saveExternal(b) {
   } catch (err) { throw hideKey(err, key); }
 }
 
-async function deleteExternal(id) {
-  const e = extOf(id);
-  if (!e) throw new Error('找不到這個外部模型');
+// An added agent (external model, ACP agent) cannot be deleted while a project uses it.
+function assertUnused(id, name) {
   const w = S.workspaces.find((x) => x.leader === id || x.run?.convs && x.tasks.some((t) => t.agent === id && !['DONE', 'FAILED'].includes(t.status)));
-  if (w) throw new Error(`「${label(w)}」正在用 ${e.name}（工頭或未完成的工作卡）；先換掉或等它做完再刪除`);
-  await api('DELETE', '/api/providers/' + e.providerId, {}).catch((err) => { if (!/404|not found/i.test(err.message)) throw err; });
-  S.external = S.external.filter((x) => x !== e);
+  if (w) throw new Error(`「${label(w)}」正在用 ${name}（工頭或未完成的工作卡）；先換掉或等它做完再刪除`);
+}
+function forgetAgent(id) {
   if (S.leader === id) S.leader = 'codex';
   delete AGENTS[id]; delete S.agents[id]; delete S.agentCfg[id];
   for (const x of S.workspaces) { delete x.agentCfg[id]; x.workers = x.workers.filter((a) => a !== id); if (x.finisher === id) x.finisher = ''; if (x.fallback === id) x.fallback = ''; }
   saveSettings();
+}
+const notFound = (err) => { if (!/404|not found/i.test(err.message)) throw err; };
+
+async function deleteExternal(id) {
+  const e = extOf(id);
+  if (!e) throw new Error('找不到這個外部模型');
+  assertUnused(id, e.name);
+  await api('DELETE', '/api/providers/' + e.providerId, {}).catch(notFound);
+  S.external = S.external.filter((x) => x !== e);
+  forgetAgent(id);
+}
+
+// ---------- ACP agent operations ----------
+const acpOf = (id) => S.acp.find((x) => x.id === id);
+// AionCore's other built-in ACP agents (Claude Code and Codex are Studio's own seats), installed ones first.
+async function acpCatalog() {
+  const all = (await api('GET', '/api/agents/management')) || [];
+  return all.filter((a) => a.agent_type === 'acp' && a.agent_source === 'builtin' && a.backend && !['claude', 'codex'].includes(a.backend))
+    .map((a) => ({ backend: a.backend, name: a.name, installed: !!a.installed, yolo: a.yolo_id || '', guidance: a.last_check_guidance || '', added: S.acp.some((x) => x.backend === a.backend) }))
+    .sort((a, b) => b.installed - a.installed || a.name.localeCompare(b.name));
+}
+// Add from the catalog ({ backend }) or as a custom command ({ name, command, args }).
+async function addAcp(b) {
+  let e;
+  if (b.backend) {
+    const c = (await acpCatalog()).find((x) => x.backend === b.backend);
+    if (!c) throw new Error('AionCore 沒有這個 ACP agent：' + b.backend);
+    if (c.added) throw new Error(c.name + ' 已經加入了');
+    e = { id: 'acp_' + c.backend, name: c.name, backend: c.backend, yolo: c.yolo, agentId: '', command: '', args: [] };
+  } else {
+    const name = String(b.name || '').trim(), command = String(b.command || '').trim();
+    // ponytail: arguments split on spaces, no quoting; enough for `opencode acp` / `npx -y pkg --acp`.
+    const args = String(b.args || '').trim().split(/\s+/).filter(Boolean);
+    if (!name) throw new Error('請填顯示名稱');
+    if (!command) throw new Error('請填啟動指令（例如 opencode）');
+    const agentId = (await api('POST', '/api/agents/custom', { name, command, args })).id;
+    e = { id: 'acp_' + crypto.randomBytes(4).toString('hex'), name, backend: '', yolo: '', agentId, command, args };
+  }
+  S.acp.push(e);
+  for (const w of S.workspaces) w.workers = [...new Set([...w.workers, e.id])];
+  registerAcp(e);
+  saveSettings();
+  checkAgent(e.id); // in the background, like an external model
+  return { id: e.id };
+}
+async function deleteAcp(id) {
+  const e = acpOf(id);
+  if (!e) throw new Error('找不到這個 ACP agent');
+  assertUnused(id, e.name);
+  if (e.agentId) await api('DELETE', '/api/agents/custom/' + e.agentId, {}).catch(notFound);
+  S.acp = S.acp.filter((x) => x !== e);
+  forgetAgent(id);
+}
+// A catalog agent that is not installed fails the check with AionCore's own guidance instead of a spawn error.
+async function acpReady(id) {
+  const e = acpOf(id);
+  if (!e?.backend) return;
+  const c = (await acpCatalog()).find((x) => x.backend === e.backend);
+  if (c && !c.installed) throw new Error(`${e.name} 沒有安裝。${c.guidance}`);
 }
 
 // Ask the provider which models it offers (the key comes from the form, or from the saved provider when editing).
@@ -575,6 +661,7 @@ async function checkAgent(id) {
     fs.mkdirSync(ws, { recursive: true });
     // The check uses agent defaults so a bad saved model can't make the agent look unavailable.
     if (AGENTS[id].external) await extProvider(id);
+    if (AGENTS[id].acp) await acpReady(id);
     const reply = await turn(id, await createConv(id, ws, true), 'Reply with exactly: OK', { lead: true, check: true, timeout: 120e3 });
     if (!/OK/i.test(reply)) throw new Error('沒有正常回覆：' + (reply || '(空白)'));
     if (a.checkTok === tok) a.status = 'available';
@@ -1356,6 +1443,52 @@ async function treeFiles(dir) {
     catch (e) { if (e.code === 'ENOENT') return [p, 'deleted']; throw e; }
   });
 }
+// The working tree (tracked and untracked, not ignored) as a git tree object, built in a copy of the index: HEAD, the real
+// index and the files stay as they are. Two of them give the exact diff of one card step. Nothing refers to the objects,
+// so `git gc` drops them after its prune period (two weeks by default); '' = no snapshot.
+// A worker may edit the repo config, and `git add` would run the filter programs it names outside the worker's sandbox.
+// So the add never reads the repo config: it runs in a private GIT_DIR that writes into the repo's object store, with
+// only the line-ending / file-mode keys copied over (plain values, no programs). Attributes still apply; a filter= with
+// no driver in the config git reads does nothing.
+const SNAP_KEYS = /^core\.(autocrlf|eol|safecrlf|filemode|symlinks|ignorecase|precomposeunicode|checkroundtripencoding)$/;
+async function snapTree(dir) {
+  const [index, objects, exclude, format] = ((await git(dir, 'rev-parse', '--path-format=absolute', '--git-path', 'index', '--git-path', 'objects', '--git-path', 'info/exclude', '--show-object-format')).out || '').trim().split(/\r?\n/);
+  if (!/^\w+$/.test(format || '')) return '';
+  const local = ((await git(dir, 'config', '--local', '-z', '--get-regexp', '^core\\.')).out || '').split('\0').map((e) => e.split('\n')).filter(([k, v]) => SNAP_KEYS.test(k) && v != null);
+  const tmp = path.join(RT, 'studio', 'snap-' + crypto.randomBytes(6).toString('hex')), cfg = path.join(tmp, 'config');
+  try {
+    for (const d of ['info', 'refs', 'objects']) fs.mkdirSync(path.join(tmp, d), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'HEAD'), 'ref: refs/heads/snapshot\n');
+    fs.writeFileSync(cfg, format === 'sha1' ? '[core]\n\trepositoryformatversion = 0\n' : `[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = ${format}\n`);
+    for (const [k, v] of local) if ((await sh('git', ['config', '--file', cfg, k, v])).err) return '';
+    for (const [from, to] of [[index, 'index'], [exclude, 'info/exclude']]) try { fs.copyFileSync(from, path.join(tmp, to)); } catch { /* none yet */ }
+    const env = { ...process.env, GIT_DIR: tmp, GIT_WORK_TREE: dir, GIT_INDEX_FILE: path.join(tmp, 'index'), GIT_OBJECT_DIRECTORY: objects };
+    if ((await sh('git', [...GIT_SAFE, 'add', '-A'], dir, env)).err) return '';
+    return (await sh('git', [...GIT_SAFE, 'write-tree'], dir, env)).out?.trim() || '';
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+}
+const STEP_DIFF_MAX = 400e3; // characters of patch shown for one step
+// git output read as a stream and cut at max characters (the git process is stopped there), so a huge patch still shows its start.
+function gitHead(cwd, args, max) {
+  return new Promise((res) => {
+    const p = spawn('git', [...GIT_SAFE, ...args], { cwd, windowsHide: true });
+    let out = '', err = '', cut = false;
+    const timer = setTimeout(() => p.kill(), 30e3);
+    p.stdout.setEncoding('utf8').on('data', (d) => { if (cut) return; out += d; if (out.length > max) { cut = true; p.kill(); } });
+    p.stderr.setEncoding('utf8').on('data', (d) => { err += d; });
+    p.on('error', (e) => { clearTimeout(timer); res({ err: e.message }); });
+    p.on('close', (code) => { clearTimeout(timer); res(cut ? { out: out.slice(0, max), cut } : code === 0 ? { out } : { err: err.trim().slice(0, 200) || 'git 沒有完成' }); });
+  });
+}
+async function stepDiff(w, id, n) {
+  const t = w.tasks.find((x) => x.id === id), s = t?.steps?.[n];
+  if (!s) throw new Error('找不到這一步');
+  // A worktree card's folder is removed after its merge; its snapshot objects live in the main repository.
+  const dir = (await workspaceOf(t.worktree?.repoPath || t.workdir || w.project)).path;
+  const r = await gitHead(dir, ['-c', 'core.quotepath=false', 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '--stat', '--patch', s.before, s.after], STEP_DIFF_MAX);
+  if (r.err) throw new Error('讀不到這一步的 diff（可能已被 git 清掉）：' + r.err);
+  return { text: r.cut ? r.out + `\n…（只顯示前 ${STEP_DIFF_MAX / 1000}k 字元）` : r.out };
+}
 // Paths whose entry differs between two snapshots: added, changed or deleted.
 function changedFiles(before, after) {
   const key = (e) => JSON.stringify(e.slice(1));
@@ -1816,6 +1949,7 @@ async function runCard(w, t) {
   t.firstStartedAt ||= t.workingSince;
   t.wakeNote = '';
   log(w, t.agent, 'worker', (note ? '收到等待的結果，繼續：' : t.resumed ? '繼續工作：' : '開始工作：') + t.title);
+  let snap = null; // { dir, at, before }: a writing step's tree before it; the after-tree is taken however the step ends
   try {
     const deps = (t.after || []).map((id) => w.tasks.find((x) => x.id === id)).filter(Boolean);
     const knowsTask = t.briefed === workKey(t); // this agent's conversation has had the full card brief (a handoff or a new tier starts over)
@@ -1858,6 +1992,7 @@ ${STATUS_RULES}`;
       log(w, t.agent, 'worker', '已停下，等工頭轉達你的新指示：' + t.title);
     };
     const dir = isWriter(t) ? (await workspaceOf(t.workdir || w.project)).path : '', before = dir ? await treeFiles(dir).catch(() => null) : null;
+    if (dir) snap = { dir, at: nowIso(), before: await snapTree(dir) };
     const reported = new Set(), parsed = (r) => { const st = parseStatus(r); st?.files.forEach((f) => reported.add(f)); return st; };
     const reply = await step(prompt);
     if (t.interrupted) { park(); return; }
@@ -1933,6 +2068,9 @@ ${STATUS_RULES}`;
     t.detail = e.message;
     log(w, t.agent, 'worker', t.result + '：' + t.title, e.message);
     wakeWaiters(w, t);
+  } finally { // also a step that was paused, stopped, timed out or failed: its partial edits are worth a look
+    const after = snap?.before && await snapTree(snap.dir);
+    if (after && after !== snap.before) (t.steps ||= []).push({ at: snap.at, before: snap.before, after }); // only steps that changed files
   }
 }
 
@@ -2194,7 +2332,7 @@ async function cardDetail(w, id) {
     .map((m) => ({ at: m.created_at, kind: m.type === 'tool_call' ? 'tool' : 'say', text: clip(m.type === 'tool_call' ? itemText(m) : answerText(itemText(m)).split('\n')[0], 160), running: m.type === 'tool_call' && m.status !== 'finish' }));
   const last = [...mine].reverse().find(say);
   return { id: t.id, title: t.title, agent: t.agent, status: t.status, usage: t.usage || null, workingSince: t.workingSince, firstStartedAt: t.firstStartedAt, wait: t.wait, result: t.result,
-    activity: convActivity.get(cid) || null, acts, lastSay: last ? clip(answerText(itemText(last)), 800) : '', asks: t.asks || [],
+    activity: convActivity.get(cid) || null, acts, steps: (t.steps || []).map((s) => s.at), lastSay: last ? clip(answerText(itemText(last)), 800) : '', asks: t.asks || [],
     log: mine.slice(-50).map((m) => ({ at: m.created_at, who: m.position === 'right' ? 'Studio' : 'AI', kind: m.type, text: clip(itemText(m), 600) })) };
 }
 
@@ -2347,11 +2485,13 @@ function pokeExternal(w, t) {
 // Per project: what the last job was for, what is done, and the REAL Git / GitHub state (read with git / gh).
 // Refreshed when Studio starts, when a project tab opens, when a job ends, before 接著處理 and before a Leader handoff.
 // Git / GitHub wins over what agents wrote earlier.
-const sh = (cmd, args, cwd) => new Promise((res) => execFile(cmd, args, { cwd, windowsHide: true, timeout: 30000, maxBuffer: 8 << 20 },
+const sh = (cmd, args, cwd, env) => new Promise((res) => execFile(cmd, args, { cwd, env, windowsHide: true, timeout: 30000, maxBuffer: 8 << 20 },
   (e, out, err) => res(e ? { err: String(err || e.message).trim().slice(0, 200) } : { out: String(out) })));
 // Folders owned by another Windows account (e.g. the Codex sandbox user) need safe.directory to be readable.
 // Only local reads that run no repo-configured programs go through it: fsmonitor is off, and nothing here talks to a remote.
-const git = (cwd, ...args) => sh('git', ['-c', 'safe.directory=*', '-c', 'core.fsmonitor=false', ...args], cwd);
+// snapTree also writes objects (never refs, the index or files), without reading the repo config.
+const GIT_SAFE = ['-c', 'safe.directory=*', '-c', 'core.fsmonitor=false'];
+const git = (cwd, ...args) => sh('git', [...GIT_SAFE, ...args], cwd);
 const PR_FIELDS = 'number,title,state,headRefName,mergedAt,url,statusCheckRollup,reviewDecision,author';
 const UNRESOLVED_Q = 'query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){reviewThreads(first:100){nodes{isResolved}}}}}';
 
@@ -3066,6 +3206,7 @@ const routes = {
   'POST /api/answer': (b) => answer(wsOf(b.ws), b.taskId, b.text),
   'POST /api/continue-card': (b) => continueCard(wsOf(b.ws), b.taskId),
   'POST /api/card/detail': (b) => cardDetail(wsOf(b.ws), b.taskId),
+  'POST /api/card/diff': (b) => stepDiff(wsOf(b.ws), b.taskId, Number(b.step)),
   'POST /api/card/ask': (b) => askAgent(wsOf(b.ws), b.taskId, b.text),
   'POST /api/card/delegate': (b) => delegateAsk(wsOf(b.ws), b.taskId, b.agent),
   'POST /api/check': () => { checkAll().then(refreshClaudeLimits); },
@@ -3084,6 +3225,10 @@ const routes = {
   'POST /api/external/delete': (b) => deleteExternal(b.id),
   'POST /api/external/models': (b) => extModels(b),
   'POST /api/external/check': (b) => { if (!extOf(b.id)) throw new Error('找不到這個外部模型'); checkAgent(b.id); },
+  'GET /api/acp/catalog': () => acpCatalog(),
+  'POST /api/acp/add': (b) => addAcp(b),
+  'POST /api/acp/delete': (b) => deleteAcp(b.id),
+  'POST /api/acp/check': (b) => { if (!acpOf(b.id)) throw new Error('找不到這個 ACP agent'); checkAgent(b.id); },
   // One-time login for Studio's separate Codex home, in a visible console window.
   // Claude uses the machine's normal Claude Code login (no separate home).
   'POST /api/claude-login': () => { spawn('cmd', ['/c', 'start', 'Claude login (Studio)', 'cmd', '/k', 'claude', 'auth', 'login'], { detached: true, stdio: 'ignore' }); },
@@ -3101,7 +3246,7 @@ const routes = {
 };
 
 // The event log keeps only ids and settings from a request body: never free text (requests, notes) or secrets (API keys).
-const READ_POSTS = new Set(['POST /api/limits/refresh', 'POST /api/check', 'POST /api/card/detail', 'POST /api/external/models', 'POST /api/runtime/readiness', 'POST /api/runtime/check-port']);
+const READ_POSTS = new Set(['POST /api/limits/refresh', 'POST /api/check', 'POST /api/card/detail', 'POST /api/card/diff', 'POST /api/external/models', 'POST /api/runtime/readiness', 'POST /api/runtime/check-port']);
 const EVENT_FIELDS = ['ws', 'path', 'taskId', 'agent', 'to', 'id', 'mode', 'strategy', 'max', 'cap', 'port', 'on', 'interrupt', 'time', 'days'];
 const pickEventFields = (b) => Object.fromEntries(EVENT_FIELDS.map((k) => [k, b?.[k]]).filter(([, v]) => v != null && (typeof v !== 'object' || Array.isArray(v))));
 
