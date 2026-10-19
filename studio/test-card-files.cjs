@@ -21,12 +21,12 @@ const { execFile, execFileSync } = require('node:child_process');
     return 'Nothing to change.\nSTATUS: DONE';
   }, { execFile });
   try {
-    const cards = {};
+    const cards = {}, wss = {};
     // title, writes, files expected to be flagged as changed-but-unreported
     for (const [title, writes, unreported] of [['listed', true, []], ['partial', true, ['b.txt']], ['silent', true, ['a.txt']], ['none', true, []], ['reader', false, []]]) {
       await new Promise((r) => setTimeout(r, 30)); // the previous card's edits are older than this job
       env.logs.length = 0; env.events.length = 0; env.S.workspaces.length = 0;
-      const w = newW(); w.project = repo; w.run.project = repo; w.run.startedAt = new Date().toISOString(); env.S.workspaces.push(w);
+      const w = wss[title] = newW(); w.project = repo; w.run.project = repo; w.run.startedAt = new Date().toISOString(); env.S.workspaces.push(w);
       const t = cards[title] = { id: title, title, agent: 'codex', writes, status: 'WAITING', after: [], instructions: 'x' }; w.tasks.push(t);
       await api.runTask(w, t);
       assert.strictEqual(t.status, 'DONE', title + ': ' + t.result);
@@ -42,6 +42,12 @@ const { execFile, execFileSync } = require('node:child_process');
     assert.deepStrictEqual([cards.listed.files.length, cards.listed.files[0], cards.listed.files[1], cards.listed.files[3]], [4, 'a.txt', 'b.txt', 'c.txt'], 'the reported list stays on the card, paths normalised');
     assert.deepStrictEqual([cards.partial.files, cards.silent.files, 'files' in cards.reader], [['a.txt'], [], false], 'no snapshot or list for a read-only card');
     assert.strictEqual(fs.readFileSync(path.join(repo, 'a.txt'), 'utf8'), 'A4', 'nothing in the tree is reverted');
-    console.log('card files: listed vs changed, absolute and ./ paths, deletions, ignored output, missing FILES line, read-only cards: PASS');
+    // Step diffs: a writing step that changed files keeps a before / after tree, read back as a patch; the real index stays as it was.
+    assert.deepStrictEqual([cards.listed.steps?.length, cards.none.steps, cards.reader.steps], [1, undefined, undefined], 'only writing steps that changed files');
+    const patch = (await api.stepDiff(wss.listed, 'listed', 0)).text;
+    for (const s of ['+A', '+++ b/new.txt', '--- a/c.txt']) assert.ok(patch.includes(s), 'step diff has ' + s);
+    assert.ok(!patch.includes('build.log'), 'ignored output is not in the step diff');
+    assert.strictEqual(git('diff', '--cached', '--name-only'), '', 'snapshots never stage anything');
+    console.log('card files: listed vs changed, absolute and ./ paths, deletions, ignored output, missing FILES line, read-only cards, step diffs: PASS');
   } finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 }); }
 })().catch((e) => { console.error('FAIL', e); process.exit(1); });

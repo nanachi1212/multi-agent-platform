@@ -47,6 +47,20 @@ function registerExternal(e) {
   for (const w of S.workspaces) w.agentCfg[e.id] ??= { model: '', effort: '' };
 }
 
+// ---------- More ACP agents ----------
+// AionCore runs Claude Code and Codex over ACP and has a catalog of other ACP agents (Gemini CLI, OpenCode, Kimi…).
+// The user adds one from that catalog (backend) or as a custom command (AionCore keeps it; Studio keeps its agentId).
+// Studio does not know their modes: a Worker uses the catalog's "allow everything" mode when there is one, else the
+// default mode, where Studio answers permission requests (allow for Workers, reject for the Leader). Read-only cards
+// keep the prompt fence (RO_MODE), like Antigravity.
+function registerAcp(e) {
+  const who = e.agentId ? { agent_id: e.agentId } : { backend: e.backend };
+  AGENTS[e.id] = { name: e.name, acp: true, create: (ws, lead) => ({ type: 'acp', extra: { ...who, workspace: ws, ...(!lead && e.yolo ? { session_mode: e.yolo } : {}) } }) };
+  (S.agents[e.id] ??= { id: e.id, status: 'checking', note: '', working: 0, models: [], efforts: [] }).name = e.name;
+  S.agentCfg[e.id] ??= { model: '', effort: '' };
+  for (const w of S.workspaces) w.agentCfg[e.id] ??= { model: '', effort: '' };
+}
+
 // What a project does when a job is done: stop (default) | suggest next steps | auto-continue (user opts in).
 const AFTER_DONE = ['stop', 'suggest', 'auto'];
 const STRATEGY_IDS = ['save', 'balanced', 'quality', 'custom']; // model strategies (see STRATEGIES)
@@ -54,7 +68,7 @@ const DELIVERY_IDS = ['auto', 'pr']; // delivery: auto = all the way to merge (d
 const AUTO_MAX_DEFAULT = 5; // auto-started jobs in a row before Studio stops and waits for the user (per project; 0 = no limit)
 const TOKEN_CAP_DEFAULT = 0; // tokens one card may spend before Studio stops it (0 = no cap); checked between steps, not inside one
 // S.leader is the default Leader for newly opened projects.
-const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [], leases: [], external: [],
+const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [], leases: [], external: [], acp: [],
   limits: {}, notify: true, notices: [], noticeSeq: 0, runtimes: [] };
 // One workspace per project folder: its own Leader, board, team chat and run, so projects work side by side.
 // name = optional display name (tabs, cards, notifications); the folder name is used when empty.
@@ -88,6 +102,7 @@ const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { retu
 try {
   const saved = JSON.parse(fs.readFileSync(SETTINGS, 'utf8'));
   for (const e of saved.external || []) if (e?.id && e.providerId && e.model) { S.external.push({ id: String(e.id), name: String(e.name || e.model), platform: e.platform, baseUrl: String(e.baseUrl || ''), isFullUrl: !!e.isFullUrl, model: String(e.model), providerId: String(e.providerId) }); registerExternal(S.external.at(-1)); }
+  for (const e of saved.acp || []) if (e?.id && (e.backend || e.agentId)) { S.acp.push({ id: String(e.id), name: String(e.name || e.id), backend: String(e.backend || ''), yolo: String(e.yolo || ''), agentId: String(e.agentId || ''), command: String(e.command || ''), args: (e.args || []).map(String) }); registerAcp(S.acp.at(-1)); }
   if (AGENTS[saved.leader]) S.leader = saved.leader;
   for (const id in S.agentCfg) Object.assign(S.agentCfg[id], saved.agentCfg?.[id]);
   // Older settings had one `project` and global models; it becomes the first open workspace with those models.
@@ -105,7 +120,7 @@ try {
 
 function saveSettings() {
   const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, tokenCap: w.tokenCap, mission: w.mission, routines: w.routines }));
-  writeJson(SETTINGS, { leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external });
+  writeJson(SETTINGS, { leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external, acp: S.acp });
 }
 
 function saveRun(w, status) {
@@ -530,17 +545,75 @@ async function saveExternal(b) {
   } catch (err) { throw hideKey(err, key); }
 }
 
-async function deleteExternal(id) {
-  const e = extOf(id);
-  if (!e) throw new Error('找不到這個外部模型');
+// An added agent (external model, ACP agent) cannot be deleted while a project uses it.
+function assertUnused(id, name) {
   const w = S.workspaces.find((x) => x.leader === id || x.run?.convs && x.tasks.some((t) => t.agent === id && !['DONE', 'FAILED'].includes(t.status)));
-  if (w) throw new Error(`「${label(w)}」正在用 ${e.name}（工頭或未完成的工作卡）；先換掉或等它做完再刪除`);
-  await api('DELETE', '/api/providers/' + e.providerId, {}).catch((err) => { if (!/404|not found/i.test(err.message)) throw err; });
-  S.external = S.external.filter((x) => x !== e);
+  if (w) throw new Error(`「${label(w)}」正在用 ${name}（工頭或未完成的工作卡）；先換掉或等它做完再刪除`);
+}
+function forgetAgent(id) {
   if (S.leader === id) S.leader = 'codex';
   delete AGENTS[id]; delete S.agents[id]; delete S.agentCfg[id];
   for (const x of S.workspaces) { delete x.agentCfg[id]; x.workers = x.workers.filter((a) => a !== id); if (x.finisher === id) x.finisher = ''; if (x.fallback === id) x.fallback = ''; }
   saveSettings();
+}
+const notFound = (err) => { if (!/404|not found/i.test(err.message)) throw err; };
+
+async function deleteExternal(id) {
+  const e = extOf(id);
+  if (!e) throw new Error('找不到這個外部模型');
+  assertUnused(id, e.name);
+  await api('DELETE', '/api/providers/' + e.providerId, {}).catch(notFound);
+  S.external = S.external.filter((x) => x !== e);
+  forgetAgent(id);
+}
+
+// ---------- ACP agent operations ----------
+const acpOf = (id) => S.acp.find((x) => x.id === id);
+// AionCore's other built-in ACP agents (Claude Code and Codex are Studio's own seats), installed ones first.
+async function acpCatalog() {
+  const all = (await api('GET', '/api/agents/management')) || [];
+  return all.filter((a) => a.agent_type === 'acp' && a.agent_source === 'builtin' && a.backend && !['claude', 'codex'].includes(a.backend))
+    .map((a) => ({ backend: a.backend, name: a.name, installed: !!a.installed, yolo: a.yolo_id || '', guidance: a.last_check_guidance || '', added: S.acp.some((x) => x.backend === a.backend) }))
+    .sort((a, b) => b.installed - a.installed || a.name.localeCompare(b.name));
+}
+// Add from the catalog ({ backend }) or as a custom command ({ name, command, args }).
+async function addAcp(b) {
+  let e;
+  if (b.backend) {
+    const c = (await acpCatalog()).find((x) => x.backend === b.backend);
+    if (!c) throw new Error('AionCore 沒有這個 ACP agent：' + b.backend);
+    if (c.added) throw new Error(c.name + ' 已經加入了');
+    e = { id: 'acp_' + c.backend, name: c.name, backend: c.backend, yolo: c.yolo, agentId: '', command: '', args: [] };
+  } else {
+    const name = String(b.name || '').trim(), command = String(b.command || '').trim();
+    // ponytail: arguments split on spaces, no quoting; enough for `opencode acp` / `npx -y pkg --acp`.
+    const args = String(b.args || '').trim().split(/\s+/).filter(Boolean);
+    if (!name) throw new Error('請填顯示名稱');
+    if (!command) throw new Error('請填啟動指令（例如 opencode）');
+    const agentId = (await api('POST', '/api/agents/custom', { name, command, args })).id;
+    e = { id: 'acp_' + crypto.randomBytes(4).toString('hex'), name, backend: '', yolo: '', agentId, command, args };
+  }
+  S.acp.push(e);
+  for (const w of S.workspaces) w.workers = [...new Set([...w.workers, e.id])];
+  registerAcp(e);
+  saveSettings();
+  checkAgent(e.id); // in the background, like an external model
+  return { id: e.id };
+}
+async function deleteAcp(id) {
+  const e = acpOf(id);
+  if (!e) throw new Error('找不到這個 ACP agent');
+  assertUnused(id, e.name);
+  if (e.agentId) await api('DELETE', '/api/agents/custom/' + e.agentId, {}).catch(notFound);
+  S.acp = S.acp.filter((x) => x !== e);
+  forgetAgent(id);
+}
+// A catalog agent that is not installed fails the check with AionCore's own guidance instead of a spawn error.
+async function acpReady(id) {
+  const e = acpOf(id);
+  if (!e?.backend) return;
+  const c = (await acpCatalog()).find((x) => x.backend === e.backend);
+  if (c && !c.installed) throw new Error(`${e.name} 沒有安裝。${c.guidance}`);
 }
 
 // Ask the provider which models it offers (the key comes from the form, or from the saved provider when editing).
@@ -575,6 +648,7 @@ async function checkAgent(id) {
     fs.mkdirSync(ws, { recursive: true });
     // The check uses agent defaults so a bad saved model can't make the agent look unavailable.
     if (AGENTS[id].external) await extProvider(id);
+    if (AGENTS[id].acp) await acpReady(id);
     const reply = await turn(id, await createConv(id, ws, true), 'Reply with exactly: OK', { lead: true, check: true, timeout: 120e3 });
     if (!/OK/i.test(reply)) throw new Error('沒有正常回覆：' + (reply || '(空白)'));
     if (a.checkTok === tok) a.status = 'available';
@@ -594,7 +668,7 @@ const available = (id) => S.agents[id]?.status === 'available';
 // A read-only card (ro) gets a conversation in the agent's non-writing mode, like the Leader: the prompt alone is not a fence.
 // Not for Antigravity: its non-writing mode makes AionCore install a per-tool permission hook that runs aioncore.exe,
 // which fails on a non-ASCII install path and blocks every tool (even reading). Its read-only cards keep the prompt fence.
-const RO_MODE = (agent) => agent !== 'antigravity';
+const RO_MODE = (agent) => agent !== 'antigravity' && !AGENTS[agent]?.acp;
 const dirTag = (d) => (d ? '@' + crypto.createHash('sha1').update(String(d)).digest('hex').slice(0, 6) : '');
 // ro: false = a writing card; true = REVIEW card in the non-writing sandbox (it reads and judges); 'chk' = CHECK card: it must RUN
 // tests / lint / builds (they write caches and build output), so it is not sandboxed, has its own conversation (an independent
@@ -1356,6 +1430,29 @@ async function treeFiles(dir) {
     catch (e) { if (e.code === 'ENOENT') return [p, 'deleted']; throw e; }
   });
 }
+// The working tree (tracked and untracked, not ignored) as a git tree object, built in a copy of the index: HEAD, the real
+// index and the files stay as they are. Two of them give the exact diff of one card step. Nothing refers to the objects,
+// so `git gc` drops them after its prune period (two weeks by default); '' = no snapshot.
+async function snapTree(dir) {
+  const real = (await git(dir, 'rev-parse', '--path-format=absolute', '--git-path', 'index')).out?.trim();
+  if (!real) return '';
+  const idx = path.join(RT, 'studio', 'idx-' + crypto.randomBytes(6).toString('hex'));
+  try {
+    try { fs.copyFileSync(real, idx); } catch { /* no index yet: git hashes every file */ }
+    const env = { ...process.env, GIT_INDEX_FILE: idx };
+    if ((await sh('git', [...GIT_SAFE, 'add', '-A'], dir, env)).err) return '';
+    return (await sh('git', [...GIT_SAFE, 'write-tree'], dir, env)).out?.trim() || '';
+  } finally { fs.rmSync(idx, { force: true }); }
+}
+const STEP_DIFF_MAX = 400e3; // characters of patch shown for one step
+async function stepDiff(w, id, n) {
+  const t = w.tasks.find((x) => x.id === id), s = t?.steps?.[n];
+  if (!s) throw new Error('找不到這一步');
+  const dir = (await workspaceOf(t.workdir || w.project)).path;
+  const r = await git(dir, '-c', 'core.quotepath=false', 'diff', '--no-color', '--no-ext-diff', '--stat', '--patch', s.before, s.after);
+  if (r.err) throw new Error('讀不到這一步的 diff（可能已被 git 清掉）：' + r.err);
+  return { text: r.out.length > STEP_DIFF_MAX ? r.out.slice(0, STEP_DIFF_MAX) + `\n…（只顯示前 ${STEP_DIFF_MAX / 1000}k 字元）` : r.out };
+}
 // Paths whose entry differs between two snapshots: added, changed or deleted.
 function changedFiles(before, after) {
   const key = (e) => JSON.stringify(e.slice(1));
@@ -1858,6 +1955,7 @@ ${STATUS_RULES}`;
       log(w, t.agent, 'worker', '已停下，等工頭轉達你的新指示：' + t.title);
     };
     const dir = isWriter(t) ? (await workspaceOf(t.workdir || w.project)).path : '', before = dir ? await treeFiles(dir).catch(() => null) : null;
+    const treeBefore = dir ? await snapTree(dir) : '', stepAt = nowIso();
     const reported = new Set(), parsed = (r) => { const st = parseStatus(r); st?.files.forEach((f) => reported.add(f)); return st; };
     const reply = await step(prompt);
     if (t.interrupted) { park(); return; }
@@ -1886,6 +1984,8 @@ ${STATUS_RULES}`;
     if (st.kind !== 'DONE' && overCap(w, t)) throw capErr(); // the step that just ended blew the budget and the card is not finished: stop it now, not at the next wake-up
     applyStatus(w, t, st, last);
     if (before) await reportFiles(w, t, dir, before, reported);
+    const treeAfter = treeBefore && await snapTree(dir);
+    if (treeAfter && treeAfter !== treeBefore) (t.steps ||= []).push({ at: stepAt, before: treeBefore, after: treeAfter }); // only steps that changed files
     if (t.status === 'DONE' && overCap(w, t)) { // finished, but the last step went over: the work stays, the user hears about it
       t.overCap = true;
       log(w, 'studio', 'system', `「${t.title}」已完成，但用了 ${cardTokens(t)} tokens，超過上限 ${w.tokenCap}。`);
@@ -2194,7 +2294,7 @@ async function cardDetail(w, id) {
     .map((m) => ({ at: m.created_at, kind: m.type === 'tool_call' ? 'tool' : 'say', text: clip(m.type === 'tool_call' ? itemText(m) : answerText(itemText(m)).split('\n')[0], 160), running: m.type === 'tool_call' && m.status !== 'finish' }));
   const last = [...mine].reverse().find(say);
   return { id: t.id, title: t.title, agent: t.agent, status: t.status, usage: t.usage || null, workingSince: t.workingSince, firstStartedAt: t.firstStartedAt, wait: t.wait, result: t.result,
-    activity: convActivity.get(cid) || null, acts, lastSay: last ? clip(answerText(itemText(last)), 800) : '', asks: t.asks || [],
+    activity: convActivity.get(cid) || null, acts, steps: (t.steps || []).map((s) => s.at), lastSay: last ? clip(answerText(itemText(last)), 800) : '', asks: t.asks || [],
     log: mine.slice(-50).map((m) => ({ at: m.created_at, who: m.position === 'right' ? 'Studio' : 'AI', kind: m.type, text: clip(itemText(m), 600) })) };
 }
 
@@ -2347,11 +2447,13 @@ function pokeExternal(w, t) {
 // Per project: what the last job was for, what is done, and the REAL Git / GitHub state (read with git / gh).
 // Refreshed when Studio starts, when a project tab opens, when a job ends, before 接著處理 and before a Leader handoff.
 // Git / GitHub wins over what agents wrote earlier.
-const sh = (cmd, args, cwd) => new Promise((res) => execFile(cmd, args, { cwd, windowsHide: true, timeout: 30000, maxBuffer: 8 << 20 },
+const sh = (cmd, args, cwd, env) => new Promise((res) => execFile(cmd, args, { cwd, env, windowsHide: true, timeout: 30000, maxBuffer: 8 << 20 },
   (e, out, err) => res(e ? { err: String(err || e.message).trim().slice(0, 200) } : { out: String(out) })));
 // Folders owned by another Windows account (e.g. the Codex sandbox user) need safe.directory to be readable.
 // Only local reads that run no repo-configured programs go through it: fsmonitor is off, and nothing here talks to a remote.
-const git = (cwd, ...args) => sh('git', ['-c', 'safe.directory=*', '-c', 'core.fsmonitor=false', ...args], cwd);
+// (snapTree also writes objects, never refs, the index or files.)
+const GIT_SAFE = ['-c', 'safe.directory=*', '-c', 'core.fsmonitor=false'];
+const git = (cwd, ...args) => sh('git', [...GIT_SAFE, ...args], cwd);
 const PR_FIELDS = 'number,title,state,headRefName,mergedAt,url,statusCheckRollup,reviewDecision,author';
 const UNRESOLVED_Q = 'query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){reviewThreads(first:100){nodes{isResolved}}}}}';
 
@@ -3066,6 +3168,7 @@ const routes = {
   'POST /api/answer': (b) => answer(wsOf(b.ws), b.taskId, b.text),
   'POST /api/continue-card': (b) => continueCard(wsOf(b.ws), b.taskId),
   'POST /api/card/detail': (b) => cardDetail(wsOf(b.ws), b.taskId),
+  'POST /api/card/diff': (b) => stepDiff(wsOf(b.ws), b.taskId, Number(b.step)),
   'POST /api/card/ask': (b) => askAgent(wsOf(b.ws), b.taskId, b.text),
   'POST /api/card/delegate': (b) => delegateAsk(wsOf(b.ws), b.taskId, b.agent),
   'POST /api/check': () => { checkAll().then(refreshClaudeLimits); },
@@ -3084,6 +3187,10 @@ const routes = {
   'POST /api/external/delete': (b) => deleteExternal(b.id),
   'POST /api/external/models': (b) => extModels(b),
   'POST /api/external/check': (b) => { if (!extOf(b.id)) throw new Error('找不到這個外部模型'); checkAgent(b.id); },
+  'GET /api/acp/catalog': () => acpCatalog(),
+  'POST /api/acp/add': (b) => addAcp(b),
+  'POST /api/acp/delete': (b) => deleteAcp(b.id),
+  'POST /api/acp/check': (b) => { if (!acpOf(b.id)) throw new Error('找不到這個 ACP agent'); checkAgent(b.id); },
   // One-time login for Studio's separate Codex home, in a visible console window.
   // Claude uses the machine's normal Claude Code login (no separate home).
   'POST /api/claude-login': () => { spawn('cmd', ['/c', 'start', 'Claude login (Studio)', 'cmd', '/k', 'claude', 'auth', 'login'], { detached: true, stdio: 'ignore' }); },
@@ -3101,7 +3208,7 @@ const routes = {
 };
 
 // The event log keeps only ids and settings from a request body: never free text (requests, notes) or secrets (API keys).
-const READ_POSTS = new Set(['POST /api/limits/refresh', 'POST /api/check', 'POST /api/card/detail', 'POST /api/external/models', 'POST /api/runtime/readiness', 'POST /api/runtime/check-port']);
+const READ_POSTS = new Set(['POST /api/limits/refresh', 'POST /api/check', 'POST /api/card/detail', 'POST /api/card/diff', 'POST /api/external/models', 'POST /api/runtime/readiness', 'POST /api/runtime/check-port']);
 const EVENT_FIELDS = ['ws', 'path', 'taskId', 'agent', 'to', 'id', 'mode', 'strategy', 'max', 'cap', 'port', 'on', 'interrupt', 'time', 'days'];
 const pickEventFields = (b) => Object.fromEntries(EVENT_FIELDS.map((k) => [k, b?.[k]]).filter(([, v]) => v != null && (typeof v !== 'object' || Array.isArray(v))));
 

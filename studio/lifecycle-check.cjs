@@ -1180,10 +1180,10 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
 
   { // 32) use the real conversation modes: a CHECK conversion must stop its old turn before releasing ownership
     const created = [], turns = [], stopped = []; let mayStop = false;
-    const modes = new Function('isWriter', 'crypto', 'createConv', 'tierCfg',
+    const modes = new Function('isWriter', 'crypto', 'createConv', 'tierCfg', 'AGENTS',
       region('const RO_MODE =', "// This run's conversations") + '\nreturn { roOf, workKey, conv };')(
         (t) => t.writes !== false, nodeCrypto,
-        async (agent, dir, lead) => { const cid = 'conv-' + created.length; created.push({ agent, lead, cid }); return cid; }, () => ({}));
+        async (agent, dir, lead) => { const cid = 'conv-' + created.length; created.push({ agent, lead, cid }); return cid; }, () => ({}), {});
     const E = makeEnv(() => '', { ...modes,
       stopTurn: async (cid) => { stopped.push(cid); return mayStop; },
       turn: async (agent, cid, text, opts) => { turns.push({ cid, text, opts }); return 'GO\nRead the diff.\nSTATUS: DONE'; } });

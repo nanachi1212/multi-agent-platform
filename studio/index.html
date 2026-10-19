@@ -209,6 +209,8 @@
   .att.bad { background:var(--bad-soft); color:var(--bad); } .att.ok { background:var(--ok-soft); color:var(--ok); }
   .att.on { background:var(--work-soft); color:var(--work); } .att.pz { background:var(--pause-soft); color:var(--pause); }
   details.tech { margin-top:4px; font-size:12px; } details.tech summary { cursor:pointer; color:var(--muted); }
+  pre.diff { white-space:pre; max-height:420px; overflow:auto; background:var(--panel2); border-radius:8px; padding:8px; margin:6px 0 0; font:11.5px/1.5 Consolas,monospace; }
+  pre.diff .add { color:var(--ok); } pre.diff .del { color:var(--bad); } pre.diff .hunk { color:var(--accent); }
   details.tech pre { white-space:pre-wrap; word-break:break-word; max-height:220px; overflow:auto; background:var(--panel2); border-radius:8px; padding:8px; margin:4px 0 0; font:11.5px/1.5 Consolas,monospace; }
   .sys-wrap { align-self:center; max-width:90%; display:flex; flex-direction:column; align-items:center; }
   .err { color:var(--bad); font-weight:600; }
@@ -354,6 +356,8 @@
     <section class="seats" id="ovSeats"></section>
     <h2 class="zone">外部模型（API）</h2>
     <section class="panel" id="extList"></section>
+    <h2 class="zone">ACP Agent</h2>
+    <section class="panel" id="acpList"></section>
   </main>
 
   <main class="stage" id="projectView" hidden>
@@ -404,6 +408,22 @@
     <div class="row"><button class="btn small ghost" id="extFetch" title="用上面的網址和 key 向服務詢問有哪些模型">取得模型清單</button><span class="hint" id="extFetchNote"></span></div>
     <div class="hint" style="color:var(--bad)" id="extErr"></div>
     <div class="row"><button class="btn pz" id="extSave">儲存並測試</button></div>
+  </div>
+</dialog>
+
+<dialog id="acpDlg" style="width:min(560px,94vw)">
+  <div class="dlg-h"><b>新增 ACP Agent</b><span class="spacer"></span><button class="btn small" id="acpClose">關閉</button></div>
+  <div class="dlg-b">
+    <label>從 AionCore 的清單選<select id="acpPick"><option value="">讀取中…</option></select></label>
+    <div class="hint" id="acpPickNote">要先在這台電腦安裝並登入那個 agent 的 CLI。</div>
+    <details id="acpCustom"><summary>清單裡沒有：用自訂指令</summary>
+      <label>顯示名稱<input type="text" id="acpName" placeholder="例如：我的 OpenCode" autocomplete="off"></label>
+      <label>啟動指令<input type="text" id="acpCmd" placeholder="例如：opencode" autocomplete="off"></label>
+      <label>參數（用空白分開）<input type="text" id="acpArgs" placeholder="例如：acp" autocomplete="off"></label>
+      <div class="hint">這個指令要能以 ACP（Agent Client Protocol）模式在標準輸入輸出上對話。</div>
+    </details>
+    <div class="hint" style="color:var(--bad)" id="acpErr"></div>
+    <div class="row"><button class="btn pz" id="acpSave">加入並測試</button></div>
   </div>
 </dialog>
 
@@ -563,10 +583,10 @@ function statusHtml(a, w) {
 }
 
 // External models (added by the user with name, URL, key, model). The key is never shown: it lives in AionCore.
+const statusTag = (a) => a.status === 'available' ? '<span class="tag ok">可用</span>' : a.status === 'unavailable' ? '<span class="tag bad">不可用</span>' : '<span class="tag">檢查中…</span>';
 function extHtml() {
   const rows = (S.external || []).map((e) => {
-    const a = S.agents.find((x) => x.id === e.id) || {};
-    const st = a.status === 'available' ? '<span class="tag ok">可用</span>' : a.status === 'unavailable' ? '<span class="tag bad">不可用</span>' : '<span class="tag">檢查中…</span>';
+    const a = S.agents.find((x) => x.id === e.id) || {}, st = statusTag(a);
     return `<div class="row" style="align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0;border-top:1px solid var(--line)">
       <b>${esc(e.name)}</b> ${st}<span class="hint">${esc(e.model)} · ${esc(e.platform)} · ${esc(e.baseUrl)}</span>
       ${a.status === 'unavailable' ? `<span class="hint" style="color:var(--bad)">${esc(a.note)}</span>` : ''}
@@ -574,6 +594,38 @@ function extHtml() {
   }).join('');
   return `<div class="hint">把 OpenAI 相容（或 Anthropic／Gemini）的外部模型接進來，它會像 Codex、Claude 一樣成為團隊成員：可以當工頭或成員，會讀寫專案檔案。</div>${rows}<div class="row" style="margin-top:8px"><button class="btn small" data-ext-add>＋ 新增外部模型</button></div>`;
 }
+// ACP agents: from AionCore's catalog or a custom command. They join the team like Codex and Claude.
+function acpHtml() {
+  const rows = (S.acp || []).map((e) => {
+    const a = S.agents.find((x) => x.id === e.id) || {};
+    return `<div class="row" style="align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0;border-top:1px solid var(--line)">
+      <b>${esc(e.name)}</b> ${statusTag(a)}<span class="hint">${esc(e.backend ? 'AionCore 內建：' + e.backend : '自訂指令：' + [e.command, ...e.args].join(' '))}</span>
+      ${a.status === 'unavailable' ? `<span class="hint" style="color:var(--bad)">${esc(a.note)}</span>` : ''}
+      <span class="spacer"></span><button class="btn small ghost" data-acp-check="${e.id}">重新測試</button><button class="btn small ghost" data-acp-del="${e.id}">刪除</button></div>`;
+  }).join('');
+  return `<div class="hint">把其他走 ACP 的 coding agent（Gemini CLI、OpenCode、Kimi…）加進團隊：可以當工頭或成員，會讀寫專案檔案。唯讀的審查卡只靠提示約束，和 Antigravity 一樣。</div>${rows}<div class="row" style="margin-top:8px"><button class="btn small" data-acp-add>＋ 新增 ACP Agent</button></div>`;
+}
+async function acpOpen() {
+  $('acpErr').textContent = ''; $('acpName').value = ''; $('acpCmd').value = ''; $('acpArgs').value = ''; $('acpCustom').open = false;
+  $('acpPick').innerHTML = '<option value="">讀取中…</option>';
+  $('acpDlg').showModal();
+  const r = await fetch('/api/acp/catalog'), list = await r.json().catch(() => ({}));
+  if (!r.ok) { $('acpPick').innerHTML = '<option value="">（讀不到清單）</option>'; $('acpErr').textContent = list.error || ''; return; }
+  $('acpPick').innerHTML = '<option value="">（選一個，或用下面的自訂指令）</option>' + list.map((c) =>
+    `<option value="${esc(c.backend)}" ${c.added ? 'disabled' : ''}>${esc(c.name)}${c.added ? '（已加入）' : c.installed ? '（已安裝）' : '（未安裝）'}</option>`).join('');
+}
+$('acpClose').onclick = () => $('acpDlg').close();
+$('acpSave').onclick = async () => {
+  const b = $('acpSave'), backend = $('acpPick').value;
+  const body = backend ? { backend } : { name: $('acpName').value, command: $('acpCmd').value, args: $('acpArgs').value };
+  b.disabled = true; $('acpErr').textContent = '';
+  try {
+    const r = await fetch('/api/acp/add', { method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify(body) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { $('acpErr').textContent = j.error || ('錯誤 ' + r.status); return; }
+    $('acpDlg').close(); refresh();
+  } finally { b.disabled = false; }
+};
 let extEditId = '';
 function extOpen(id) {
   const e = id ? S.external.find((x) => x.id === id) : null;
@@ -648,9 +700,18 @@ function workHtml(d) {
     <h3>最近活動</h3><ul style="margin:0;padding-left:18px">${acts}</ul>
     ${d.lastSay ? `<h3>最近一句 AI 訊息</h3><div class="res" style="white-space:pre-wrap">${esc(d.lastSay)}</div>` : ''}
     ${asks ? '<h3>詢問進度</h3>' + asks : ''}
+    ${d.steps?.length ? `<h3>每一步改了什麼</h3><div class="row" style="gap:6px;flex-wrap:wrap">${d.steps.map((at, i) => `<button class="btn small ${workDiff?.n === i ? 'pz' : 'ghost'}" data-step-diff="${i}">第 ${i + 1} 步 · ${hhmm(at)}</button>`).join('')}</div>${workDiff ? `<pre class="diff">${diffHtml(workDiff.text)}</pre>` : ''}` : ''}
     <details class="tech" id="workLog" ${workLogOpen ? 'open' : ''}><summary>查看完整執行紀錄（最近 ${d.log.length} 筆）</summary><pre>${esc(d.log.map((m) => `${hhmm(m.at)} ${m.who} ${m.kind}: ${m.text}`).join('\n'))}</pre></details>`;
 }
-let workLogOpen = false;
+let workLogOpen = false, workDiff = null; // { n, text } of the step diff shown in the open work details
+const diffHtml = (s) => esc(s).split('\n').map((l) => /^\+(?!\+\+)/.test(l) ? `<span class="add">${l}</span>` : /^-(?!--)/.test(l) ? `<span class="del">${l}</span>` : /^@@/.test(l) ? `<span class="hunk">${l}</span>` : l).join('\n');
+async function showStepDiff(n) {
+  if (workDiff?.n === n) { workDiff = null; return loadWork(); } // a second click closes it
+  const r = await fetch('/api/card/diff', { method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify({ ws:workOpen.ws, taskId:workOpen.id, step:n }) });
+  const j = await r.json().catch(() => ({}));
+  workDiff = { n, text: r.ok ? j.text || '（沒有差異）' : j.error || '讀取失敗' };
+  loadWork();
+}
 async function loadWork() {
   if (!workOpen || !$('workDlg').open) return;
   const r = await fetch('/api/card/detail', { method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify({ ws:workOpen.ws, taskId:workOpen.id }) });
@@ -661,7 +722,7 @@ async function loadWork() {
   $('workAsk').hidden = !ASKABLE.includes(d.status);
   $('workBody').innerHTML = workHtml(d);
 }
-function openWork(ws, id) { workOpen = { ws, id }; workLogOpen = false; $('workBody').innerHTML = '<div class="empty">讀取中…</div>'; $('workDlg').showModal(); loadWork(); }
+function openWork(ws, id) { workOpen = { ws, id }; workLogOpen = false; workDiff = null; $('workBody').innerHTML = '<div class="empty">讀取中…</div>'; $('workDlg').showModal(); loadWork(); }
 async function askWork(text) {
   if (!workOpen) return;
   await post('/api/card/ask', { ws:workOpen.ws, taskId:workOpen.id, text }).catch(() => {});
@@ -705,7 +766,7 @@ function boardHtml(tasks, agents, editable) {
         ${t.result && t.status !== 'PAUSED' ? `<div class="res">${esc(t.result)}</div>` : ''}
         ${PARKED.includes(t.status) && !blk ? `<div class="res"><b>${esc(waitLine(t))}</b></div>` : ''}
         ${workState(t) ? `<div class="res"><b>${workState(t).ic} ${esc(workState(t).text)}</b></div>` : ''}
-        ${editable && ASKABLE.includes(t.status) ? workButtons(t, curPath()) : ''}
+        ${editable && (ASKABLE.includes(t.status) || t.steps?.length) ? workButtons(t, curPath()) : ''}
         ${t.usage ? `<div class="res" style="font-size:12px;opacity:0.85">🪙 ${esc(usageLine(t.usage))}${w.tokenCap ? ' ／ 上限 ' + fmtTok(w.tokenCap) : ''}</div>` : ''}
         <div class="res" style="font-size:12px;opacity:0.85">📁 <b>Workspace</b> ${esc(ws.fullLine)}</div>
         <div class="res" style="font-size:12px;opacity:0.85">⚡ <b>Runtime</b> ${rts.length ? esc(rts.map(formatRuntimeItem).join(' · ')) : '—'}</div>
@@ -1131,6 +1192,7 @@ function renderOverview() {
   $('matrix').innerHTML = matrixHtml();
   if (!$('ovSeats').contains(document.activeElement)) $('ovSeats').innerHTML = S.agents.map((a) => seatHtml(a, null)).join('');
   if (!$('extList').contains(document.activeElement)) $('extList').innerHTML = extHtml();
+  if (!$('acpList').contains(document.activeElement)) $('acpList').innerHTML = acpHtml();
 }
 
 function renderProject(w, force) {
@@ -1481,6 +1543,10 @@ document.addEventListener('click', (e) => {
     return post('/api/start', { ws: p, request: $('request').value }).then(() => { drafts[p] = ''; $('request').value = ''; b.blur(); }).catch(() => {});
   }
   if (b.hasAttribute('data-recheck')) return post('/api/check');
+  if (b.dataset.stepDiff) return showStepDiff(Number(b.dataset.stepDiff));
+  if (b.hasAttribute('data-acp-add')) return acpOpen();
+  if (b.dataset.acpCheck) return post('/api/acp/check', { id: b.dataset.acpCheck }).catch(() => {});
+  if (b.dataset.acpDel) { const e = S.acp.find((x) => x.id === b.dataset.acpDel); return confirm('刪除 ACP Agent「' + (e?.name || '') + '」？\n\n已經完成的工作卡和紀錄不受影響。') && post('/api/acp/delete', { id: b.dataset.acpDel }).catch(() => {}); }
   if (b.hasAttribute('data-ext-add')) return extOpen('');
   if (b.dataset.extEdit) return extOpen(b.dataset.extEdit);
   if (b.dataset.extCheck) return post('/api/external/check', { id: b.dataset.extCheck }).catch(() => {});
