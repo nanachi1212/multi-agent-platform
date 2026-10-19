@@ -1433,21 +1433,26 @@ async function treeFiles(dir) {
 // The working tree (tracked and untracked, not ignored) as a git tree object, built in a copy of the index: HEAD, the real
 // index and the files stay as they are. Two of them give the exact diff of one card step. Nothing refers to the objects,
 // so `git gc` drops them after its prune period (two weeks by default); '' = no snapshot.
-// A worker may edit the repo config, and `git add` runs its filter programs outside the worker's sandbox: every
-// filter.<name>.clean / .process is blanked for the snapshot (git skips an empty command; a required filter then fails
-// the add, so there is no snapshot). Config that cannot be read: no snapshot either.
+// A worker may edit the repo config, and `git add` would run the filter programs it names outside the worker's sandbox.
+// So the add never reads the repo config: it runs in a private GIT_DIR that writes into the repo's object store, with
+// only the line-ending / file-mode keys copied over (plain values, no programs). Attributes still apply; a filter= with
+// no driver in the config git reads does nothing.
+const SNAP_KEYS = /^core\.(autocrlf|eol|safecrlf|filemode|symlinks|ignorecase|precomposeunicode|checkroundtripencoding)$/;
 async function snapTree(dir) {
-  const real = (await git(dir, 'rev-parse', '--path-format=absolute', '--git-path', 'index')).out?.trim();
-  const cfg = real && (await git(dir, 'config', '--list')).out;
-  if (!real || cfg == null) return '';
-  const noFilters = [...new Set([...cfg.matchAll(/^filter\.(.+)\.(?:clean|process)=/gm)].map((m) => m[1]))].flatMap((n) => ['-c', `filter.${n}.clean=`, '-c', `filter.${n}.process=`]);
-  const idx = path.join(RT, 'studio', 'idx-' + crypto.randomBytes(6).toString('hex'));
+  const [index, objects, exclude, format] = ((await git(dir, 'rev-parse', '--path-format=absolute', '--git-path', 'index', '--git-path', 'objects', '--git-path', 'info/exclude', '--show-object-format')).out || '').trim().split(/\r?\n/);
+  if (!/^\w+$/.test(format || '')) return '';
+  const local = ((await git(dir, 'config', '--local', '-z', '--get-regexp', '^core\\.')).out || '').split('\0').map((e) => e.split('\n')).filter(([k, v]) => SNAP_KEYS.test(k) && v != null);
+  const tmp = path.join(RT, 'studio', 'snap-' + crypto.randomBytes(6).toString('hex')), cfg = path.join(tmp, 'config');
   try {
-    try { fs.copyFileSync(real, idx); } catch { /* no index yet: git hashes every file */ }
-    const env = { ...process.env, GIT_INDEX_FILE: idx };
-    if ((await sh('git', [...GIT_SAFE, ...noFilters, 'add', '-A'], dir, env)).err) return '';
+    for (const d of ['info', 'refs', 'objects']) fs.mkdirSync(path.join(tmp, d), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'HEAD'), 'ref: refs/heads/snapshot\n');
+    fs.writeFileSync(cfg, format === 'sha1' ? '[core]\n\trepositoryformatversion = 0\n' : `[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = ${format}\n`);
+    for (const [k, v] of local) if ((await sh('git', ['config', '--file', cfg, k, v])).err) return '';
+    for (const [from, to] of [[index, 'index'], [exclude, 'info/exclude']]) try { fs.copyFileSync(from, path.join(tmp, to)); } catch { /* none yet */ }
+    const env = { ...process.env, GIT_DIR: tmp, GIT_WORK_TREE: dir, GIT_INDEX_FILE: path.join(tmp, 'index'), GIT_OBJECT_DIRECTORY: objects };
+    if ((await sh('git', [...GIT_SAFE, 'add', '-A'], dir, env)).err) return '';
     return (await sh('git', [...GIT_SAFE, 'write-tree'], dir, env)).out?.trim() || '';
-  } finally { fs.rmSync(idx, { force: true }); }
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 }
 const STEP_DIFF_MAX = 400e3; // characters of patch shown for one step
 async function stepDiff(w, id, n) {
@@ -2456,7 +2461,7 @@ const sh = (cmd, args, cwd, env) => new Promise((res) => execFile(cmd, args, { c
   (e, out, err) => res(e ? { err: String(err || e.message).trim().slice(0, 200) } : { out: String(out) })));
 // Folders owned by another Windows account (e.g. the Codex sandbox user) need safe.directory to be readable.
 // Only local reads that run no repo-configured programs go through it: fsmonitor is off, and nothing here talks to a remote.
-// snapTree also writes objects (never refs, the index or files), with every filter program blanked.
+// snapTree also writes objects (never refs, the index or files), without reading the repo config.
 const GIT_SAFE = ['-c', 'safe.directory=*', '-c', 'core.fsmonitor=false'];
 const git = (cwd, ...args) => sh('git', [...GIT_SAFE, ...args], cwd);
 const PR_FIELDS = 'number,title,state,headRefName,mergedAt,url,statusCheckRollup,reviewDecision,author';
