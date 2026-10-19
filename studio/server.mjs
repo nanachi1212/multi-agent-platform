@@ -343,14 +343,27 @@ function setWorker(w, agent, on) {
 
 const active = new Map(); // conversationId -> turnId (for Stop)
 
+// The option that allows (allow = true) or rejects a permission request. ACP marks each option with a kind
+// (allow_once / allow_always / reject_once / reject_always); without kinds, a clear word in the option decides.
+// No clear option: a Worker takes the first one (it may write anyway); a rejecting turn gets null and never guesses.
+const ALLOW_WORD = /\b(allow|approve|accept|yes|proceed)\b/i, REJECT_WORD = /\b(reject|deny|cancel|abort|no)\b/i;
+function pickOption(opts, allow) {
+  const kind = (o) => String(o.kind ?? o.data?.kind ?? ''), text = (o) => [o.value, o.option_id, o.optionId, o.label, o.name].filter((x) => x != null).join(' ');
+  const pick = opts.some(kind) ? opts.find((o) => (allow ? /^allow/ : /^reject/).test(kind(o)))
+    : opts.find((o) => (allow ? ALLOW_WORD : REJECT_WORD).test(text(o)) && !(allow ? REJECT_WORD : ALLOW_WORD).test(text(o)));
+  return pick || (allow ? opts[0] || null : null);
+}
 async function answerConfirmations(w, convId, allow) {
-  // Modes are chosen so this should not happen; if it does, never leave a turn hanging.
+  // Modes are chosen so this rarely happens (ACP agents without a known mode rely on it); never leave a turn hanging.
   for (const c of (await api('GET', `/api/conversations/${convId}/confirmations`)) || []) {
-    const opts = c.options || [];
-    const re = allow ? /allow|approve|accept|yes|proceed/i : /reject|deny|cancel|abort|no/i;
-    const pick = opts.find((o) => re.test(String(o.value))) || opts[allow ? 0 : opts.length - 1];
+    const opts = c.options || [], pick = pickOption(opts, allow);
+    if (!pick && opts.length) { // nothing is clearly a rejection: stop the turn instead of answering with a guess
+      log(w, 'studio', 'system', '權限詢問沒有可辨認的「拒絕」選項，Studio 停止這一步，不替它允許。');
+      await cancelTurn(convId);
+      continue;
+    }
     await api('POST', `/api/conversations/${convId}/confirmations/${encodeURIComponent(c.callId ?? c.id)}/confirm`,
-      { msg_id: c.msgId ?? c.id, data: pick ? pick.value : allow ? 'allow' : 'reject' }).catch((e) => log(w, 'studio', 'system', '自動回應確認失敗：' + e.message));
+      { msg_id: c.msgId ?? c.id, data: pick ? pick.value ?? pick.option_id ?? pick.optionId : allow ? 'allow' : 'reject' }).catch((e) => log(w, 'studio', 'system', '自動回應確認失敗：' + e.message));
   }
 }
 
@@ -1455,13 +1468,26 @@ async function snapTree(dir) {
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 }
 const STEP_DIFF_MAX = 400e3; // characters of patch shown for one step
+// git output read as a stream and cut at max characters (the git process is stopped there), so a huge patch still shows its start.
+function gitHead(cwd, args, max) {
+  return new Promise((res) => {
+    const p = spawn('git', [...GIT_SAFE, ...args], { cwd, windowsHide: true });
+    let out = '', err = '', cut = false;
+    const timer = setTimeout(() => p.kill(), 30e3);
+    p.stdout.setEncoding('utf8').on('data', (d) => { if (cut) return; out += d; if (out.length > max) { cut = true; p.kill(); } });
+    p.stderr.setEncoding('utf8').on('data', (d) => { err += d; });
+    p.on('error', (e) => { clearTimeout(timer); res({ err: e.message }); });
+    p.on('close', (code) => { clearTimeout(timer); res(cut ? { out: out.slice(0, max), cut } : code === 0 ? { out } : { err: err.trim().slice(0, 200) || 'git 沒有完成' }); });
+  });
+}
 async function stepDiff(w, id, n) {
   const t = w.tasks.find((x) => x.id === id), s = t?.steps?.[n];
   if (!s) throw new Error('找不到這一步');
-  const dir = (await workspaceOf(t.workdir || w.project)).path;
-  const r = await git(dir, '-c', 'core.quotepath=false', 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '--stat', '--patch', s.before, s.after);
+  // A worktree card's folder is removed after its merge; its snapshot objects live in the main repository.
+  const dir = (await workspaceOf(t.worktree?.repoPath || t.workdir || w.project)).path;
+  const r = await gitHead(dir, ['-c', 'core.quotepath=false', 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '--stat', '--patch', s.before, s.after], STEP_DIFF_MAX);
   if (r.err) throw new Error('讀不到這一步的 diff（可能已被 git 清掉）：' + r.err);
-  return { text: r.out.length > STEP_DIFF_MAX ? r.out.slice(0, STEP_DIFF_MAX) + `\n…（只顯示前 ${STEP_DIFF_MAX / 1000}k 字元）` : r.out };
+  return { text: r.cut ? r.out + `\n…（只顯示前 ${STEP_DIFF_MAX / 1000}k 字元）` : r.out };
 }
 // Paths whose entry differs between two snapshots: added, changed or deleted.
 function changedFiles(before, after) {
@@ -1923,6 +1949,7 @@ async function runCard(w, t) {
   t.firstStartedAt ||= t.workingSince;
   t.wakeNote = '';
   log(w, t.agent, 'worker', (note ? '收到等待的結果，繼續：' : t.resumed ? '繼續工作：' : '開始工作：') + t.title);
+  let snap = null; // { dir, at, before }: a writing step's tree before it; the after-tree is taken however the step ends
   try {
     const deps = (t.after || []).map((id) => w.tasks.find((x) => x.id === id)).filter(Boolean);
     const knowsTask = t.briefed === workKey(t); // this agent's conversation has had the full card brief (a handoff or a new tier starts over)
@@ -1965,7 +1992,7 @@ ${STATUS_RULES}`;
       log(w, t.agent, 'worker', '已停下，等工頭轉達你的新指示：' + t.title);
     };
     const dir = isWriter(t) ? (await workspaceOf(t.workdir || w.project)).path : '', before = dir ? await treeFiles(dir).catch(() => null) : null;
-    const treeBefore = dir ? await snapTree(dir) : '', stepAt = nowIso();
+    if (dir) snap = { dir, at: nowIso(), before: await snapTree(dir) };
     const reported = new Set(), parsed = (r) => { const st = parseStatus(r); st?.files.forEach((f) => reported.add(f)); return st; };
     const reply = await step(prompt);
     if (t.interrupted) { park(); return; }
@@ -1994,8 +2021,6 @@ ${STATUS_RULES}`;
     if (st.kind !== 'DONE' && overCap(w, t)) throw capErr(); // the step that just ended blew the budget and the card is not finished: stop it now, not at the next wake-up
     applyStatus(w, t, st, last);
     if (before) await reportFiles(w, t, dir, before, reported);
-    const treeAfter = treeBefore && await snapTree(dir);
-    if (treeAfter && treeAfter !== treeBefore) (t.steps ||= []).push({ at: stepAt, before: treeBefore, after: treeAfter }); // only steps that changed files
     if (t.status === 'DONE' && overCap(w, t)) { // finished, but the last step went over: the work stays, the user hears about it
       t.overCap = true;
       log(w, 'studio', 'system', `「${t.title}」已完成，但用了 ${cardTokens(t)} tokens，超過上限 ${w.tokenCap}。`);
@@ -2043,6 +2068,9 @@ ${STATUS_RULES}`;
     t.detail = e.message;
     log(w, t.agent, 'worker', t.result + '：' + t.title, e.message);
     wakeWaiters(w, t);
+  } finally { // also a step that was paused, stopped, timed out or failed: its partial edits are worth a look
+    const after = snap?.before && await snapTree(snap.dir);
+    if (after && after !== snap.before) (t.steps ||= []).push({ at: snap.at, before: snap.before, after }); // only steps that changed files
   }
 }
 

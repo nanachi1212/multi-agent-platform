@@ -1217,6 +1217,18 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
     console.log('32 read-only conversion: confirmed stop, lease release, new sandbox, restart, shared conversation: PASS');
   }
 
+  { // 35) permission answers: ACP option kinds first, clear words second; a rejecting turn never guesses
+    const pickOption = new Function(region('const ALLOW_WORD =', 'async function answerConfirmations') + '\nreturn pickOption;')();
+    const kinds = [{ value: 'x1', kind: 'reject_once' }, { value: 'x2', kind: 'allow_once' }];
+    assert.strictEqual(pickOption(kinds, true).value, 'x2', 'allow by kind, not by position');
+    assert.strictEqual(pickOption(kinds, false).value, 'x1', 'reject by kind, not by position');
+    assert.strictEqual(pickOption([{ value: 'a', kind: 'allow_once' }, { value: 'b', kind: 'allow_always' }], false), null, 'no reject kind: no answer');
+    assert.strictEqual(pickOption([{ value: 'opt-1' }, { value: 'opt-2' }], false), null, 'opaque ids: a rejecting turn does not guess');
+    assert.strictEqual(pickOption([{ value: 'allow', label: 'Allow (not recommended)' }, { value: 'deny' }], false).value, 'deny', 'words, and "not" is not "no"');
+    assert.strictEqual(pickOption([{ value: 'opt-1' }], true).value, 'opt-1', 'a worker may take the first option');
+    console.log('35 permission answers by ACP kind, then words; rejecting turns never guess: PASS');
+  }
+
   { // 33) one available worker cannot review its own implementation; historical authors count after a handoff
     const E = makeEnv((agent, text) => {
       if (text.includes('LEADER (foreman)')) return JSON.stringify({ subtasks: [

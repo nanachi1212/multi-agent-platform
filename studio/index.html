@@ -705,10 +705,13 @@ function workHtml(d) {
 }
 let workLogOpen = false, workDiff = null; // { n, text } of the step diff shown in the open work details
 const diffHtml = (s) => esc(s).split('\n').map((l) => /^\+(?!\+\+)/.test(l) ? `<span class="add">${l}</span>` : /^-(?!--)/.test(l) ? `<span class="del">${l}</span>` : /^@@/.test(l) ? `<span class="hunk">${l}</span>` : l).join('\n');
+let diffSeq = 0; // only the latest request may fill workDiff (a slower old answer, or one for another card, is dropped)
 async function showStepDiff(n) {
+  const seq = ++diffSeq;
   if (workDiff?.n === n) { workDiff = null; return loadWork(); } // a second click closes it
   const r = await fetch('/api/card/diff', { method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify({ ws:workOpen.ws, taskId:workOpen.id, step:n }) });
   const j = await r.json().catch(() => ({}));
+  if (seq !== diffSeq) return;
   workDiff = { n, text: r.ok ? j.text || '（沒有差異）' : j.error || '讀取失敗' };
   loadWork();
 }
@@ -722,7 +725,7 @@ async function loadWork() {
   $('workAsk').hidden = !ASKABLE.includes(d.status);
   $('workBody').innerHTML = workHtml(d);
 }
-function openWork(ws, id) { workOpen = { ws, id }; workLogOpen = false; workDiff = null; $('workBody').innerHTML = '<div class="empty">讀取中…</div>'; $('workDlg').showModal(); loadWork(); }
+function openWork(ws, id) { workOpen = { ws, id }; workLogOpen = false; workDiff = null; diffSeq++; $('workBody').innerHTML = '<div class="empty">讀取中…</div>'; $('workDlg').showModal(); loadWork(); }
 async function askWork(text) {
   if (!workOpen) return;
   await post('/api/card/ask', { ws:workOpen.ws, taskId:workOpen.id, text }).catch(() => {});

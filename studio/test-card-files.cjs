@@ -2,7 +2,7 @@
 // Run: node studio/test-card-files.cjs   (real git in a temp repository, scripted agent replies, no network)
 const { assert, makeEnv, mkTmp, newW } = require('./lifecycle-harness.cjs');
 const fs = require('node:fs'), path = require('node:path');
-const { execFile, execFileSync } = require('node:child_process');
+const { execFile, execFileSync, spawn } = require('node:child_process');
 
 (async () => {
   const root = mkTmp('studio-files-'), repo = path.join(root, 'repo');
@@ -17,9 +17,10 @@ const { execFile, execFileSync } = require('node:child_process');
     if (text.includes('Task: listed')) { write('a.txt', 'A'); write('b.txt', 'B'); write('new.txt', 'n'); fs.unlinkSync(path.join(repo, 'c.txt')); write('out/build.log', 'x'); return `Edited.\nSTATUS: DONE\nFILES: a.txt, ./b.txt, ${repo}\\new.txt, c.txt`; }
     if (text.includes('Task: partial')) { write('a.txt', 'A2'); write('b.txt', 'B2'); return 'Edited.\nSTATUS: DONE\nFILES: a.txt'; }
     if (text.includes('Task: silent')) { write('a.txt', 'A3'); return 'Edited.\nSTATUS: DONE'; }
+    if (text.includes('Task: crash')) { write('big.txt', 'line of a large generated file\n'.repeat(20000)); throw new Error('agent crashed mid-step'); }
     if (text.includes('Task: reader')) { write('a.txt', 'A4'); return 'Read.\nSTATUS: DONE'; }
     return 'Nothing to change.\nSTATUS: DONE';
-  }, { execFile });
+  }, { execFile, spawn });
   try {
     const cards = {}, wss = {};
     // title, writes, files expected to be flagged as changed-but-unreported
@@ -48,6 +49,14 @@ const { execFile, execFileSync } = require('node:child_process');
     for (const s of ['+A', '+++ b/new.txt', '--- a/c.txt']) assert.ok(patch.includes(s), 'step diff has ' + s);
     assert.ok(!patch.includes('build.log'), 'ignored output is not in the step diff');
     assert.strictEqual(git('diff', '--cached', '--name-only'), '', 'snapshots never stage anything');
+    // A step that ends in an error still records what it changed; a patch over the limit is cut, not lost.
+    await new Promise((r) => setTimeout(r, 30));
+    const cw = newW(); cw.project = repo; cw.run.project = repo; cw.run.startedAt = new Date().toISOString(); env.S.workspaces.length = 0; env.S.workspaces.push(cw);
+    const crash = { id: 'crash', title: 'crash', agent: 'codex', writes: true, status: 'WAITING', after: [], instructions: 'x' }; cw.tasks.push(crash);
+    await api.runTask(cw, crash);
+    assert.strictEqual(crash.steps?.length, 1, 'failed step keeps its diff');
+    const big = (await api.stepDiff(cw, 'crash', 0)).text;
+    assert.ok(big.includes('big.txt') && big.endsWith('k 字元）') && big.length < 401e3, 'large patch is cut at the limit');
     // A worker that can edit the repo config must not get a program run by Studio's own git: snapshots never run filters.
     git('config', 'filter.trap.clean', 'echo ran > FILTER_RAN; cat # x.clean=y'); write('.gitattributes', 'trap.dat filter=trap\n'); write('trap.dat', 'x');
     assert.ok(await api.snapTree(repo), 'snapshot still taken');
