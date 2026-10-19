@@ -1449,7 +1449,7 @@ async function stepDiff(w, id, n) {
   const t = w.tasks.find((x) => x.id === id), s = t?.steps?.[n];
   if (!s) throw new Error('找不到這一步');
   const dir = (await workspaceOf(t.workdir || w.project)).path;
-  const r = await git(dir, '-c', 'core.quotepath=false', 'diff', '--no-color', '--no-ext-diff', '--stat', '--patch', s.before, s.after);
+  const r = await git(dir, '-c', 'core.quotepath=false', 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '--stat', '--patch', s.before, s.after);
   if (r.err) throw new Error('讀不到這一步的 diff（可能已被 git 清掉）：' + r.err);
   return { text: r.out.length > STEP_DIFF_MAX ? r.out.slice(0, STEP_DIFF_MAX) + `\n…（只顯示前 ${STEP_DIFF_MAX / 1000}k 字元）` : r.out };
 }
@@ -2451,7 +2451,8 @@ const sh = (cmd, args, cwd, env) => new Promise((res) => execFile(cmd, args, { c
   (e, out, err) => res(e ? { err: String(err || e.message).trim().slice(0, 200) } : { out: String(out) })));
 // Folders owned by another Windows account (e.g. the Codex sandbox user) need safe.directory to be readable.
 // Only local reads that run no repo-configured programs go through it: fsmonitor is off, and nothing here talks to a remote.
-// (snapTree also writes objects, never refs, the index or files.)
+// snapTree also writes objects (never refs, the index or files); like `git status`, its `git add` runs clean filters only
+// when the repo's own local config defines them (filter commands are never cloned).
 const GIT_SAFE = ['-c', 'safe.directory=*', '-c', 'core.fsmonitor=false'];
 const git = (cwd, ...args) => sh('git', [...GIT_SAFE, ...args], cwd);
 const PR_FIELDS = 'number,title,state,headRefName,mergedAt,url,statusCheckRollup,reviewDecision,author';
