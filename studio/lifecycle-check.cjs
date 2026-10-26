@@ -931,7 +931,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
     assert.ok(env.notices.some((n) => n.title.includes('額度用完')));
     // when the quota is back: the latest full plan window, else the time the error names, else one hour
     const now0 = new Date(2026, 9, 26, 10, 0).getTime(), s = now0 / 1000;
-    env.S.limits = { claude: { windows: [{ used: 1, resetsAt: s + 600 }, { used: 0.97, resetsAt: s + 86400 }, { used: 0.2, resetsAt: s + 9e5 }] } };
+    env.S.limits = { claude: { windows: [{ used: 1, resetsAt: s + 600 }, { used: 1, resetsAt: s + 86400 }, { used: 0.96, resetsAt: s + 2e5 }, { used: 0.2, resetsAt: s + 9e5 }] } };
     assert.strictEqual(api.quotaResumeAt('claude', 'rate limit', now0), now0 + 86400e3 + 60e3, 'full weekly window wins');
     assert.strictEqual(api.quotaResumeAt('codex', `Claude AI usage limit reached|${s + 300}`, now0), now0 + 300e3 + 60e3, 'epoch in the error');
     assert.strictEqual(api.quotaResumeAt('codex', "You've hit your limit · resets 3pm (Asia/Taipei)", now0), new Date(2026, 9, 26, 15, 1).getTime(), 'clock time today');

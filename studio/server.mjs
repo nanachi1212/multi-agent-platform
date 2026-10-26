@@ -458,7 +458,8 @@ async function sendSteer(w, agent, convId) {
   if (!notes?.length) return;
   // not sendMessage(): on CONFLICT it stops the running turn to resend, the opposite of a steer
   try {
-    await api('POST', `/api/conversations/${convId}/messages`, { content: `New instruction from the user (via the leader), sent while you are working on this task:\n${notes.join('\n')}\n\nApply it as you continue. Your final reply keeps the same STATUS rules.` });
+    const res = await api('POST', `/api/conversations/${convId}/messages`, { content: `New instruction from the user (via the leader), sent while you are working on this task:\n${notes.join('\n')}\n\nApply it as you continue. Your final reply keeps the same STATUS rules.` });
+    if (res?.turn_id) active.set(convId, res.turn_id); // the turn ended first and AionCore opened a new one: Stop must reach that one
     log(w, 'studio', 'system', `已把你的指示插進 ${agentName(agent)} 正在做的這一步（沒有打斷）。`);
   } catch (e) {
     st.fallback(notes);
@@ -755,7 +756,7 @@ const MAX_QUOTA_WAITS = 5;
 // outlasts the 5-hour one), else a time the error names ("|1760000000", "resets 3pm", "try again in 20 min"),
 // else one hour from now. One extra minute so the retry lands after the reset, not on it.
 function quotaResumeAt(agent, msg, now = Date.now()) {
-  const full = (S.limits?.[agent]?.windows || []).filter((x) => x.used >= 0.95 && x.resetsAt * 1000 > now);
+  const full = (S.limits?.[agent]?.windows || []).filter((x) => x.used >= 0.99 && x.resetsAt * 1000 > now);
   if (full.length) return Math.max(...full.map((x) => x.resetsAt * 1000)) + 60e3;
   const epoch = /\|(\d{10})\b/.exec(msg);
   if (epoch && epoch[1] * 1000 > now) return epoch[1] * 1000 + 60e3;
@@ -1553,34 +1554,41 @@ async function undoStep(w, id, n) {
   if (!isDir(dir)) throw new Error('這張卡的資料夾已經不在（worktree 可能已清掉），沒有檔案可以復原');
   const key = treeKey(dir);
   if (S.leases.some((l) => l.key === key && l.status === 'EXTERNAL')) throw new Error('這個資料夾已宣告由外部接手，Studio 不改它的檔案');
-  const res = await privateGit(dir, async (g, tmp) => {
-    const now = await writeTree(g);
-    if (!now) return { err: '讀不到目前的檔案狀態' };
-    const names = (r) => (r.out || '').split('\0').filter(Boolean);
-    const changed = await g('diff', '--name-status', '-z', '--no-renames', s.after, s.before);
-    if (changed.err) return { err: '讀不到這一步的內容（可能已被 git 清掉）：' + changed.err };
-    const list = names(changed), restore = [], remove = [];
-    for (let i = 0; i + 1 < list.length; i += 2) (list[i] === 'D' ? remove : restore).push(list[i + 1]); // D: the step created it
-    const all = [...restore, ...remove];
-    if (!all.length) return { err: '這一步沒有檔案差異' };
-    const later = new Set(names(await g('diff', '--name-only', '-z', '--no-renames', s.after, now)));
-    const clash = all.filter((p) => later.has(p));
-    if (clash.length) return { err: `這一步之後又改過 ${clash.slice(0, 5).join('、')}${clash.length > 5 ? ` 等 ${clash.length} 個檔案` : ''}，無法乾淨地復原` };
-    if (restore.length) {
-      const list = path.join(tmp, 'paths');
-      fs.writeFileSync(list, restore.join('\0'));
-      const r = await g('restore', `--source=${s.before}`, '--worktree', `--pathspec-from-file=${list}`, '--pathspec-file-nul');
-      if (r.err) return { err: 'git restore 失敗：' + r.err };
+  w.stepsInFlight = (w.stepsInFlight || 0) + 1; // the watcher must not call our own edits "unknown"
+  try {
+    const res = await privateGit(dir, async (g, tmp) => {
+      const now = await writeTree(g);
+      if (!now) return { err: '讀不到目前的檔案狀態' };
+      const names = (r) => (r.out || '').split('\0').filter(Boolean);
+      const changed = await g('diff', '--name-status', '-z', '--no-renames', s.after, s.before);
+      if (changed.err) return { err: '讀不到這一步的內容（可能已被 git 清掉）：' + changed.err };
+      const list = names(changed), restore = [], remove = [];
+      for (let i = 0; i + 1 < list.length; i += 2) (list[i] === 'D' ? remove : restore).push(list[i + 1]); // D: the step created it
+      const all = [...restore, ...remove];
+      if (!all.length) return { err: '這一步沒有檔案差異' };
+      const later = new Set(names(await g('diff', '--name-only', '-z', '--no-renames', s.after, now)));
+      const clash = all.filter((p) => later.has(p));
+      if (clash.length) return { err: `這一步之後又改過 ${clash.slice(0, 5).join('、')}${clash.length > 5 ? ` 等 ${clash.length} 個檔案` : ''}，無法乾淨地復原` };
+      if (restore.length) {
+        const list = path.join(tmp, 'paths');
+        fs.writeFileSync(list, restore.join('\0'));
+        const r = await g('restore', `--source=${s.before}`, '--worktree', `--pathspec-from-file=${list}`, '--pathspec-file-nul');
+        if (r.err) return { now, after: await writeTree(g), files: all.length, partial: 'git restore 失敗：' + r.err }; // some files may have changed
+      }
+      for (const p of remove) fs.rmSync(path.join(dir, p), { force: true });
+      return { now, after: await writeTree(g), files: all.length };
+    });
+    if (!res) throw new Error('無法讀取這個資料夾的 git 狀態，沒有復原');
+    if (res.err) throw new Error(res.err + '，檔案都沒有改動');
+    (t.steps ||= []).push({ at: nowIso(), before: res.now, after: res.after || res.now, undo: n, ...(res.partial && { partial: true }) });
+    if (w.run) { const stamp = await treeStamp(w, dir); (w.run.treeStamps ||= {})[key] = stamp; if (!t.workdir) w.run.treeStamp = stamp; } // our own edit, not an unknown one
+    if (res.partial) {
+      log(w, 'studio', 'system', `復原「${t.title}」第 ${n + 1} 步時出錯（${clip(res.partial, 160)}），可能只還原了一部分；已記成第 ${t.steps.length} 步。`);
+      throw new Error(res.partial + '，可能只還原了一部分，請看這一步的 diff');
     }
-    for (const p of remove) fs.rmSync(path.join(dir, p), { force: true });
-    return { now, after: await writeTree(g), files: all.length };
-  });
-  if (!res) throw new Error('無法讀取這個資料夾的 git 狀態，沒有復原');
-  if (res.err) throw new Error(res.err + '，檔案都沒有改動');
-  (t.steps ||= []).push({ at: nowIso(), before: res.now, after: res.after, undo: n });
-  if (w.run) { const stamp = await treeStamp(w, dir); (w.run.treeStamps ||= {})[key] = stamp; if (!t.workdir) w.run.treeStamp = stamp; } // our own edit, not an unknown one
-  log(w, 'studio', 'system', `已復原「${t.title}」第 ${n + 1} 步改的 ${res.files} 個檔案（commit 不動）；這次復原記成第 ${t.steps.length} 步，可以再復原回去。`);
-  return { files: res.files };
+    log(w, 'studio', 'system', `已復原「${t.title}」第 ${n + 1} 步改的 ${res.files} 個檔案（commit 不動）；這次復原記成第 ${t.steps.length} 步，可以再復原回去。`);
+    return { files: res.files };
+  } finally { w.stepsInFlight--; }
 }
 // Paths whose entry differs between two snapshots: added, changed or deleted.
 function changedFiles(before, after) {
@@ -1976,6 +1984,7 @@ async function cleanupWorktree(w, t) {
   cleaningNow.add(wt.path); wt.retryAt = 0;
   try {
     if (wt.removed) { // an earlier try removed the worktree: only the branch is left, deleted only if it still points where it did
+      if ((await checked(wt.repoPath, 'worktree', 'list', '--porcelain', '-z')).split('\0').includes('branch refs/heads/' + wt.branch)) throw new Error('分支仍有其他 worktree 使用');
       await checked(wt.repoPath, 'update-ref', '-d', 'refs/heads/' + wt.branch, wt.removedHead);
       Object.assign(wt, { cleaned: true, cleanupError: '' });
       return log(w, 'studio', 'system', `已清掉 branch「${wt.branch}」（worktree 先前已移除）。`);
