@@ -728,6 +728,28 @@ function chargeUsage(run, agent, t, d) {
 
 // ---------- Automatic fallback when a worker's quota is gone ----------
 const QUOTA_RE = /usage limit|hit your (?:usage )?limit|rate.?limit|quota|RESOURCE_EXHAUSTED|\b429\b|too many requests|insufficient_quota|credit balance|額度/i;
+// An empty balance does not come back by itself (Cindy's usageLimit.ts makes the same split): those cards fail as before.
+const BILLING_RE = /insufficient_quota|credit balance|billing|餘額|余额/i;
+const MAX_QUOTA_WAITS = 5;
+// When an agent's used-up quota is back, in ms: the latest reset among its full plan windows (a full weekly window
+// outlasts the 5-hour one), else a time the error names ("|1760000000", "resets 3pm", "try again in 20 min"),
+// else one hour from now. One extra minute so the retry lands after the reset, not on it.
+function quotaResumeAt(agent, msg, now = Date.now()) {
+  const full = (S.limits?.[agent]?.windows || []).filter((x) => x.used >= 0.95 && x.resetsAt * 1000 > now);
+  if (full.length) return Math.max(...full.map((x) => x.resetsAt * 1000)) + 60e3;
+  const epoch = /\|(\d{10})\b/.exec(msg);
+  if (epoch && epoch[1] * 1000 > now) return epoch[1] * 1000 + 60e3;
+  const clock = /(?:resets?|try again)\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b/i.exec(msg);
+  if (clock) {
+    const d = new Date(now);
+    d.setHours(Number(clock[1]) % 12 + (/p/i.test(clock[3]) ? 12 : 0), Number(clock[2] || 0), 0, 0);
+    if (d.getTime() <= now) d.setDate(d.getDate() + 1);
+    return d.getTime() + 60e3;
+  }
+  const after = /(?:resets?|try again|retry)\D{0,15}in\s*~?\s*(\d+)\s*(hours?|hrs?|h|minutes?|mins?|m)\b/i.exec(msg);
+  if (after) return now + after[1] * (/^h/i.test(after[2]) ? 3600e3 : 60e3) + 60e3;
+  return now + 3600e3;
+}
 
 const SUBTASK_RULES = `- Each subtask goes to exactly one worker id from the list above.
 - Workers run in parallel, one task at a time each. Spread independent parts across different workers.
@@ -2055,6 +2077,16 @@ ${STATUS_RULES}`;
       setTimeout(() => withdrawAgent(w, from, fb).catch((err) => { t.hold = false; log(w, 'studio', 'system', '自動改派給備援成員失敗：' + err.message); pump(w); }), 0);
       return;
     }
+    if (!(e instanceof Halt) && QUOTA_RE.test(e.message) && !BILLING_RE.test(e.message) && (t.quotaWaits || 0) < MAX_QUOTA_WAITS) {
+      // no fallback: park the card (it keeps its conversation and its lease) and resume it when the quota is back
+      const at = quotaResumeAt(t.agent, e.message);
+      t.quotaWaits = (t.quotaWaits || 0) + 1;
+      Object.assign(t, { status: 'WAITING_EXTERNAL', detail: e.message, wait: { what: `${agentName(t.agent)} 的額度重置`, quotaAt: at, manual: false } });
+      const when = new Date(at).toLocaleString('zh-TW', { hour12: false, month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+      log(w, 'studio', 'system', `${agentName(t.agent)} 的額度用完或被限流：「${t.title}」先停在這裡，約 ${when} 額度重置後自動接著做（第 ${t.quotaWaits}/${MAX_QUOTA_WAITS} 次）。`, e.message);
+      notify(`${label(w)}：${agentName(t.agent)} 額度用完，約 ${when} 自動繼續`, t.title, 'done', w.project);
+      return;
+    }
     if (!(e instanceof Halt) && !e.timeout && !e.stuck && !t.hard && JSON.stringify(tierCfg(w, t.agent, true)) !== JSON.stringify(tierCfg(w, t.agent, false))) {
       Object.assign(t, { hard: true, escalated: true, status: 'WAITING', resumed: true, detail: e.message });
       log(w, 'studio', 'system', `「${t.title}」用平常的模型沒做成，自動改用強模型重試一次。`, e.message);
@@ -2472,7 +2504,12 @@ async function checkExternal(w, t) {
 }
 
 function watchExternal() {
-  for (const w of S.workspaces) if (w.run?.active) for (const t of w.tasks) if (t.status === 'WAITING_EXTERNAL') { if (t.wait?.pokeAt) pokeExternal(w, t); else checkExternal(w, t); }
+  for (const w of S.workspaces) if (w.run?.active) for (const t of w.tasks) if (t.status === 'WAITING_EXTERNAL') { if (t.wait?.quotaAt) resumeAfterQuota(w, t); else if (t.wait?.pokeAt) pokeExternal(w, t); else checkExternal(w, t); }
+}
+function resumeAfterQuota(w, t) {
+  if (Date.now() < t.wait.quotaAt) return;
+  wake(w, t, 'Your usage limit has reset. Continue the task from where you stopped; do not redo work that is already done.',
+    `${agentName(t.agent)} 的額度重置時間到了：「${t.title}」自動接著做。`);
 }
 function pokeExternal(w, t) {
   if (Date.now() < t.wait.pokeAt) return;

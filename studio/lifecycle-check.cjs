@@ -892,16 +892,44 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
     assert.deepStrictEqual([w.tasks[0].agent, w.tasks[0].status, w.workers, !!w.tasks[0].escalated], ['codex', 'DONE', ['codex'], false], 'moved, not escalated');
     assert.ok(fbTurns === 1 && env.prompts.filter((p) => p.agent === 'codex').at(-1).text.includes('Task: impl'), 'the fallback got the full brief');
     assert.ok(env.notices.some((n) => n.title.includes('額度用完')));
-    // without a fallback the card fails as before
+    // when the quota is back: the latest full plan window, else the time the error names, else one hour
+    const now0 = new Date(2026, 9, 26, 10, 0).getTime(), s = now0 / 1000;
+    env.S.limits = { claude: { windows: [{ used: 1, resetsAt: s + 600 }, { used: 0.97, resetsAt: s + 86400 }, { used: 0.2, resetsAt: s + 9e5 }] } };
+    assert.strictEqual(api.quotaResumeAt('claude', 'rate limit', now0), now0 + 86400e3 + 60e3, 'full weekly window wins');
+    assert.strictEqual(api.quotaResumeAt('codex', `Claude AI usage limit reached|${s + 300}`, now0), now0 + 300e3 + 60e3, 'epoch in the error');
+    assert.strictEqual(api.quotaResumeAt('codex', "You've hit your limit · resets 3pm (Asia/Taipei)", now0), new Date(2026, 9, 26, 15, 1).getTime(), 'clock time today');
+    assert.strictEqual(api.quotaResumeAt('codex', 'usage limit, try again at 9:30 AM', now0), new Date(2026, 9, 27, 9, 31).getTime(), 'clock time already passed: tomorrow');
+    assert.strictEqual(api.quotaResumeAt('codex', 'Try again in ~20 min', now0), now0 + 21 * 60e3, 'minutes from now');
+    assert.strictEqual(api.quotaResumeAt('codex', '429 Too Many Requests', now0), now0 + 3600e3, 'unknown: one hour');
+    delete env.S.limits;
+    // without a fallback the card parks until the quota resets, then the same agent continues it
+    let limited = 1;
     ({ env, api } = makeEnv((agent, text) => {
       if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"impl","agent":"antigravity","instructions":"x"}]}';
       if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
-      throw new Error('429 Too Many Requests');
+      if (limited-- > 0) throw new Error('429 Too Many Requests');
+      return text.includes('usage limit has reset') ? 'built\nSTATUS: DONE' : 'lost the note\nSTATUS: BLOCKED';
     }, { tierCfg: () => ({ model: '', effort: '' }) }));
     w = newW(); w.workers = ['antigravity', 'codex']; env.S.workspaces.push(w);
     api.planPhase(w);
-    assert.ok(await waitFor(() => w.tasks[0]?.status === 'FAILED'), 'no fallback set: fails as before');
-    console.log('20 token usage accounting + automatic fallback on quota errors: PASS');
+    assert.ok(await waitFor(() => w.tasks[0]?.status === 'WAITING_EXTERNAL'), 'no fallback set: the card waits for the reset');
+    const q = w.tasks[0];
+    assert.ok(q.wait.quotaAt > Date.now() + 59 * 60e3 && !q.wait.manual && q.quotaWaits === 1 && !q.escalated, 'unknown reset time: one hour, no escalation, no 繼續 button');
+    api.watchExternal(); await settle();
+    assert.strictEqual(q.status, 'WAITING_EXTERNAL', 'not resumed before the reset');
+    q.wait.quotaAt = 1; api.watchExternal();
+    assert.ok(await waitFor(() => w.run.result === 'done'), 'resumed after the reset and finished');
+    assert.deepStrictEqual([q.agent, q.status], ['antigravity', 'DONE']);
+    // an empty balance does not reset by itself: the card fails as before
+    ({ env, api } = makeEnv((agent, text) => {
+      if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"impl","agent":"antigravity","instructions":"x"}]}';
+      if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+      throw new Error('Your credit balance is too low');
+    }, { tierCfg: () => ({ model: '', effort: '' }) }));
+    w = newW(); w.workers = ['antigravity', 'codex']; env.S.workspaces.push(w);
+    api.planPhase(w);
+    assert.ok(await waitFor(() => w.tasks[0]?.status === 'FAILED'), 'billing error: fails as before');
+    console.log('20 token usage accounting + automatic fallback / resume after reset on quota errors: PASS');
 
     // 21) 交給 X 處理: a question the user does not understand goes to another agent with the question
     ({ env, api } = makeEnv((agent, text) => {
