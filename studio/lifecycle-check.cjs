@@ -172,6 +172,43 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
   assert.strictEqual(w.run.result, 'done');
   console.log('9 hard card + interrupt now (stop, Leader note, continue): PASS');
 
+  // 9b) 插話: the Leader's note goes into Codex's running step (no stop, no extra step); Antigravity cannot take it mid-turn, so it gets it after its step
+  {
+    const steered = [];
+    const fake = async (agent, cid, text) => {
+      env.prompts.push({ agent, cid, text }); env.active.set(cid, 't');
+      try {
+        if (text.includes('LEADER (foreman)')) return '{"message":"ok","subtasks":[{"title":"impl","agent":"codex","instructions":"build"},{"title":"docs","agent":"antigravity","instructions":"docs","writes":false}]}';
+        if (text.includes('the user sent new instructions')) {
+          const id = (t) => text.match(new RegExp(`id (\\w+) \\[\\w+\\] ${t}`))[1];
+          return JSON.stringify({ message: '好', tell: [{ card: id('impl'), note: 'use blue' }, { card: id('docs'), note: 'docs in blue' }], cancel: [], add: [] });
+        }
+        if (text.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+        if (text.includes('Task: impl') || text.includes('Task: docs')) {
+          for (let i = 0; i < 100 && !env.prompts.some((p) => p.text.includes('the user sent new instructions')); i++) await new Promise((r) => setTimeout(r, 10));
+          await new Promise((r) => setTimeout(r, 40)); // the Leader's answer is applied while both steps still run
+          const n = env.steers.get(cid)?.notes.splice(0) || []; steered.push(...n);
+          return (n.length ? 'Blue mid-step.' : 'Red.') + '\nSTATUS: DONE';
+        }
+        if (text.startsWith('New instruction from the user')) return 'Docs blue.\nSTATUS: DONE';
+        return 'ok\nSTATUS: DONE';
+      } finally { env.active.delete(cid); }
+    };
+    ({ env, api } = makeEnv(() => 'unused', { steers: new Map(), STEER_AGENTS: new Set(['claude', 'codex']), turn: fake }));
+    w = newW(); env.S.workspaces.push(w);
+    await api.planPhase(w);
+    await new Promise((r) => setTimeout(r, 30));
+    api.instruct(w, '改藍色', false, true);
+    for (let i = 0; i < 100 && w.run.result !== 'done'; i++) await settle();
+    assert.strictEqual(w.run.result, 'done', 'job finished');
+    const byTitle = (x) => w.tasks.find((t) => t.title === x);
+    assert.deepStrictEqual([steered, byTitle('impl').result, !!byTitle('impl').interrupted], [['use blue'], 'Blue mid-step.', false], 'Codex got it inside its step, not stopped');
+    assert.ok(!env.prompts.some((p) => p.agent === 'codex' && p.text.startsWith('New instruction from the user')), 'no extra step for the steered note');
+    assert.strictEqual(byTitle('docs').result, 'Docs blue.', 'Antigravity got it after its step');
+    assert.ok(env.logs.some((l) => l.text === '你的指示（插話）：改藍色') && env.logs.some((l) => l.text.includes('插進 Codex 正在做的這一步')));
+    console.log('9b steer: note into the running step (Claude / Codex), queued for the others: PASS');
+  }
+
   // 10) model strategies pick real catalog models; a failed normal card is retried once on the strong model
   const tierSrc = region('const STRATEGIES = {', 'function setStrategy(');
   const catalogs = { claude: { models: ['default', 'opus', 'fable', 'sonnet', 'haiku', 'claude-sonnet-5'].map((value) => ({ value })), efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },

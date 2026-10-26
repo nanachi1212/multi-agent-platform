@@ -1036,7 +1036,7 @@ function officeHtml(w) {
     ${running || paused ? `<div class="ask">工作進行中，想補充或修改指示？</div>
     <textarea id="instruction" placeholder="例如：按鈕改成藍色。或：先不要 merge，等我看過。\n工頭會決定要轉告哪位成員、取消或追加哪些工作卡。">${esc(drafts['i:' + w.project] || '')}</textarea>
     <div class="row"><span class="hint">${paused ? '工作暫停中：指示會先保留，按「繼續」後交給工頭' : r?.notes || r?.noting ? '⏳ 工頭正在看你的指示…' : '正在工作的成員做完手上這一步就會收到'}</span><span class="err" id="err"></span><span class="spacer"></span>
-      <label class="hint" style="display:flex;align-items:center;gap:4px;cursor:pointer" title="正在做的成員會馬上停下（手上這一步可能做到一半），等工頭看完指示再接著做"><input type="checkbox" id="interruptChk">⚡ 立刻打斷正在做的成員</label>
+      <select id="deliverSel" class="hint" title="排隊：成員做完手上這一步才收到。插話：直接送進成員正在做的這一步、不停下（Claude、Codex 才支援，其他成員自動改成排隊）。立刻打斷：成員馬上停下（這一步可能做到一半），等工頭看完再接著做。"><option value="queue">🕒 這一步做完再轉達</option><option value="steer">💬 插話（不打斷）</option><option value="interrupt">⚡ 立刻打斷</option></select>
       <button class="btn primary" id="instructBtn">📣 告訴工頭</button></div>
     <div class="hint" style="border-top:1px dashed var(--line);padding-top:10px;font-weight:700">新的工作要等這件做完才能交辦</div>` : ''}
     <div class="ask">今天想讓「${esc(w.name)}」做什麼？</div>
@@ -1529,7 +1529,7 @@ document.addEventListener('click', (e) => {
   }
   if (b.id === 'instructBtn') {
     const p = ws();
-    return post('/api/instruct', { ws: p, text: $('instruction').value, interrupt: !!$('interruptChk')?.checked }).then(() => { drafts['i:' + p] = ''; $('office')._html = ''; render(); }).catch(() => {});
+    return post('/api/instruct', { ws: p, text: $('instruction').value, interrupt: $('deliverSel')?.value === 'interrupt', steer: $('deliverSel')?.value === 'steer' }).then(() => { drafts['i:' + p] = ''; $('office')._html = ''; render(); }).catch(() => {});
   }
   if (b.hasAttribute('data-continue-state') || b.hasAttribute('data-refresh-state')) {
     b.disabled = true; b.textContent = b.hasAttribute('data-refresh-state') ? '讀取中…' : '核對狀態中…';

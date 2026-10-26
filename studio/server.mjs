@@ -448,6 +448,23 @@ async function stepEvidence(agent, convId, w, dir, { snapshot = processSnapshot,
 const acpTree = (rows) => { if (!aionProcess) return []; try { return processTree(rows, aionProcess).map((p) => p.pid).filter((pid) => pid !== aionProcess.pid); } catch { return []; } };
 // timeout = how long the agent may show NO progress (new messages); a long job that keeps working is never cut off.
 // bill = where this turn's tokens go: a card, 'lead' (default for Leader turns), or nothing (availability checks).
+// 插話 (Cindy's delivery: 'steer'): a user note sent INTO the turn that is running, without stopping it. AionCore delivers
+// it mid-turn for Claude and Codex (codex turn/steer); if the turn has just ended it opens a new turn with it, which this
+// same turn() then waits for, so nothing runs unseen. Notes not sent before the turn ends go back through fallback(notes).
+const STEER_AGENTS = new Set(['claude', 'codex']);
+const steers = new Map(); // conversationId -> { notes: [], fallback(notes) }
+async function sendSteer(w, agent, convId) {
+  const st = steers.get(convId), notes = st?.notes.splice(0);
+  if (!notes?.length) return;
+  // not sendMessage(): on CONFLICT it stops the running turn to resend, the opposite of a steer
+  try {
+    await api('POST', `/api/conversations/${convId}/messages`, { content: `New instruction from the user (via the leader), sent while you are working on this task:\n${notes.join('\n')}\n\nApply it as you continue. Your final reply keeps the same STATUS rules.` });
+    log(w, 'studio', 'system', `已把你的指示插進 ${agentName(agent)} 正在做的這一步（沒有打斷）。`);
+  } catch (e) {
+    st.fallback(notes);
+    log(w, 'studio', 'system', `插話沒有送進去（${clip(e.message, 120)}）：改成這一步做完再轉達。`);
+  }
+}
 async function turn(agent, convId, text, { w, lead = false, check = false, allowStart, ask = false, timeout = 25 * 60e3, progressEvery = 30000, bill = lead && !check ? 'lead' : null } = {}) {
   const run = w?.run;
   if (!check && (run?.stopped || run?.paused || allowStart && !allowStart())) throw new Halt('執行已停止');
@@ -470,6 +487,7 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
       const rt = (await api('GET', `/api/conversations/${convId}`)).runtime || {};
       if (rt.pending_confirmations) await answerConfirmations(w, convId, !lead);
       if (rt.state === 'idle' && !rt.is_processing) { confirmedIdle = true; break; }
+      if (!rt.pending_confirmations) await sendSteer(w, agent, convId);
       const now = Date.now();
       if (now - checkedAt >= progressEvery) {
         checkedAt = now;
@@ -499,6 +517,8 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
   } finally {
     active.delete(convId);
     convActivity.delete(convId);
+    const left = steers.get(convId); steers.delete(convId);
+    if (left?.notes.length) left.fallback(left.notes); // the step ended first: the card hands them over after it
     if (!check) S.agents[agent].working--;
     if (agent === 'codex') refreshCodexLimits();
     if (bill) chargeUsage(run, agent, bill === 'lead' ? null : bill, usageDelta(usage0, await usageOf(convId)));
@@ -2414,13 +2434,15 @@ async function cardDetail(w, id) {
 // The user's note goes to the Leader, who decides: tell a worker (on its card), cancel cards that
 // have not started, or add cards. A busy Leader (planning / final check) gets the notes right after.
 // interrupt = stop the working cards' current step now; they continue after the Leader has read the note.
-function instruct(w, text, interrupt = false) {
+// steer = the Leader's note goes into the working card's current step (Claude / Codex), without stopping it.
+function instruct(w, text, interrupt = false, steer = false) {
   text = String(text || '').trim();
   if (!text) throw new Error('請輸入指示');
   const run = w.run;
   if (!run?.active && !run?.paused) throw new Error('目前沒有進行中的工作；新的工作請用「交給團隊」');
   if (run.active && run.ask && !run.summarizing) return answer(w, '', text); // the Leader is waiting for an answer: this is it
-  log(w, 'user', 'user', (interrupt ? '你的指示（立刻打斷）：' : '你的指示：') + text);
+  log(w, 'user', 'user', (interrupt ? '你的指示（立刻打斷）：' : steer ? '你的指示（插話）：' : '你的指示：') + text);
+  if (steer && !interrupt) run.steer = true;
   if (interrupt && run.active) {
     const working = w.tasks.filter((t) => t.status === 'WORKING');
     for (const t of working) {
@@ -2442,7 +2464,8 @@ async function processNotes(w) {
   // Planning and the final check read the notes themselves when they end (see planPhase / summarize).
   if (!run?.active || run.noting || run.asking || run.phase !== 'working' || run.summarizing || !run.notes?.length) return;
   run.noting = true;
-  const notes = run.notes.splice(0);
+  const notes = run.notes.splice(0), steer = run.steer;
+  run.steer = false;
   const gen = run.leaderGen, lead = run.leader;
   const workers = workersFor(w, lead);
   try {
@@ -2477,6 +2500,13 @@ ${SUBTASK_RULES}`;
     for (const x of Array.isArray(d.tell) ? d.tell : []) {
       const t = w.tasks.find((y) => y.id === String(x?.card)), note = String(x?.note || '').trim();
       if (!t || !note) continue;
+      const cid = run.convs[workKey(t)];
+      if (t.status === 'WORKING' && steer && STEER_AGENTS.has(t.agent) && cid && active.has(cid)) {
+        const st = steers.get(cid) || { notes: [], fallback: (n) => (t.notes ??= []).push(...n) };
+        st.notes.push(note); steers.set(cid, st);
+        log(w, 'studio', 'system', `指示會插進 ${agentName(t.agent)} 正在做的這一步（「${t.title}」，不打斷）。`);
+        continue;
+      }
       if (t.status === 'WORKING') (t.notes ??= []).push(note);
       else if (PARKED.includes(t.status) || (t.status === 'WAITING' && t.wakeNote)) wake(w, t, 'New instruction from the user (via the leader): ' + note); // a pending wake (e.g. an interrupted card) gets it added
       else if (['WAITING', 'PAUSED', 'INTERRUPTED'].includes(t.status)) t.instructions += '\n\nInstruction added by the user during the job: ' + note;
@@ -3280,7 +3310,7 @@ const routes = {
   'POST /api/reassign': (b) => reassign(wsOf(b.ws), b.taskId, b.agent),
   'POST /api/continue': (b) => { const w = wsOf(b.ws); w.autoRounds = 0; return continueProject(w); },
   'POST /api/project-state/refresh': (b) => refreshState(wsOf(b.ws)),
-  'POST /api/instruct': (b) => instruct(wsOf(b.ws), b.text, !!b.interrupt),
+  'POST /api/instruct': (b) => instruct(wsOf(b.ws), b.text, !!b.interrupt, !!b.steer),
   'POST /api/strategy': (b) => setStrategy(wsOf(b.ws), b.strategy),
   'POST /api/answer': (b) => answer(wsOf(b.ws), b.taskId, b.text),
   'POST /api/continue-card': (b) => continueCard(wsOf(b.ws), b.taskId),
