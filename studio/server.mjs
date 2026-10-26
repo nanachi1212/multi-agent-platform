@@ -1954,11 +1954,23 @@ function removeIncluded(wt) {
   return true;
 }
 // The PR is merged (or, without a remote, the branch is part of the base): the worktree and its branch can go.
+// A failure that may pass by itself (gh / network, a merge GitHub does not show yet, a file still locked) is retried after
+// 1 and then 5 minutes (Cindy's worktree-recycle budget: 3 failures); a check that says the tree is not ours or not clean,
+// the third failure, or 「保留」 stops it until the user presses 「重試清理」.
+const CLEANUP_RETRY_MIN = [1, 5]; // minutes before the 2nd and 3rd try
+const cleaningNow = new Set(); // worktree paths being cleaned (not saved: a restart never leaves one stuck)
+const CLEANUP_STOP_RE = /無法確認這是本卡|不符|仍有修改|查核期間|其他 worktree|but expected/; // but expected: the branch moved after the check
 async function cleanupWorktree(w, t) {
   const wt = t.worktree;
-  if (!wt || wt.cleaned) return;
+  if (!wt || wt.cleaned || cleaningNow.has(wt.path)) return;
   const checked = async (cwd, ...args) => { const r = await git(cwd, ...args); if (r.err || typeof r.out !== 'string') throw new Error(r.err || 'Git 沒有回傳結果'); return r.out.trim(); };
+  cleaningNow.add(wt.path); wt.retryAt = 0;
   try {
+    if (wt.removed) { // an earlier try removed the worktree: only the branch is left, deleted only if it still points where it did
+      await checked(wt.repoPath, 'update-ref', '-d', 'refs/heads/' + wt.branch, wt.removedHead);
+      Object.assign(wt, { cleaned: true, cleanupError: '' });
+      return log(w, 'studio', 'system', `已清掉 branch「${wt.branch}」（worktree 先前已移除）。`);
+    }
     if (treeKey(path.dirname(canonPath(wt.path))) !== treeKey(path.join(RT, 'studio', 'worktrees')) || !path.basename(wt.path).endsWith('-' + t.id)
       || treeKey(wt.repoPath) !== treeKey(w.project) || !wt.branch.startsWith(`studio/${t.id}-`)) throw new Error('無法確認這是本卡建立的 worktree');
     const trees = await checked(wt.repoPath, 'worktree', 'list', '--porcelain', '-z');
@@ -1975,7 +1987,7 @@ async function cleanupWorktree(w, t) {
     if (await checked(wt.path, 'status', '--porcelain', '--untracked-files=all', '--ignored')) throw new Error('仍有修改、未追蹤或忽略的檔案');
     if (head !== await checked(wt.path, 'rev-parse', 'HEAD')) throw new Error('查核期間 HEAD 已改變');
     await checked(wt.repoPath, 'worktree', 'remove', wt.path);
-    wt.removed = true;
+    Object.assign(wt, { removed: true, removedHead: head });
     const remaining = await checked(wt.repoPath, 'worktree', 'list', '--porcelain', '-z');
     if (remaining.split('\0').includes('branch refs/heads/' + wt.branch)) throw new Error('分支仍有其他 worktree 使用');
     // Compare-and-delete also supports squash merges, without deleting a branch that moved after verification.
@@ -1984,8 +1996,27 @@ async function cleanupWorktree(w, t) {
     log(w, 'studio', 'system', `已驗證交付：清掉本次建立的 worktree 和 branch「${wt.branch}」。`);
   } catch (e) {
     wt.cleanupError = e.message;
-    log(w, 'studio', 'system', `worktree「${wt.branch}」清理未完成${wt.removed ? '（worktree 已移除，分支保留）' : '，保留現況'}：${e.message}`);
+    wt.cleanupTries = (wt.cleanupTries || 0) + 1;
+    const wait = !wt.kept && !CLEANUP_STOP_RE.test(e.message) && CLEANUP_RETRY_MIN[wt.cleanupTries - 1];
+    wt.retryAt = wait ? Date.now() + wait * 60e3 : 0;
+    log(w, 'studio', 'system', `worktree「${wt.branch}」清理未完成${wt.removed ? '（worktree 已移除，分支保留）' : '，保留現況'}：${e.message}`
+      + (wait ? `；${wait} 分鐘後自動再試（已失敗 ${wt.cleanupTries}/${CLEANUP_RETRY_MIN.length + 1} 次）。` : '；不再自動重試，可在工作卡按「重試清理」或「保留」。'));
+  } finally { cleaningNow.delete(wt.path); }
+}
+function retryCleanups(now = Date.now()) {
+  for (const w of S.workspaces) for (const t of w.tasks) if (t.worktree?.retryAt && now >= t.worktree.retryAt) cleanupWorktree(w, t);
+}
+// 重試清理 = a fresh budget and one try now; 保留 = this worktree and branch stay, nothing retries them.
+async function worktreeCleanupAction(w, id, action) {
+  const t = w.tasks.find((x) => x.id === id), wt = t?.worktree;
+  if (!wt || wt.cleaned) throw new Error('這張卡沒有待清理的 worktree');
+  if (action === 'keep') {
+    Object.assign(wt, { kept: true, retryAt: 0 });
+    return log(w, 'studio', 'system', `保留 worktree「${wt.branch}」：Studio 不會再自動清理它。`);
   }
+  if (t.status !== 'DONE') throw new Error('卡片完成後才能清理它的 worktree');
+  Object.assign(wt, { kept: false, cleanupTries: 0 });
+  await cleanupWorktree(w, t);
 }
 
 // ----- unknown changes: never reset / stash / overwrite; stop writing and ask -----
@@ -3316,6 +3347,7 @@ const routes = {
   'POST /api/continue-card': (b) => continueCard(wsOf(b.ws), b.taskId),
   'POST /api/card/detail': (b) => cardDetail(wsOf(b.ws), b.taskId),
   'POST /api/card/diff': (b) => stepDiff(wsOf(b.ws), b.taskId, Number(b.step)),
+  'POST /api/card/worktree-cleanup': (b) => worktreeCleanupAction(wsOf(b.ws), b.taskId, b.action === 'keep' ? 'keep' : 'retry'),
   'POST /api/card/undo-step': (b) => undoStep(wsOf(b.ws), b.taskId, Number(b.step)),
   'POST /api/card/ask': (b) => askAgent(wsOf(b.ws), b.taskId, b.text),
   'POST /api/card/delegate': (b) => delegateAsk(wsOf(b.ws), b.taskId, b.agent),
@@ -3397,6 +3429,7 @@ for (const w of S.workspaces) {
 await startAion();
 watchCatalogs();
 setInterval(watchExternal, 60000); // GitHub PR / CI waits
+setInterval(retryCleanups, 60000); // worktree cleanups that failed for a reason that may pass
 setInterval(runRoutines, 30000); // routines: checked twice a minute so an HH:MM slot starts within that minute
 await refreshRuntimeReadiness();
 setInterval(() => refreshRuntimeReadiness().catch(() => {}), 10000);

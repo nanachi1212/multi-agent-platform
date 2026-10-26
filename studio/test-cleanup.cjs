@@ -59,10 +59,30 @@ const { execFile, execFileSync } = require('node:child_process');
         if (scenario === 'moved-ref') assert.strictEqual(git('rev-parse', branch), moved);
         if (scenario === 'ignored') assert.strictEqual(fs.readFileSync(path.join(dir, 'ignored.txt'), 'utf8'), 'must survive');
         if (scenario === 'dirty-remote') assert.ok(git('remote') && !calls.some((c) => c[0] === 'gh') && t.worktree.cleanupError === '仍有修改或未追蹤的檔案', 'an ordinary dirty tree is refused before GitHub is asked');
+        // a failure that may pass by itself is retried in a minute; a check that the tree is not ours / not clean is not
+        assert.strictEqual(!!t.worktree.retryAt, ['status-error', 'remove-error', 'ref-error', 'old-pr'].includes(scenario), scenario + ': retry? ' + t.worktree.cleanupError);
         if (scenario === 'include-edited') assert.deepStrictEqual([fs.readFileSync(path.join(dir, 'ignored.txt'), 'utf8'), fs.lstatSync(path.join(dir, 'deps')).isSymbolicLink(), t.worktree.cleanupError], ['edited', true, '仍有修改、未追蹤或忽略的檔案'], 'an edited copy keeps the copy, the link and the worktree');
       }
     }
-    console.log('worktree cleanup: dirty/ignored files, failed checks/removal, current PR HEAD, squash merge, moved ref, path containment, .worktreeinclude copy/link and its removal: PASS');
+    // retry budget: a timed retry finishes a cleanup whose branch deletion failed; three temporary failures stop it; 保留 / 重試清理
+    if (git('remote')) git('remote', 'remove', 'origin');
+    const fresh = async (id) => { const w = newW(); w.project = repo; w.run.project = repo; w.run.active = false; E.env.S.workspaces.length = 0; E.env.S.workspaces.push(w);
+      const t = { id, title: id, agent: 'codex', writes: true, status: 'PAUSED', after: [] }; w.tasks.push(t); const r = await E.api.useWorktree(w, id); t.status = 'DONE'; trees.push(r); return { w, t, ...r }; };
+    let c = await fresh('retry1');
+    scenario = 'ref-error'; await E.api.cleanupWorktree(c.w, c.t);
+    assert.ok(c.t.worktree.removed && c.t.worktree.retryAt > Date.now() && c.t.worktree.cleanupTries === 1);
+    scenario = 'clean'; E.api.retryCleanups(c.t.worktree.retryAt);
+    for (let i = 0; i < 200 && !c.t.worktree.cleaned; i++) await new Promise((r) => setTimeout(r, 25));
+    assert.ok(c.t.worktree.cleaned && !git('branch', '--list', c.branch), 'the timed retry deleted the branch the first try left');
+    c = await fresh('retry2');
+    scenario = 'remove-error';
+    for (let i = 0; i < 3; i++) await E.api.cleanupWorktree(c.w, c.t);
+    assert.deepStrictEqual([c.t.worktree.cleanupTries, c.t.worktree.retryAt], [3, 0], 'third temporary failure: no more automatic tries');
+    await E.api.worktreeCleanupAction(c.w, c.t.id, 'keep');
+    assert.ok(c.t.worktree.kept && E.env.logs.at(-1).text.includes('保留'));
+    scenario = 'clean'; await E.api.worktreeCleanupAction(c.w, c.t.id, 'retry');
+    assert.ok(c.t.worktree.cleaned && !c.t.worktree.kept && !fs.existsSync(c.path), '重試清理 runs now with a fresh budget');
+    console.log('worktree cleanup: dirty/ignored files, failed checks/removal, current PR HEAD, squash merge, moved ref, path containment, .worktreeinclude copy/link and its removal, retry budget, keep / retry: PASS');
   } finally {
     for (const wt of trees) if (fs.existsSync(wt.path)) git('worktree', 'remove', '--force', wt.path);
     fs.rmSync(root, { recursive: true, force: true });

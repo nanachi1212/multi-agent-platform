@@ -774,7 +774,7 @@ function boardHtml(tasks, agents, editable) {
         <div class="res" style="font-size:12px;opacity:0.85">📁 <b>Workspace</b> ${esc(ws.fullLine)}</div>
         <div class="res" style="font-size:12px;opacity:0.85">⚡ <b>Runtime</b> ${rts.length ? esc(rts.map(formatRuntimeItem).join(' · ')) : '—'}</div>
         ${t.blocked && editable ? blockedHtml(w, t) : ''}
-        ${t.worktree ? `<div class="res">🌿 獨立 worktree：${esc(t.worktree.branch)}${t.worktree.cleaned ? '（已清掉）' : ''}</div>` : ''}
+        ${t.worktree ? `<div class="res">🌿 獨立 worktree：${esc(t.worktree.branch)}${t.worktree.cleaned ? '（已清掉）' : t.worktree.kept ? '（保留，不自動清理）' : ''}${!t.worktree.cleaned && t.worktree.cleanupError ? `<br>清理未完成：${esc(t.worktree.cleanupError)}${t.worktree.retryAt ? `（${hhmm(t.worktree.retryAt)} 自動再試）` : ''}${t.status === 'DONE' ? ` <button class="btn small ghost" data-wt-cleanup="retry" data-wt-task="${t.id}">重試清理</button>` : ''}${t.worktree.kept ? '' : ` <button class="btn small ghost" data-wt-cleanup="keep" data-wt-task="${t.id}">保留</button>`}` : ''}</div>` : ''}
         ${t.handoffs?.length ? `<div class="res">🤝 交接：${t.handoffs.map((h) => esc(name(h.from)) + ' → ' + esc(name(h.to))).join('、')}</div>` : ''}
         ${t.detail ? `<details class="tech"><summary>查看技術細節</summary><pre>${esc(t.detail)}</pre></details>` : ''}
         ${editable && st !== 'WORKING' && st !== 'DONE' ? `<div class="re"><select data-task="${t.id}">${avail.map((a) => `<option value="${a.id}" ${a.id === t.agent ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><button class="btn small" data-reassign="${t.id}">改派</button></div>` : ''}
@@ -1518,6 +1518,7 @@ document.addEventListener('click', (e) => {
   if (!b) return;
   if (b.id === 'tabAdd') return browse();
   if (b.dataset.readonly) return post('/api/card/readonly', { ws: ws(), taskId: b.dataset.readonly }).catch(() => {});
+  if (b.dataset.wtCleanup) return post('/api/card/worktree-cleanup', { ws: ws(), taskId: b.dataset.wtTask, action: b.dataset.wtCleanup }).catch(() => {});
   if (b.dataset.worktree) return confirm('為這張卡建立獨立 worktree（自己的 branch 和資料夾）？\n\n它會和目前的寫入者同時進行；merge 之後 Studio 會自動清掉這個 worktree 和 branch。') && post('/api/card/worktree', { ws: ws(), taskId: b.dataset.worktree }).catch(() => {});
   if (b.hasAttribute('data-claim')) { const l = prompt('誰要改這個工作區？（例如：Claude 視窗、我自己）', '外部 Agent'); return l && post('/api/workspace/claim', { ws: ws(), label: l }).catch(() => {}); }
   if (b.hasAttribute('data-release-claim')) return post('/api/workspace/release-claim', { ws: ws() }).catch(() => {});
