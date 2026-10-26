@@ -18,7 +18,7 @@ Windows 優先的多 AI 協作平台。**Multi-Agent Studio** 是一個本機網
 2. 雙擊 `start-studio.cmd`，瀏覽器會打開 `http://127.0.0.1:4848`（連接埠被佔用時自動改用下一個）。關掉黑色視窗就會停止。
 3. 在左側「開啟專案」選一個資料夾，在「今天想讓『專案名』做什麼？」輸入需求，按「▶ 交給團隊」。
 
-第一次啟動會下載 AionCore v0.2.2（官方版本，SHA-256 驗證）到 `runtime/`。Studio 的 Codex 使用獨立資料夾（`runtime/studio/codex-home`），不會出現在你平常的 Codex 紀錄裡；第一次要在 Codex 卡片按「登入 Codex（Studio 專用）」。
+第一次啟動會下載 AionCore v0.2.2（官方版本，SHA-256 驗證）到 `runtime/`。Studio 的 Codex 使用獨立資料夾（`runtime/studio/codex-home`），不會出現在你平常的 Codex 紀錄裡；第一次要在 Codex 卡片按「登入 Codex（Studio 專用）」。你的全域規則 `~/.codex/AGENTS.md` 每次啟動 Studio 時會複製進這個資料夾，改了規則重啟 Studio 就生效（Claude 本來就會讀 `~/.claude/CLAUDE.md`）。
 
 使用獨立 `STUDIO_RUNTIME` 測試時，預設也會建立未登入的 Codex home。可明確設定 `STUDIO_CODEX_HOME` 指向已登入的 **Studio 專用目錄**；登入、可用性檢查與 Agent 執行會使用同一目錄，不複製憑證。這會共用該 home 的 Codex 設定、登入與 session 紀錄；Studio 工作卡、租約及測試資料仍位於獨立 runtime。未設定時維持原本的隔離方式。
 
@@ -114,7 +114,7 @@ A Windows-first multi-agent collaboration platform. **Multi-Agent Studio** is a 
 2. Double-click `start-studio.cmd`. The browser opens `http://127.0.0.1:4848` (the next free port is used if it is taken). Close the console window to stop.
 3. Open a project folder in the sidebar, type what you want under "今天想讓「<project>」做什麼？", and press "▶ 交給團隊".
 
-The first start downloads AionCore v0.2.2 (official release, SHA-256 checked) into `runtime/`. Studio runs Codex with its own home (`runtime/studio/codex-home`), so its sessions never appear in your normal Codex history; log in once with the "登入 Codex（Studio 專用）" button on the Codex card.
+The first start downloads AionCore v0.2.2 (official release, SHA-256 checked) into `runtime/`. Studio runs Codex with its own home (`runtime/studio/codex-home`), so its sessions never appear in your normal Codex history; log in once with the "登入 Codex（Studio 專用）" button on the Codex card. Your global `~/.codex/AGENTS.md` is copied into that home at each Studio start, so an edited rule applies after a restart (Claude reads `~/.claude/CLAUDE.md` on its own).
 
 A separate `STUDIO_RUNTIME` also gets a fresh, unauthenticated Codex home by default. Set `STUDIO_CODEX_HOME` explicitly to an authenticated **Studio-specific directory** to reuse its login without copying credentials. Login, availability checks, and execution use that same home, including its Codex configuration and session history; Studio cards, leases, and fixture data remain in the separate runtime. Without this override, the existing isolation behavior is unchanged.
 

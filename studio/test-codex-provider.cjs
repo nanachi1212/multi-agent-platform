@@ -9,6 +9,22 @@ const { region } = require('./lifecycle-harness.cjs');
   assert.equal(resolveHome({ CODEX_HOME: 'ambient-home' }), path.join(rt, 'studio', 'codex-home'));
   assert.equal(resolveHome({ STUDIO_CODEX_HOME: home }), home);
 
+  // the user's global AGENTS.md is copied into Studio's Codex home; nothing to copy, or the same file, is left alone
+  const fs = require('node:fs'), os = require('node:os');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-rules-')), user = path.join(tmp, 'user'), studio = path.join(tmp, 'studio');
+  for (const d of [user, studio]) fs.mkdirSync(d);
+  const sync = new Function('process', 'path', 'RT', 'fs', 'os', homeCode.replace('return CODEX_HOME;', 'return syncCodexRules;'))({ env: {} }, path, rt, fs, os);
+  try {
+    assert.equal(sync({ CODEX_HOME: user }, studio), false, 'no global AGENTS.md: nothing copied');
+    assert.ok(!fs.existsSync(path.join(studio, 'AGENTS.md')));
+    fs.writeFileSync(path.join(user, 'AGENTS.md'), 'use pwsh');
+    assert.equal(sync({ CODEX_HOME: user }, studio), true);
+    fs.writeFileSync(path.join(user, 'AGENTS.md'), 'use pwsh 7');
+    sync({ CODEX_HOME: user }, studio);
+    assert.equal(fs.readFileSync(path.join(studio, 'AGENTS.md'), 'utf8'), 'use pwsh 7', 'the next start picks up an edit');
+    assert.equal(sync({ CODEX_HOME: user }, user), false, 'Studio pointed at the user home itself: no self-copy');
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+
   let status = 'Not logged in', exit = new Error('exit 1'), calls = 0;
   const failureNote = new Function('execFile', 'process', 'CODEX_HOME',
     region('async function codexFailureNote', 'async function checkAgent') + '\nreturn codexFailureNote;')(

@@ -4,6 +4,7 @@ import http from 'node:http';
 import { createWorkspaceLeaseStore } from './workspace-lease.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawn, execFile } from 'node:child_process';
 import { cleanupRuntime, verifyRuntimeProcess, cleanupJobRuntimes, cleanupStaleRuntimes, checkPortOwnership, getProcessInfo, isPidAlive, killProcessTree, listRuntimes, registerRuntime, updateRuntime, isSafeTempDir } from './runtime-registry.mjs';
@@ -24,6 +25,16 @@ const AION_ZIP_SHA256 = 'd1ed8d1da869230c18701747d07e8f068db5b8c9442e65261304aeb
 let PORT = Number(process.env.STUDIO_PORT || 4848); // moves up when the port is taken (see server.listen)
 // Studio's Codex gets its own home so its sessions never show up in the user's own Codex history.
 const CODEX_HOME = process.env.STUDIO_CODEX_HOME ? path.resolve(process.env.STUDIO_CODEX_HOME) : path.join(RT, 'studio', 'codex-home');
+// Codex reads global rules from its home's AGENTS.md, so the user's own one is copied into Studio's home at each start.
+// ponytail: a deleted global AGENTS.md leaves the last copy; delete it by hand if that ever matters.
+function syncCodexRules(env = process.env, home = CODEX_HOME) {
+  const src = path.join(env.CODEX_HOME ? path.resolve(env.CODEX_HOME) : path.join(os.homedir(), '.codex'), 'AGENTS.md'), dst = path.join(home, 'AGENTS.md');
+  try {
+    if (!fs.existsSync(src) || path.resolve(src).toLowerCase() === path.resolve(dst).toLowerCase()) return false;
+    fs.copyFileSync(src, dst);
+    return true;
+  } catch (e) { console.error('複製全域 AGENTS.md 到 Studio 的 Codex 失敗：' + e.message); return false; }
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Agents are just a catalog; any of them can be Leader or Worker.
@@ -211,6 +222,7 @@ async function startAion() {
   const work = path.join(RT, 'studio', 'work');
   for (const d of [data, work]) fs.mkdirSync(d, { recursive: true });
   fs.mkdirSync(CODEX_HOME, { recursive: true });
+  syncCodexRules();
   const logFile = fs.createWriteStream(path.join(RT, 'studio', 'aioncore.out.txt'));
   const p = spawn(AION, ['--local', '--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)],
     { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, CODEX_HOME } });
