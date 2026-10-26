@@ -1473,22 +1473,24 @@ async function treeFiles(dir) {
 // only the line-ending / file-mode keys copied over (plain values, no programs). Attributes still apply; a filter= with
 // no driver in the config git reads does nothing.
 const SNAP_KEYS = /^core\.(autocrlf|eol|safecrlf|filemode|symlinks|ignorecase|precomposeunicode|checkroundtripencoding)$/;
-async function snapTree(dir) {
+// fn(g) gets a git runner bound to that private GIT_DIR (index copied, HEAD / real index / refs untouched); null = could not set it up.
+async function privateGit(dir, fn) {
   const [index, objects, exclude, format] = ((await git(dir, 'rev-parse', '--path-format=absolute', '--git-path', 'index', '--git-path', 'objects', '--git-path', 'info/exclude', '--show-object-format')).out || '').trim().split(/\r?\n/);
-  if (!/^\w+$/.test(format || '')) return '';
+  if (!/^\w+$/.test(format || '')) return null;
   const local = ((await git(dir, 'config', '--local', '-z', '--get-regexp', '^core\\.')).out || '').split('\0').map((e) => e.split('\n')).filter(([k, v]) => SNAP_KEYS.test(k) && v != null);
   const tmp = path.join(RT, 'studio', 'snap-' + crypto.randomBytes(6).toString('hex')), cfg = path.join(tmp, 'config');
   try {
     for (const d of ['info', 'refs', 'objects']) fs.mkdirSync(path.join(tmp, d), { recursive: true });
     fs.writeFileSync(path.join(tmp, 'HEAD'), 'ref: refs/heads/snapshot\n');
     fs.writeFileSync(cfg, format === 'sha1' ? '[core]\n\trepositoryformatversion = 0\n' : `[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = ${format}\n`);
-    for (const [k, v] of local) if ((await sh('git', ['config', '--file', cfg, k, v])).err) return '';
+    for (const [k, v] of local) if ((await sh('git', ['config', '--file', cfg, k, v])).err) return null;
     for (const [from, to] of [[index, 'index'], [exclude, 'info/exclude']]) try { fs.copyFileSync(from, path.join(tmp, to)); } catch { /* none yet */ }
     const env = { ...process.env, GIT_DIR: tmp, GIT_WORK_TREE: dir, GIT_INDEX_FILE: path.join(tmp, 'index'), GIT_OBJECT_DIRECTORY: objects };
-    if ((await sh('git', [...GIT_SAFE, 'add', '-A'], dir, env)).err) return '';
-    return (await sh('git', [...GIT_SAFE, 'write-tree'], dir, env)).out?.trim() || '';
+    return await fn((...args) => sh('git', [...GIT_SAFE, ...args], dir, env), tmp);
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 }
+const writeTree = async (g) => (await g('add', '-A')).err ? '' : (await g('write-tree')).out?.trim() || '';
+const snapTree = async (dir) => (await privateGit(dir, writeTree)) || '';
 const STEP_DIFF_MAX = 400e3; // characters of patch shown for one step
 // git output read as a stream and cut at max characters (the git process is stopped there), so a huge patch still shows its start.
 function gitHead(cwd, args, max) {
@@ -1510,6 +1512,46 @@ async function stepDiff(w, id, n) {
   const r = await gitHead(dir, ['-c', 'core.quotepath=false', 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '--stat', '--patch', s.before, s.after], STEP_DIFF_MAX);
   if (r.err) throw new Error('讀不到這一步的 diff（可能已被 git 清掉）：' + r.err);
   return { text: r.cut ? r.out + `\n…（只顯示前 ${STEP_DIFF_MAX / 1000}k 字元）` : r.out };
+}
+// 復原這一步 (Cindy's savepoint rollback): the files this step changed go back to how they were before it. Only the
+// working tree changes (HEAD, commits and the real index stay), only while no card edits files, and only when nothing
+// after the step touched those files; otherwise nothing changes. The undo is recorded as a step itself, so it can be undone.
+async function undoStep(w, id, n) {
+  const t = w.tasks.find((x) => x.id === id), s = t?.steps?.[n];
+  if (!s) throw new Error('找不到這一步');
+  if (w.tasks.some((x) => x.status === 'WORKING' && isWriter(x))) throw new Error('有工作卡正在修改檔案：先按暫停或等它做完，再復原');
+  const dir = (await workspaceOf(t.workdir || w.project)).path;
+  if (!isDir(dir)) throw new Error('這張卡的資料夾已經不在（worktree 可能已清掉），沒有檔案可以復原');
+  const key = treeKey(dir);
+  if (S.leases.some((l) => l.key === key && l.status === 'EXTERNAL')) throw new Error('這個資料夾已宣告由外部接手，Studio 不改它的檔案');
+  const res = await privateGit(dir, async (g, tmp) => {
+    const now = await writeTree(g);
+    if (!now) return { err: '讀不到目前的檔案狀態' };
+    const names = (r) => (r.out || '').split('\0').filter(Boolean);
+    const changed = await g('diff', '--name-status', '-z', '--no-renames', s.after, s.before);
+    if (changed.err) return { err: '讀不到這一步的內容（可能已被 git 清掉）：' + changed.err };
+    const list = names(changed), restore = [], remove = [];
+    for (let i = 0; i + 1 < list.length; i += 2) (list[i] === 'D' ? remove : restore).push(list[i + 1]); // D: the step created it
+    const all = [...restore, ...remove];
+    if (!all.length) return { err: '這一步沒有檔案差異' };
+    const later = new Set(names(await g('diff', '--name-only', '-z', '--no-renames', s.after, now)));
+    const clash = all.filter((p) => later.has(p));
+    if (clash.length) return { err: `這一步之後又改過 ${clash.slice(0, 5).join('、')}${clash.length > 5 ? ` 等 ${clash.length} 個檔案` : ''}，無法乾淨地復原` };
+    if (restore.length) {
+      const list = path.join(tmp, 'paths');
+      fs.writeFileSync(list, restore.join('\0'));
+      const r = await g('restore', `--source=${s.before}`, '--worktree', `--pathspec-from-file=${list}`, '--pathspec-file-nul');
+      if (r.err) return { err: 'git restore 失敗：' + r.err };
+    }
+    for (const p of remove) fs.rmSync(path.join(dir, p), { force: true });
+    return { now, after: await writeTree(g), files: all.length };
+  });
+  if (!res) throw new Error('無法讀取這個資料夾的 git 狀態，沒有復原');
+  if (res.err) throw new Error(res.err + '，檔案都沒有改動');
+  (t.steps ||= []).push({ at: nowIso(), before: res.now, after: res.after, undo: n });
+  if (w.run) { const stamp = await treeStamp(w, dir); (w.run.treeStamps ||= {})[key] = stamp; if (!t.workdir) w.run.treeStamp = stamp; } // our own edit, not an unknown one
+  log(w, 'studio', 'system', `已復原「${t.title}」第 ${n + 1} 步改的 ${res.files} 個檔案（commit 不動）；這次復原記成第 ${t.steps.length} 步，可以再復原回去。`);
+  return { files: res.files };
 }
 // Paths whose entry differs between two snapshots: added, changed or deleted.
 function changedFiles(before, after) {
@@ -2364,7 +2406,7 @@ async function cardDetail(w, id) {
     .map((m) => ({ at: m.created_at, kind: m.type === 'tool_call' ? 'tool' : 'say', text: clip(m.type === 'tool_call' ? itemText(m) : answerText(itemText(m)).split('\n')[0], 160), running: m.type === 'tool_call' && m.status !== 'finish' }));
   const last = [...mine].reverse().find(say);
   return { id: t.id, title: t.title, agent: t.agent, status: t.status, usage: t.usage || null, workingSince: t.workingSince, firstStartedAt: t.firstStartedAt, wait: t.wait, result: t.result,
-    activity: convActivity.get(cid) || null, acts, steps: (t.steps || []).map((s) => s.at), lastSay: last ? clip(answerText(itemText(last)), 800) : '', asks: t.asks || [],
+    activity: convActivity.get(cid) || null, acts, steps: (t.steps || []).map((s) => ({ at: s.at, undo: s.undo })), lastSay: last ? clip(answerText(itemText(last)), 800) : '', asks: t.asks || [],
     log: mine.slice(-50).map((m) => ({ at: m.created_at, who: m.position === 'right' ? 'Studio' : 'AI', kind: m.type, text: clip(itemText(m), 600) })) };
 }
 
@@ -3244,6 +3286,7 @@ const routes = {
   'POST /api/continue-card': (b) => continueCard(wsOf(b.ws), b.taskId),
   'POST /api/card/detail': (b) => cardDetail(wsOf(b.ws), b.taskId),
   'POST /api/card/diff': (b) => stepDiff(wsOf(b.ws), b.taskId, Number(b.step)),
+  'POST /api/card/undo-step': (b) => undoStep(wsOf(b.ws), b.taskId, Number(b.step)),
   'POST /api/card/ask': (b) => askAgent(wsOf(b.ws), b.taskId, b.text),
   'POST /api/card/delegate': (b) => delegateAsk(wsOf(b.ws), b.taskId, b.agent),
   'POST /api/check': () => { checkAll().then(refreshClaudeLimits); },

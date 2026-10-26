@@ -700,7 +700,7 @@ function workHtml(d) {
     <h3>最近活動</h3><ul style="margin:0;padding-left:18px">${acts}</ul>
     ${d.lastSay ? `<h3>最近一句 AI 訊息</h3><div class="res" style="white-space:pre-wrap">${esc(d.lastSay)}</div>` : ''}
     ${asks ? '<h3>詢問進度</h3>' + asks : ''}
-    ${d.steps?.length ? `<h3>每一步改了什麼</h3><div class="row" style="gap:6px;flex-wrap:wrap">${d.steps.map((at, i) => `<button class="btn small ${workDiff?.n === i ? 'pz' : 'ghost'}" data-step-diff="${i}">第 ${i + 1} 步 · ${hhmm(at)}</button>`).join('')}</div>${workDiff ? `<pre class="diff">${diffHtml(workDiff.text)}</pre>` : ''}` : ''}
+    ${d.steps?.length ? `<h3>每一步改了什麼</h3><div class="row" style="gap:6px;flex-wrap:wrap">${d.steps.map((s, i) => `<button class="btn small ${workDiff?.n === i ? 'pz' : 'ghost'}" data-step-diff="${i}">第 ${i + 1} 步${s.undo != null ? `（復原第 ${s.undo + 1} 步）` : ''} · ${hhmm(s.at)}</button>`).join('')}</div>${workDiff ? `<div class="row" style="margin-top:6px"><button class="btn small ghost" data-step-undo="${workDiff.n}">↩ 復原這一步</button></div><pre class="diff">${diffHtml(workDiff.text)}</pre>` : ''}` : ''}
     <details class="tech" id="workLog" ${workLogOpen ? 'open' : ''}><summary>查看完整執行紀錄（最近 ${d.log.length} 筆）</summary><pre>${esc(d.log.map((m) => `${hhmm(m.at)} ${m.who} ${m.kind}: ${m.text}`).join('\n'))}</pre></details>`;
 }
 let workLogOpen = false, workDiff = null; // { n, text } of the step diff shown in the open work details
@@ -1548,6 +1548,7 @@ document.addEventListener('click', (e) => {
   }
   if (b.hasAttribute('data-recheck')) return post('/api/check');
   if (b.dataset.stepDiff) return showStepDiff(Number(b.dataset.stepDiff));
+  if (b.dataset.stepUndo) return confirm(`把第 ${Number(b.dataset.stepUndo) + 1} 步改的檔案改回這一步之前？\n\n• 只改檔案，commit 和 branch 不動\n• 這一步之後又改過同一個檔案時，什麼都不會改\n• 這次復原也會記成一步，可以再復原回去`) && post('/api/card/undo-step', { ws:workOpen.ws, taskId:workOpen.id, step:Number(b.dataset.stepUndo) }).then(() => { workDiff = null; loadWork(); }).catch(() => {});
   if (b.hasAttribute('data-acp-add')) return acpOpen();
   if (b.dataset.acpCheck) return post('/api/acp/check', { id: b.dataset.acpCheck }).catch(() => {});
   if (b.dataset.acpDel) { const e = S.acp.find((x) => x.id === b.dataset.acpDel); return confirm('刪除 ACP Agent「' + (e?.name || '') + '」？\n\n已經完成的工作卡和紀錄不受影響。') && post('/api/acp/delete', { id: b.dataset.acpDel }).catch(() => {}); }
