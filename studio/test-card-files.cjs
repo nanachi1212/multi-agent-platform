@@ -18,6 +18,7 @@ const { execFile, execFileSync, spawn } = require('node:child_process');
     if (text.includes('Task: partial')) { write('a.txt', 'A2'); write('b.txt', 'B2'); return 'Edited.\nSTATUS: DONE\nFILES: a.txt'; }
     if (text.includes('Task: silent')) { write('a.txt', 'A3'); return 'Edited.\nSTATUS: DONE'; }
     if (text.includes('Task: crash')) { write('big.txt', 'line of a large generated file\n'.repeat(20000)); throw new Error('agent crashed mid-step'); }
+    if (text.includes('Task: undoable')) { write('b.txt', 'B5'); write('sub/u.txt', 'u'); fs.unlinkSync(path.join(repo, 'new.txt')); return 'Edited.\nSTATUS: DONE\nFILES: b.txt, sub/u.txt, new.txt'; }
     if (text.includes('Task: reader')) { write('a.txt', 'A4'); return 'Read.\nSTATUS: DONE'; }
     return 'Nothing to change.\nSTATUS: DONE';
   }, { execFile, spawn });
@@ -57,10 +58,41 @@ const { execFile, execFileSync, spawn } = require('node:child_process');
     assert.strictEqual(crash.steps?.length, 1, 'failed step keeps its diff');
     const big = (await api.stepDiff(cw, 'crash', 0)).text;
     assert.ok(big.includes('big.txt') && big.endsWith('k 字元）') && big.length < 401e3, 'large patch is cut at the limit');
+    // 復原這一步: the step's files go back (edits, created and deleted files), HEAD and the index stay; the undo is a step too.
+    await new Promise((r) => setTimeout(r, 30));
+    const uw = newW(); uw.project = repo; uw.run.project = repo; uw.run.startedAt = new Date().toISOString(); env.S.workspaces.length = 0; env.S.workspaces.push(uw);
+    const ut = { id: 'undo', title: 'undoable', agent: 'codex', writes: true, status: 'WAITING', after: [], instructions: 'x' }; uw.tasks.push(ut);
+    await api.runTask(uw, ut);
+    const read = (f) => fs.existsSync(path.join(repo, f)) ? fs.readFileSync(path.join(repo, f), 'utf8') : null;
+    assert.strictEqual(ut.status, 'DONE', 'undoable: ' + ut.result + ' ' + ut.detail);
+    const head = git('rev-parse', 'HEAD');
+    uw.tasks.push({ id: 'busy', title: 'busy', status: 'WORKING', writes: true });
+    await assert.rejects(api.undoStep(uw, 'undo', 0), /正在修改/, 'not while a writer works');
+    uw.tasks.pop();
+    assert.deepStrictEqual((await api.undoStep(uw, 'undo', 0)).files, 3);
+    assert.deepStrictEqual([read('b.txt'), read('sub/u.txt'), read('new.txt'), read('a.txt')], ['B2', null, 'n', 'A4'], 'step undone, other files kept');
+    assert.deepStrictEqual([git('rev-parse', 'HEAD'), git('diff', '--cached', '--name-only'), ut.steps.length, ut.steps[1].undo], [head, '', 2, 0], 'HEAD and index untouched, undo recorded');
+    await api.undoStep(uw, 'undo', 1);
+    assert.deepStrictEqual([read('b.txt'), read('sub/u.txt'), read('new.txt')], ['B5', 'u', null], 'the undo can be undone');
+    const before = read('a.txt');
+    await assert.rejects(api.undoStep(wss.listed, 'listed', 0), /無法乾淨地復原.*檔案都沒有改動/, 'later edits to the same file: refused');
+    assert.deepStrictEqual([read('a.txt'), read('b.txt')], [before, 'B5'], 'a refused undo changes nothing');
     // A worker that can edit the repo config must not get a program run by Studio's own git: snapshots never run filters.
     git('config', 'filter.trap.clean', 'echo ran > FILTER_RAN; cat # x.clean=y'); write('.gitattributes', 'trap.dat filter=trap\n'); write('trap.dat', 'x');
     assert.ok(await api.snapTree(repo), 'snapshot still taken');
     assert.ok(!fs.existsSync(path.join(repo, 'FILTER_RAN')), 'repo-configured clean filter did not run');
-    console.log('card files: listed vs changed, absolute and ./ paths, deletions, ignored output, missing FILES line, read-only cards, step diffs: PASS');
+    // Rules in another agent's file: the brief names them, the agent's own file is left to the agent, nothing is written
+    assert.strictEqual(api.rulesNote('codex', repo), '', 'no rules files: no note');
+    write('CLAUDE.md', 'use pwsh');
+    assert.ok(api.rulesNote('codex', repo).includes('in CLAUDE.md') && api.rulesNote('antigravity', repo).includes('CLAUDE.md') && api.rulesNote('qwen', repo).includes('CLAUDE.md'));
+    assert.strictEqual(api.rulesNote('claude', repo), '', 'Claude reads CLAUDE.md itself');
+    write('AGENTS.md', 'see CLAUDE.md');
+    assert.ok(api.rulesNote('claude', repo).includes('in AGENTS.md (') && api.rulesNote('antigravity', repo).includes('AGENTS.md, CLAUDE.md'));
+    const rw = newW(); rw.project = repo; rw.run.project = repo; rw.run.startedAt = new Date().toISOString(); env.S.workspaces.length = 0; env.S.workspaces.push(rw);
+    const rt = { id: 'rules', title: 'rules', agent: 'codex', writes: false, status: 'WAITING', after: [], instructions: 'x' }; rw.tasks.push(rt);
+    await api.runTask(rw, rt);
+    assert.ok(env.prompts.at(-1).text.includes('keeps rules for AI agents in CLAUDE.md'), 'the Codex brief names CLAUDE.md');
+    assert.ok(!fs.existsSync(path.join(repo, 'GEMINI.md')), 'no rules file is created');
+    console.log('card files: listed vs changed, absolute and ./ paths, deletions, ignored output, missing FILES line, read-only cards, step diffs, step undo, rules files: PASS');
   } finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 }); }
 })().catch((e) => { console.error('FAIL', e); process.exit(1); });

@@ -700,7 +700,7 @@ function workHtml(d) {
     <h3>最近活動</h3><ul style="margin:0;padding-left:18px">${acts}</ul>
     ${d.lastSay ? `<h3>最近一句 AI 訊息</h3><div class="res" style="white-space:pre-wrap">${esc(d.lastSay)}</div>` : ''}
     ${asks ? '<h3>詢問進度</h3>' + asks : ''}
-    ${d.steps?.length ? `<h3>每一步改了什麼</h3><div class="row" style="gap:6px;flex-wrap:wrap">${d.steps.map((at, i) => `<button class="btn small ${workDiff?.n === i ? 'pz' : 'ghost'}" data-step-diff="${i}">第 ${i + 1} 步 · ${hhmm(at)}</button>`).join('')}</div>${workDiff ? `<pre class="diff">${diffHtml(workDiff.text)}</pre>` : ''}` : ''}
+    ${d.steps?.length ? `<h3>每一步改了什麼</h3><div class="row" style="gap:6px;flex-wrap:wrap">${d.steps.map((s, i) => `<button class="btn small ${workDiff?.n === i ? 'pz' : 'ghost'}" data-step-diff="${i}">第 ${i + 1} 步${s.undo != null ? `（復原第 ${s.undo + 1} 步）` : ''} · ${hhmm(s.at)}</button>`).join('')}</div>${workDiff ? `<div class="row" style="margin-top:6px"><button class="btn small ghost" data-step-undo="${workDiff.n}">↩ 復原這一步</button></div><pre class="diff">${diffHtml(workDiff.text)}</pre>` : ''}` : ''}
     <details class="tech" id="workLog" ${workLogOpen ? 'open' : ''}><summary>查看完整執行紀錄（最近 ${d.log.length} 筆）</summary><pre>${esc(d.log.map((m) => `${hhmm(m.at)} ${m.who} ${m.kind}: ${m.text}`).join('\n'))}</pre></details>`;
 }
 let workLogOpen = false, workDiff = null; // { n, text } of the step diff shown in the open work details
@@ -774,7 +774,7 @@ function boardHtml(tasks, agents, editable) {
         <div class="res" style="font-size:12px;opacity:0.85">📁 <b>Workspace</b> ${esc(ws.fullLine)}</div>
         <div class="res" style="font-size:12px;opacity:0.85">⚡ <b>Runtime</b> ${rts.length ? esc(rts.map(formatRuntimeItem).join(' · ')) : '—'}</div>
         ${t.blocked && editable ? blockedHtml(w, t) : ''}
-        ${t.worktree ? `<div class="res">🌿 獨立 worktree：${esc(t.worktree.branch)}${t.worktree.cleaned ? '（已清掉）' : ''}</div>` : ''}
+        ${t.worktree ? `<div class="res">🌿 獨立 worktree：${esc(t.worktree.branch)}${t.worktree.cleaned ? '（已清掉）' : t.worktree.kept ? '（保留，不自動清理）' : ''}${!t.worktree.cleaned && t.worktree.cleanupError ? `<br>清理未完成：${esc(t.worktree.cleanupError)}${t.worktree.retryAt ? `（${hhmm(t.worktree.retryAt)} 自動再試）` : ''}${t.status === 'DONE' ? ` <button class="btn small ghost" data-wt-cleanup="retry" data-wt-task="${t.id}">重試清理</button>` : ''}${t.worktree.kept ? '' : ` <button class="btn small ghost" data-wt-cleanup="keep" data-wt-task="${t.id}">保留</button>`}` : ''}</div>` : ''}
         ${t.handoffs?.length ? `<div class="res">🤝 交接：${t.handoffs.map((h) => esc(name(h.from)) + ' → ' + esc(name(h.to))).join('、')}</div>` : ''}
         ${t.detail ? `<details class="tech"><summary>查看技術細節</summary><pre>${esc(t.detail)}</pre></details>` : ''}
         ${editable && st !== 'WORKING' && st !== 'DONE' ? `<div class="re"><select data-task="${t.id}">${avail.map((a) => `<option value="${a.id}" ${a.id === t.agent ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><button class="btn small" data-reassign="${t.id}">改派</button></div>` : ''}
@@ -933,6 +933,7 @@ function waitLine(t) {
   if (wt.backendPort) return wt.recoveryReason || `Studio 正在安全檢查 backend ${wt.backendPort}；health 與 application ready 通過後會自動重啟 smoke 並繼續`;
   if (wt.recoveryReason) return wt.recoveryReason;
   if (wt.pr && !wt.manual) return `在等 GitHub CI（PR ${prShort(wt.pr)}）：${wt.ci || '檢查中'}（Studio 每分鐘檢查，跑完自動交回 ${name(t.agent)}）`;
+  if (wt.quotaAt) return `在等 ${name(t.agent)} 的額度重置：約 ${new Date(wt.quotaAt).toLocaleString('zh-TW', { hour12:false, month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit' })} 自動接著做（不用按繼續）`;
   if (wt.pokeAt) return `在等「${wt.what || '外部結果'}」：Studio 無法自動確認，每 5 分鐘請 ${name(t.agent)} 自己看一次（已看 ${t.pokes || 0}/3 次，之後才問你）`;
   return `在等「${wt.what || '外部結果'}」：Studio 無法自動確認${wt.error ? '（' + wt.error + '）' : ''}，好了請按「繼續」`;
 }
@@ -1035,7 +1036,7 @@ function officeHtml(w) {
     ${running || paused ? `<div class="ask">工作進行中，想補充或修改指示？</div>
     <textarea id="instruction" placeholder="例如：按鈕改成藍色。或：先不要 merge，等我看過。\n工頭會決定要轉告哪位成員、取消或追加哪些工作卡。">${esc(drafts['i:' + w.project] || '')}</textarea>
     <div class="row"><span class="hint">${paused ? '工作暫停中：指示會先保留，按「繼續」後交給工頭' : r?.notes || r?.noting ? '⏳ 工頭正在看你的指示…' : '正在工作的成員做完手上這一步就會收到'}</span><span class="err" id="err"></span><span class="spacer"></span>
-      <label class="hint" style="display:flex;align-items:center;gap:4px;cursor:pointer" title="正在做的成員會馬上停下（手上這一步可能做到一半），等工頭看完指示再接著做"><input type="checkbox" id="interruptChk">⚡ 立刻打斷正在做的成員</label>
+      <select id="deliverSel" class="hint" title="排隊：成員做完手上這一步才收到。插話：直接送進成員正在做的這一步、不停下（Claude、Codex 才支援，其他成員自動改成排隊）。立刻打斷：成員馬上停下（這一步可能做到一半），等工頭看完再接著做。"><option value="queue">🕒 這一步做完再轉達</option><option value="steer">💬 插話（不打斷）</option><option value="interrupt">⚡ 立刻打斷</option></select>
       <button class="btn primary" id="instructBtn">📣 告訴工頭</button></div>
     <div class="hint" style="border-top:1px dashed var(--line);padding-top:10px;font-weight:700">新的工作要等這件做完才能交辦</div>` : ''}
     <div class="ask">今天想讓「${esc(w.name)}」做什麼？</div>
@@ -1517,6 +1518,7 @@ document.addEventListener('click', (e) => {
   if (!b) return;
   if (b.id === 'tabAdd') return browse();
   if (b.dataset.readonly) return post('/api/card/readonly', { ws: ws(), taskId: b.dataset.readonly }).catch(() => {});
+  if (b.dataset.wtCleanup) return post('/api/card/worktree-cleanup', { ws: ws(), taskId: b.dataset.wtTask, action: b.dataset.wtCleanup }).catch(() => {});
   if (b.dataset.worktree) return confirm('為這張卡建立獨立 worktree（自己的 branch 和資料夾）？\n\n它會和目前的寫入者同時進行；merge 之後 Studio 會自動清掉這個 worktree 和 branch。') && post('/api/card/worktree', { ws: ws(), taskId: b.dataset.worktree }).catch(() => {});
   if (b.hasAttribute('data-claim')) { const l = prompt('誰要改這個工作區？（例如：Claude 視窗、我自己）', '外部 Agent'); return l && post('/api/workspace/claim', { ws: ws(), label: l }).catch(() => {}); }
   if (b.hasAttribute('data-release-claim')) return post('/api/workspace/release-claim', { ws: ws() }).catch(() => {});
@@ -1528,7 +1530,7 @@ document.addEventListener('click', (e) => {
   }
   if (b.id === 'instructBtn') {
     const p = ws();
-    return post('/api/instruct', { ws: p, text: $('instruction').value, interrupt: !!$('interruptChk')?.checked }).then(() => { drafts['i:' + p] = ''; $('office')._html = ''; render(); }).catch(() => {});
+    return post('/api/instruct', { ws: p, text: $('instruction').value, interrupt: $('deliverSel')?.value === 'interrupt', steer: $('deliverSel')?.value === 'steer' }).then(() => { drafts['i:' + p] = ''; $('office')._html = ''; render(); }).catch(() => {});
   }
   if (b.hasAttribute('data-continue-state') || b.hasAttribute('data-refresh-state')) {
     b.disabled = true; b.textContent = b.hasAttribute('data-refresh-state') ? '讀取中…' : '核對狀態中…';
@@ -1547,6 +1549,7 @@ document.addEventListener('click', (e) => {
   }
   if (b.hasAttribute('data-recheck')) return post('/api/check');
   if (b.dataset.stepDiff) return showStepDiff(Number(b.dataset.stepDiff));
+  if (b.dataset.stepUndo) return confirm(`把第 ${Number(b.dataset.stepUndo) + 1} 步改的檔案改回這一步之前？\n\n• 只改檔案，commit 和 branch 不動\n• 這一步之後又改過同一個檔案時，什麼都不會改\n• 這次復原也會記成一步，可以再復原回去`) && post('/api/card/undo-step', { ws:workOpen.ws, taskId:workOpen.id, step:Number(b.dataset.stepUndo) }).then(() => { workDiff = null; loadWork(); }).catch(() => {});
   if (b.hasAttribute('data-acp-add')) return acpOpen();
   if (b.dataset.acpCheck) return post('/api/acp/check', { id: b.dataset.acpCheck }).catch(() => {});
   if (b.dataset.acpDel) { const e = S.acp.find((x) => x.id === b.dataset.acpDel); return confirm('刪除 ACP Agent「' + (e?.name || '') + '」？\n\n已經完成的工作卡和紀錄不受影響。') && post('/api/acp/delete', { id: b.dataset.acpDel }).catch(() => {}); }

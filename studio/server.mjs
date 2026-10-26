@@ -448,6 +448,24 @@ async function stepEvidence(agent, convId, w, dir, { snapshot = processSnapshot,
 const acpTree = (rows) => { if (!aionProcess) return []; try { return processTree(rows, aionProcess).map((p) => p.pid).filter((pid) => pid !== aionProcess.pid); } catch { return []; } };
 // timeout = how long the agent may show NO progress (new messages); a long job that keeps working is never cut off.
 // bill = where this turn's tokens go: a card, 'lead' (default for Leader turns), or nothing (availability checks).
+// 插話 (Cindy's delivery: 'steer'): a user note sent INTO the turn that is running, without stopping it. AionCore delivers
+// it mid-turn for Claude and Codex (codex turn/steer); if the turn has just ended it opens a new turn with it, which this
+// same turn() then waits for, so nothing runs unseen. Notes not sent before the turn ends go back through fallback(notes).
+const STEER_AGENTS = new Set(['claude', 'codex']);
+const steers = new Map(); // conversationId -> { notes: [], fallback(notes) }
+async function sendSteer(w, agent, convId) {
+  const st = steers.get(convId), notes = st?.notes.splice(0);
+  if (!notes?.length) return;
+  // not sendMessage(): on CONFLICT it stops the running turn to resend, the opposite of a steer
+  try {
+    const res = await api('POST', `/api/conversations/${convId}/messages`, { content: `New instruction from the user (via the leader), sent while you are working on this task:\n${notes.join('\n')}\n\nApply it as you continue. Your final reply keeps the same STATUS rules.` });
+    if (res?.turn_id) active.set(convId, res.turn_id); // the turn ended first and AionCore opened a new one: Stop must reach that one
+    log(w, 'studio', 'system', `已把你的指示插進 ${agentName(agent)} 正在做的這一步（沒有打斷）。`);
+  } catch (e) {
+    st.fallback(notes);
+    log(w, 'studio', 'system', `插話沒有送進去（${clip(e.message, 120)}）：改成這一步做完再轉達。`);
+  }
+}
 async function turn(agent, convId, text, { w, lead = false, check = false, allowStart, ask = false, timeout = 25 * 60e3, progressEvery = 30000, bill = lead && !check ? 'lead' : null } = {}) {
   const run = w?.run;
   if (!check && (run?.stopped || run?.paused || allowStart && !allowStart())) throw new Halt('執行已停止');
@@ -470,6 +488,7 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
       const rt = (await api('GET', `/api/conversations/${convId}`)).runtime || {};
       if (rt.pending_confirmations) await answerConfirmations(w, convId, !lead);
       if (rt.state === 'idle' && !rt.is_processing) { confirmedIdle = true; break; }
+      if (!rt.pending_confirmations) await sendSteer(w, agent, convId);
       const now = Date.now();
       if (now - checkedAt >= progressEvery) {
         checkedAt = now;
@@ -499,6 +518,8 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
   } finally {
     active.delete(convId);
     convActivity.delete(convId);
+    const left = steers.get(convId); steers.delete(convId);
+    if (left?.notes.length) left.fallback(left.notes); // the step ended first: the card hands them over after it
     if (!check) S.agents[agent].working--;
     if (agent === 'codex') refreshCodexLimits();
     if (bill) chargeUsage(run, agent, bill === 'lead' ? null : bill, usageDelta(usage0, await usageOf(convId)));
@@ -728,6 +749,28 @@ function chargeUsage(run, agent, t, d) {
 
 // ---------- Automatic fallback when a worker's quota is gone ----------
 const QUOTA_RE = /usage limit|hit your (?:usage )?limit|rate.?limit|quota|RESOURCE_EXHAUSTED|\b429\b|too many requests|insufficient_quota|credit balance|額度/i;
+// An empty balance does not come back by itself (Cindy's usageLimit.ts makes the same split): those cards fail as before.
+const BILLING_RE = /insufficient_quota|credit balance|billing|餘額|余额/i;
+const MAX_QUOTA_WAITS = 5;
+// When an agent's used-up quota is back, in ms: the latest reset among its full plan windows (a full weekly window
+// outlasts the 5-hour one), else a time the error names ("|1760000000", "resets 3pm", "try again in 20 min"),
+// else one hour from now. One extra minute so the retry lands after the reset, not on it.
+function quotaResumeAt(agent, msg, now = Date.now()) {
+  const full = (S.limits?.[agent]?.windows || []).filter((x) => x.used >= 0.99 && x.resetsAt * 1000 > now);
+  if (full.length) return Math.max(...full.map((x) => x.resetsAt * 1000)) + 60e3;
+  const epoch = /\|(\d{10})\b/.exec(msg);
+  if (epoch && epoch[1] * 1000 > now) return epoch[1] * 1000 + 60e3;
+  const clock = /(?:resets?|try again)\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b/i.exec(msg);
+  if (clock) {
+    const d = new Date(now);
+    d.setHours(Number(clock[1]) % 12 + (/p/i.test(clock[3]) ? 12 : 0), Number(clock[2] || 0), 0, 0);
+    if (d.getTime() <= now) d.setDate(d.getDate() + 1);
+    return d.getTime() + 60e3;
+  }
+  const after = /(?:resets?|try again|retry)\D{0,15}in\s*~?\s*(\d+)\s*(hours?|hrs?|h|minutes?|mins?|m)\b/i.exec(msg);
+  if (after) return now + after[1] * (/^h/i.test(after[2]) ? 3600e3 : 60e3) + 60e3;
+  return now + 3600e3;
+}
 
 const SUBTASK_RULES = `- Each subtask goes to exactly one worker id from the list above.
 - Workers run in parallel, one task at a time each. Spread independent parts across different workers.
@@ -1000,7 +1043,16 @@ function setMission(w, text) {
   w.mission = String(text || '').trim().slice(0, 2000);
   saveSettings();
 }
-const missionNote = (w) => w.mission ? `\nThe project's long-term goal (written by the user; keep the work aligned with it, but do only what the request asks):\n"""\n${w.mission}\n"""\n` : '';
+// Each agent reads only its own rules file (Claude CLAUDE.md, Codex AGENTS.md, Antigravity GEMINI.md). A project that keeps
+// its rules in another agent's file would otherwise be worked on without them, so the brief names those files. Nothing is
+// copied or written (Cindy's cross-agent-convert creates the missing file instead; here the user's repo stays as it is).
+const RULE_FILES = ['AGENTS.md', 'CLAUDE.md', 'GEMINI.md'];
+const NATIVE_RULES = { claude: 'CLAUDE.md', codex: 'AGENTS.md', antigravity: 'GEMINI.md' };
+function rulesNote(agent, dir) {
+  const other = RULE_FILES.filter((f) => f !== NATIVE_RULES[agent] && fs.existsSync(path.join(dir, f)));
+  return other.length ? `\nThis project keeps rules for AI agents in ${other.join(', ')} (folder root). Read ${other.length > 1 ? 'them' : 'it'} before you start and follow ${other.length > 1 ? 'them' : 'it'}; where ${other.length > 1 ? 'they name' : 'it names'} another agent's tools or commands, use your own equivalent. Files that only point to or repeat each other need reading once.\n` : '';
+}
+const missionNote = (w) => w.mission ?`\nThe project's long-term goal (written by the user; keep the work aligned with it, but do only what the request asks):\n"""\n${w.mission}\n"""\n` : '';
 
 // ---------- Routines: a request handed to the team on a schedule ----------
 // Per project: { id, request, time 'HH:MM', days (0 = Sunday ... 6), on, since, lastAt, lastResult }.
@@ -1451,22 +1503,24 @@ async function treeFiles(dir) {
 // only the line-ending / file-mode keys copied over (plain values, no programs). Attributes still apply; a filter= with
 // no driver in the config git reads does nothing.
 const SNAP_KEYS = /^core\.(autocrlf|eol|safecrlf|filemode|symlinks|ignorecase|precomposeunicode|checkroundtripencoding)$/;
-async function snapTree(dir) {
+// fn(g) gets a git runner bound to that private GIT_DIR (index copied, HEAD / real index / refs untouched); null = could not set it up.
+async function privateGit(dir, fn) {
   const [index, objects, exclude, format] = ((await git(dir, 'rev-parse', '--path-format=absolute', '--git-path', 'index', '--git-path', 'objects', '--git-path', 'info/exclude', '--show-object-format')).out || '').trim().split(/\r?\n/);
-  if (!/^\w+$/.test(format || '')) return '';
+  if (!/^\w+$/.test(format || '')) return null;
   const local = ((await git(dir, 'config', '--local', '-z', '--get-regexp', '^core\\.')).out || '').split('\0').map((e) => e.split('\n')).filter(([k, v]) => SNAP_KEYS.test(k) && v != null);
   const tmp = path.join(RT, 'studio', 'snap-' + crypto.randomBytes(6).toString('hex')), cfg = path.join(tmp, 'config');
   try {
     for (const d of ['info', 'refs', 'objects']) fs.mkdirSync(path.join(tmp, d), { recursive: true });
     fs.writeFileSync(path.join(tmp, 'HEAD'), 'ref: refs/heads/snapshot\n');
     fs.writeFileSync(cfg, format === 'sha1' ? '[core]\n\trepositoryformatversion = 0\n' : `[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = ${format}\n`);
-    for (const [k, v] of local) if ((await sh('git', ['config', '--file', cfg, k, v])).err) return '';
+    for (const [k, v] of local) if ((await sh('git', ['config', '--file', cfg, k, v])).err) return null;
     for (const [from, to] of [[index, 'index'], [exclude, 'info/exclude']]) try { fs.copyFileSync(from, path.join(tmp, to)); } catch { /* none yet */ }
     const env = { ...process.env, GIT_DIR: tmp, GIT_WORK_TREE: dir, GIT_INDEX_FILE: path.join(tmp, 'index'), GIT_OBJECT_DIRECTORY: objects };
-    if ((await sh('git', [...GIT_SAFE, 'add', '-A'], dir, env)).err) return '';
-    return (await sh('git', [...GIT_SAFE, 'write-tree'], dir, env)).out?.trim() || '';
+    return await fn((...args) => sh('git', [...GIT_SAFE, ...args], dir, env), tmp);
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 }
+const writeTree = async (g) => (await g('add', '-A')).err ? '' : (await g('write-tree')).out?.trim() || '';
+const snapTree = async (dir) => (await privateGit(dir, writeTree)) || '';
 const STEP_DIFF_MAX = 400e3; // characters of patch shown for one step
 // git output read as a stream and cut at max characters (the git process is stopped there), so a huge patch still shows its start.
 function gitHead(cwd, args, max) {
@@ -1488,6 +1542,53 @@ async function stepDiff(w, id, n) {
   const r = await gitHead(dir, ['-c', 'core.quotepath=false', 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '--stat', '--patch', s.before, s.after], STEP_DIFF_MAX);
   if (r.err) throw new Error('讀不到這一步的 diff（可能已被 git 清掉）：' + r.err);
   return { text: r.cut ? r.out + `\n…（只顯示前 ${STEP_DIFF_MAX / 1000}k 字元）` : r.out };
+}
+// 復原這一步 (Cindy's savepoint rollback): the files this step changed go back to how they were before it. Only the
+// working tree changes (HEAD, commits and the real index stay), only while no card edits files, and only when nothing
+// after the step touched those files; otherwise nothing changes. The undo is recorded as a step itself, so it can be undone.
+async function undoStep(w, id, n) {
+  const t = w.tasks.find((x) => x.id === id), s = t?.steps?.[n];
+  if (!s) throw new Error('找不到這一步');
+  if (w.tasks.some((x) => x.status === 'WORKING' && isWriter(x))) throw new Error('有工作卡正在修改檔案：先按暫停或等它做完，再復原');
+  const dir = (await workspaceOf(t.workdir || w.project)).path;
+  if (!isDir(dir)) throw new Error('這張卡的資料夾已經不在（worktree 可能已清掉），沒有檔案可以復原');
+  const key = treeKey(dir);
+  if (S.leases.some((l) => l.key === key && l.status === 'EXTERNAL')) throw new Error('這個資料夾已宣告由外部接手，Studio 不改它的檔案');
+  w.stepsInFlight = (w.stepsInFlight || 0) + 1; // the watcher must not call our own edits "unknown"
+  try {
+    const res = await privateGit(dir, async (g, tmp) => {
+      const now = await writeTree(g);
+      if (!now) return { err: '讀不到目前的檔案狀態' };
+      const names = (r) => (r.out || '').split('\0').filter(Boolean);
+      const changed = await g('diff', '--name-status', '-z', '--no-renames', s.after, s.before);
+      if (changed.err) return { err: '讀不到這一步的內容（可能已被 git 清掉）：' + changed.err };
+      const list = names(changed), restore = [], remove = [];
+      for (let i = 0; i + 1 < list.length; i += 2) (list[i] === 'D' ? remove : restore).push(list[i + 1]); // D: the step created it
+      const all = [...restore, ...remove];
+      if (!all.length) return { err: '這一步沒有檔案差異' };
+      const later = new Set(names(await g('diff', '--name-only', '-z', '--no-renames', s.after, now)));
+      const clash = all.filter((p) => later.has(p));
+      if (clash.length) return { err: `這一步之後又改過 ${clash.slice(0, 5).join('、')}${clash.length > 5 ? ` 等 ${clash.length} 個檔案` : ''}，無法乾淨地復原` };
+      if (restore.length) {
+        const list = path.join(tmp, 'paths');
+        fs.writeFileSync(list, restore.join('\0'));
+        const r = await g('restore', `--source=${s.before}`, '--worktree', `--pathspec-from-file=${list}`, '--pathspec-file-nul');
+        if (r.err) return { now, after: await writeTree(g), files: all.length, partial: 'git restore 失敗：' + r.err }; // some files may have changed
+      }
+      for (const p of remove) fs.rmSync(path.join(dir, p), { force: true });
+      return { now, after: await writeTree(g), files: all.length };
+    });
+    if (!res) throw new Error('無法讀取這個資料夾的 git 狀態，沒有復原');
+    if (res.err) throw new Error(res.err + '，檔案都沒有改動');
+    (t.steps ||= []).push({ at: nowIso(), before: res.now, after: res.after || res.now, undo: n, ...(res.partial && { partial: true }) });
+    if (w.run) { const stamp = await treeStamp(w, dir); (w.run.treeStamps ||= {})[key] = stamp; if (!t.workdir) w.run.treeStamp = stamp; } // our own edit, not an unknown one
+    if (res.partial) {
+      log(w, 'studio', 'system', `復原「${t.title}」第 ${n + 1} 步時出錯（${clip(res.partial, 160)}），可能只還原了一部分；已記成第 ${t.steps.length} 步。`);
+      throw new Error(res.partial + '，可能只還原了一部分，請看這一步的 diff');
+    }
+    log(w, 'studio', 'system', `已復原「${t.title}」第 ${n + 1} 步改的 ${res.files} 個檔案（commit 不動）；這次復原記成第 ${t.steps.length} 步，可以再復原回去。`);
+    return { files: res.files };
+  } finally { w.stepsInFlight--; }
 }
 // Paths whose entry differs between two snapshots: added, changed or deleted.
 function changedFiles(before, after) {
@@ -1870,11 +1971,24 @@ function removeIncluded(wt) {
   return true;
 }
 // The PR is merged (or, without a remote, the branch is part of the base): the worktree and its branch can go.
+// A failure that may pass by itself (gh / network, a merge GitHub does not show yet, a file still locked) is retried after
+// 1 and then 5 minutes (Cindy's worktree-recycle budget: 3 failures); a check that says the tree is not ours or not clean,
+// the third failure, or 「保留」 stops it until the user presses 「重試清理」.
+const CLEANUP_RETRY_MIN = [1, 5]; // minutes before the 2nd and 3rd try
+const cleaningNow = new Set(); // worktree paths being cleaned (not saved: a restart never leaves one stuck)
+const CLEANUP_STOP_RE = /無法確認這是本卡|不符|仍有修改|查核期間|其他 worktree|but expected/; // but expected: the branch moved after the check
 async function cleanupWorktree(w, t) {
   const wt = t.worktree;
-  if (!wt || wt.cleaned) return;
+  if (!wt || wt.cleaned || cleaningNow.has(wt.path)) return;
   const checked = async (cwd, ...args) => { const r = await git(cwd, ...args); if (r.err || typeof r.out !== 'string') throw new Error(r.err || 'Git 沒有回傳結果'); return r.out.trim(); };
+  cleaningNow.add(wt.path); wt.retryAt = 0;
   try {
+    if (wt.removed) { // an earlier try removed the worktree: only the branch is left, deleted only if it still points where it did
+      if ((await checked(wt.repoPath, 'worktree', 'list', '--porcelain', '-z')).split('\0').includes('branch refs/heads/' + wt.branch)) throw new Error('分支仍有其他 worktree 使用');
+      await checked(wt.repoPath, 'update-ref', '-d', 'refs/heads/' + wt.branch, wt.removedHead);
+      Object.assign(wt, { cleaned: true, cleanupError: '' });
+      return log(w, 'studio', 'system', `已清掉 branch「${wt.branch}」（worktree 先前已移除）。`);
+    }
     if (treeKey(path.dirname(canonPath(wt.path))) !== treeKey(path.join(RT, 'studio', 'worktrees')) || !path.basename(wt.path).endsWith('-' + t.id)
       || treeKey(wt.repoPath) !== treeKey(w.project) || !wt.branch.startsWith(`studio/${t.id}-`)) throw new Error('無法確認這是本卡建立的 worktree');
     const trees = await checked(wt.repoPath, 'worktree', 'list', '--porcelain', '-z');
@@ -1891,7 +2005,7 @@ async function cleanupWorktree(w, t) {
     if (await checked(wt.path, 'status', '--porcelain', '--untracked-files=all', '--ignored')) throw new Error('仍有修改、未追蹤或忽略的檔案');
     if (head !== await checked(wt.path, 'rev-parse', 'HEAD')) throw new Error('查核期間 HEAD 已改變');
     await checked(wt.repoPath, 'worktree', 'remove', wt.path);
-    wt.removed = true;
+    Object.assign(wt, { removed: true, removedHead: head });
     const remaining = await checked(wt.repoPath, 'worktree', 'list', '--porcelain', '-z');
     if (remaining.split('\0').includes('branch refs/heads/' + wt.branch)) throw new Error('分支仍有其他 worktree 使用');
     // Compare-and-delete also supports squash merges, without deleting a branch that moved after verification.
@@ -1900,8 +2014,27 @@ async function cleanupWorktree(w, t) {
     log(w, 'studio', 'system', `已驗證交付：清掉本次建立的 worktree 和 branch「${wt.branch}」。`);
   } catch (e) {
     wt.cleanupError = e.message;
-    log(w, 'studio', 'system', `worktree「${wt.branch}」清理未完成${wt.removed ? '（worktree 已移除，分支保留）' : '，保留現況'}：${e.message}`);
+    wt.cleanupTries = (wt.cleanupTries || 0) + 1;
+    const wait = !wt.kept && !CLEANUP_STOP_RE.test(e.message) && CLEANUP_RETRY_MIN[wt.cleanupTries - 1];
+    wt.retryAt = wait ? Date.now() + wait * 60e3 : 0;
+    log(w, 'studio', 'system', `worktree「${wt.branch}」清理未完成${wt.removed ? '（worktree 已移除，分支保留）' : '，保留現況'}：${e.message}`
+      + (wait ? `；${wait} 分鐘後自動再試（已失敗 ${wt.cleanupTries}/${CLEANUP_RETRY_MIN.length + 1} 次）。` : '；不再自動重試，可在工作卡按「重試清理」或「保留」。'));
+  } finally { cleaningNow.delete(wt.path); }
+}
+function retryCleanups(now = Date.now()) {
+  for (const w of S.workspaces) for (const t of w.tasks) if (t.worktree?.retryAt && now >= t.worktree.retryAt) cleanupWorktree(w, t);
+}
+// 重試清理 = a fresh budget and one try now; 保留 = this worktree and branch stay, nothing retries them.
+async function worktreeCleanupAction(w, id, action) {
+  const t = w.tasks.find((x) => x.id === id), wt = t?.worktree;
+  if (!wt || wt.cleaned) throw new Error('這張卡沒有待清理的 worktree');
+  if (action === 'keep') {
+    Object.assign(wt, { kept: true, retryAt: 0 });
+    return log(w, 'studio', 'system', `保留 worktree「${wt.branch}」：Studio 不會再自動清理它。`);
   }
+  if (t.status !== 'DONE') throw new Error('卡片完成後才能清理它的 worktree');
+  Object.assign(wt, { kept: false, cleanupTries: 0 });
+  await cleanupWorktree(w, t);
 }
 
 // ----- unknown changes: never reset / stash / overwrite; stop writing and ask -----
@@ -1963,7 +2096,7 @@ ${w.backendPort ? `If you must run this project's backend on port ${w.backendPor
 Task: ${t.title}
 Instructions:
 ${t.instructions}
-${missionNote(w)}${deps.length ? `\nResults of the earlier cards this task builds on:\n${deps.map((d) => `- ${d.title} (${agentName(d.agent)}): ${d.result}`).join('\n')}\n` : ''}
+${missionNote(w)}${rulesNote(t.agent, t.workdir || run.project)}${deps.length ? `\nResults of the earlier cards this task builds on:\n${deps.map((d) => `- ${d.title} (${agentName(d.agent)}): ${d.result}`).join('\n')}\n` : ''}
 ${roleRules(t)}
 ${accessRules(t)}
 ${isWriter(t) && t.role !== 'check' ? deliveryRules(w.delivery, 'worker') : ''}
@@ -2053,6 +2186,16 @@ ${STATUS_RULES}`;
       log(w, 'studio', 'system', `${agentName(from)} 的額度用完或被限流：依「備援」設定，它在這個專案的卡改由 ${agentName(fb)} 接手。`, e.message);
       notify(`${label(w)}：${agentName(from)} 額度用完，已改由 ${agentName(fb)} 接手`, t.title, 'done', w.project);
       setTimeout(() => withdrawAgent(w, from, fb).catch((err) => { t.hold = false; log(w, 'studio', 'system', '自動改派給備援成員失敗：' + err.message); pump(w); }), 0);
+      return;
+    }
+    if (!(e instanceof Halt) && QUOTA_RE.test(e.message) && !BILLING_RE.test(e.message) && (t.quotaWaits || 0) < MAX_QUOTA_WAITS) {
+      // no fallback: park the card (it keeps its conversation and its lease) and resume it when the quota is back
+      const at = quotaResumeAt(t.agent, e.message);
+      t.quotaWaits = (t.quotaWaits || 0) + 1;
+      Object.assign(t, { status: 'WAITING_EXTERNAL', detail: e.message, wait: { what: `${agentName(t.agent)} 的額度重置`, quotaAt: at, manual: false } });
+      const when = new Date(at).toLocaleString('zh-TW', { hour12: false, month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+      log(w, 'studio', 'system', `${agentName(t.agent)} 的額度用完或被限流：「${t.title}」先停在這裡，約 ${when} 額度重置後自動接著做（第 ${t.quotaWaits}/${MAX_QUOTA_WAITS} 次）。`, e.message);
+      notify(`${label(w)}：${agentName(t.agent)} 額度用完，約 ${when} 自動繼續`, t.title, 'done', w.project);
       return;
     }
     if (!(e instanceof Halt) && !e.timeout && !e.stuck && !t.hard && JSON.stringify(tierCfg(w, t.agent, true)) !== JSON.stringify(tierCfg(w, t.agent, false))) {
@@ -2332,7 +2475,7 @@ async function cardDetail(w, id) {
     .map((m) => ({ at: m.created_at, kind: m.type === 'tool_call' ? 'tool' : 'say', text: clip(m.type === 'tool_call' ? itemText(m) : answerText(itemText(m)).split('\n')[0], 160), running: m.type === 'tool_call' && m.status !== 'finish' }));
   const last = [...mine].reverse().find(say);
   return { id: t.id, title: t.title, agent: t.agent, status: t.status, usage: t.usage || null, workingSince: t.workingSince, firstStartedAt: t.firstStartedAt, wait: t.wait, result: t.result,
-    activity: convActivity.get(cid) || null, acts, steps: (t.steps || []).map((s) => s.at), lastSay: last ? clip(answerText(itemText(last)), 800) : '', asks: t.asks || [],
+    activity: convActivity.get(cid) || null, acts, steps: (t.steps || []).map((s) => ({ at: s.at, undo: s.undo })), lastSay: last ? clip(answerText(itemText(last)), 800) : '', asks: t.asks || [],
     log: mine.slice(-50).map((m) => ({ at: m.created_at, who: m.position === 'right' ? 'Studio' : 'AI', kind: m.type, text: clip(itemText(m), 600) })) };
 }
 
@@ -2340,13 +2483,15 @@ async function cardDetail(w, id) {
 // The user's note goes to the Leader, who decides: tell a worker (on its card), cancel cards that
 // have not started, or add cards. A busy Leader (planning / final check) gets the notes right after.
 // interrupt = stop the working cards' current step now; they continue after the Leader has read the note.
-function instruct(w, text, interrupt = false) {
+// steer = the Leader's note goes into the working card's current step (Claude / Codex), without stopping it.
+function instruct(w, text, interrupt = false, steer = false) {
   text = String(text || '').trim();
   if (!text) throw new Error('請輸入指示');
   const run = w.run;
   if (!run?.active && !run?.paused) throw new Error('目前沒有進行中的工作；新的工作請用「交給團隊」');
   if (run.active && run.ask && !run.summarizing) return answer(w, '', text); // the Leader is waiting for an answer: this is it
-  log(w, 'user', 'user', (interrupt ? '你的指示（立刻打斷）：' : '你的指示：') + text);
+  log(w, 'user', 'user', (interrupt ? '你的指示（立刻打斷）：' : steer ? '你的指示（插話）：' : '你的指示：') + text);
+  if (steer && !interrupt) run.steer = true;
   if (interrupt && run.active) {
     const working = w.tasks.filter((t) => t.status === 'WORKING');
     for (const t of working) {
@@ -2368,7 +2513,8 @@ async function processNotes(w) {
   // Planning and the final check read the notes themselves when they end (see planPhase / summarize).
   if (!run?.active || run.noting || run.asking || run.phase !== 'working' || run.summarizing || !run.notes?.length) return;
   run.noting = true;
-  const notes = run.notes.splice(0);
+  const notes = run.notes.splice(0), steer = run.steer;
+  run.steer = false;
   const gen = run.leaderGen, lead = run.leader;
   const workers = workersFor(w, lead);
   try {
@@ -2403,6 +2549,13 @@ ${SUBTASK_RULES}`;
     for (const x of Array.isArray(d.tell) ? d.tell : []) {
       const t = w.tasks.find((y) => y.id === String(x?.card)), note = String(x?.note || '').trim();
       if (!t || !note) continue;
+      const cid = run.convs[workKey(t)];
+      if (t.status === 'WORKING' && steer && STEER_AGENTS.has(t.agent) && cid && active.has(cid)) {
+        const st = steers.get(cid) || { notes: [], fallback: (n) => (t.notes ??= []).push(...n) };
+        st.notes.push(note); steers.set(cid, st);
+        log(w, 'studio', 'system', `指示會插進 ${agentName(t.agent)} 正在做的這一步（「${t.title}」，不打斷）。`);
+        continue;
+      }
       if (t.status === 'WORKING') (t.notes ??= []).push(note);
       else if (PARKED.includes(t.status) || (t.status === 'WAITING' && t.wakeNote)) wake(w, t, 'New instruction from the user (via the leader): ' + note); // a pending wake (e.g. an interrupted card) gets it added
       else if (['WAITING', 'PAUSED', 'INTERRUPTED'].includes(t.status)) t.instructions += '\n\nInstruction added by the user during the job: ' + note;
@@ -2472,7 +2625,12 @@ async function checkExternal(w, t) {
 }
 
 function watchExternal() {
-  for (const w of S.workspaces) if (w.run?.active) for (const t of w.tasks) if (t.status === 'WAITING_EXTERNAL') { if (t.wait?.pokeAt) pokeExternal(w, t); else checkExternal(w, t); }
+  for (const w of S.workspaces) if (w.run?.active) for (const t of w.tasks) if (t.status === 'WAITING_EXTERNAL') { if (t.wait?.quotaAt) resumeAfterQuota(w, t); else if (t.wait?.pokeAt) pokeExternal(w, t); else checkExternal(w, t); }
+}
+function resumeAfterQuota(w, t) {
+  if (Date.now() < t.wait.quotaAt) return;
+  wake(w, t, 'Your usage limit has reset. Continue the task from where you stopped; do not redo work that is already done.',
+    `${agentName(t.agent)} 的額度重置時間到了：「${t.title}」自動接著做。`);
 }
 function pokeExternal(w, t) {
   if (Date.now() < t.wait.pokeAt) return;
@@ -3201,12 +3359,14 @@ const routes = {
   'POST /api/reassign': (b) => reassign(wsOf(b.ws), b.taskId, b.agent),
   'POST /api/continue': (b) => { const w = wsOf(b.ws); w.autoRounds = 0; return continueProject(w); },
   'POST /api/project-state/refresh': (b) => refreshState(wsOf(b.ws)),
-  'POST /api/instruct': (b) => instruct(wsOf(b.ws), b.text, !!b.interrupt),
+  'POST /api/instruct': (b) => instruct(wsOf(b.ws), b.text, !!b.interrupt, !!b.steer),
   'POST /api/strategy': (b) => setStrategy(wsOf(b.ws), b.strategy),
   'POST /api/answer': (b) => answer(wsOf(b.ws), b.taskId, b.text),
   'POST /api/continue-card': (b) => continueCard(wsOf(b.ws), b.taskId),
   'POST /api/card/detail': (b) => cardDetail(wsOf(b.ws), b.taskId),
   'POST /api/card/diff': (b) => stepDiff(wsOf(b.ws), b.taskId, Number(b.step)),
+  'POST /api/card/worktree-cleanup': (b) => worktreeCleanupAction(wsOf(b.ws), b.taskId, b.action === 'keep' ? 'keep' : 'retry'),
+  'POST /api/card/undo-step': (b) => undoStep(wsOf(b.ws), b.taskId, Number(b.step)),
   'POST /api/card/ask': (b) => askAgent(wsOf(b.ws), b.taskId, b.text),
   'POST /api/card/delegate': (b) => delegateAsk(wsOf(b.ws), b.taskId, b.agent),
   'POST /api/check': () => { checkAll().then(refreshClaudeLimits); },
@@ -3287,6 +3447,7 @@ for (const w of S.workspaces) {
 await startAion();
 watchCatalogs();
 setInterval(watchExternal, 60000); // GitHub PR / CI waits
+setInterval(retryCleanups, 60000); // worktree cleanups that failed for a reason that may pass
 setInterval(runRoutines, 30000); // routines: checked twice a minute so an HH:MM slot starts within that minute
 await refreshRuntimeReadiness();
 setInterval(() => refreshRuntimeReadiness().catch(() => {}), 10000);
