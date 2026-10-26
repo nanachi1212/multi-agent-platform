@@ -1042,7 +1042,16 @@ function setMission(w, text) {
   w.mission = String(text || '').trim().slice(0, 2000);
   saveSettings();
 }
-const missionNote = (w) => w.mission ? `\nThe project's long-term goal (written by the user; keep the work aligned with it, but do only what the request asks):\n"""\n${w.mission}\n"""\n` : '';
+// Each agent reads only its own rules file (Claude CLAUDE.md, Codex AGENTS.md, Antigravity GEMINI.md). A project that keeps
+// its rules in another agent's file would otherwise be worked on without them, so the brief names those files. Nothing is
+// copied or written (Cindy's cross-agent-convert creates the missing file instead; here the user's repo stays as it is).
+const RULE_FILES = ['AGENTS.md', 'CLAUDE.md', 'GEMINI.md'];
+const NATIVE_RULES = { claude: 'CLAUDE.md', codex: 'AGENTS.md', antigravity: 'GEMINI.md' };
+function rulesNote(agent, dir) {
+  const other = RULE_FILES.filter((f) => f !== NATIVE_RULES[agent] && fs.existsSync(path.join(dir, f)));
+  return other.length ? `\nThis project keeps rules for AI agents in ${other.join(', ')} (folder root). Read ${other.length > 1 ? 'them' : 'it'} before you start and follow ${other.length > 1 ? 'them' : 'it'}; where ${other.length > 1 ? 'they name' : 'it names'} another agent's tools or commands, use your own equivalent. Files that only point to or repeat each other need reading once.\n` : '';
+}
+const missionNote = (w) => w.mission ?`\nThe project's long-term goal (written by the user; keep the work aligned with it, but do only what the request asks):\n"""\n${w.mission}\n"""\n` : '';
 
 // ---------- Routines: a request handed to the team on a schedule ----------
 // Per project: { id, request, time 'HH:MM', days (0 = Sunday ... 6), on, since, lastAt, lastResult }.
@@ -2078,7 +2087,7 @@ ${w.backendPort ? `If you must run this project's backend on port ${w.backendPor
 Task: ${t.title}
 Instructions:
 ${t.instructions}
-${missionNote(w)}${deps.length ? `\nResults of the earlier cards this task builds on:\n${deps.map((d) => `- ${d.title} (${agentName(d.agent)}): ${d.result}`).join('\n')}\n` : ''}
+${missionNote(w)}${rulesNote(t.agent, t.workdir || run.project)}${deps.length ? `\nResults of the earlier cards this task builds on:\n${deps.map((d) => `- ${d.title} (${agentName(d.agent)}): ${d.result}`).join('\n')}\n` : ''}
 ${roleRules(t)}
 ${accessRules(t)}
 ${isWriter(t) && t.role !== 'check' ? deliveryRules(w.delivery, 'worker') : ''}

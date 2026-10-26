@@ -81,6 +81,18 @@ const { execFile, execFileSync, spawn } = require('node:child_process');
     git('config', 'filter.trap.clean', 'echo ran > FILTER_RAN; cat # x.clean=y'); write('.gitattributes', 'trap.dat filter=trap\n'); write('trap.dat', 'x');
     assert.ok(await api.snapTree(repo), 'snapshot still taken');
     assert.ok(!fs.existsSync(path.join(repo, 'FILTER_RAN')), 'repo-configured clean filter did not run');
-    console.log('card files: listed vs changed, absolute and ./ paths, deletions, ignored output, missing FILES line, read-only cards, step diffs, step undo: PASS');
+    // Rules in another agent's file: the brief names them, the agent's own file is left to the agent, nothing is written
+    assert.strictEqual(api.rulesNote('codex', repo), '', 'no rules files: no note');
+    write('CLAUDE.md', 'use pwsh');
+    assert.ok(api.rulesNote('codex', repo).includes('in CLAUDE.md') && api.rulesNote('antigravity', repo).includes('CLAUDE.md') && api.rulesNote('qwen', repo).includes('CLAUDE.md'));
+    assert.strictEqual(api.rulesNote('claude', repo), '', 'Claude reads CLAUDE.md itself');
+    write('AGENTS.md', 'see CLAUDE.md');
+    assert.ok(api.rulesNote('claude', repo).includes('in AGENTS.md (') && api.rulesNote('antigravity', repo).includes('AGENTS.md, CLAUDE.md'));
+    const rw = newW(); rw.project = repo; rw.run.project = repo; rw.run.startedAt = new Date().toISOString(); env.S.workspaces.length = 0; env.S.workspaces.push(rw);
+    const rt = { id: 'rules', title: 'rules', agent: 'codex', writes: false, status: 'WAITING', after: [], instructions: 'x' }; rw.tasks.push(rt);
+    await api.runTask(rw, rt);
+    assert.ok(env.prompts.at(-1).text.includes('keeps rules for AI agents in CLAUDE.md'), 'the Codex brief names CLAUDE.md');
+    assert.ok(!fs.existsSync(path.join(repo, 'GEMINI.md')), 'no rules file is created');
+    console.log('card files: listed vs changed, absolute and ./ paths, deletions, ignored output, missing FILES line, read-only cards, step diffs, step undo, rules files: PASS');
   } finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 }); }
 })().catch((e) => { console.error('FAIL', e); process.exit(1); });
