@@ -7,7 +7,7 @@ const { execFile, execFileSync } = require('node:child_process');
   fs.mkdirSync(repo);
   const git = (...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', windowsHide: true }).trim();
   git('init', '-qb', 'main'); git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.invalid');
-  fs.writeFileSync(path.join(repo, '.gitignore'), 'ignored.txt\n'); git('add', '.'); git('commit', '-qm', 'base');
+  fs.writeFileSync(path.join(repo, '.gitignore'), 'ignored.txt\ncache/\nnode_modules/\n'); git('add', '.'); git('commit', '-qm', 'base');
   const initial = git('rev-parse', 'HEAD'), trees = [];
   let scenario, prHead, moved, calls;
   const E = makeEnv(() => '', { RT: root, execFile: (cmd, args, opts, cb) => {
@@ -20,9 +20,13 @@ const { execFile, execFileSync } = require('node:child_process');
     });
   } });
   try {
-    for (scenario of ['clean', 'setup', 'dirty', 'ignored', 'status-error', 'remove-error', 'ref-error', 'moved-ref', 'old-pr', 'squash-pr', 'dirty-remote', 'outside', 'include', 'include-edited', 'setup-include']) {
+    for (scenario of ['clean', 'setup', 'dirty', 'ignored', 'status-error', 'remove-error', 'ref-error', 'moved-ref', 'old-pr', 'squash-pr', 'dirty-remote', 'outside', 'include', 'include-edited', 'setup-include', 'setup-later', 'setup-zh']) {
       calls = []; const w = newW(); w.project = repo; w.run.project = repo; w.run.active = false;
-      if (scenario.startsWith('setup')) w.worktreeSetup = 'echo made> ignored.txt'; // setup-include: overwrites the .worktreeinclude copy
+      w.worktreeSetup = { setup: 'echo made> ignored.txt && mkdir node_modules && echo m> node_modules\\m.txt', 'setup-include': 'echo made> ignored.txt', 'setup-later': 'mkdir cache && echo a> cache\\a.txt', 'setup-zh': 'echo ok' }[scenario] || ''; // setup-include: overwrites the .worktreeinclude copy
+      if (scenario === 'setup-zh') { // a non-ASCII .worktreeinclude path: git status quotes it unless read with -z
+        fs.writeFileSync(path.join(repo, '秘密.env'), 'secret'); fs.appendFileSync(path.join(repo, '.gitignore'), '秘密.env\n'); fs.appendFileSync(path.join(repo, '.worktreeinclude'), '秘密.env\n');
+        git('add', '.'); git('commit', '-qm', 'zh include');
+      }
       const t = { id: scenario, title: scenario, agent: 'codex', writes: true, status: 'PAUSED', after: [] }; w.tasks.push(t);
       if (scenario === 'include') { // once: an ignored file and folder, and the include list itself (tracked, like Orca's)
         fs.mkdirSync(path.join(repo, 'deps')); fs.writeFileSync(path.join(repo, 'deps', 'x.txt'), 'dep');
@@ -31,7 +35,10 @@ const { execFile, execFileSync } = require('node:child_process');
         git('add', '.'); git('commit', '-qm', 'include list');
       }
       const { path: dir, branch } = await E.api.useWorktree(w, t.id); trees.push({ path: dir, branch });
-      if (scenario === 'setup') assert.deepStrictEqual([fs.readFileSync(path.join(dir, 'ignored.txt'), 'utf8').trim(), t.worktree.setupIgnored, t.hold, E.env.logs.at(-1).text.includes('設定指令已完成')], ['made', ['!! ignored.txt'], false, true], 'the setup command ran in the worktree before the card');
+      if (scenario === 'setup') assert.deepStrictEqual([fs.readFileSync(path.join(dir, 'ignored.txt'), 'utf8').trim(), t.worktree.setupIgnored.map((e) => e.path), !!t.hold, t.preparing, E.env.logs.at(-1).text.includes('設定指令已完成')], ['made', ['ignored.txt', 'node_modules/'], false, false, true], 'the setup command ran in the worktree before the card');
+      if (scenario === 'setup') fs.writeFileSync(path.join(dir, 'node_modules', 'later.txt'), 'rebuildable'); // node_modules may change: it goes anyway
+      if (scenario === 'setup-later') fs.writeFileSync(path.join(dir, 'cache', 'keep.txt'), 'must survive');
+      if (scenario === 'setup-zh') { prHead = git('-C', dir, 'rev-parse', 'HEAD'); assert.ok(!(t.worktree.setupIgnored || []).some((e) => String(e.path || e).includes('秘密') || String(e).includes('\\347')), 'the non-ASCII copy is not the setup command\'s: ' + JSON.stringify(t.worktree.setupIgnored)); fs.writeFileSync(path.join(dir, '秘密.env'), 'edited'); }
       if (scenario === 'setup-include') assert.deepStrictEqual(t.worktree.setupIgnored, [], 'a .worktreeinclude path is never the setup command\'s');
       if (scenario.startsWith('include')) {
         prHead = git('-C', dir, 'rev-parse', 'HEAD');
@@ -53,6 +60,8 @@ const { execFile, execFileSync } = require('node:child_process');
       await E.api.cleanupWorktree(w, t);
       assert.ok(!calls.some((c) => c.includes('--force') || c.includes('-D')), 'production cleanup never uses force');
       if (scenario === 'setup-include') assert.deepStrictEqual([fs.readFileSync(path.join(dir, 'ignored.txt'), 'utf8').trim(), t.worktree.cleanupError], ['made', '仍有修改、未追蹤或忽略的檔案'], 'a changed copy still stops cleanup');
+      if (scenario === 'setup-later') assert.deepStrictEqual([fs.readFileSync(path.join(dir, 'cache', 'keep.txt'), 'utf8'), t.worktree.cleanupError], ['must survive', '仍有修改、未追蹤或忽略的檔案'], 'a file added later to a setup folder stops cleanup');
+      if (scenario === 'setup-zh') assert.deepStrictEqual([fs.existsSync(path.join(dir, '秘密.env')) && fs.readFileSync(path.join(dir, '秘密.env'), 'utf8'), t.worktree.cleanupError], ['edited', '仍有修改、未追蹤或忽略的檔案'], 'an edited non-ASCII copy stops cleanup');
       if (['clean', 'setup', 'squash-pr', 'include'].includes(scenario)) {
         assert.strictEqual(t.worktree.cleaned, true, scenario + ': ' + t.worktree.cleanupError); assert.ok(!fs.existsSync(dir)); assert.strictEqual(git('branch', '--list', branch), '');
         if (scenario === 'include') assert.deepStrictEqual([fs.readFileSync(path.join(repo, 'deps', 'x.txt'), 'utf8'), fs.readFileSync(path.join(repo, 'ignored.txt'), 'utf8')], ['dep', 'secret'], 'removing the link and the copy never touches the primary checkout');
@@ -68,6 +77,17 @@ const { execFile, execFileSync } = require('node:child_process');
         if (scenario === 'include-edited') assert.deepStrictEqual([fs.readFileSync(path.join(dir, 'ignored.txt'), 'utf8'), fs.lstatSync(path.join(dir, 'deps')).isSymbolicLink(), t.worktree.cleanupError], ['edited', true, '仍有修改、未追蹤或忽略的檔案'], 'an edited copy keeps the copy, the link and the worktree');
       }
     }
+    // While the worktree is made and its setup command runs, the card cannot start and cannot be handed off.
+    { const w = newW(); w.project = repo; w.run.project = repo; w.run.active = false; w.worktreeSetup = 'ping -n 3 127.0.0.1 > nul';
+      const t = { id: 'prep', title: 'prep', agent: 'codex', writes: true, status: 'WAITING', after: [] }; w.tasks.push(t);
+      const making = E.api.useWorktree(w, t.id);
+      assert.ok(t.preparing, 'preparing from the first moment');
+      await assert.rejects(E.api.handoffWriter(w, 'claude', t.id), /準備/, 'no handoff while preparing');
+      for (let i = 0; i < 100 && !t.worktree; i++) await new Promise((r) => setTimeout(r, 20)); // now the setup command runs
+      w.run.active = true; E.api.pump(w);
+      assert.ok(t.status === 'WAITING' && !w.executingSteps?.has(t.id), 'the card does not start during setup');
+      w.run.active = false; const r = await making; trees.push(r);
+      assert.ok(!t.preparing && t.worktree.setupIgnored, 'ready after setup'); }
     // retry budget: a timed retry finishes a cleanup whose branch deletion failed; three temporary failures stop it; 保留 / 重試清理
     if (git('remote')) git('remote', 'remove', 'origin');
     const fresh = async (id) => { const w = newW(); w.project = repo; w.run.project = repo; w.run.active = false; E.env.S.workspaces.length = 0; E.env.S.workspaces.push(w);
