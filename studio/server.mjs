@@ -2032,22 +2032,36 @@ async function killSetup(e) {
 // A kill that did not end the whole tree: the card stays blocked like a restart's leftover, with the processes still
 // there, and the next Resume / Stop / new job / claim checks them again. Waiters are let go at once: the command may never
 // exit. A PID the snapshot does not show has ended; without a snapshot each is kept with no identity (blocked while alive).
-async function setupStuck(e, k) {
-  if (e.stuck) return;
-  e.stuck = true;
-  const { w, t } = e;
-  t.preparing = true;
+// One transition per preparation, shared: a second caller (the finalizer after the command exited) waits until the
+// processes are recorded; the registry entry stays (claims, Start, Stop keep waiting) until then.
+function setupStuck(e, k) {
+  return e.stuck ||= (async () => {
+    const { w, t } = e;
+    t.preparing = true;
+    const pids = [...new Set([e.child?.pid, ...(k.remaining || [])].filter(Boolean))];
+    if (t.worktree) {
+      t.worktree.setupProc ||= { pid: e.child?.pid };
+      await recordLeft(t, pids);
+      t.worktree.setupKillError = `PID ${pids.join('、')} 的程序樹沒有確認全部終止`;
+    }
+    log(w, 'studio', 'system', `「${t.title}」的 worktree 設定指令無法確認已停止，卡片保持阻擋；按「繼續」、Stop 或外部接手時會再試。`);
+    saveRun(w, w.run?.paused ? 'paused' : 'running');
+    if (preparing.get(t.id) === e) preparing.delete(t.id);
+    e.giveUp?.();
+  })();
+}
+// Adds the processes a kill reported as still there to the card's record: with their identity, or by PID alone when the
+// process list cannot be read (then blocked while that PID lives). A PID the list does not show has ended.
+async function recordLeft(t, pids) {
+  if (!t.worktree || !pids.length) return;
   const rows = await processSnapshot().catch(() => null);
-  const pids = [...new Set([e.child?.pid, ...(k.remaining || [])].filter(Boolean))];
-  if (t.worktree) {
-    t.worktree.setupProc ||= { pid: e.child?.pid };
-    t.worktree.setupLeft = pids.map((pid) => { const r = rows?.find((x) => x.pid === pid); return r ? { pid, creationDate: r.creationDate, executable: r.executable } : rows ? null : { pid }; }).filter(Boolean);
-    t.worktree.setupKillError = `PID ${pids.join('、')} 的程序樹沒有確認全部終止`;
+  const left = new Map((t.worktree.setupLeft || []).map((p) => [p.pid, p]));
+  for (const pid of pids) {
+    const r = rows?.find((x) => x.pid === pid);
+    if (r) left.set(pid, { pid, creationDate: r.creationDate, executable: r.executable });
+    else if (!rows && !left.has(pid)) left.set(pid, { pid });
   }
-  log(w, 'studio', 'system', `「${t.title}」的 worktree 設定指令無法確認已停止，卡片保持阻擋；按「繼續」、Stop 或外部接手時會再試。`);
-  saveRun(w, w.run?.paused ? 'paused' : 'running');
-  if (preparing.get(t.id) === e) preparing.delete(t.id);
-  e.giveUp?.();
+  t.worktree.setupLeft = [...left.values()];
 }
 // A restart: Studio closed while a setup command ran, and on Windows that command outlives it. The card stays preparing
 // (blocked) until a fresh snapshot shows the command gone; it is killed only while the saved identity still matches, so a
@@ -2062,8 +2076,10 @@ async function killLeftSetup(w, t) {
     if (odd) throw new Error(`PID ${odd.pid} 仍在執行，但無法確認是不是當時的設定指令（沒有記到建立時間），所以沒有終止它；請自行確認並結束該程序，或等它結束後再試`);
     const live = procs.filter((p) => rows.some((r) => sameSetup(r, p)));
     if (live.length) {
-      const ok = (await Promise.all(live.map((p) => killProcessTree(p.pid).catch(() => null)))).every((r) => r?.ok);
-      if (!ok || (await processSnapshot()).some((r) => live.some((p) => sameSetup(r, p)))) throw new Error(`PID ${live.map((p) => p.pid).join('、')} 終止失敗或仍在執行`);
+      const res = await Promise.all(live.map((p) => killProcessTree(p.pid).catch(() => ({ ok: false, remaining: [p.pid] }))));
+      // what this kill reported as still there is recorded before refusing: the next try checks it too
+      if (res.some((r) => !r?.ok)) { await recordLeft(t, res.flatMap((r) => r?.remaining || [])); throw new Error(`PID ${live.map((p) => p.pid).join('、')} 終止失敗或仍在執行`); }
+      if ((await processSnapshot()).some((r) => live.some((p) => sameSetup(r, p)))) throw new Error(`PID ${live.map((p) => p.pid).join('、')} 終止失敗或仍在執行`);
       log(w, 'studio', 'system', `沒跑完的 worktree 設定指令（PID ${live.map((p) => p.pid).join('、')}）已終止。`);
     }
     delete t.worktree.setupProc; delete t.worktree.setupLeft; delete t.worktree.setupKillError;

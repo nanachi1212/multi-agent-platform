@@ -336,6 +336,54 @@ const { execFile, execFileSync } = require('node:child_process');
         trees.push(await making);
         assert.ok(!alive(pid) && !t.preparing && t.worktree.setupIgnored.length === 0 && E13.env.logs.some((l) => l.text.includes('超過 10 分鐘')), 'ended by the limit; nothing it left is deletable');
       }
+      // A kill that ends only the root and reports its child still there; kids() reads the real tree before.
+      const kids = async (pid) => { const rows = await processSnapshot(), out = [pid]; for (let i = 0; i < out.length; i++) for (const r of rows) if (r.parent === out[i] && !out.includes(r.pid)) out.push(r.pid); return out.slice(1); };
+      const rootOnly = async (pid) => { // everything but the ping goes (conhost too, so the command's exit is seen at once)
+        const rows = await processSnapshot(), left = await kids(pid);
+        for (const k of [...left, pid]) if (!/ping/i.test(rows.find((r) => r.pid === k)?.executable || '')) try { process.kill(k); } catch {}
+        return { ok: false, killed: true, rootPid: pid, remaining: left };
+      };
+      // A retry of a leftover whose kill leaves a child: that child is recorded, so the next retry does not unblock the card
+      // just because the old root is gone.
+      {
+        let first = true;
+        const E14 = makeEnv(() => '', { RT: root, processSnapshot, execFile,
+          killProcessTree: async (pid) => first ? (first = false, rootOnly(pid)) : { ok: false, killed: false, rootPid: pid, remaining: [pid] } });
+        const L = await leftover(E14.env, 'left-child');
+        for (let i = 0; i < 100 && !(await kids(L.p.pid)).length; i++) await new Promise((r) => setTimeout(r, 20));
+        const all = await kids(L.p.pid), child = (await processSnapshot()).find((r) => all.includes(r.pid) && /ping/i.test(r.executable || '')).pid;
+        E14.api.loadRun(L.w, { id: 'restart14', status: 'paused', tasks: [L.t], activity: [], convs: {} });
+        for (let i = 0; i < 300 && !L.t.worktree.setupKillError; i++) await new Promise((r) => setTimeout(r, 20));
+        assert.ok(L.t.worktree.setupLeft?.some((p) => p.pid === child && p.creationDate), 'the child the kill left is recorded');
+        await gone(L.p.pid);
+        await assert.rejects(E14.api.claimWorkspace(L.dir, { label: 'retry' }), /無法確認已停止/, 'the next retry still sees the child and refuses');
+        assert.ok(L.t.preparing && alive(child), 'the card stays blocked while the child lives');
+        for (const k of all) try { process.kill(k); } catch {} await gone(...all);
+        await E14.api.claimWorkspace(L.dir, { label: 'after' }); await E14.api.releaseClaim(L.dir);
+        assert.ok(!L.t.preparing, 'cleared once the child is gone');
+      }
+      // Stop's kill fails and the command then ends (its last child too) while the stuck record is still being written (a
+      // slow process list): the finalizer waits for that one transition, so the card is never released half-recorded and
+      // the transition never writes back onto a card a claim has already cleared.
+      {
+        let slow = false;
+        const E15 = makeEnv(() => '', { RT: root, execFile,
+          processSnapshot: async () => { if (slow) await new Promise((r) => setTimeout(r, 5000)); return processSnapshot(); },
+          killProcessTree: async (pid) => { const r = await rootOnly(pid); slow = true; return r; } });
+        const { w, t, making } = await liveSetup(E15, 'race-stuck', 'ping -n 3 127.0.0.1 > nul 2>&1'); // its ping ends in ~2 s
+        making.catch(() => {}); // it rejects once stuck; awaited below
+        trees.push({ path: t.worktree.path, branch: t.worktree.branch });
+        const began = Date.now(), stopping = E15.api.stopAndDrain(w).catch((e) => e);
+        for (let i = 0; i < 1000 && E15.api.settingUp(w); i++) await new Promise((r) => setTimeout(r, 10));
+        const freed = Date.now() - began;
+        const claimed = await E15.api.claimWorkspace(t.workdir, { label: 'in between' }).then(() => 'granted', (e) => e.message);
+        assert.ok(/無法確認已停止/.test((await stopping)?.message || ''), 'Stop is refused');
+        await making.catch(() => {});
+        await new Promise((r) => setTimeout(r, Math.max(0, 6500 - (Date.now() - began)))); // any late write has happened
+        assert.ok(freed >= 4500, 'the registry was held until the processes were recorded');
+        assert.ok(claimed === 'granted' && !t.preparing && !t.worktree.setupKillError && !t.worktree.setupLeft, 'once granted, nothing wrote the stuck record back onto the card');
+        slow = false; await E15.api.releaseClaim(t.workdir);
+      }
       // Output over the old 16 MiB buffer: the command runs to its own end (Node used to kill cmd.exe alone, leaving its
       // children) and only the tail is kept.
       {
