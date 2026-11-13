@@ -1997,10 +1997,13 @@ async function makeWorktree(w, t, e) {
   const info = await workspaceOf(w.project);
   if (!info.isGit) throw new Error('這個資料夾不是 git 專案，不能建立獨立 worktree');
   const dir = path.join(RT, 'studio', 'worktrees', `${path.basename(info.path)}-${t.id}`);
-  e.keys.add(info.key).add(treeKey(dir));
+  e.keys.add(info.key);
   const branch = `studio/${t.id}-${slugOf(t.title)}`;
   const base = (await git(info.path, 'symbolic-ref', '-q', '--short', 'refs/remotes/origin/HEAD')).out?.trim() || 'HEAD';
   fs.mkdirSync(path.dirname(dir), { recursive: true });
+  // The folder does not exist yet, so treeKey cannot resolve it; its parent does: real parent + name is the key a claim
+  // of the new folder will compute (an 8.3 short name or a junction in RT would otherwise differ).
+  e.keys.add(treeKey(dir)).add(treeKey(path.join(canonPath(path.dirname(dir)), path.basename(dir))));
   const r = await git(info.path, 'worktree', 'add', '-b', branch, dir, base);
   if (r.err) throw new Error('建立 worktree 失敗：' + r.err);
   e.keys.add(treeKey(dir)); // now it exists: its real path (a link in RT) is a key too

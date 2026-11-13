@@ -3,7 +3,8 @@ const fs = require('node:fs'), path = require('node:path');
 const { execFile, execFileSync } = require('node:child_process');
 
 (async () => {
-  const root = mkTmp('studio-cleanup-'), repo = path.join(root, 'repo');
+  // reached through a junction, like CI's 8.3 temp path: a path spelled before its folder exists differs from the real one
+  const real = mkTmp('studio-cleanup-'), root = real + '-via'; fs.symlinkSync(real, root, 'junction'); const repo = path.join(root, 'repo');
   fs.mkdirSync(repo);
   const git = (...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', windowsHide: true }).trim();
   git('init', '-qb', 'main'); git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.invalid');
@@ -158,6 +159,6 @@ const { execFile, execFileSync } = require('node:child_process');
     console.log('worktree cleanup: dirty/ignored files, failed checks/removal, current PR HEAD, squash merge, moved ref, path containment, .worktreeinclude copy/link and its removal, worktree setup command, retry budget, keep / retry: PASS');
   } finally {
     for (const wt of trees) if (fs.existsSync(wt.path)) git('worktree', 'remove', '--force', wt.path);
-    fs.rmSync(root, { recursive: true, force: true, maxRetries: 40, retryDelay: 150 });
+    fs.rmdirSync(root); fs.rmSync(real, { recursive: true, force: true, maxRetries: 40, retryDelay: 150 });
   }
 })().catch((e) => { console.error(e); process.exitCode = 1; });
