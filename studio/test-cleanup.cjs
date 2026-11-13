@@ -153,7 +153,24 @@ const { execFile, execFileSync } = require('node:child_process');
       await assert.rejects(E2.api.resume(F.w), /無法確認已停止/, 'Resume retries and refuses while it cannot be ended');
       await assert.rejects(E2.api.claimWorkspace(F.dir, { label: 'too early' }), /無法確認已停止/, 'a claim retries and refuses while it cannot be ended');
       await assert.rejects(Promise.resolve().then(() => E2.api.closeWorkspace(F.w)), /準備/, 'the project cannot be closed meanwhile');
+      E2.env.S.leases = E2.env.S.leases || {};
+      const leasesBefore = JSON.stringify(E2.env.S.leases);
+      await assert.rejects(E2.api.stopAndDrain(F.w), /無法確認已停止/, 'Stop retries and refuses while it cannot be ended');
+      assert.ok(F.t.preparing && F.t.worktree.setupProc?.pid === F.p.pid && !F.w.run.stopped && F.w.tasks.includes(F.t) && JSON.stringify(E2.env.S.leases) === leasesBefore, 'a refused Stop keeps the card, the identity and the leases');
       F.p.kill();
+      // No creation time saved (Studio closed before the snapshot came back) and the PID is alive: maybe a reused PID, so it is not killed.
+      const E3 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async (pid) => { throw new Error('must not kill PID ' + pid); }, execFile });
+      const U = await leftover(E3.env, 'unknown');
+      U.t.worktree.setupProc = { pid: U.p.pid, command: 'ping -n 60 127.0.0.1' };
+      E3.api.loadRun(U.w, { id: 'restart3', status: 'paused', tasks: [U.t], activity: [], convs: {} });
+      for (let i = 0; i < 500 && !U.t.worktree.setupKillError; i++) await new Promise((r) => setTimeout(r, 20));
+      assert.ok(alive(U.p.pid) && U.t.preparing && /無法確認是不是當時的設定指令/.test(U.t.worktree.setupKillError), 'an unconfirmed identity blocks instead of killing');
+      await assert.rejects(E3.api.claimWorkspace(U.dir, { label: 'unknown' }), /無法確認/, 'a claim stays refused meanwhile');
+      U.p.kill();
+      for (let i = 0; i < 200 && alive(U.p.pid); i++) await new Promise((r) => setTimeout(r, 20));
+      await E3.api.claimWorkspace(U.dir, { label: 'after it ended' }); // the PID is gone: the retry clears the card
+      assert.ok(!U.t.preparing && !U.t.worktree.setupProc, 'once the PID is gone the card is unblocked');
+      await E3.api.releaseClaim(U.dir);
     }
     // retry budget: a timed retry finishes a cleanup whose branch deletion failed; three temporary failures stop it; 保留 / 重試清理
     if (git('remote')) git('remote', 'remove', 'origin');

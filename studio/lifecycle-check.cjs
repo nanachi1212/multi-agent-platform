@@ -1322,7 +1322,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
       for (const level of ['open', 'wait', 'need', 'done']) {
         const E = makeEnv(() => ''), wk = newW(); wk.run = null; wk.pstate = { level };
         let planned = 0;
-        const deps = { ...E.env, stillStopping: () => false, latestJob: () => previous,
+        const deps = { ...E.env, stillStopping: () => false, endLeftSetups: async () => {}, latestJob: () => previous,
           projectContext: () => 'Verified project state', knownRefs: (job) => job.refs,
           planPhase: () => { planned++; } };
         const names = Object.keys(deps);

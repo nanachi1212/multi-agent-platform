@@ -1265,6 +1265,7 @@ async function start(w, request, cont = false, inherit = false) {
   if (cont && w.run?.paused) return resume(w); // the paused job itself picks up where it stopped
   if (w.run?.active) throw new Error('這個專案的團隊正在工作中，請先等待、暫停或按 Stop');
   if (stillStopping(w)) throw new Error('Agent 還在停下中，不能啟動新工作');
+  await endLeftSetups(w, w.tasks);
   if (!isDir(w.project)) throw new Error('專案資料夾不存在：' + w.project);
   if (!request.trim()) throw new Error('請輸入需求');
   const lead = w.leader;
@@ -1823,6 +1824,7 @@ async function drainExecution(w, cards = w.tasks) {
 }
 async function pauseAndDrain(w) { pause(w); await drainExecution(w); saveRun(w, 'paused'); }
 async function stopAndDrain(w) {
+  await endLeftSetups(w, w.tasks); // a leftover setup that cannot be ended keeps the job, its leases and the card's record
   stop(w); await stopPreparing(w, '已停止'); await drainExecution(w); releaseJobLeases(w, 'stopped');
   for (const t of w.tasks) if (isWriter(t)) await releaseLock(w, t);
   saveRun(w, 'stopped');
@@ -1987,15 +1989,15 @@ async function stopPreparing(w, why) {
 }
 // A restart: Studio closed while a setup command ran, and on Windows that command outlives it. The card stays preparing
 // (blocked) until a fresh snapshot shows the command gone; it is killed only while the saved identity still matches, so a
-// reused PID is never touched. Identity: PID + creation time + executable, or (saved before the snapshot came back)
-// PID + cmd.exe running this very command line.
-const sameSetup = (r, p) => r.pid === p.pid && (p.creationDate
-  ? String(r.creationDate) === String(p.creationDate) && String(r.executable || '').toLowerCase() === String(p.executable || '').toLowerCase()
-  : /(^|\\)cmd\.exe$/i.test(r.executable || '') && String(r.command || '').includes(p.command));
+// reused PID is never touched. Identity: PID + creation time + executable. Saved before its snapshot came back (no
+// creation time), a live process with that PID cannot be told apart from a reused one: it is not killed, the card stays blocked.
+const sameSetup = (r, p) => r.pid === p.pid && String(r.creationDate) === String(p.creationDate) && String(r.executable || '').toLowerCase() === String(p.executable || '').toLowerCase();
 async function killLeftSetup(w, t) {
   const p = t.worktree?.setupProc;
   if (p) {
-    if ((await processSnapshot()).some((r) => sameSetup(r, p))) {
+    const rows = await processSnapshot();
+    if (!p.creationDate && rows.some((r) => r.pid === p.pid)) throw new Error(`PID ${p.pid} 仍在執行，但無法確認是不是當時的設定指令（沒有記到建立時間），所以沒有終止它；請自行確認並結束該程序，或等它結束後再試`);
+    if (rows.some((r) => sameSetup(r, p))) {
       const res = await killProcessTree(p.pid);
       if (!res?.ok || (await processSnapshot()).some((r) => sameSetup(r, p))) throw new Error(`PID ${p.pid} 終止失敗或仍在執行`);
       log(w, 'studio', 'system', `Studio 重開前沒跑完的 worktree 設定指令（PID ${p.pid}）已終止。`);
