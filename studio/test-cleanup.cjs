@@ -306,6 +306,36 @@ const { execFile, execFileSync } = require('node:child_process');
         await new Promise((r) => setTimeout(r, 50));
         assert.ok(w.run.phase === 'summarizing' || !w.run.active, 'the wrap-up comes once the setup has ended');
       }
+      // The 10-minute limit (shortened here) hits, its kill fails, the command then ends by itself while a retry clears the
+      // card: the old flow's late result must not write a setupIgnored list over the retry's conservative empty one.
+      {
+        process.env.STUDIO_SETUP_LIMIT_MS = '1000';
+        // the late flow's read of the ignored files is slowed, so the retry clears the card before that result arrives
+        const slowStatus = (cmd, args, opts, cb) => args.includes('--ignored') ? setTimeout(() => execFile(cmd, args, opts, cb), 1500) : execFile(cmd, args, opts, cb);
+        const E12 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async (pid) => ({ ok: false, killed: false, rootPid: pid, remaining: [pid] }), execFile: slowStatus });
+        delete process.env.STUDIO_SETUP_LIMIT_MS;
+        const { w, t, making } = await liveSetup(E12, 'late', 'mkdir cache & cd cache & echo a> a.txt & cd .. & ping -n 4 127.0.0.1 > nul'); // cache/ is ignored, not included
+        const pid = t.worktree.setupProc.pid;
+        await assert.rejects(making, /無法確認已停止/, 'the limit hit and its kill failed: stuck');
+        assert.ok(t.preparing && alive(pid), 'stuck while the command still runs');
+        trees.push({ path: t.worktree.path, branch: t.worktree.branch });
+        await gone(pid); // the command ends by itself
+        await E12.api.claimWorkspace(t.workdir, { label: 'right after' }); // the retry finds it gone and clears the card
+        await new Promise((r) => setTimeout(r, 2500)); // the old flow's late result has arrived by now
+        assert.ok(!t.preparing && Array.isArray(t.worktree.setupIgnored) && t.worktree.setupIgnored.length === 0, 'nothing the half-run setup left is marked deletable');
+        assert.ok(!E12.env.logs.some((l) => /設定指令已完成|設定指令沒有成功/.test(l.text)), 'the late result logged nothing');
+        await E12.api.releaseClaim(t.workdir);
+      }
+      // The limit hits and the kill works: like Stop, what the half-run setup left is never trusted.
+      {
+        process.env.STUDIO_SETUP_LIMIT_MS = '1000';
+        const E13 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree, execFile });
+        delete process.env.STUDIO_SETUP_LIMIT_MS;
+        const { t, making } = await liveSetup(E13, 'slow', 'mkdir cache & cd cache & echo a> a.txt & cd .. & ping -n 30 127.0.0.1 > nul');
+        const pid = t.worktree.setupProc.pid;
+        trees.push(await making);
+        assert.ok(!alive(pid) && !t.preparing && t.worktree.setupIgnored.length === 0 && E13.env.logs.some((l) => l.text.includes('超過 10 分鐘')), 'ended by the limit; nothing it left is deletable');
+      }
       // Output over the old 16 MiB buffer: the command runs to its own end (Node used to kill cmd.exe alone, leaving its
       // children) and only the tail is kept.
       {

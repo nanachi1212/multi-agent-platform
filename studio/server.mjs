@@ -2109,13 +2109,16 @@ async function makeWorktree(w, t, e) {
   Object.assign(t, { workdir: dir, worktree: { path: dir, branch, base, repoPath: info.path, included: inc.entries }, blocked: null, blockReason: '', blockLogged: '' });
   log(w, 'studio', 'system', `「${t.title}」改在獨立 worktree 做（branch ${branch}）：不會碰到主資料夾的寫入者。${inc.text ? ' .worktreeinclude：' + inc.text + '。' : ''}`);
   if (w.worktreeSetup && !e.stopped) {
-    const why = await worktreeSetup(w.worktreeSetup, dir, () => killSetup(e), (child) => {
+    const why = await worktreeSetup(w.worktreeSetup, dir, () => { e.stopped ||= '超過 10 分鐘沒有結束'; return killSetup(e); }, (child) => {
       e.child = child;
       t.worktree.setupProc = { pid: child.pid, command: w.worktreeSetup }; // at once: a restart can find it even before the snapshot below
       saveRun(w, w.run?.paused ? 'paused' : 'running');
       // kept with the card so a restarted Studio can end a command that outlived it
       processSnapshot().then((rows) => { const p = rows.find((x) => x.pid === child.pid); if (p && t.preparing && t.worktree) { t.worktree.setupProc = { pid: p.pid, creationDate: p.creationDate, executable: p.executable }; saveRun(w, w.run?.paused ? 'paused' : 'running'); } }, () => {});
     });
+    // Stuck (a kill failed): the card is the retry's now, and it may already be cleared and running; this late result of
+    // the command touches nothing (above all no setupIgnored list that would let cleanup delete files).
+    if (e.stuck) return { path: dir, branch };
     if (e.stopped) { t.worktree.setupIgnored = []; log(w, 'studio', 'system', `worktree 設定指令已終止（${e.stopped}），它留下的檔案清理時都不會刪。`); return { path: dir, branch }; }
     // The ignored paths the setup made, each with a stamp of everything under it: cleanup deletes one only while it is
     // unchanged (node_modules is rebuilt anyway, so it goes even when changed). .worktreeinclude copies are never on the
@@ -2141,6 +2144,7 @@ function pathStamp(root) {
 // onStart(child) gets the process; at 10 minutes the whole tree goes (execFile's own timeout would leave npm's children running).
 // spawn, not execFile: execFile's output limit kills cmd.exe alone and leaves what it started running; only the tail of
 // the output is kept here. The 10-minute limit calls onTimeout, which ends the whole tree (and confirms it).
+const SETUP_LIMIT_MS = Number(process.env.STUDIO_SETUP_LIMIT_MS) || 600e3; // the env value only for tests
 const worktreeSetup = (cmd, cwd, onTimeout, onStart) => new Promise((res) => {
   let late = false, timer, said = '';
   const keep = (d) => { said = (said + d).slice(-4000); };
@@ -2150,7 +2154,7 @@ const worktreeSetup = (cmd, cwd, onTimeout, onStart) => new Promise((res) => {
   child.on('error', (e) => end(`無法執行（${e.code || e.message}）`));
   child.on('close', (code, signal) => end(late ? '超過 10 分鐘沒有結束' : code === 0 ? '' : `結束碼 ${code ?? signal}`));
   if (!child.pid) return;
-  timer = setTimeout(() => { late = true; onTimeout?.(child); }, 600e3);
+  timer = setTimeout(() => { late = true; onTimeout?.(child); }, SETUP_LIMIT_MS);
   onStart?.(child);
 });
 async function useReadOnly(w, taskId) {
