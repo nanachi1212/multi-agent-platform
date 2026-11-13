@@ -1263,9 +1263,14 @@ async function start(w, request, cont = false, inherit = false) {
   // "繼續…" / the 接著上次的工作 button continue the latest job instead of starting from zero.
   cont = cont || CONTINUE_RE.test(request);
   if (cont && w.run?.paused) return resume(w); // the paused job itself picks up where it stopped
+  return launching(w, () => startJob(w, request, cont, inherit));
+}
+async function startJob(w, request, cont, inherit) {
+  await endLeftSetups(w, w.tasks); // a card that still tracks a leftover setup command must not be dropped by a new job
+  if (settingUp(w)) throw new Error('上一件工作還有卡片的 worktree 在準備（設定指令還在跑），請等它完成或按 Stop');
+  // no await from here on: the checks below hold when the job is made
   if (w.run?.active) throw new Error('這個專案的團隊正在工作中，請先等待、暫停或按 Stop');
   if (stillStopping(w)) throw new Error('Agent 還在停下中，不能啟動新工作');
-  await endLeftSetups(w, w.tasks);
   if (!isDir(w.project)) throw new Error('專案資料夾不存在：' + w.project);
   if (!request.trim()) throw new Error('請輸入需求');
   const lead = w.leader;
@@ -1825,7 +1830,12 @@ async function drainExecution(w, cards = w.tasks) {
 async function pauseAndDrain(w) { pause(w); await drainExecution(w); saveRun(w, 'paused'); }
 async function stopAndDrain(w) {
   await endLeftSetups(w, w.tasks); // a leftover setup that cannot be ended keeps the job, its leases and the card's record
-  stop(w); await stopPreparing(w, '已停止'); await drainExecution(w); releaseJobLeases(w, 'stopped');
+  // Live setup commands are ended before the job is marked stopped: only a paused job is loaded again after a restart,
+  // so a command that cannot be confirmed gone keeps the job paused and its card blocked with the command's identity.
+  while (settingUp(w)) { if (w.run?.active) pause(w); await stopPreparing(w, '已停止'); }
+  const stuck = w.tasks.find((t) => t.preparing);
+  if (stuck) throw new Error(`「${stuck.title}」的 worktree 設定指令無法確認已停止（${stuck.worktree?.setupKillError || '原因不明'}），工作保持暫停、卡片保持阻擋；可稍後再按 Stop`);
+  stop(w); await drainExecution(w); releaseJobLeases(w, 'stopped');
   for (const t of w.tasks) if (isWriter(t)) await releaseLock(w, t);
   saveRun(w, 'stopped');
 }
@@ -1971,20 +1981,34 @@ async function useWorktree(w, taskId) {
   if (t.workdir) throw new Error('這張卡已經在獨立 worktree 裡');
   if (['WORKING', 'DONE'].includes(t.status) || w.executingSteps?.has(t.id)) throw new Error('這張卡已經開始或已完成');
   if (t.preparing) throw new Error('這張卡的 worktree 正在準備中');
+  if (!w.run || w.run.stopped) throw new Error('這件工作已經停止，不能再建立 worktree');
   t.preparing = true; // set before the first await: the card neither starts nor changes hands until the worktree is ready
   // Registered before anything is written: the project folder and the worktree folder it will have (an external claim of
   // either waits), and later the setup process (Stop and closing end it). Independent of S.workspaces.
   const e = { w, t, keys: new Set([treeKey(w.project)]), child: null, stopped: '' };
-  e.promise = makeWorktree(w, t, e);
+  // A kill (Stop, the 10-minute limit) that did not end the whole tree: the card stays blocked like a restart's leftover,
+  // with the processes still there, and the next Resume / Stop / new job / claim checks them again.
+  e.promise = makeWorktree(w, t, e).finally(async () => {
+    const k = await Promise.resolve(e.killing || e.child?.killing).catch(() => ({ ok: false, remaining: [] }));
+    if (k && !k.ok && t.worktree?.setupProc) {
+      const rows = await processSnapshot().catch(() => []);
+      t.worktree.setupLeft = rows.filter((r) => (k.remaining || []).includes(r.pid)).map((r) => ({ pid: r.pid, creationDate: r.creationDate, executable: r.executable }));
+      t.worktree.setupKillError = `PID ${[...new Set((k.remaining || []).concat(t.worktree.setupProc.pid))].join('、')} 的程序樹沒有確認全部終止`;
+      log(w, 'studio', 'system', `「${t.title}」的 worktree 設定指令無法確認已停止，卡片保持阻擋；按「繼續」、Stop 或外部接手時會再試。`);
+      saveRun(w, w.run?.paused ? 'paused' : 'running');
+    } else { t.preparing = false; if (t.worktree) delete t.worktree.setupProc; }
+    preparing.delete(t.id);
+    pump(w);
+  });
   preparing.set(t.id, e);
-  try { return await e.promise; }
-  finally { preparing.delete(t.id); t.preparing = false; if (t.worktree) delete t.worktree.setupProc; pump(w); }
+  return e.promise;
 }
-const preparing = new Map(); // card id -> { w, t, keys, promise, child, stopped }: a worktree being made and set up
+const preparing = new Map(); // card id -> { w, t, keys, promise, child, stopped, killing, leftover }: a worktree being made and set up
+const settingUp = (w) => [...preparing.values()].some((e) => e.w === w && !e.leftover);
 // Stop / close: the setup command (and what it started) ends, and its preparation has settled before this returns.
 async function stopPreparing(w, why) {
   const mine = [...preparing.values()].filter((e) => e.w === w);
-  for (const e of mine) { e.stopped = why; if (e.child?.pid) await killProcessTree(e.child.pid).catch(() => {}); }
+  for (const e of mine) { e.stopped = why; if (e.child?.pid) e.killing = killProcessTree(e.child.pid); }
   await Promise.all(mine.map((e) => e.promise.catch(() => {})));
 }
 // A restart: Studio closed while a setup command ran, and on Windows that command outlives it. The card stays preparing
@@ -1993,20 +2017,22 @@ async function stopPreparing(w, why) {
 // creation time), a live process with that PID cannot be told apart from a reused one: it is not killed, the card stays blocked.
 const sameSetup = (r, p) => r.pid === p.pid && String(r.creationDate) === String(p.creationDate) && String(r.executable || '').toLowerCase() === String(p.executable || '').toLowerCase();
 async function killLeftSetup(w, t) {
-  const p = t.worktree?.setupProc;
-  if (p) {
+  const procs = [t.worktree?.setupProc, ...(t.worktree?.setupLeft || [])].filter(Boolean);
+  if (procs.length) {
     const rows = await processSnapshot();
-    if (!p.creationDate && rows.some((r) => r.pid === p.pid)) throw new Error(`PID ${p.pid} 仍在執行，但無法確認是不是當時的設定指令（沒有記到建立時間），所以沒有終止它；請自行確認並結束該程序，或等它結束後再試`);
-    if (rows.some((r) => sameSetup(r, p))) {
-      const res = await killProcessTree(p.pid);
-      if (!res?.ok || (await processSnapshot()).some((r) => sameSetup(r, p))) throw new Error(`PID ${p.pid} 終止失敗或仍在執行`);
-      log(w, 'studio', 'system', `Studio 重開前沒跑完的 worktree 設定指令（PID ${p.pid}）已終止。`);
+    const odd = procs.find((p) => !p.creationDate && rows.some((r) => r.pid === p.pid));
+    if (odd) throw new Error(`PID ${odd.pid} 仍在執行，但無法確認是不是當時的設定指令（沒有記到建立時間），所以沒有終止它；請自行確認並結束該程序，或等它結束後再試`);
+    const live = procs.filter((p) => rows.some((r) => sameSetup(r, p)));
+    if (live.length) {
+      const ok = (await Promise.all(live.map((p) => killProcessTree(p.pid).catch(() => null)))).every((r) => r?.ok);
+      if (!ok || (await processSnapshot()).some((r) => live.some((p) => sameSetup(r, p)))) throw new Error(`PID ${live.map((p) => p.pid).join('、')} 終止失敗或仍在執行`);
+      log(w, 'studio', 'system', `沒跑完的 worktree 設定指令（PID ${live.map((p) => p.pid).join('、')}）已終止。`);
     }
-    delete t.worktree.setupProc; delete t.worktree.setupKillError;
+    delete t.worktree.setupProc; delete t.worktree.setupLeft; delete t.worktree.setupKillError;
   }
   t.preparing = false;
   if (t.worktree) t.worktree.setupIgnored = []; // nothing it left is trusted at cleanup
-  t.wakeNote = [t.wakeNote, 'NOTE: Studio closed while this worktree was being prepared; its setup command did not finish. Check that dependencies are installed before you start.'].filter(Boolean).join('\n\n');
+  t.wakeNote = [t.wakeNote, 'NOTE: the setup command of this worktree did not finish (Studio closed or the command was ended). Check that dependencies are installed before you start.'].filter(Boolean).join('\n\n');
 }
 // The restart cleanup as a preparation: a claim, Resume and Close wait for it like for any other. A failure keeps the card
 // preparing with the identity and the error, and the next Resume or claim tries again.
@@ -2080,7 +2106,7 @@ const worktreeSetup = (cmd, cwd, onStart) => new Promise((res) => {
   const child = execFile('cmd.exe', ['/d', '/s', '/c', `"${cmd}"`], { cwd, windowsHide: true, windowsVerbatimArguments: true, maxBuffer: 16 << 20 },
     (e, out, err) => { clearTimeout(timer); const said = String(err || out || '').trim().slice(-200); res(e ? (late ? '超過 10 分鐘沒有結束' : typeof e.code === 'number' ? `結束碼 ${e.code}` : `無法執行（${e.code || e.message}）`) + (said ? '：' + said : '') : ''); });
   if (!child?.pid) return;
-  timer = setTimeout(() => { late = true; killProcessTree(child.pid).catch(() => {}); }, 600e3);
+  timer = setTimeout(() => { late = true; child.killing = killProcessTree(child.pid); }, 600e3);
   onStart?.(child);
 });
 async function useReadOnly(w, taskId) {
@@ -3122,6 +3148,14 @@ function loadRun(w, r) {
 }
 
 // w is null when continuing from history: the record's project picks (or opens) the workspace.
+// Start and Resume of a project run one at a time: both wait (a leftover setup command, agents stopping) after their
+// checks, so a second click would pass the same checks and the two would overwrite each other's job.
+const launchingWs = new Set();
+async function launching(w, fn) {
+  if (launchingWs.has(w)) throw new Error('這個專案正在開始或繼續工作，請稍候再試');
+  launchingWs.add(w);
+  try { return await fn(); } finally { launchingWs.delete(w); }
+}
 async function resume(w, id, opts = {}) {
   if (id && w?.run?.id !== id) {
     const r = readHistory(id);
@@ -3132,6 +3166,9 @@ async function resume(w, id, opts = {}) {
       loadRun(w, r);
     }
   }
+  return launching(w, () => resumeJob(w, opts));
+}
+async function resumeJob(w, opts) {
   const run = w?.run;
   if (run?.stopped && !run.paused) throw new Error('這件工作已經停止，不能繼續；按「▶ 接著處理」開新的一輪');
   if (!run?.paused) throw new Error('沒有暫停中的工作');
@@ -3171,6 +3208,7 @@ async function resume(w, id, opts = {}) {
       if (!got.ok) throw new Error('工作區已由另一個 Agent 接手，本工作保持暫停');
       got.lease.status = 'RESERVED'; reservations.push(got); saveLeases();
     }
+    if (w.run !== run || run.stopped || !run.paused) throw new Error('等待期間這件工作已被停止或換成別的工作，沒有繼續'); // Stop may have come during the waits above
   } catch (e) {
     for (const got of reservations) if (!got.reused) retire(got.lease, 'resume failed');
     saveLeases(); throw e;

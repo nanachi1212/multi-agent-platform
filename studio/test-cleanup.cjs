@@ -1,4 +1,4 @@
-const { assert, makeEnv, mkTmp, newW } = require('./lifecycle-harness.cjs');
+const { assert, makeEnv, mkTmp, newW, region } = require('./lifecycle-harness.cjs');
 const fs = require('node:fs'), path = require('node:path');
 const { execFile, execFileSync } = require('node:child_process');
 
@@ -96,7 +96,7 @@ const { execFile, execFileSync } = require('node:child_process');
       // An external claim of that worktree waits until the setup command has ended; the card stays paused.
       E.env.S.workspaces.length = 0; E.env.S.workspaces.push(w);
       const ext = await E.api.claimWorkspace(t.workdir, { label: 'ext' });
-      assert.ok(ext && !t.preparing && !t2.preparing && !w.run.active, 'the external claim waited for both setup commands');
+      assert.ok(ext && !t.preparing && !w.run.active, 'the external claim waited for the setup command of that worktree');
       await E.api.releaseClaim(t.workdir);
       w.run.active = false; const r = await making; trees.push(r, await making2);
       assert.ok(!t.preparing && t.worktree.setupIgnored, 'ready after setup'); }
@@ -171,6 +171,59 @@ const { execFile, execFileSync } = require('node:child_process');
       await E3.api.claimWorkspace(U.dir, { label: 'after it ended' }); // the PID is gone: the retry clears the card
       assert.ok(!U.t.preparing && !U.t.worktree.setupProc, 'once the PID is gone the card is unblocked');
       await E3.api.releaseClaim(U.dir);
+      // The real start(), sharing the env's launch lock and setup registry.
+      const makeStart = (E, planned) => {
+        const deps = { ...E.env, launching: E.api.launching, endLeftSetups: E.api.endLeftSetups, settingUp: E.api.settingUp, resume: E.api.resume,
+          stillStopping: () => false, latestJob: () => null, projectContext: () => '', knownRefs: () => [], planPhase: () => { planned.n++; } };
+        const names = Object.keys(deps);
+        return new Function(...names, region('const CONTINUE_RE =', 'async function planPhase(w)') + '\nreturn start;')(...names.map((k) => deps[k]));
+      };
+      // Concurrency while a restart's leftover is being ended (a slow kill keeps the window open): a second Resume and a
+      // Start are refused, Stop waits for the same cleanup, and the Resume that waited does not revive the stopped job.
+      {
+        const E4 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async (pid) => { await new Promise((r) => setTimeout(r, 1500)); return killProcessTree(pid); }, execFile });
+        const planned = { n: 0 }, start = makeStart(E4, planned);
+        const C = await leftover(E4.env, 'race');
+        E4.api.loadRun(C.w, { id: 'restart4', status: 'paused', tasks: [C.t], activity: [], convs: {} });
+        const r1 = E4.api.resume(C.w);
+        await assert.rejects(E4.api.resume(C.w), /正在開始或繼續/, 'a second Resume is refused while the first waits');
+        await assert.rejects(start(C.w, 'another job'), /正在開始或繼續/, 'a Start is refused while a Resume waits');
+        const stopping = E4.api.stopAndDrain(C.w);
+        await assert.rejects(r1, /已被停止|已經停止/, 'the Resume that waited sees the Stop and gives up');
+        await stopping;
+        assert.ok(!alive(C.p.pid) && !C.t.preparing && C.w.run.stopped && !C.w.run.active && planned.n === 0, 'Stop waited for the old command; nothing was started');
+        const s1 = start(C.w, 'job one'), s2 = start(C.w, 'job two');
+        await s1; await assert.rejects(s2, /正在開始或繼續|正在工作中/, 'two Starts at once make one job');
+        assert.ok(planned.n === 1 && C.w.run.request === 'job one', 'only the first Start made a job');
+      }
+      // A live setup command whose kill fails: a new job is refused while it runs, Stop keeps the job paused (only a paused
+      // job is loaded after a restart) and the card blocked with its identity; once the command is gone, Stop goes through.
+      {
+        // The failed kill reports a process of the tree as still there (a real one, outliving the command).
+        const stray = spawn('ping', ['-n', '60', '127.0.0.1'], { windowsHide: true, stdio: 'ignore' });
+        for (let i = 0; i < 100 && !(await processSnapshot()).some((r) => r.pid === stray.pid); i++) await new Promise((r) => setTimeout(r, 20));
+        const E5 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async (pid) => ({ ok: false, killed: false, rootPid: pid, remaining: [pid, stray.pid] }), execFile });
+        const planned = { n: 0 }, start = makeStart(E5, planned);
+        const w = newW(); w.project = repo; w.run.project = repo; w.run.active = true; w.worktreeSetup = 'ping -n 3 127.0.0.1 > nul';
+        E5.env.S.workspaces.length = 0; E5.env.S.workspaces.push(w);
+        const t = { id: 'live', title: 'live', agent: 'codex', writes: true, status: 'WAITING', after: [] }, t2 = { id: 'late', title: 'late', agent: 'claude', writes: true, status: 'WAITING', after: [] };
+        w.tasks.push(t, t2);
+        const making = E5.api.useWorktree(w, t.id);
+        for (let i = 0; i < 300 && !t.worktree?.setupProc?.creationDate; i++) await new Promise((r) => setTimeout(r, 20));
+        const pid = t.worktree.setupProc.pid;
+        E5.api.pause(w);
+        await assert.rejects(start(w, 'new job'), /worktree 在準備/, 'a new job is refused while a setup command runs');
+        await assert.rejects(E5.api.stopAndDrain(w), /無法確認已停止/, 'Stop is refused when the kill fails');
+        const child = t.worktree.setupLeft?.find((p) => p.pid === stray.pid)?.pid;
+        assert.ok(child && alive(child) && t.worktree.setupLeft.every((p) => p.creationDate), 'the process the failed kill left is tracked with its identity');
+        assert.ok(w.run.paused && !w.run.stopped && t.preparing && t.worktree.setupProc?.pid === pid && t.worktree.setupKillError, 'the job stays paused and the card blocked with its identity');
+        trees.push(await making);
+        await assert.rejects(start(w, 'new job'), /無法確認已停止|仍在執行/, 'a new job is refused while the card is stuck');
+        process.kill(child); for (let i = 0; i < 300 && (alive(pid) || alive(child)); i++) await new Promise((r) => setTimeout(r, 20));
+        await E5.api.stopAndDrain(w); // the command is gone now: the retry clears the card and Stop goes through
+        assert.ok(w.run.stopped && !t.preparing && !t.worktree.setupProc && !t.worktree.setupLeft && planned.n === 0, 'Stop went through once the command was gone');
+        await assert.rejects(E5.api.useWorktree(w, t2.id), /已經停止/, 'no new worktree on a stopped job');
+      }
     }
     // retry budget: a timed retry finishes a cleanup whose branch deletion failed; three temporary failures stop it; 保留 / 重試清理
     if (git('remote')) git('remote', 'remove', 'origin');
