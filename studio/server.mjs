@@ -1843,10 +1843,10 @@ async function claimWorkspace(dir, who = {}) {
   for (const w of jobs) {
     if (w.run.active) pause(w);
     // A worktree being made or set up is no executing step: wait for that command too (paused, its card will not start after).
-    for (const t of w.tasks.filter((x) => x.preparing && preparingNow.has(x.id))) {
-      log(w, 'studio', 'system', `外部接手（${labelText}）等「${t.title}」的 worktree 準備完成（建立和設定指令最多約 10 分鐘）。`);
-      await preparingNow.get(t.id).catch(() => {});
-    }
+    // The promises are taken first: a preparation that ends while another is awaited leaves preparingNow.
+    const making = w.tasks.filter((x) => preparingNow.has(x.id)).map((x) => [x, preparingNow.get(x.id)]);
+    for (const [t] of making) log(w, 'studio', 'system', `外部接手（${labelText}）等「${t.title}」的 worktree 準備完成（建立和設定指令最多約 10 分鐘）。`);
+    await Promise.all(making.map(([, p]) => p.catch(() => {})));
     await drainExecution(w);
     w.run.claimedBy = labelText;
   }

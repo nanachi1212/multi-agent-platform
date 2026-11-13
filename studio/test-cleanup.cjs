@@ -80,6 +80,10 @@ const { execFile, execFileSync } = require('node:child_process');
     // While the worktree is made and its setup command runs, the card cannot start and cannot be handed off.
     { const w = newW(); w.project = repo; w.run.project = repo; w.run.active = false; w.worktreeSetup = 'ping -n 3 127.0.0.1 > nul';
       const t = { id: 'prep', title: 'prep', agent: 'codex', writes: true, status: 'WAITING', after: [] }; w.tasks.push(t);
+      // a second card, listed after the first but started before it, finishes its setup first
+      const t2 = { id: 'prep2', title: 'prep2', agent: 'claude', writes: true, status: 'WAITING', after: [] }; w.tasks.push(t2);
+      const making2 = E.api.useWorktree(w, t2.id);
+      await new Promise((r) => setTimeout(r, 400));
       const making = E.api.useWorktree(w, t.id);
       assert.ok(t.preparing, 'preparing from the first moment');
       await assert.rejects(E.api.handoffWriter(w, 'claude', t.id), /準備/, 'no handoff while preparing');
@@ -89,9 +93,9 @@ const { execFile, execFileSync } = require('node:child_process');
       // An external claim of that worktree waits until the setup command has ended; the card stays paused.
       E.env.S.workspaces.length = 0; E.env.S.workspaces.push(w);
       const ext = await E.api.claimWorkspace(t.workdir, { label: 'ext' });
-      assert.ok(ext && !t.preparing && !w.run.active, 'the external claim waited for the setup command');
+      assert.ok(ext && !t.preparing && !t2.preparing && !w.run.active, 'the external claim waited for both setup commands');
       await E.api.releaseClaim(t.workdir);
-      w.run.active = false; const r = await making; trees.push(r);
+      w.run.active = false; const r = await making; trees.push(r, await making2);
       assert.ok(!t.preparing && t.worktree.setupIgnored, 'ready after setup'); }
     // retry budget: a timed retry finishes a cleanup whose branch deletion failed; three temporary failures stop it; 保留 / 重試清理
     if (git('remote')) git('remote', 'remove', 'origin');
