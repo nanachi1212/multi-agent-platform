@@ -1,21 +1,24 @@
-const { assert, makeEnv, mkTmp, newW } = require('./lifecycle-harness.cjs');
+const { assert, makeEnv, mkTmp, newW, region } = require('./lifecycle-harness.cjs');
 const fs = require('node:fs'), path = require('node:path');
 const { execFile, execFileSync } = require('node:child_process');
 
 (async () => {
-  const root = mkTmp('studio-cleanup-'), repo = path.join(root, 'repo');
+  // reached through a junction, like CI's 8.3 temp path: a path spelled before its folder exists differs from the real one
+  const real = mkTmp('studio-cleanup-'), root = real + '-via'; fs.symlinkSync(real, root, 'junction'); const repo = path.join(root, 'repo');
   fs.mkdirSync(repo);
   const git = (...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', windowsHide: true }).trim();
   git('init', '-qb', 'main'); git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.invalid');
   fs.writeFileSync(path.join(repo, '.gitignore'), 'ignored.txt\ncache/\nnode_modules/\n'); git('add', '.'); git('commit', '-qm', 'base');
   const initial = git('rev-parse', 'HEAD'), trees = [];
-  let scenario, prHead, moved, calls;
-  const E = makeEnv(() => '', { RT: root, execFile: (cmd, args, opts, cb) => {
+  let scenario, prHead, moved, calls, afterAdd;
+  const { processSnapshot } = await import('./codex-runtime.mjs'), { killProcessTree } = await import('./runtime-registry.mjs');
+  const E = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree, execFile: (cmd, args, opts, cb) => {
     calls.push([cmd, ...args]);
     if (cmd === 'gh') return cb(null, JSON.stringify([{ number: 1, headRefOid: prHead }]));
     if (scenario === 'status-error' && args.includes('status') || scenario === 'remove-error' && args.includes('remove') || scenario === 'ref-error' && args.includes('update-ref')) return cb(new Error('injected failure'), '', 'injected failure');
-    execFile(cmd, args, opts, (err, out, stderr) => {
+    return execFile(cmd, args, opts, (err, out, stderr) => {
       if (!err && scenario === 'moved-ref' && args.includes('remove')) git('update-ref', 'refs/heads/' + trees.at(-1).branch, moved);
+      if (!err && afterAdd && args.includes('worktree') && args.includes('add')) { afterAdd(args.at(-2)); return setTimeout(() => cb(err, out, stderr), 3000); } // the folder exists, Studio records it only after the claim looked
       cb(err, out, stderr);
     });
   } });
@@ -80,14 +83,342 @@ const { execFile, execFileSync } = require('node:child_process');
     // While the worktree is made and its setup command runs, the card cannot start and cannot be handed off.
     { const w = newW(); w.project = repo; w.run.project = repo; w.run.active = false; w.worktreeSetup = 'ping -n 3 127.0.0.1 > nul';
       const t = { id: 'prep', title: 'prep', agent: 'codex', writes: true, status: 'WAITING', after: [] }; w.tasks.push(t);
+      // a second card, listed after the first but started before it, finishes its setup first
+      const t2 = { id: 'prep2', title: 'prep2', agent: 'claude', writes: true, status: 'WAITING', after: [] }; w.tasks.push(t2);
+      const making2 = E.api.useWorktree(w, t2.id);
+      await new Promise((r) => setTimeout(r, 400));
       const making = E.api.useWorktree(w, t.id);
       assert.ok(t.preparing, 'preparing from the first moment');
       await assert.rejects(E.api.handoffWriter(w, 'claude', t.id), /準備/, 'no handoff while preparing');
       for (let i = 0; i < 100 && !t.worktree; i++) await new Promise((r) => setTimeout(r, 20)); // now the setup command runs
       w.run.active = true; E.api.pump(w);
       assert.ok(t.status === 'WAITING' && !w.executingSteps?.has(t.id), 'the card does not start during setup');
-      w.run.active = false; const r = await making; trees.push(r);
+      // An external claim of that worktree waits until the setup command has ended; the card stays paused.
+      E.env.S.workspaces.length = 0; E.env.S.workspaces.push(w);
+      const ext = await E.api.claimWorkspace(t.workdir, { label: 'ext' });
+      assert.ok(ext && !t.preparing && !w.run.active, 'the external claim waited for the setup command of that worktree');
+      await E.api.releaseClaim(t.workdir);
+      w.run.active = false; const r = await making; trees.push(r, await making2);
       assert.ok(!t.preparing && t.worktree.setupIgnored, 'ready after setup'); }
+    // The whole life of a setup command is tracked: a claim right after `git worktree add` (before Studio records the
+    // folder), Stop, closing the project, and a restart all find it.
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const prepCard = (id, cmd) => { const w = newW(); w.project = repo; w.run.project = repo; w.run.active = false; w.worktreeSetup = cmd;
+      E.env.S.workspaces.length = 0; E.env.S.workspaces.push(w); const t = { id, title: id, agent: 'codex', writes: true, status: 'WAITING', after: [] }; w.tasks.push(t); return { w, t }; };
+    {
+      const { w, t } = prepCard('gap', 'ping -n 3 127.0.0.1 > nul');
+      let claimed, claimedWhilePreparing;
+      afterAdd = (dir) => { afterAdd = null; claimed = E.api.claimWorkspace(dir, { label: 'early' }).then((v) => { claimedWhilePreparing = t.preparing; return v; }); };
+      const r = await E.api.useWorktree(w, t.id); trees.push(r);
+      assert.ok(await claimed && claimedWhilePreparing === false, 'a claim made before Studio recorded the worktree still waits for the setup command');
+      await E.api.releaseClaim(r.path);
+    }
+    {
+      const { w, t } = prepCard('stopped', 'ping -n 60 127.0.0.1 > nul');
+      w.run.paused = true; const making = E.api.useWorktree(w, t.id);
+      for (let i = 0; i < 300 && !t.worktree?.setupProc; i++) await new Promise((r) => setTimeout(r, 20)); // the command runs
+      await assert.rejects(Promise.resolve().then(() => E.api.closeWorkspace(w)), /準備/, 'a project cannot be closed while its worktree is being prepared');
+      const pid = t.worktree.setupProc?.pid, began = Date.now();
+      await E.api.stopAndDrain(w);
+      assert.ok(!t.preparing && Date.now() - began < 30e3 && !alive(pid), 'Stop ends the setup command before it reports stopped');
+      trees.push(await making);
+    }
+    {
+      const { spawn } = require('node:child_process');
+      const ids = async (...pids) => { const rows = await processSnapshot(); return pids.map((pid) => { const r = rows.find((x) => x.pid === pid); return r ? { pid, creationDate: r.creationDate, executable: r.executable } : { pid }; }); };
+      const leftover = async (env, id) => { // a setup command a closed Studio left running in a real worktree
+        const dir = path.join(root, 'left-' + id); git('worktree', 'add', '-q', dir); trees.push({ path: dir });
+        const p = spawn('cmd.exe', ['/d', '/c', 'ping -n 60 127.0.0.1 > nul'], { windowsHide: true });
+        const proc = (await processSnapshot()).find((x) => x.pid === p.pid);
+        const w = newW(); w.project = repo; env.S.workspaces.length = 0; env.S.workspaces.push(w);
+        const t = { id, title: id, agent: 'codex', writes: true, status: 'WAITING', after: [], preparing: true, workdir: dir, worktree: { path: dir, setupProc: { pid: proc.pid, creationDate: proc.creationDate, executable: proc.executable } } };
+        return { w, t, p, dir };
+      };
+      // Resumed and claimed right after the restart: the card stays blocked and the claim returns only once the old command is gone.
+      const L = await leftover(E.env, 'left');
+      E.api.loadRun(L.w, { id: 'restart', status: 'paused', tasks: [L.t], activity: [], convs: {} });
+      assert.ok(L.t.preparing, 'still blocked while the old command is being ended');
+      L.w.run.active = true; L.w.run.paused = false; E.api.pump(L.w);
+      assert.ok(L.t.status === 'WAITING' && !L.w.executingSteps?.has(L.t.id), 'the card does not start before the old command has ended');
+      L.w.run.active = false; L.w.run.paused = true;
+      await E.api.claimWorkspace(L.dir, { label: 'right after restart' });
+      assert.ok(!alive(L.p.pid) && !L.t.preparing && !L.t.worktree.setupProc, 'the claim returned only after the old setup command was ended');
+      await E.api.releaseClaim(L.dir);
+      // The kill fails: everything stays blocked, the identity is kept for a retry, and nothing says it was ended.
+      const E2 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async () => ({ ok: false, killed: false }), execFile });
+      const F = await leftover(E2.env, 'stuck');
+      E2.api.loadRun(F.w, { id: 'restart2', status: 'paused', tasks: [F.t], activity: [], convs: {} });
+      for (let i = 0; i < 500 && !F.t.worktree.setupKillError; i++) await new Promise((r) => setTimeout(r, 20));
+      assert.ok(F.t.preparing && F.t.worktree.setupProc?.pid === F.p.pid && F.t.worktree.setupKillError, 'a failed kill keeps the card blocked and the identity for a retry');
+      assert.ok(!E2.env.logs.some((l) => l.text.includes('已終止')) && E2.env.logs.some((l) => l.text.includes('無法確認已停止')), 'a failed kill is not reported as ended');
+      await assert.rejects(E2.api.resume(F.w), /無法確認已停止/, 'Resume retries and refuses while it cannot be ended');
+      await assert.rejects(E2.api.claimWorkspace(F.dir, { label: 'too early' }), /無法確認已停止/, 'a claim retries and refuses while it cannot be ended');
+      await assert.rejects(Promise.resolve().then(() => E2.api.closeWorkspace(F.w)), /準備/, 'the project cannot be closed meanwhile');
+      E2.env.S.leases = E2.env.S.leases || {};
+      const leasesBefore = JSON.stringify(E2.env.S.leases);
+      await assert.rejects(E2.api.stopAndDrain(F.w), /無法確認已停止/, 'Stop retries and refuses while it cannot be ended');
+      assert.ok(F.t.preparing && F.t.worktree.setupProc?.pid === F.p.pid && !F.w.run.stopped && F.w.tasks.includes(F.t) && JSON.stringify(E2.env.S.leases) === leasesBefore, 'a refused Stop keeps the card, the identity and the leases');
+      F.p.kill();
+      // No creation time saved (Studio closed before the snapshot came back) and the PID is alive: maybe a reused PID, so it is not killed.
+      const E3 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async (pid) => { throw new Error('must not kill PID ' + pid); }, execFile });
+      const U = await leftover(E3.env, 'unknown');
+      U.t.worktree.setupProc = { pid: U.p.pid, command: 'ping -n 60 127.0.0.1' };
+      E3.api.loadRun(U.w, { id: 'restart3', status: 'paused', tasks: [U.t], activity: [], convs: {} });
+      for (let i = 0; i < 500 && !U.t.worktree.setupKillError; i++) await new Promise((r) => setTimeout(r, 20));
+      assert.ok(alive(U.p.pid) && U.t.preparing && /無法確認是不是當時的設定指令/.test(U.t.worktree.setupKillError), 'an unconfirmed identity blocks instead of killing');
+      await assert.rejects(E3.api.claimWorkspace(U.dir, { label: 'unknown' }), /無法確認/, 'a claim stays refused meanwhile');
+      U.p.kill();
+      for (let i = 0; i < 200 && alive(U.p.pid); i++) await new Promise((r) => setTimeout(r, 20));
+      await E3.api.claimWorkspace(U.dir, { label: 'after it ended' }); // the PID is gone: the retry clears the card
+      assert.ok(!U.t.preparing && !U.t.worktree.setupProc, 'once the PID is gone the card is unblocked');
+      await E3.api.releaseClaim(U.dir);
+      // The real start(), sharing the env's launch lock and setup registry.
+      const makeStart = (E, planned) => {
+        const deps = { ...E.env, launching: E.api.launching, endLeftSetups: E.api.endLeftSetups, settingUp: E.api.settingUp, resume: E.api.resume,
+          stillStopping: () => false, latestJob: () => null, projectContext: () => '', knownRefs: () => [], planPhase: () => { planned.n++; } };
+        const names = Object.keys(deps);
+        return new Function(...names, region('const CONTINUE_RE =', 'async function planPhase(w)') + '\nreturn start;')(...names.map((k) => deps[k]));
+      };
+      // Concurrency while a restart's leftover is being ended (a slow kill keeps the window open): a second Resume and a
+      // Start are refused, Stop waits for the same cleanup, and the Resume that waited does not revive the stopped job.
+      {
+        const E4 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async (pid) => { await new Promise((r) => setTimeout(r, 1500)); return killProcessTree(pid); }, execFile });
+        const planned = { n: 0 }, start = makeStart(E4, planned);
+        const C = await leftover(E4.env, 'race');
+        E4.api.loadRun(C.w, { id: 'restart4', status: 'paused', tasks: [C.t], activity: [], convs: {} });
+        const r1 = E4.api.resume(C.w);
+        await assert.rejects(E4.api.resume(C.w), /正在開始或繼續/, 'a second Resume is refused while the first waits');
+        await assert.rejects(start(C.w, 'another job'), /正在開始或繼續/, 'a Start is refused while a Resume waits');
+        const stopping = E4.api.stopAndDrain(C.w);
+        await assert.rejects(r1, /已被停止|已經停止/, 'the Resume that waited sees the Stop and gives up');
+        await stopping;
+        assert.ok(!alive(C.p.pid) && !C.t.preparing && C.w.run.stopped && !C.w.run.active && planned.n === 0, 'Stop waited for the old command; nothing was started');
+        const s1 = start(C.w, 'job one'), s2 = start(C.w, 'job two');
+        await s1; await assert.rejects(s2, /正在開始或繼續|正在工作中/, 'two Starts at once make one job');
+        assert.ok(planned.n === 1 && C.w.run.request === 'job one', 'only the first Start made a job');
+      }
+      // A live setup command whose kill fails: a new job is refused while it runs, Stop keeps the job paused (only a paused
+      // job is loaded after a restart) and the card blocked with its identity; once the command is gone, Stop goes through.
+      {
+        // The failed kill reports a process of the tree as still there (a real one, outliving the command).
+        const stray = spawn('ping', ['-n', '60', '127.0.0.1'], { windowsHide: true, stdio: 'ignore' });
+        for (let i = 0; i < 100 && !(await processSnapshot()).some((r) => r.pid === stray.pid); i++) await new Promise((r) => setTimeout(r, 20));
+        const E5 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async (pid) => ({ ok: false, killed: false, rootPid: pid, remaining: [pid, stray.pid], left: await ids(pid, stray.pid) }), execFile });
+        const planned = { n: 0 }, start = makeStart(E5, planned);
+        const w = newW(); w.project = repo; w.run.project = repo; w.run.active = true; w.worktreeSetup = 'ping -n 3 127.0.0.1 > nul';
+        E5.env.S.workspaces.length = 0; E5.env.S.workspaces.push(w);
+        const t = { id: 'live', title: 'live', agent: 'codex', writes: true, status: 'WAITING', after: [] }, t2 = { id: 'late', title: 'late', agent: 'claude', writes: true, status: 'WAITING', after: [] };
+        w.tasks.push(t, t2);
+        const making = E5.api.useWorktree(w, t.id);
+        for (let i = 0; i < 300 && !t.worktree?.setupProc?.creationDate; i++) await new Promise((r) => setTimeout(r, 20));
+        const pid = t.worktree.setupProc.pid;
+        E5.api.pause(w);
+        await assert.rejects(start(w, 'new job'), /worktree 在準備/, 'a new job is refused while a setup command runs');
+        await assert.rejects(E5.api.stopAndDrain(w), /無法確認已停止/, 'Stop is refused when the kill fails');
+        const child = t.worktree.setupLeft?.find((p) => p.pid === stray.pid)?.pid;
+        assert.ok(child && alive(child) && t.worktree.setupLeft.every((p) => p.creationDate), 'the process the failed kill left is tracked with its identity');
+        assert.ok(w.run.paused && !w.run.stopped && t.preparing && t.worktree.setupProc?.pid === pid && t.worktree.setupKillError, 'the job stays paused and the card blocked with its identity');
+        await assert.rejects(making, /無法確認已停止/, "the preparation ends as stuck at once, not when the command exits"); trees.push({ path: t.worktree.path, branch: t.worktree.branch });
+        await assert.rejects(start(w, 'new job'), /無法確認已停止|仍在執行/, 'a new job is refused while the card is stuck');
+        process.kill(child); for (let i = 0; i < 300 && (alive(pid) || alive(child)); i++) await new Promise((r) => setTimeout(r, 20));
+        await E5.api.stopAndDrain(w); // the command is gone now: the retry clears the card and Stop goes through
+        assert.ok(w.run.stopped && !t.preparing && !t.worktree.setupProc && !t.worktree.setupLeft && planned.n === 0, 'Stop went through once the command was gone');
+        await assert.rejects(E5.api.useWorktree(w, t2.id), /已經停止/, 'no new worktree on a stopped job');
+      }
+      const straySpawn = async () => { const s = spawn('ping', ['-n', '60', '127.0.0.1'], { windowsHide: true, stdio: 'ignore' }); for (let i = 0; i < 100 && !(await processSnapshot()).some((r) => r.pid === s.pid); i++) await new Promise((r) => setTimeout(r, 20)); return s; };
+      const gone = async (...pids) => { for (let i = 0; i < 300 && pids.some(alive); i++) await new Promise((r) => setTimeout(r, 20)); };
+      const liveSetup = async (E, id, cmd = 'ping -n 3 127.0.0.1 > nul', before = []) => {
+        const w = newW(); w.project = repo; w.run.project = repo; w.run.active = true; w.worktreeSetup = cmd;
+        E.env.S.workspaces.length = 0; E.env.S.workspaces.push(w);
+        const t = { id, title: id, agent: 'codex', writes: true, status: 'WAITING', after: before.map((x) => x.id) }; w.tasks.push(...before, t);
+        const making = E.api.useWorktree(w, t.id);
+        making.catch(() => {}); // a stuck preparation rejects early; each test awaits it where it needs to
+        for (let i = 0; i < 300 && !t.worktree?.setupProc?.creationDate; i++) await new Promise((r) => setTimeout(r, 20));
+        return { w, t, making };
+      };
+      // A claim already waiting when a Stop's kill fails: it checks again after its wait and gets no write lease.
+      {
+        const stray = await straySpawn();
+        const E6 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async (pid) => ({ ok: false, killed: false, rootPid: pid, remaining: [pid, stray.pid] }), execFile });
+        const { w, t, making } = await liveSetup(E6, 'waited');
+        const claim = E6.api.claimWorkspace(t.workdir, { label: 'waiting' });
+        await new Promise((r) => setTimeout(r, 200)); // the claim waits for the setup command
+        await assert.rejects(E6.api.stopAndDrain(w), /無法確認已停止/, 'Stop is refused when the kill fails');
+        await assert.rejects(claim, /無法確認已停止/, 'the waiting claim checks again and is refused');
+        assert.ok(!E6.env.S.leases.some((l) => l.owner.kind === 'external' && l.status !== 'RELEASED') && t.preparing, 'no external write lease; the card stays blocked');
+        await making.catch(() => {}); trees.push({ path: t.worktree.path, branch: t.worktree.branch });
+        stray.kill(); await gone(stray.pid);
+      }
+      // The kill leaves a child and the identity lookup then fails: the known PID is kept with no identity, so a retry
+      // neither kills it (it could be a reused PID) nor takes it as gone while it is alive.
+      {
+        const stray = await straySpawn();
+        let snapFails = false;
+        const E7 = makeEnv(() => '', { RT: root, processSnapshot: async () => { if (snapFails) throw new Error('process list unavailable'); return processSnapshot(); },
+          killProcessTree: async (pid) => { snapFails = true; return { ok: false, killed: false, rootPid: pid, remaining: [pid, stray.pid] }; }, execFile });
+        const { w, t, making } = await liveSetup(E7, 'unknown-left');
+        await assert.rejects(E7.api.stopAndDrain(w), /無法確認已停止/, 'Stop is refused when the kill fails');
+        const kept = t.worktree.setupLeft?.find((p) => p.pid === stray.pid);
+        assert.ok(kept && !kept.creationDate && t.preparing, 'the known PID is kept, identity unknown');
+        await making.catch(() => {}); trees.push({ path: t.worktree.path, branch: t.worktree.branch });
+        snapFails = false;
+        await assert.rejects(E7.api.stopAndDrain(w), /無法確認是不是當時的設定指令/, 'a retry keeps blocking while that PID is alive');
+        assert.ok(alive(stray.pid) && t.preparing && w.run.paused && !w.run.stopped, 'it was not killed and the job stays paused');
+        stray.kill(); await gone(stray.pid, t.worktree.setupProc.pid); // the command itself, unknown too, ends by itself
+        snapFails = false; await E7.api.stopAndDrain(w);
+        assert.ok(w.run.stopped && !t.preparing && !t.worktree.setupLeft, 'once that PID is gone, Stop goes through');
+      }
+      // The kill fails and the command keeps running: Stop answers at once (no wait for a command that may never exit), the
+      // card is stuck with the command's identity; its late exit does not unblock or re-block anything by itself.
+      {
+        const E8 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async (pid) => ({ ok: false, killed: false, rootPid: pid, remaining: [pid], left: await ids(pid) }), execFile });
+        const { w, t, making } = await liveSetup(E8, 'never-ends', 'ping -n 30 127.0.0.1 > nul');
+        const pid = t.worktree.setupProc.pid, began = Date.now();
+        await assert.rejects(E8.api.stopAndDrain(w), /無法確認已停止/, 'Stop is refused');
+        await assert.rejects(making, /無法確認已停止/, 'the preparation ends as stuck');
+        assert.ok(Date.now() - began < 8000 && alive(pid), 'nobody waited for the command to exit');
+        assert.ok(t.preparing && t.worktree.setupLeft.some((p) => p.pid === pid && p.creationDate) && w.run.paused, 'stuck with the identity; the job stays paused');
+        trees.push({ path: t.worktree.path, branch: t.worktree.branch });
+        await killProcessTree(pid); await gone(pid);
+        await E8.api.stopAndDrain(w);
+        await new Promise((r) => setTimeout(r, 300)); // the command's own exit has been handled by now
+        assert.ok(w.run.stopped && !t.preparing && !t.worktree.setupLeft, 'cleared once it was gone, and its late exit did not block the card again');
+      }
+      // Resuming another job from history replaces the project's job: refused while a card still tracks a setup command.
+      {
+        const other = { id: 'other-job', project: repo, status: 'paused', tasks: [], activity: [], convs: {} };
+        let target;
+        const E9 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree, execFile, readHistory: () => other, openWorkspace: () => ({ project: repo }), wsOf: () => target });
+        const { w, t, making } = await liveSetup(E9, 'switch'); target = w;
+        const before = w.run.id; E9.api.pause(w);
+        await assert.rejects(E9.api.resume(w, 'other-job'), /worktree 在準備/, 'no switch while a setup command runs');
+        assert.ok(w.run.id === before && w.tasks.includes(t) && t.preparing, 'the current job and its card are kept');
+        trees.push(await making);
+        await E9.api.resume(w, 'other-job').catch(() => {});
+        assert.ok(w.run.id === 'other-job', 'the switch goes through once the setup has ended');
+      }
+      // A card whose dependency fails while its worktree is being set up: no wrap-up until the setup has ended.
+      {
+        const E10 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree, execFile });
+        const dep = { id: 'dep', title: 'dep', agent: 'claude', writes: false, status: 'FAILED', after: [] };
+        const { w, t, making } = await liveSetup(E10, 'after-dep', 'ping -n 3 127.0.0.1 > nul', [dep]);
+        w.run.phase = 'working'; E10.api.pump(w);
+        assert.ok(t.status === 'FAILED' && t.preparing && w.run.phase === 'working' && w.run.active, 'the job does not wrap up during setup');
+        trees.push(await making);
+        await new Promise((r) => setTimeout(r, 50));
+        assert.ok(w.run.phase === 'summarizing' || !w.run.active, 'the wrap-up comes once the setup has ended');
+      }
+      // The 10-minute limit (shortened here) hits, its kill fails, the command then ends by itself while a retry clears the
+      // card: the old flow's late result must not write a setupIgnored list over the retry's conservative empty one.
+      {
+        process.env.STUDIO_SETUP_LIMIT_MS = '1000';
+        // the late flow's read of the ignored files is slowed, so the retry clears the card before that result arrives
+        const slowStatus = (cmd, args, opts, cb) => args.includes('--ignored') ? setTimeout(() => execFile(cmd, args, opts, cb), 1500) : execFile(cmd, args, opts, cb);
+        const E12 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async (pid) => ({ ok: false, killed: false, rootPid: pid, remaining: [pid] }), execFile: slowStatus });
+        delete process.env.STUDIO_SETUP_LIMIT_MS;
+        const { w, t, making } = await liveSetup(E12, 'late', 'mkdir cache & cd cache & echo a> a.txt & cd .. & ping -n 4 127.0.0.1 > nul'); // cache/ is ignored, not included
+        const pid = t.worktree.setupProc.pid;
+        await assert.rejects(making, /無法確認已停止/, 'the limit hit and its kill failed: stuck');
+        assert.ok(t.preparing && alive(pid), 'stuck while the command still runs');
+        trees.push({ path: t.worktree.path, branch: t.worktree.branch });
+        await gone(pid); // the command ends by itself
+        await E12.api.claimWorkspace(t.workdir, { label: 'right after' }); // the retry finds it gone and clears the card
+        await new Promise((r) => setTimeout(r, 2500)); // the old flow's late result has arrived by now
+        assert.ok(!t.preparing && Array.isArray(t.worktree.setupIgnored) && t.worktree.setupIgnored.length === 0, 'nothing the half-run setup left is marked deletable');
+        assert.ok(!E12.env.logs.some((l) => /設定指令已完成|設定指令沒有成功/.test(l.text)), 'the late result logged nothing');
+        await E12.api.releaseClaim(t.workdir);
+      }
+      // The limit hits and the kill works: like Stop, what the half-run setup left is never trusted.
+      {
+        process.env.STUDIO_SETUP_LIMIT_MS = '1000';
+        const E13 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree, execFile });
+        delete process.env.STUDIO_SETUP_LIMIT_MS;
+        const { t, making } = await liveSetup(E13, 'slow', 'mkdir cache & cd cache & echo a> a.txt & cd .. & ping -n 30 127.0.0.1 > nul');
+        const pid = t.worktree.setupProc.pid;
+        trees.push(await making);
+        assert.ok(!alive(pid) && !t.preparing && t.worktree.setupIgnored.length === 0 && E13.env.logs.some((l) => l.text.includes('超過 10 分鐘')), 'ended by the limit; nothing it left is deletable');
+      }
+      // A kill that ends only the root and reports its child still there; kids() reads the real tree before.
+      const kids = async (pid) => { const rows = await processSnapshot(), out = [pid]; for (let i = 0; i < out.length; i++) for (const r of rows) if (r.parent === out[i] && !out.includes(r.pid)) out.push(r.pid); return out.slice(1); };
+      const rootOnly = async (pid) => { // everything but the ping goes (conhost too, so the command's exit is seen at once)
+        const rows = await processSnapshot(), left = await kids(pid);
+        for (const k of [...left, pid]) if (!/ping/i.test(rows.find((r) => r.pid === k)?.executable || '')) try { process.kill(k); } catch {}
+        return { ok: false, killed: true, rootPid: pid, remaining: left, left: left.map((k) => { const r = rows.find((x) => x.pid === k); return r ? { pid: k, creationDate: r.creationDate, executable: r.executable } : { pid: k }; }) };
+      };
+      // A retry of a leftover whose kill leaves a child: that child is recorded, so the next retry does not unblock the card
+      // just because the old root is gone.
+      {
+        let first = true;
+        const E14 = makeEnv(() => '', { RT: root, processSnapshot, execFile,
+          killProcessTree: async (pid) => first ? (first = false, rootOnly(pid)) : { ok: false, killed: false, rootPid: pid, remaining: [pid] } });
+        const L = await leftover(E14.env, 'left-child');
+        for (let i = 0; i < 100 && !(await kids(L.p.pid)).length; i++) await new Promise((r) => setTimeout(r, 20));
+        const all = await kids(L.p.pid), child = (await processSnapshot()).find((r) => all.includes(r.pid) && /ping/i.test(r.executable || '')).pid;
+        E14.api.loadRun(L.w, { id: 'restart14', status: 'paused', tasks: [L.t], activity: [], convs: {} });
+        for (let i = 0; i < 300 && !L.t.worktree.setupKillError; i++) await new Promise((r) => setTimeout(r, 20));
+        assert.ok(L.t.worktree.setupLeft?.some((p) => p.pid === child && p.creationDate), 'the child the kill left is recorded');
+        await gone(L.p.pid);
+        await assert.rejects(E14.api.claimWorkspace(L.dir, { label: 'retry' }), /無法確認已停止/, 'the next retry still sees the child and refuses');
+        assert.ok(L.t.preparing && alive(child), 'the card stays blocked while the child lives');
+        for (const k of all) try { process.kill(k); } catch {} await gone(...all);
+        await E14.api.claimWorkspace(L.dir, { label: 'after' }); await E14.api.releaseClaim(L.dir);
+        assert.ok(!L.t.preparing, 'cleared once the child is gone');
+      }
+      // Stop's kill fails and the command then ends while its child lives: the finalizer and the kill share one stuck
+      // transition, so a claim right after the registry entry goes already sees the recorded child and is refused; once the
+      // child has ended the claim goes through and no late transition writes back onto the card.
+      {
+        const E15 = makeEnv(() => '', { RT: root, execFile, processSnapshot, killProcessTree: rootOnly });
+        const { w, t, making } = await liveSetup(E15, 'race-stuck', 'ping -n 6 127.0.0.1 > nul 2>&1'); // its ping ends in ~5 s
+        trees.push({ path: t.worktree.path, branch: t.worktree.branch });
+        const pid = t.worktree.setupProc.pid, child = (await processSnapshot()).find((r) => r.parent === pid && /ping/i.test(r.executable || '')).pid;
+        const stopping = E15.api.stopAndDrain(w).catch((e) => e);
+        for (let i = 0; i < 1000 && E15.api.settingUp(w); i++) await new Promise((r) => setTimeout(r, 10));
+        await assert.rejects(E15.api.claimWorkspace(t.workdir, { label: 'in between' }), /無法確認已停止/, 'a claim right after sees the recorded child');
+        assert.ok(t.preparing && t.worktree.setupLeft?.some((p) => p.pid === child && p.creationDate), 'the child is on the record');
+        assert.ok(/無法確認已停止/.test((await stopping)?.message || ''), 'Stop is refused');
+        await making.catch(() => {}); for (let i = 0; i < 600 && alive(child); i++) await new Promise((r) => setTimeout(r, 20));
+        await E15.api.claimWorkspace(t.workdir, { label: 'after' });
+        await new Promise((r) => setTimeout(r, 1000)); // any late write has happened
+        assert.ok(!t.preparing && !t.worktree.setupKillError && !t.worktree.setupLeft, 'once granted, nothing wrote the stuck record back onto the card');
+        await E15.api.releaseClaim(t.workdir);
+      }
+      // PID reuse and a late child: a recorded PID now belongs to another program and the kill reports it with that program's
+      // identity: the record keeps the original one, so no retry kills it. A child the setup made after the kill began is in
+      // the kill's own snapshot: it is recorded with that identity and keeps the card blocked while it lives.
+      {
+        const reused = await straySpawn(); // holds the PID the record says was the setup's child (an older process)
+        let born = null, L16; const hit = [];
+        const E16 = makeEnv(() => '', { RT: root, processSnapshot, execFile, killProcessTree: async (pid) => {
+          if (pid !== L16.p.pid) { hit.push(pid); return { ok: false, killed: false, rootPid: pid, remaining: [pid], left: await ids(pid) }; }
+          born ||= await straySpawn(); // made by the setup after the kill began; the kill's snapshot shows it
+          return { ok: false, killed: false, rootPid: pid, remaining: [reused.pid, born.pid], left: await ids(reused.pid, born.pid) };
+        } });
+        L16 = await leftover(E16.env, 'reuse');
+        L16.t.worktree.setupLeft = [{ pid: reused.pid, creationDate: '/Date(1000)/', executable: 'C:\\Windows\\system32\\PING.EXE' }];
+        E16.api.loadRun(L16.w, { id: 'restart16', status: 'paused', tasks: [L16.t], activity: [], convs: {} });
+        for (let i = 0; i < 300 && !L16.t.worktree.setupKillError; i++) await new Promise((r) => setTimeout(r, 20));
+        assert.ok(L16.t.worktree.setupLeft.find((p) => p.pid === reused.pid)?.creationDate === '/Date(1000)/', 'a recorded PID keeps its original identity');
+        assert.ok(L16.t.worktree.setupLeft.some((p) => p.pid === born.pid && p.creationDate), 'the late child is recorded with its identity');
+        L16.p.kill(); await gone(L16.p.pid);
+        await assert.rejects(E16.api.claimWorkspace(L16.dir, { label: 'retry' }), /無法確認已停止/, 'still blocked while the late child lives');
+        assert.ok(!hit.includes(reused.pid) && alive(reused.pid), 'the reused PID was not killed');
+        born.kill(); await gone(born.pid);
+        await E16.api.claimWorkspace(L16.dir, { label: 'after' }); await E16.api.releaseClaim(L16.dir);
+        assert.ok(!L16.t.preparing && !hit.includes(reused.pid) && alive(reused.pid), 'cleared without touching the reused PID');
+        reused.kill(); await gone(reused.pid);
+      }
+      // Output over the old 16 MiB buffer: the command runs to its own end (Node used to kill cmd.exe alone, leaving its
+      // children) and only the tail is kept.
+      {
+        const big = path.join(real, 'big.txt'); fs.writeFileSync(big, Buffer.alloc(17 << 20, 'x'));
+        const E11 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree, execFile });
+        const { t, making } = await liveSetup(E11, 'loud', `type "${big}" & echo tail-marker`);
+        trees.push(await making);
+        assert.ok(!t.preparing && E11.env.logs.some((l) => l.text.includes('worktree 設定指令已完成')) && !E11.env.logs.some((l) => /MAXBUFFER|沒有成功/.test(l.text)), 'a loud command is not cut off');
+        fs.rmSync(big);
+      }
+    }
     // retry budget: a timed retry finishes a cleanup whose branch deletion failed; three temporary failures stop it; 保留 / 重試清理
     if (git('remote')) git('remote', 'remove', 'origin');
     const fresh = async (id) => { const w = newW(); w.project = repo; w.run.project = repo; w.run.active = false; E.env.S.workspaces.length = 0; E.env.S.workspaces.push(w);
@@ -115,6 +446,6 @@ const { execFile, execFileSync } = require('node:child_process');
     console.log('worktree cleanup: dirty/ignored files, failed checks/removal, current PR HEAD, squash merge, moved ref, path containment, .worktreeinclude copy/link and its removal, worktree setup command, retry budget, keep / retry: PASS');
   } finally {
     for (const wt of trees) if (fs.existsSync(wt.path)) git('worktree', 'remove', '--force', wt.path);
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmdirSync(root); fs.rmSync(real, { recursive: true, force: true, maxRetries: 40, retryDelay: 150 });
   }
 })().catch((e) => { console.error(e); process.exitCode = 1; });

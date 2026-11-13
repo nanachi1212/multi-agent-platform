@@ -63,6 +63,9 @@ const { execFile, execFileSync, spawn } = require('node:child_process');
     fs.mkdirSync(hooks); fs.writeFileSync(path.join(hooks, 'reference-transaction'), `#!/bin/sh\necho ran > "${mark}"\n`, { mode: 0o755 });
     git('config', 'core.hooksPath', hooks); git('update-ref', 'refs/hook-probe', 'HEAD'); git('update-ref', '-d', 'refs/hook-probe');
     assert.ok(fs.existsSync(mark), 'the probe hook runs for a plain update-ref'); fs.rmSync(mark);
+    // and none planted where Studio might point hooksPath (a fixed folder under its runtime, writable by a worker)
+    const planted = path.join(env.RT, 'studio', 'no-hooks'); fs.mkdirSync(planted, { recursive: true });
+    fs.copyFileSync(path.join(hooks, 'reference-transaction'), path.join(planted, 'reference-transaction'));
     await api.runTask(cw, crash);
     assert.ok(!fs.existsSync(mark), 'Studio\'s step refs run no repository hook');
     git('config', '--unset', 'core.hooksPath');

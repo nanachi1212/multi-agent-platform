@@ -93,23 +93,27 @@ export async function killIdentities(list, snapshot = processSnapshot) {
  */
 export async function killProcessTree(rootPid, snapshot = processSnapshot) {
   if (!rootPid || !isPidAlive(rootPid)) return { ok: true, killed: false };
-  let children;
+  let children, root;
   try {
-    const rows = await snapshot(), root = rows.find((p) => p.pid === rootPid);
+    const rows = await snapshot(); root = rows.find((p) => p.pid === rootPid);
     children = root ? processTree(rows, root).slice(1) : [];
-  } catch (e) { return { ok: false, killed: false, rootPid, children: [], remaining: [rootPid] }; } // unknown tree: kill nothing
+  } catch (e) { return { ok: false, killed: false, rootPid, children: [], remaining: [rootPid], left: [{ pid: rootPid }] }; } // unknown tree: kill nothing
+  // `left`: what is still there, with the identity from this snapshot, taken before anything was killed (a later snapshot
+  // could show a reused PID); a PID it did not show has no identity.
+  const known = [root, ...children].filter(Boolean);
+  const idOf = (pid) => { const p = known.find((x) => x.pid === pid); return p?.creationDate ? { pid, creationDate: p.creationDate, executable: p.executable } : { pid }; };
 
   try { process.kill(rootPid, 'SIGKILL'); } catch (e) {} // already exited
   let victims = [];
   try { victims = await killIdentities(children, snapshot); }
-  catch (e) { return { ok: false, killed: true, rootPid, children: [], remaining: [rootPid, ...children.map((p) => p.pid)].filter(isPidAlive) }; }
+  catch (e) { const remaining = [rootPid, ...children.map((p) => p.pid)].filter(isPidAlive); return { ok: false, killed: true, rootPid, children: [], remaining, left: remaining.map(idOf) }; }
 
   const pids = [rootPid, ...victims];
   for (let i = 0; i < 20 && pids.some(isPidAlive); i++) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   const remaining = pids.filter(isPidAlive);
-  return { ok: remaining.length === 0, killed: true, rootPid, children: victims, remaining };
+  return { ok: remaining.length === 0, killed: true, rootPid, children: victims, remaining, left: remaining.map(idOf) };
 }
 
 export async function getPortOccupant(port) {

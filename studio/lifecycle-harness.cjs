@@ -4,7 +4,7 @@ const assert = require('assert');
 const nodeCrypto = require('crypto');
 const src = require('fs').readFileSync(require('path').join(__dirname, 'server.mjs'), 'utf8').replace(/\r\n/g, '\n');
 const region = (a, b) => { const i = src.indexOf(a), j = src.indexOf(b, i); if (i < 0 || j < 0) throw new Error('region ' + a); return src.slice(i, j); };
-const code = region('function handoffNote(run)', '// ---------- Plan limits') + region('async function planPhase(w)', '// Changing the Leader mid-run') + region('// ---------- HTTP ----------', 'const routes =');
+const code = region('function handoffNote(run)', '// ---------- Plan limits') + region('async function planPhase(w)', '// Changing the Leader mid-run') + region('function closeWorkspace(w)', 'function removeRecent(p)') + region('// ---------- HTTP ----------', 'const routes =');
 // Only the regions above are loaded. A server.mjs function the tested code calls but that lives outside them would
 // fail only when a test happens to reach it (a ReferenceError deep inside a run), so name it before any test runs.
 const topNames = (s) => new Set([...s.matchAll(/^(?:async\s+)?function\s+(\w+)|^(?:const|let)\s+(\w+)\s*=/gm)].map((m) => m[1] || m[2]));
@@ -22,6 +22,7 @@ function makeEnv(script, overrides = {}) {
   const logs = [], notices = [], prompts = [];
   const env = {
     createWorkspaceLeaseStore, process,
+    processSnapshot: async () => [], killProcessTree: async () => ({ ok: true, killed: false }),
     listRuntimes: () => [], cleanupJobRuntimes: async () => ({ cleaned: 0, blocked: [] }),
     AGENTS: { claude: { name: 'Claude Code' }, codex: { name: 'Codex' }, antigravity: { name: 'Antigravity' } },
     S: { workspaces: [], leases: [] }, RT: mkTmp('studio-rt-'), PORT: 4848, api: async () => ({ items: [] }), stopTurn: async () => true, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 20))), crypto: nodeCrypto, logs, notices, prompts,
@@ -40,13 +41,14 @@ function makeEnv(script, overrides = {}) {
     workKey: (t) => t.agent + ':work' + (t.hard ? ':hard' : '') + (t.workdir ? '@wt' : ''),
     conv: async (w, agent, lead, hard, workdir) => { const k = agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : '') + (workdir ? '@wt' : ''); return (w.run.convs[k] ??= k); },
     turn: async (agent, cid, text) => { prompts.push({ agent, cid, text }); await new Promise((r) => setTimeout(r, 5)); return script(agent, text); },
+    spawn: require('child_process').spawn, // only the worktree setup command uses it
     execFile: (cmd, args, opts, cb) => cb(new Error('no git / gh in test'), '', ''), isDir: () => true, readHistory() {}, openWorkspace() {}, wsOf() {},
   };
   env.agentName = (id) => env.AGENTS[id]?.name || id;
   Object.assign(env, overrides);
   const names = Object.keys(env);
   checkOutside(names);
-  const api = new Function(...names, code + '\nreturn { planPhase, pump, summarize, answer, continueCard, wake, parseStatus, finish, autoNext, instruct, pause, resume, stop, handoffWriter, claimWorkspace, releaseClaim, useWorktree, useReadOnly, checkWorkspaces, acquireWrite, workspaceOf, loadLeases, saveLeases, releaseLease, leaseState, leaseView, writerOf, retire, beatLeases, cleanupWorktree, runTask, endWriteStep, treeKey, newLease, flagExternalModification, loadRun, reassign, recoverBackendWait, startManagedRuntime, drainExecution, pauseAndDrain, stopAndDrain, takeWriteSlot, treeStamp, INSTANCE, askAgent, cardDetail, workInfo, resolveAsks, cardStep, watchExternal, withdrawAgent, applyStatus, usageDelta, chargeUsage, delegateAsk, parseSubtasks, overCap, verdictOf, reviewAuthors, loadRun, routineDue, saveRoutine, deleteRoutine, runRoutines, setMission, planPrompt, stepDiff, snapTree, quotaResumeAt, undoStep, retryCleanups, worktreeCleanupAction, rulesNote, handoffExcerpt };')(...names.map((k) => env[k])); // test harness: our own code
+  const api = new Function(...names, code + '\nreturn { planPhase, pump, summarize, answer, continueCard, wake, parseStatus, finish, autoNext, instruct, pause, resume, stop, handoffWriter, claimWorkspace, releaseClaim, useWorktree, useReadOnly, checkWorkspaces, acquireWrite, workspaceOf, loadLeases, saveLeases, releaseLease, leaseState, leaseView, writerOf, retire, beatLeases, cleanupWorktree, runTask, endWriteStep, treeKey, newLease, flagExternalModification, loadRun, reassign, recoverBackendWait, startManagedRuntime, drainExecution, pauseAndDrain, stopAndDrain, takeWriteSlot, treeStamp, INSTANCE, askAgent, cardDetail, workInfo, resolveAsks, cardStep, watchExternal, withdrawAgent, applyStatus, usageDelta, chargeUsage, delegateAsk, parseSubtasks, overCap, verdictOf, reviewAuthors, loadRun, routineDue, saveRoutine, deleteRoutine, runRoutines, setMission, planPrompt, stepDiff, snapTree, quotaResumeAt, undoStep, retryCleanups, worktreeCleanupAction, rulesNote, handoffExcerpt, closeWorkspace, endLeftSetups, launching, settingUp };')(...names.map((k) => env[k])); // test harness: our own code
   return { env, api };
 }
 const newW = () => ({ project: 'P', leader: 'claude', workers: ['claude', 'codex', 'antigravity'], tasks: [], activity: [],
