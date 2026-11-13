@@ -58,7 +58,14 @@ const { execFile, execFileSync, spawn } = require('node:child_process');
     await new Promise((r) => setTimeout(r, 30));
     const cw = newW(); cw.project = repo; cw.run.project = repo; cw.run.startedAt = new Date().toISOString(); env.S.workspaces.length = 0; env.S.workspaces.push(cw);
     const crash = { id: 'crash', title: 'crash', agent: 'codex', writes: true, status: 'WAITING', after: [], instructions: 'x' }; cw.tasks.push(crash);
+    // A hook the worker wrote (core.hooksPath + reference-transaction) never runs when Studio keeps a step.
+    const hooks = path.join(root, 'hooks'), mark = path.join(root, 'HOOK_RAN').replace(/\\/g, '/');
+    fs.mkdirSync(hooks); fs.writeFileSync(path.join(hooks, 'reference-transaction'), `#!/bin/sh\necho ran > "${mark}"\n`, { mode: 0o755 });
+    git('config', 'core.hooksPath', hooks); git('update-ref', 'refs/hook-probe', 'HEAD'); git('update-ref', '-d', 'refs/hook-probe');
+    assert.ok(fs.existsSync(mark), 'the probe hook runs for a plain update-ref'); fs.rmSync(mark);
     await api.runTask(cw, crash);
+    assert.ok(!fs.existsSync(mark), 'Studio\'s step refs run no repository hook');
+    git('config', '--unset', 'core.hooksPath');
     assert.strictEqual(crash.steps?.length, 1, 'failed step keeps its diff');
     assert.deepStrictEqual([git('for-each-ref', '--format=%(refname)', 'refs/studio/steps/old/'), !!git('rev-parse', '--verify', 'refs/studio/steps/crash/1')], ['', true], 'the 90-day-old ref is pruned, the new one kept');
     const big = (await api.stepDiff(cw, 'crash', 0)).text;

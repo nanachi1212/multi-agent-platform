@@ -1332,13 +1332,13 @@ function pump(w) {
     const deps = (t.after || []).map(byId).filter(Boolean);
     if (deps.some((d) => d.status === 'FAILED')) { Object.assign(t, { status: 'FAILED', result: '前一張工作卡失敗，這張沒有開始；交給工頭決定下一步。' }); continue; }
     if (deps.some((d) => d.status !== 'DONE')) continue;
-    if (!t.hold && !w.executingSteps?.has(t.id) && !w.tasks.some((x) => x.status === 'WORKING' && x.agent === t.agent) && !(isWriter(t) && writerBusy(w, t))) runTask(w, t);
+    if (!t.hold && !t.preparing && !w.executingSteps?.has(t.id) && !w.tasks.some((x) => x.status === 'WORKING' && x.agent === t.agent) && !(isWriter(t) && writerBusy(w, t))) runTask(w, t);
   }
   // Follow both dependency and agent waits; a runnable/external/user-held card can still make progress.
   const onAgents = w.tasks.filter((t) => t.status === 'WAITING_AGENT');
   const canProgress = (t, seen = new Set()) => {
     if (seen.has(t.id)) return false;
-    if (t.hold || !['WAITING', 'WAITING_AGENT'].includes(t.status)) return true;
+    if (t.hold || t.preparing || !['WAITING', 'WAITING_AGENT'].includes(t.status)) return true;
     const next = new Set(seen).add(t.id);
     if (t.status === 'WAITING_AGENT') {
       const targets = w.tasks.filter((x) => x !== t && x.agent === t.wait?.agent && OPEN.includes(x.status));
@@ -1543,15 +1543,20 @@ const snapTree = async (dir) => (await privateGit(dir, writeTree)) || '';
 // ponytail: pruning only runs in a repo that gets new steps; a project never used again keeps its last refs.
 const STEP_KEEP_DAYS = 90;
 const STEP_GIT = ['-c', 'user.name=Multi-Agent Studio', '-c', 'user.email=studio@localhost', '-c', 'commit.gpgsign=false'];
+// A worker may write a hook (reference-transaction runs on update-ref) and point core.hooksPath at it: Studio's own ref
+// writes point hooksPath at an empty folder, so no repository hook runs with Studio's rights.
 async function keepStep(dir, t) {
   const n = t.steps.length, s = t.steps[n - 1];
-  const commit = async (tree, ...parent) => (await git(dir, ...STEP_GIT, 'commit-tree', tree, ...parent, '-m', `Studio step ${n} of card ${t.id}`)).out?.trim();
+  const noHooks = path.join(RT, 'studio', 'no-hooks');
+  fs.mkdirSync(noHooks, { recursive: true });
+  const g = (...args) => git(dir, ...STEP_GIT, '-c', 'core.hooksPath=' + noHooks, ...args);
+  const commit = async (tree, ...parent) => (await g('commit-tree', tree, ...parent, '-m', `Studio step ${n} of card ${t.id}`)).out?.trim();
   const before = await commit(s.before), after = before && await commit(s.after, '-p', before);
-  if (!after || (await git(dir, 'update-ref', `refs/studio/steps/${t.id}/${n}`, after)).err) return; // the step still works until gc
+  if (!after || (await g('update-ref', `refs/studio/steps/${t.id}/${n}`, after)).err) return; // the step still works until gc
   const old = Date.now() / 1e3 - STEP_KEEP_DAYS * 86400;
-  for (const line of ((await git(dir, 'for-each-ref', '--format=%(committerdate:unix) %(refname)', 'refs/studio/steps/')).out || '').split('\n')) {
+  for (const line of ((await g('for-each-ref', '--format=%(committerdate:unix) %(refname)', 'refs/studio/steps/')).out || '').split('\n')) {
     const [at, ref] = line.trim().split(' ');
-    if (ref && Number(at) < old) await git(dir, 'update-ref', '-d', ref);
+    if (ref && Number(at) < old) await g('update-ref', '-d', ref);
   }
 }
 const STEP_DIFF_MAX = 400e3; // characters of patch shown for one step
@@ -1911,6 +1916,7 @@ async function handoffWriter(w, toAgent, taskId, extraNote = '') {
   const held = S.leases.find((l) => l.mode === 'write' && l.jobId === run.id && ['ACTIVE', 'RESERVED'].includes(leaseState(l)));
   const t = taskId ? w.tasks.find((x) => x.id === taskId) : held && w.tasks.find((x) => x.id === held.cardId);
   if (!t) throw new Error('目前沒有人在這個工作區寫入，不需要交接（直接把工作卡改派即可）');
+  if (t.preparing) throw new Error('這張卡的 worktree 還在準備中（建立或設定指令），完成後才能交接');
   if (run.stopped) throw new Error('這件工作已經停止，不能交接');
   const from = t.agent;
   if (from === toAgent) throw new Error(`${agentName(toAgent)} 已經是這張卡的寫入者`);
@@ -1949,7 +1955,13 @@ async function useWorktree(w, taskId) {
   const t = w.tasks.find((x) => x.id === taskId);
   if (!t || !isWriter(t)) throw new Error('只有會修改檔案的工作卡才需要獨立 worktree');
   if (t.workdir) throw new Error('這張卡已經在獨立 worktree 裡');
-  if (['WORKING', 'DONE'].includes(t.status)) throw new Error('這張卡已經開始或已完成');
+  if (['WORKING', 'DONE'].includes(t.status) || w.executingSteps?.has(t.id)) throw new Error('這張卡已經開始或已完成');
+  if (t.preparing) throw new Error('這張卡的 worktree 正在準備中');
+  t.preparing = true; // set before the first await: the card neither starts nor changes hands until the worktree is ready
+  try { return await makeWorktree(w, t); }
+  finally { t.preparing = false; pump(w); }
+}
+async function makeWorktree(w, t) {
   const info = await workspaceOf(w.project);
   if (!info.isGit) throw new Error('這個資料夾不是 git 專案，不能建立獨立 worktree');
   const dir = path.join(RT, 'studio', 'worktrees', `${path.basename(info.path)}-${t.id}`);
@@ -1962,19 +1974,25 @@ async function useWorktree(w, taskId) {
   Object.assign(t, { workdir: dir, worktree: { path: dir, branch, base, repoPath: info.path, included: inc.entries }, blocked: null, blockReason: '', blockLogged: '' });
   log(w, 'studio', 'system', `「${t.title}」改在獨立 worktree 做（branch ${branch}）：不會碰到主資料夾的寫入者。${inc.text ? ' .worktreeinclude：' + inc.text + '。' : ''}`);
   if (w.worktreeSetup) {
-    t.hold = true; // the card starts only after the setup command
-    try {
-      const why = await worktreeSetup(w.worktreeSetup, dir);
-      // The ignored files the setup made (node_modules...) are expected at cleanup; anything else still stops it.
-      // .worktreeinclude copies are never on this list: removeIncluded checks them, and a changed copy must still stop cleanup.
-      const own = inc.entries.map((e) => e.rel.replace(/\\/g, '/').replace(/\/$/, '') + '/');
-      t.worktree.setupIgnored = ((await git(dir, 'status', '--porcelain', '--ignored', '--untracked-files=normal')).out || '').split('\n')
-        .filter((l) => { const p = l.slice(3).replace(/^"|"$/g, '').replace(/\/$/, '') + '/'; return l.startsWith('!! ') && !own.some((o) => o.startsWith(p) || p.startsWith(o)); });
-      log(w, 'studio', 'system', why ? `worktree 設定指令沒有成功（${why}），「${t.title}」照樣開始，成員可能要自己補裝。` : `worktree 設定指令已完成：${w.worktreeSetup}`);
-    } finally { t.hold = false; }
+    const why = await worktreeSetup(w.worktreeSetup, dir);
+    // The ignored paths the setup made, each with a stamp of everything under it: cleanup deletes one only while it is
+    // unchanged (node_modules is rebuilt anyway, so it goes even when changed). .worktreeinclude copies are never on the
+    // list: removeIncluded checks them, and a changed copy must still stop cleanup.
+    const own = inc.entries.map((e) => e.rel.replace(/\\/g, '/').replace(/\/$/, '') + '/');
+    t.worktree.setupIgnored = (await ignoredPaths(dir)).filter((p) => { const s = p.replace(/\/$/, '') + '/'; return !own.some((o) => o.startsWith(s) || s.startsWith(o)); })
+      .map((p) => ({ path: p, stamp: rebuildable(p) ? '' : pathStamp(path.join(dir, p)) }));
+    log(w, 'studio', 'system', why ? `worktree 設定指令沒有成功（${why}），「${t.title}」照樣開始，成員可能要自己補裝。` : `worktree 設定指令已完成：${w.worktreeSetup}`);
   }
-  pump(w);
   return { path: dir, branch };
+}
+// Ignored paths at the top of what git reports (a fully ignored folder is one entry). -z: no quoting of non-ASCII names.
+const ignoredPaths = async (dir) => ((await git(dir, 'status', '--porcelain', '-z', '--ignored', '--untracked-files=normal')).out || '').split('\0').filter((e) => e.startsWith('!! ')).map((e) => e.slice(3));
+const rebuildable = (p) => path.basename(p.replace(/\/$/, '')) === 'node_modules';
+// Every name, size and time under a path, links not followed: a file added, changed or removed later changes it. '' = unreadable.
+function pathStamp(root) {
+  const h = crypto.createHash('sha1');
+  const walk = (p) => { const st = fs.lstatSync(p); h.update(`${path.relative(root, p)}\0${st.size}\0${st.mtimeMs}\0`); if (st.isDirectory() && !st.isSymbolicLink()) for (const n of fs.readdirSync(p).sort()) walk(path.join(p, n)); };
+  try { walk(root); return h.digest('hex'); } catch { return ''; }
 }
 // t3code's runOnWorktreeCreate: the project's setup command (npm ci...) in a new worktree, like a routine precheck but
 // with 10 minutes. '' = done; otherwise why it failed. The user typed the command into their own Studio.
@@ -1983,7 +2001,7 @@ const worktreeSetup = (cmd, cwd) => new Promise((res) => execFile('cmd.exe', ['/
 async function useReadOnly(w, taskId) {
   const t = w.tasks.find((x) => x.id === taskId);
   if (!t) throw new Error('找不到這張工作卡');
-  if (['WORKING', 'DONE'].includes(t.status) || w.executingSteps?.has(t.id) || t.hold) throw new Error('這張卡已經開始、正在交接或已完成；請先完成暫停');
+  if (['WORKING', 'DONE'].includes(t.status) || w.executingSteps?.has(t.id) || t.hold || t.preparing) throw new Error('這張卡已經開始、正在交接、worktree 準備中或已完成；請先完成暫停');
   if (w.tasks.some((x) => x !== t && workKey(x) === workKey(t) && (x.status === 'WORKING' || w.executingSteps?.has(x.id)))) throw new Error('這位成員正在用同一個對話執行另一張卡；請先完成暫停');
   const run = w.run;
   if (!run || run.stopped) throw new Error('這件工作已經停止，不能切換唯讀');
@@ -2065,8 +2083,11 @@ async function cleanupWorktree(w, t) {
       if (pr.err || !JSON.parse(pr.out).some((p) => p.headRefOid === head)) throw new Error('無法確認當前 HEAD 已由 PR 交付');
     } else await checked(wt.repoPath, 'merge-base', '--is-ancestor', head, 'HEAD');
     removeIncluded(wt); // delivered: Studio's own copies and links go first; a changed copy keeps everything and fails the next check
-    const setupMade = new Set(wt.setupIgnored || []); // ignored entries the worktree setup command made: git worktree remove deletes them
-    if ((await checked(wt.path, 'status', '--porcelain', '--untracked-files=normal', '--ignored')).split('\n').some((l) => l && !setupMade.has(l))) throw new Error('仍有修改、未追蹤或忽略的檔案');
+    // What is left must be ignored paths the setup command made, still as it left them (node_modules: any state);
+    // git worktree remove deletes those. Anything else, or a changed one, keeps the worktree.
+    const setupMade = new Map((wt.setupIgnored || []).filter((e) => e && typeof e === 'object').map((e) => [e.path, e]));
+    const okLeft = (e) => { const s = e.startsWith('!! ') && setupMade.get(e.slice(3)); return !!s && (rebuildable(s.path) || (!!s.stamp && s.stamp === pathStamp(path.join(wt.path, s.path)))); };
+    if ((await checked(wt.path, 'status', '--porcelain', '-z', '--untracked-files=normal', '--ignored')).split('\0').some((e) => e && !okLeft(e))) throw new Error('仍有修改、未追蹤或忽略的檔案');
     if (head !== await checked(wt.path, 'rev-parse', 'HEAD')) throw new Error('查核期間 HEAD 已改變');
     await checked(wt.repoPath, 'worktree', 'remove', wt.path);
     Object.assign(wt, { removed: true, removedHead: head });
@@ -2179,7 +2200,7 @@ ${STATUS_RULES}`;
           if (t.interrupted) return '';
           if (run.stopped || run.paused) throw new Halt(run.stopped ? '已停止' : '已暫停');
         }
-        return await turn(t.agent, cid, text, { w, lead: !isWriter(t), bill: t, timeout: CARD_STALL_MS, allowStart: () => t.agent === startAgent && !t.hold && run.active });
+        return await turn(t.agent, cid, text, { w, lead: !isWriter(t), bill: t, timeout: CARD_STALL_MS, allowStart: () => t.agent === startAgent && !t.hold && !t.preparing && run.active });
       } catch (e) { if (t.interrupted && !(e instanceof Halt)) return ''; throw e; } finally { cardStep.delete(cid); t.stepEndAt = Date.now(); }
     };
     const park = () => {
@@ -3003,6 +3024,8 @@ function loadRun(w, r) {
   // Cards that were mid-work when the Studio closed are interrupted; waiting cards keep waiting.
   for (const t of r.tasks) if (t.status === 'WORKING') Object.assign(t, { status: 'INTERRUPTED', result: '已中斷', resumed: true });
   for (const t of r.tasks) Object.assign(t, { hold: false, interrupted: false }, t.forcedReadOnly ? { role: 'review', writes: false, briefed: '' } : {});
+  // Studio closed while a worktree was being made or set up: nothing of the setup is trusted at cleanup, and the worker is told.
+  for (const t of r.tasks.filter((x) => x.preparing)) { t.preparing = false; if (t.worktree) t.worktree.setupIgnored = []; t.wakeNote = [t.wakeNote, 'NOTE: Studio closed while this worktree was being prepared; its setup command may not have finished. Check that dependencies are installed before you start.'].filter(Boolean).join('\n\n'); }
   w.tasks = r.tasks;
   w.activity = r.activity;
   w.run = { id: r.id, startedAt: r.startedAt, project: r.project, leader: r.leader, request: r.request, convs: r.convs || {}, phase: r.phase || 'working', leaderGen: 0, rounds: r.rounds || 0, ask: r.ask || null, notes: r.notes || [], goal: r.goal, refs: r.refs, context: r.context, continues: r.continues, active: false, paused: true, stopped: false, summarizing: false };
