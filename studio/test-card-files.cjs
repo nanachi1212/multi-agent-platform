@@ -50,12 +50,17 @@ const { execFile, execFileSync, spawn } = require('node:child_process');
     for (const s of ['+A', '+++ b/new.txt', '--- a/c.txt']) assert.ok(patch.includes(s), 'step diff has ' + s);
     assert.ok(!patch.includes('build.log'), 'ignored output is not in the step diff');
     assert.strictEqual(git('diff', '--cached', '--name-only'), '', 'snapshots never stage anything');
+    assert.deepStrictEqual([git('rev-parse', 'refs/studio/steps/listed/1^{tree}'), git('rev-parse', 'refs/studio/steps/listed/1^^{tree}')], [cards.listed.steps[0].after, cards.listed.steps[0].before], 'a ref keeps the step from git gc');
+    // a step ref older than 90 days goes when the next step is kept
+    const oldTree = git('write-tree'), oldEnv = { ...process.env, GIT_COMMITTER_DATE: '2000-01-01T00:00:00Z' };
+    execFileSync('git', ['update-ref', 'refs/studio/steps/old/1', execFileSync('git', ['commit-tree', oldTree, '-m', 'old'], { cwd: repo, env: oldEnv, encoding: 'utf8' }).trim()], { cwd: repo });
     // A step that ends in an error still records what it changed; a patch over the limit is cut, not lost.
     await new Promise((r) => setTimeout(r, 30));
     const cw = newW(); cw.project = repo; cw.run.project = repo; cw.run.startedAt = new Date().toISOString(); env.S.workspaces.length = 0; env.S.workspaces.push(cw);
     const crash = { id: 'crash', title: 'crash', agent: 'codex', writes: true, status: 'WAITING', after: [], instructions: 'x' }; cw.tasks.push(crash);
     await api.runTask(cw, crash);
     assert.strictEqual(crash.steps?.length, 1, 'failed step keeps its diff');
+    assert.deepStrictEqual([git('for-each-ref', '--format=%(refname)', 'refs/studio/steps/old/'), !!git('rev-parse', '--verify', 'refs/studio/steps/crash/1')], ['', true], 'the 90-day-old ref is pruned, the new one kept');
     const big = (await api.stepDiff(cw, 'crash', 0)).text;
     assert.ok(big.includes('big.txt') && big.endsWith('k 字元）') && big.length < 401e3, 'large patch is cut at the limit');
     // 復原這一步: the step's files go back (edits, created and deleted files), HEAD and the index stay; the undo is a step too.
@@ -93,6 +98,10 @@ const { execFile, execFileSync, spawn } = require('node:child_process');
     await api.runTask(rw, rt);
     assert.ok(env.prompts.at(-1).text.includes('keeps rules for AI agents in CLAUDE.md'), 'the Codex brief names CLAUDE.md');
     assert.ok(!fs.existsSync(path.join(repo, 'GEMINI.md')), 'no rules file is created');
-    console.log('card files: listed vs changed, absolute and ./ paths, deletions, ignored output, missing FILES line, read-only cards, step diffs, step undo, rules files: PASS');
+    // Handoff: the new writer gets the latest messages themselves within the budget, oldest of them first, older ones counted.
+    const msgs = [{ type: 'text', position: 'right', content: { content: 'Task: brief' } }, ...Array.from({ length: 10 }, (_, i) => ({ type: 'text', position: 'left', content: { content: `report ${i} ` + 'x'.repeat(2000) } }))];
+    const ex = await makeEnv(() => '', { api: async () => ({ items: msgs }) }).api.handoffExcerpt('c1', 'codex');
+    assert.ok(ex.startsWith('(6 earlier messages left out)\n[Codex] report 5 ') && ex.includes('[Codex] report 9 ') && !ex.includes('report 4 ') && ex.length < 12100, 'handoff excerpt: ' + ex.slice(0, 80));
+    console.log('card files: listed vs changed, absolute and ./ paths, deletions, ignored output, missing FILES line, read-only cards, step diffs and refs, step undo, rules files, handoff excerpt: PASS');
   } finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 }); }
 })().catch((e) => { console.error('FAIL', e); process.exit(1); });
