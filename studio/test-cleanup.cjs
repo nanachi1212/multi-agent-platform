@@ -384,6 +384,30 @@ const { execFile, execFileSync } = require('node:child_process');
         assert.ok(claimed === 'granted' && !t.preparing && !t.worktree.setupKillError && !t.worktree.setupLeft, 'once granted, nothing wrote the stuck record back onto the card');
         slow = false; await E15.api.releaseClaim(t.workdir);
       }
+      // PID reuse: a recorded child's PID now belongs to another program, and a fresh PID the kill reports was created after
+      // the kill began. Neither is (re)identified, so no retry ever kills them.
+      {
+        const reused = await straySpawn(); // holds the PID the record says was the setup's child (an older process)
+        let late = null; const hit = [];
+        const E16 = makeEnv(() => '', { RT: root, processSnapshot, execFile, killProcessTree: async (pid) => {
+          if (pid !== L16.p.pid) { hit.push(pid); return { ok: false, killed: false, rootPid: pid, remaining: [pid] }; }
+          if (late) return { ok: false, killed: false, rootPid: pid, remaining: [reused.pid] };
+          late = await straySpawn(); // a process that appears after the first kill began, at a PID that kill reports
+          return { ok: false, killed: false, rootPid: pid, remaining: [reused.pid, late.pid] };
+        } });
+        const L16 = await leftover(E16.env, 'reuse');
+        L16.t.worktree.setupLeft = [{ pid: reused.pid, creationDate: '/Date(1000)/', executable: 'C:\\Windows\\system32\\PING.EXE' }];
+        E16.api.loadRun(L16.w, { id: 'restart16', status: 'paused', tasks: [L16.t], activity: [], convs: {} });
+        for (let i = 0; i < 300 && !L16.t.worktree.setupKillError; i++) await new Promise((r) => setTimeout(r, 20));
+        assert.ok(L16.t.worktree.setupLeft.find((p) => p.pid === reused.pid)?.creationDate === '/Date(1000)/', 'a recorded PID keeps its original identity');
+        assert.ok(!L16.t.worktree.setupLeft.some((p) => p.pid === late.pid), 'a PID created after the kill began is not recorded');
+        await assert.rejects(E16.api.claimWorkspace(L16.dir, { label: 'retry' }), /無法確認已停止/, 'still blocked while the setup command lives');
+        assert.ok(!hit.includes(reused.pid) && !hit.includes(late.pid) && alive(reused.pid) && alive(late.pid), 'no unrelated process was killed');
+        L16.p.kill(); await gone(L16.p.pid);
+        await E16.api.claimWorkspace(L16.dir, { label: 'after' }); await E16.api.releaseClaim(L16.dir);
+        assert.ok(!L16.t.preparing && !hit.includes(reused.pid) && !hit.includes(late.pid), 'cleared without touching them');
+        reused.kill(); late.kill(); await gone(reused.pid, late.pid);
+      }
       // Output over the old 16 MiB buffer: the command runs to its own end (Node used to kill cmd.exe alone, leaving its
       // children) and only the tail is kept.
       {

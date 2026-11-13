@@ -2025,6 +2025,7 @@ async function stopPreparing(w, why) {
 // Ends a running setup command with everything it started (Stop, closing, the 10-minute limit).
 async function killSetup(e) {
   if (!e.child?.pid || e.killing) return;
+  e.killSince = Date.now();
   e.killing = killProcessTree(e.child.pid).catch(() => ({ ok: false, remaining: [e.child.pid] }));
   const k = await e.killing;
   if (!k.ok) await setupStuck(e, k);
@@ -2041,7 +2042,7 @@ function setupStuck(e, k) {
     const pids = [...new Set([e.child?.pid, ...(k.remaining || [])].filter(Boolean))];
     if (t.worktree) {
       t.worktree.setupProc ||= { pid: e.child?.pid };
-      await recordLeft(t, pids);
+      await recordLeft(t, pids, e.killSince || Date.now());
       t.worktree.setupKillError = `PID ${pids.join('、')} 的程序樹沒有確認全部終止`;
     }
     log(w, 'studio', 'system', `「${t.title}」的 worktree 設定指令無法確認已停止，卡片保持阻擋；按「繼續」、Stop 或外部接手時會再試。`);
@@ -2050,16 +2051,20 @@ function setupStuck(e, k) {
     e.giveUp?.();
   })();
 }
-// Adds the processes a kill reported as still there to the card's record: with their identity, or by PID alone when the
-// process list cannot be read (then blocked while that PID lives). A PID the list does not show has ended.
-async function recordLeft(t, pids) {
+// Adds the processes a kill (begun at `since`) reported as still there to the card's record: with their identity, or by
+// PID alone when the process list cannot be read (then blocked while that PID lives). A PID the list does not show has
+// ended. Never re-identified: a PID already on the record keeps what it has, and one whose process was created after the
+// kill began is a reused PID (the reported process ended), so a later retry never kills an unrelated process.
+const bornAt = (r) => Number(/-?\d+/.exec(String(r.creationDate ?? ''))?.[0]) || 0;
+async function recordLeft(t, pids, since) {
   if (!t.worktree || !pids.length) return;
   const rows = await processSnapshot().catch(() => null);
   const left = new Map((t.worktree.setupLeft || []).map((p) => [p.pid, p]));
   for (const pid of pids) {
+    if (left.has(pid)) continue;
     const r = rows?.find((x) => x.pid === pid);
-    if (r) left.set(pid, { pid, creationDate: r.creationDate, executable: r.executable });
-    else if (!rows && !left.has(pid)) left.set(pid, { pid });
+    if (r) { if (bornAt(r) <= since) left.set(pid, { pid, creationDate: r.creationDate, executable: r.executable }); }
+    else if (!rows) left.set(pid, { pid });
   }
   t.worktree.setupLeft = [...left.values()];
 }
@@ -2076,9 +2081,9 @@ async function killLeftSetup(w, t) {
     if (odd) throw new Error(`PID ${odd.pid} 仍在執行，但無法確認是不是當時的設定指令（沒有記到建立時間），所以沒有終止它；請自行確認並結束該程序，或等它結束後再試`);
     const live = procs.filter((p) => rows.some((r) => sameSetup(r, p)));
     if (live.length) {
-      const res = await Promise.all(live.map((p) => killProcessTree(p.pid).catch(() => ({ ok: false, remaining: [p.pid] }))));
+      const since = Date.now(), res = await Promise.all(live.map((p) => killProcessTree(p.pid).catch(() => ({ ok: false, remaining: [p.pid] }))));
       // what this kill reported as still there is recorded before refusing: the next try checks it too
-      if (res.some((r) => !r?.ok)) { await recordLeft(t, res.flatMap((r) => r?.remaining || [])); throw new Error(`PID ${live.map((p) => p.pid).join('、')} 終止失敗或仍在執行`); }
+      if (res.some((r) => !r?.ok)) { await recordLeft(t, res.flatMap((r) => r?.remaining || []), since); throw new Error(`PID ${live.map((p) => p.pid).join('、')} 終止失敗或仍在執行`); }
       if ((await processSnapshot()).some((r) => live.some((p) => sameSetup(r, p)))) throw new Error(`PID ${live.map((p) => p.pid).join('、')} 終止失敗或仍在執行`);
       log(w, 'studio', 'system', `沒跑完的 worktree 設定指令（PID ${live.map((p) => p.pid).join('、')}）已終止。`);
     }
