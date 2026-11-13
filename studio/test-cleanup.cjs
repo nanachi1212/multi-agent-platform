@@ -217,7 +217,7 @@ const { execFile, execFileSync } = require('node:child_process');
         const child = t.worktree.setupLeft?.find((p) => p.pid === stray.pid)?.pid;
         assert.ok(child && alive(child) && t.worktree.setupLeft.every((p) => p.creationDate), 'the process the failed kill left is tracked with its identity');
         assert.ok(w.run.paused && !w.run.stopped && t.preparing && t.worktree.setupProc?.pid === pid && t.worktree.setupKillError, 'the job stays paused and the card blocked with its identity');
-        trees.push(await making);
+        await assert.rejects(making, /無法確認已停止/, "the preparation ends as stuck at once, not when the command exits"); trees.push({ path: t.worktree.path, branch: t.worktree.branch });
         await assert.rejects(start(w, 'new job'), /無法確認已停止|仍在執行/, 'a new job is refused while the card is stuck');
         process.kill(child); for (let i = 0; i < 300 && (alive(pid) || alive(child)); i++) await new Promise((r) => setTimeout(r, 20));
         await E5.api.stopAndDrain(w); // the command is gone now: the retry clears the card and Stop goes through
@@ -226,10 +226,10 @@ const { execFile, execFileSync } = require('node:child_process');
       }
       const straySpawn = async () => { const s = spawn('ping', ['-n', '60', '127.0.0.1'], { windowsHide: true, stdio: 'ignore' }); for (let i = 0; i < 100 && !(await processSnapshot()).some((r) => r.pid === s.pid); i++) await new Promise((r) => setTimeout(r, 20)); return s; };
       const gone = async (...pids) => { for (let i = 0; i < 300 && pids.some(alive); i++) await new Promise((r) => setTimeout(r, 20)); };
-      const liveSetup = async (E, id) => {
-        const w = newW(); w.project = repo; w.run.project = repo; w.run.active = true; w.worktreeSetup = 'ping -n 3 127.0.0.1 > nul';
+      const liveSetup = async (E, id, cmd = 'ping -n 3 127.0.0.1 > nul', before = []) => {
+        const w = newW(); w.project = repo; w.run.project = repo; w.run.active = true; w.worktreeSetup = cmd;
         E.env.S.workspaces.length = 0; E.env.S.workspaces.push(w);
-        const t = { id, title: id, agent: 'codex', writes: true, status: 'WAITING', after: [] }; w.tasks.push(t);
+        const t = { id, title: id, agent: 'codex', writes: true, status: 'WAITING', after: before.map((x) => x.id) }; w.tasks.push(...before, t);
         const making = E.api.useWorktree(w, t.id);
         for (let i = 0; i < 300 && !t.worktree?.setupProc?.creationDate; i++) await new Promise((r) => setTimeout(r, 20));
         return { w, t, making };
@@ -244,7 +244,7 @@ const { execFile, execFileSync } = require('node:child_process');
         await assert.rejects(E6.api.stopAndDrain(w), /無法確認已停止/, 'Stop is refused when the kill fails');
         await assert.rejects(claim, /無法確認已停止/, 'the waiting claim checks again and is refused');
         assert.ok(!E6.env.S.leases.some((l) => l.owner.kind === 'external' && l.status !== 'RELEASED') && t.preparing, 'no external write lease; the card stays blocked');
-        trees.push(await making);
+        await making.catch(() => {}); trees.push({ path: t.worktree.path, branch: t.worktree.branch });
         stray.kill(); await gone(stray.pid);
       }
       // The kill leaves a child and the identity lookup then fails: the known PID is kept with no identity, so a retry
@@ -258,13 +258,63 @@ const { execFile, execFileSync } = require('node:child_process');
         await assert.rejects(E7.api.stopAndDrain(w), /無法確認已停止/, 'Stop is refused when the kill fails');
         const kept = t.worktree.setupLeft?.find((p) => p.pid === stray.pid);
         assert.ok(kept && !kept.creationDate && t.preparing, 'the known PID is kept, identity unknown');
-        trees.push(await making);
+        await making.catch(() => {}); trees.push({ path: t.worktree.path, branch: t.worktree.branch });
         snapFails = false;
         await assert.rejects(E7.api.stopAndDrain(w), /無法確認是不是當時的設定指令/, 'a retry keeps blocking while that PID is alive');
         assert.ok(alive(stray.pid) && t.preparing && w.run.paused && !w.run.stopped, 'it was not killed and the job stays paused');
-        stray.kill(); await gone(stray.pid);
+        stray.kill(); await gone(stray.pid, t.worktree.setupProc.pid); // the command itself, unknown too, ends by itself
         snapFails = false; await E7.api.stopAndDrain(w);
         assert.ok(w.run.stopped && !t.preparing && !t.worktree.setupLeft, 'once that PID is gone, Stop goes through');
+      }
+      // The kill fails and the command keeps running: Stop answers at once (no wait for a command that may never exit), the
+      // card is stuck with the command's identity; its late exit does not unblock or re-block anything by itself.
+      {
+        const E8 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async (pid) => ({ ok: false, killed: false, rootPid: pid, remaining: [pid] }), execFile });
+        const { w, t, making } = await liveSetup(E8, 'never-ends', 'ping -n 30 127.0.0.1 > nul');
+        const pid = t.worktree.setupProc.pid, began = Date.now();
+        await assert.rejects(E8.api.stopAndDrain(w), /無法確認已停止/, 'Stop is refused');
+        await assert.rejects(making, /無法確認已停止/, 'the preparation ends as stuck');
+        assert.ok(Date.now() - began < 8000 && alive(pid), 'nobody waited for the command to exit');
+        assert.ok(t.preparing && t.worktree.setupLeft.some((p) => p.pid === pid && p.creationDate) && w.run.paused, 'stuck with the identity; the job stays paused');
+        trees.push({ path: t.worktree.path, branch: t.worktree.branch });
+        await killProcessTree(pid); await gone(pid);
+        await E8.api.stopAndDrain(w);
+        await new Promise((r) => setTimeout(r, 300)); // the command's own exit has been handled by now
+        assert.ok(w.run.stopped && !t.preparing && !t.worktree.setupLeft, 'cleared once it was gone, and its late exit did not block the card again');
+      }
+      // Resuming another job from history replaces the project's job: refused while a card still tracks a setup command.
+      {
+        const other = { id: 'other-job', project: repo, status: 'paused', tasks: [], activity: [], convs: {} };
+        let target;
+        const E9 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree, execFile, readHistory: () => other, openWorkspace: () => ({ project: repo }), wsOf: () => target });
+        const { w, t, making } = await liveSetup(E9, 'switch'); target = w;
+        const before = w.run.id; E9.api.pause(w);
+        await assert.rejects(E9.api.resume(w, 'other-job'), /worktree 在準備/, 'no switch while a setup command runs');
+        assert.ok(w.run.id === before && w.tasks.includes(t) && t.preparing, 'the current job and its card are kept');
+        trees.push(await making);
+        await E9.api.resume(w, 'other-job').catch(() => {});
+        assert.ok(w.run.id === 'other-job', 'the switch goes through once the setup has ended');
+      }
+      // A card whose dependency fails while its worktree is being set up: no wrap-up until the setup has ended.
+      {
+        const E10 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree, execFile });
+        const dep = { id: 'dep', title: 'dep', agent: 'claude', writes: false, status: 'FAILED', after: [] };
+        const { w, t, making } = await liveSetup(E10, 'after-dep', 'ping -n 3 127.0.0.1 > nul', [dep]);
+        w.run.phase = 'working'; E10.api.pump(w);
+        assert.ok(t.status === 'FAILED' && t.preparing && w.run.phase === 'working' && w.run.active, 'the job does not wrap up during setup');
+        trees.push(await making);
+        await new Promise((r) => setTimeout(r, 50));
+        assert.ok(w.run.phase === 'summarizing' || !w.run.active, 'the wrap-up comes once the setup has ended');
+      }
+      // Output over the old 16 MiB buffer: the command runs to its own end (Node used to kill cmd.exe alone, leaving its
+      // children) and only the tail is kept.
+      {
+        const big = path.join(real, 'big.txt'); fs.writeFileSync(big, Buffer.alloc(17 << 20, 'x'));
+        const E11 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree, execFile });
+        const { t, making } = await liveSetup(E11, 'loud', `type "${big}" & echo tail-marker`);
+        trees.push(await making);
+        assert.ok(!t.preparing && E11.env.logs.some((l) => l.text.includes('worktree 設定指令已完成')) && !E11.env.logs.some((l) => /MAXBUFFER|沒有成功/.test(l.text)), 'a loud command is not cut off');
+        fs.rmSync(big);
       }
     }
     // retry budget: a timed retry finishes a cleanup whose branch deletion failed; three temporary failures stop it; 保留 / 重試清理

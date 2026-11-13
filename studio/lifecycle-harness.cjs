@@ -41,6 +41,7 @@ function makeEnv(script, overrides = {}) {
     workKey: (t) => t.agent + ':work' + (t.hard ? ':hard' : '') + (t.workdir ? '@wt' : ''),
     conv: async (w, agent, lead, hard, workdir) => { const k = agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : '') + (workdir ? '@wt' : ''); return (w.run.convs[k] ??= k); },
     turn: async (agent, cid, text) => { prompts.push({ agent, cid, text }); await new Promise((r) => setTimeout(r, 5)); return script(agent, text); },
+    spawn: require('child_process').spawn, // only the worktree setup command uses it
     execFile: (cmd, args, opts, cb) => cb(new Error('no git / gh in test'), '', ''), isDir: () => true, readHistory() {}, openWorkspace() {}, wsOf() {},
   };
   env.agentName = (id) => env.AGENTS[id]?.name || id;
