@@ -1862,17 +1862,20 @@ async function claimWorkspace(dir, who = {}) {
     if (e.w.run && S.workspaces.includes(e.w)) jobs.add(e.w);
     log(e.w, 'studio', 'system', `外部接手（${labelText}）等「${e.t.title}」的 worktree 準備完成（建立和設定指令最多約 10 分鐘）。`);
   }
-  const settled = await Promise.allSettled(making.map((e) => e.promise));
-  const stuck = settled.findIndex((r, i) => r.status === 'rejected' && making[i].leftover);
-  if (stuck >= 0) throw new Error(`「${making[stuck].t.title}」在 Studio 重開前沒跑完的 worktree 設定指令無法確認已停止（${settled[stuck].reason.message}），暫時不能接手；可稍後再試`);
+  await Promise.allSettled(making.map((e) => e.promise));
+  // Checked again, not taken from the waits: a kill that failed meanwhile (a Stop during the wait) leaves the card blocked
+  // without an error here, and a new preparation may have begun.
+  setupBlocking(info.key);
   for (const w of jobs) {
     if (w.run.active) pause(w);
     await drainExecution(w);
     w.run.claimedBy = labelText;
   }
+  setupBlocking(info.key); // a preparation may have begun while the jobs drained
   const existingMirror = mirror && await foreignLock(mirrorWs);
   if (existingMirror?.status !== 'EXTERNAL') await acquireLock(mirrorWs, { title: 'External takeover' });
   try { return withLeaseTransaction(() => {
+  setupBlocking(info.key); // no await between this check and the lease below
   const holder = writerOf(info.key);
   if (holder?.owner.kind === 'studio' && holder.instance !== INSTANCE && (pidAlive(holder.pid) || ![...jobs].some((w) => w.run.id === holder.jobId))) throw new Error('另一個 Studio 仍持有寫入租約，請先停止該 Agent');
   for (const l of S.leases) if (l.key === info.key && l.mode === 'write' && l.status !== 'RELEASED' && l.owner.kind === 'studio') retire(l, `外部接手：${labelText}`);
@@ -1892,7 +1895,8 @@ async function claimWorkspace(dir, who = {}) {
   for (const w of jobs) log(w, 'studio', 'system', `工作區已由外部（${labelText}）接手：Studio 的寫入已停止，這件工作保持暫停。外部歸還後，由你按「繼續」。`);
   for (const w of jobs) saveRun(w, 'paused');
   return leaseView(ext);
-  }); } finally { clearWorkspaceLockTimer(mirrorWs, info.key); }
+  }); } catch (e) { if (existingMirror?.status !== 'EXTERNAL') await releaseLock(mirrorWs).catch(() => {}); throw e; } // refused: the lock taken for the claim goes
+  finally { clearWorkspaceLockTimer(mirrorWs, info.key); }
 }
 function clearWorkspaceLockTimer(w, key) { clearInterval(w.lockTimers?.get(key)); w.lockTimers?.delete(key); }
 async function releaseClaim(dir) {
@@ -1991,8 +1995,9 @@ async function useWorktree(w, taskId) {
   e.promise = makeWorktree(w, t, e).finally(async () => {
     const k = await Promise.resolve(e.killing || e.child?.killing).catch(() => ({ ok: false, remaining: [] }));
     if (k && !k.ok && t.worktree?.setupProc) {
-      const rows = await processSnapshot().catch(() => []);
-      t.worktree.setupLeft = rows.filter((r) => (k.remaining || []).includes(r.pid)).map((r) => ({ pid: r.pid, creationDate: r.creationDate, executable: r.executable }));
+      // A PID the snapshot does not show has ended; without a snapshot each is kept with no identity (blocked while alive).
+      const rows = await processSnapshot().catch(() => null);
+      t.worktree.setupLeft = (k.remaining || []).map((pid) => { const r = rows?.find((x) => x.pid === pid); return r ? { pid, creationDate: r.creationDate, executable: r.executable } : rows ? null : { pid }; }).filter(Boolean);
       t.worktree.setupKillError = `PID ${[...new Set((k.remaining || []).concat(t.worktree.setupProc.pid))].join('、')} 的程序樹沒有確認全部終止`;
       log(w, 'studio', 'system', `「${t.title}」的 worktree 設定指令無法確認已停止，卡片保持阻擋；按「繼續」、Stop 或外部接手時會再試。`);
       saveRun(w, w.run?.paused ? 'paused' : 'running');
@@ -2005,6 +2010,14 @@ async function useWorktree(w, taskId) {
 }
 const preparing = new Map(); // card id -> { w, t, keys, promise, child, stopped, killing, leftover }: a worktree being made and set up
 const settingUp = (w) => [...preparing.values()].some((e) => e.w === w && !e.leftover);
+// A claim of this tree is refused while a setup command there is being made, run, ended, or cannot be confirmed gone.
+function setupBlocking(key) {
+  const t = [...preparing.values()].find((e) => e.keys.has(key))?.t
+    || S.workspaces.flatMap((w) => w.tasks.filter((t) => t.preparing && [treeKey(w.project), ...(t.workdir ? [treeKey(t.workdir)] : [])].includes(key)))[0];
+  if (!t) return;
+  if (t.worktree?.setupKillError) throw new Error(`「${t.title}」的 worktree 設定指令無法確認已停止（${t.worktree.setupKillError}），暫時不能接手；可稍後再試`);
+  throw new Error(`「${t.title}」的 worktree 還在準備中，暫時不能接手；請稍後再試`);
+}
 // Stop / close: the setup command (and what it started) ends, and its preparation has settled before this returns.
 async function stopPreparing(w, why) {
   const mine = [...preparing.values()].filter((e) => e.w === w);
@@ -2041,7 +2054,7 @@ function leftSetup(w, t) {
   const e = { w, t, leftover: true, keys: new Set([treeKey(w.project), ...(t.workdir ? [treeKey(t.workdir)] : [])]), child: null, stopped: '' };
   e.promise = killLeftSetup(w, t).catch((err) => {
     if (t.worktree) t.worktree.setupKillError = err.message;
-    log(w, 'studio', 'system', `Studio 重開前沒跑完的 worktree 設定指令無法確認已停止（${err.message}）；「${t.title}」保持阻擋，按「繼續」或外部接手時會再試。`);
+    log(w, 'studio', 'system', `沒跑完的 worktree 設定指令無法確認已停止（${err.message}）；「${t.title}」保持阻擋，按「繼續」、Stop 或外部接手時會再試。`);
     throw err;
   }).finally(() => { preparing.delete(t.id); saveRun(w, w.run?.paused ? 'paused' : 'running'); });
   preparing.set(t.id, e);
@@ -2051,7 +2064,7 @@ function leftSetup(w, t) {
 async function endLeftSetups(w, cards) {
   const left = cards.filter((t) => t.preparing && !preparing.has(t.id) || preparing.get(t.id)?.leftover).map((t) => leftSetup(w, t));
   const failed = (await Promise.allSettled(left.map((e) => e.promise))).find((r) => r.status === 'rejected');
-  if (failed) throw new Error('Studio 重開前沒跑完的 worktree 設定指令無法確認已停止：' + failed.reason.message + '；可稍後再試');
+  if (failed) throw new Error('沒跑完的 worktree 設定指令無法確認已停止：' + failed.reason.message + '；可稍後再試');
 }
 async function makeWorktree(w, t, e) {
   const info = await workspaceOf(w.project);

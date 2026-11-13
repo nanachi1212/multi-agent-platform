@@ -224,6 +224,48 @@ const { execFile, execFileSync } = require('node:child_process');
         assert.ok(w.run.stopped && !t.preparing && !t.worktree.setupProc && !t.worktree.setupLeft && planned.n === 0, 'Stop went through once the command was gone');
         await assert.rejects(E5.api.useWorktree(w, t2.id), /已經停止/, 'no new worktree on a stopped job');
       }
+      const straySpawn = async () => { const s = spawn('ping', ['-n', '60', '127.0.0.1'], { windowsHide: true, stdio: 'ignore' }); for (let i = 0; i < 100 && !(await processSnapshot()).some((r) => r.pid === s.pid); i++) await new Promise((r) => setTimeout(r, 20)); return s; };
+      const gone = async (...pids) => { for (let i = 0; i < 300 && pids.some(alive); i++) await new Promise((r) => setTimeout(r, 20)); };
+      const liveSetup = async (E, id) => {
+        const w = newW(); w.project = repo; w.run.project = repo; w.run.active = true; w.worktreeSetup = 'ping -n 3 127.0.0.1 > nul';
+        E.env.S.workspaces.length = 0; E.env.S.workspaces.push(w);
+        const t = { id, title: id, agent: 'codex', writes: true, status: 'WAITING', after: [] }; w.tasks.push(t);
+        const making = E.api.useWorktree(w, t.id);
+        for (let i = 0; i < 300 && !t.worktree?.setupProc?.creationDate; i++) await new Promise((r) => setTimeout(r, 20));
+        return { w, t, making };
+      };
+      // A claim already waiting when a Stop's kill fails: it checks again after its wait and gets no write lease.
+      {
+        const stray = await straySpawn();
+        const E6 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async (pid) => ({ ok: false, killed: false, rootPid: pid, remaining: [pid, stray.pid] }), execFile });
+        const { w, t, making } = await liveSetup(E6, 'waited');
+        const claim = E6.api.claimWorkspace(t.workdir, { label: 'waiting' });
+        await new Promise((r) => setTimeout(r, 200)); // the claim waits for the setup command
+        await assert.rejects(E6.api.stopAndDrain(w), /無法確認已停止/, 'Stop is refused when the kill fails');
+        await assert.rejects(claim, /無法確認已停止/, 'the waiting claim checks again and is refused');
+        assert.ok(!E6.env.S.leases.some((l) => l.owner.kind === 'external' && l.status !== 'RELEASED') && t.preparing, 'no external write lease; the card stays blocked');
+        trees.push(await making);
+        stray.kill(); await gone(stray.pid);
+      }
+      // The kill leaves a child and the identity lookup then fails: the known PID is kept with no identity, so a retry
+      // neither kills it (it could be a reused PID) nor takes it as gone while it is alive.
+      {
+        const stray = await straySpawn();
+        let snapFails = false;
+        const E7 = makeEnv(() => '', { RT: root, processSnapshot: async () => { if (snapFails) throw new Error('process list unavailable'); return processSnapshot(); },
+          killProcessTree: async (pid) => { snapFails = true; return { ok: false, killed: false, rootPid: pid, remaining: [pid, stray.pid] }; }, execFile });
+        const { w, t, making } = await liveSetup(E7, 'unknown-left');
+        await assert.rejects(E7.api.stopAndDrain(w), /無法確認已停止/, 'Stop is refused when the kill fails');
+        const kept = t.worktree.setupLeft?.find((p) => p.pid === stray.pid);
+        assert.ok(kept && !kept.creationDate && t.preparing, 'the known PID is kept, identity unknown');
+        trees.push(await making);
+        snapFails = false;
+        await assert.rejects(E7.api.stopAndDrain(w), /無法確認是不是當時的設定指令/, 'a retry keeps blocking while that PID is alive');
+        assert.ok(alive(stray.pid) && t.preparing && w.run.paused && !w.run.stopped, 'it was not killed and the job stays paused');
+        stray.kill(); await gone(stray.pid);
+        snapFails = false; await E7.api.stopAndDrain(w);
+        assert.ok(w.run.stopped && !t.preparing && !t.worktree.setupLeft, 'once that PID is gone, Stop goes through');
+      }
     }
     // retry budget: a timed retry finishes a cleanup whose branch deletion failed; three temporary failures stop it; 保留 / 重試清理
     if (git('remote')) git('remote', 'remove', 'origin');
