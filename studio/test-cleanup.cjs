@@ -86,6 +86,11 @@ const { execFile, execFileSync } = require('node:child_process');
       for (let i = 0; i < 100 && !t.worktree; i++) await new Promise((r) => setTimeout(r, 20)); // now the setup command runs
       w.run.active = true; E.api.pump(w);
       assert.ok(t.status === 'WAITING' && !w.executingSteps?.has(t.id), 'the card does not start during setup');
+      // An external claim of that worktree waits until the setup command has ended; the card stays paused.
+      E.env.S.workspaces.length = 0; E.env.S.workspaces.push(w);
+      const ext = await E.api.claimWorkspace(t.workdir, { label: 'ext' });
+      assert.ok(ext && !t.preparing && !w.run.active, 'the external claim waited for the setup command');
+      await E.api.releaseClaim(t.workdir);
       w.run.active = false; const r = await making; trees.push(r);
       assert.ok(!t.preparing && t.worktree.setupIgnored, 'ready after setup'); }
     // retry budget: a timed retry finishes a cleanup whose branch deletion failed; three temporary failures stop it; 保留 / 重試清理
@@ -115,6 +120,6 @@ const { execFile, execFileSync } = require('node:child_process');
     console.log('worktree cleanup: dirty/ignored files, failed checks/removal, current PR HEAD, squash merge, moved ref, path containment, .worktreeinclude copy/link and its removal, worktree setup command, retry budget, keep / retry: PASS');
   } finally {
     for (const wt of trees) if (fs.existsSync(wt.path)) git('worktree', 'remove', '--force', wt.path);
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 40, retryDelay: 150 });
   }
 })().catch((e) => { console.error(e); process.exitCode = 1; });

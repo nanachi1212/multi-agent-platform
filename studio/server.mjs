@@ -1544,12 +1544,11 @@ const snapTree = async (dir) => (await privateGit(dir, writeTree)) || '';
 const STEP_KEEP_DAYS = 90;
 const STEP_GIT = ['-c', 'user.name=Multi-Agent Studio', '-c', 'user.email=studio@localhost', '-c', 'commit.gpgsign=false'];
 // A worker may write a hook (reference-transaction runs on update-ref) and point core.hooksPath at it: Studio's own ref
-// writes point hooksPath at an empty folder, so no repository hook runs with Studio's rights.
+// writes point hooksPath at the null device, which can never be a folder, so no hook can be planted there either.
+const NO_HOOKS = process.platform === 'win32' ? 'NUL' : '/dev/null';
 async function keepStep(dir, t) {
   const n = t.steps.length, s = t.steps[n - 1];
-  const noHooks = path.join(RT, 'studio', 'no-hooks');
-  fs.mkdirSync(noHooks, { recursive: true });
-  const g = (...args) => git(dir, ...STEP_GIT, '-c', 'core.hooksPath=' + noHooks, ...args);
+  const g = (...args) => git(dir, ...STEP_GIT, '-c', 'core.hooksPath=' + NO_HOOKS, ...args);
   const commit = async (tree, ...parent) => (await g('commit-tree', tree, ...parent, '-m', `Studio step ${n} of card ${t.id}`)).out?.trim();
   const before = await commit(s.before), after = before && await commit(s.after, '-p', before);
   if (!after || (await g('update-ref', `refs/studio/steps/${t.id}/${n}`, after)).err) return; // the step still works until gc
@@ -1843,6 +1842,11 @@ async function claimWorkspace(dir, who = {}) {
   }
   for (const w of jobs) {
     if (w.run.active) pause(w);
+    // A worktree being made or set up is no executing step: wait for that command too (paused, its card will not start after).
+    for (const t of w.tasks.filter((x) => x.preparing && preparingNow.has(x.id))) {
+      log(w, 'studio', 'system', `外部接手（${labelText}）等「${t.title}」的 worktree 準備完成（建立和設定指令最多約 10 分鐘）。`);
+      await preparingNow.get(t.id).catch(() => {});
+    }
     await drainExecution(w);
     w.run.claimedBy = labelText;
   }
@@ -1958,9 +1962,12 @@ async function useWorktree(w, taskId) {
   if (['WORKING', 'DONE'].includes(t.status) || w.executingSteps?.has(t.id)) throw new Error('這張卡已經開始或已完成');
   if (t.preparing) throw new Error('這張卡的 worktree 正在準備中');
   t.preparing = true; // set before the first await: the card neither starts nor changes hands until the worktree is ready
-  try { return await makeWorktree(w, t); }
-  finally { t.preparing = false; pump(w); }
+  const making = makeWorktree(w, t);
+  preparingNow.set(t.id, making);
+  try { return await making; }
+  finally { preparingNow.delete(t.id); t.preparing = false; pump(w); }
 }
+const preparingNow = new Map(); // card id -> its worktree being made and set up (an external claim waits for it)
 async function makeWorktree(w, t) {
   const info = await workspaceOf(w.project);
   if (!info.isGit) throw new Error('這個資料夾不是 git 專案，不能建立獨立 worktree');
