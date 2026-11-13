@@ -125,6 +125,7 @@ const { execFile, execFileSync } = require('node:child_process');
     }
     {
       const { spawn } = require('node:child_process');
+      const ids = async (...pids) => { const rows = await processSnapshot(); return pids.map((pid) => { const r = rows.find((x) => x.pid === pid); return r ? { pid, creationDate: r.creationDate, executable: r.executable } : { pid }; }); };
       const leftover = async (env, id) => { // a setup command a closed Studio left running in a real worktree
         const dir = path.join(root, 'left-' + id); git('worktree', 'add', '-q', dir); trees.push({ path: dir });
         const p = spawn('cmd.exe', ['/d', '/c', 'ping -n 60 127.0.0.1 > nul'], { windowsHide: true });
@@ -202,7 +203,7 @@ const { execFile, execFileSync } = require('node:child_process');
         // The failed kill reports a process of the tree as still there (a real one, outliving the command).
         const stray = spawn('ping', ['-n', '60', '127.0.0.1'], { windowsHide: true, stdio: 'ignore' });
         for (let i = 0; i < 100 && !(await processSnapshot()).some((r) => r.pid === stray.pid); i++) await new Promise((r) => setTimeout(r, 20));
-        const E5 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async (pid) => ({ ok: false, killed: false, rootPid: pid, remaining: [pid, stray.pid] }), execFile });
+        const E5 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async (pid) => ({ ok: false, killed: false, rootPid: pid, remaining: [pid, stray.pid], left: await ids(pid, stray.pid) }), execFile });
         const planned = { n: 0 }, start = makeStart(E5, planned);
         const w = newW(); w.project = repo; w.run.project = repo; w.run.active = true; w.worktreeSetup = 'ping -n 3 127.0.0.1 > nul';
         E5.env.S.workspaces.length = 0; E5.env.S.workspaces.push(w);
@@ -231,6 +232,7 @@ const { execFile, execFileSync } = require('node:child_process');
         E.env.S.workspaces.length = 0; E.env.S.workspaces.push(w);
         const t = { id, title: id, agent: 'codex', writes: true, status: 'WAITING', after: before.map((x) => x.id) }; w.tasks.push(...before, t);
         const making = E.api.useWorktree(w, t.id);
+        making.catch(() => {}); // a stuck preparation rejects early; each test awaits it where it needs to
         for (let i = 0; i < 300 && !t.worktree?.setupProc?.creationDate; i++) await new Promise((r) => setTimeout(r, 20));
         return { w, t, making };
       };
@@ -269,7 +271,7 @@ const { execFile, execFileSync } = require('node:child_process');
       // The kill fails and the command keeps running: Stop answers at once (no wait for a command that may never exit), the
       // card is stuck with the command's identity; its late exit does not unblock or re-block anything by itself.
       {
-        const E8 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async (pid) => ({ ok: false, killed: false, rootPid: pid, remaining: [pid] }), execFile });
+        const E8 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async (pid) => ({ ok: false, killed: false, rootPid: pid, remaining: [pid], left: await ids(pid) }), execFile });
         const { w, t, making } = await liveSetup(E8, 'never-ends', 'ping -n 30 127.0.0.1 > nul');
         const pid = t.worktree.setupProc.pid, began = Date.now();
         await assert.rejects(E8.api.stopAndDrain(w), /無法確認已停止/, 'Stop is refused');
@@ -341,7 +343,7 @@ const { execFile, execFileSync } = require('node:child_process');
       const rootOnly = async (pid) => { // everything but the ping goes (conhost too, so the command's exit is seen at once)
         const rows = await processSnapshot(), left = await kids(pid);
         for (const k of [...left, pid]) if (!/ping/i.test(rows.find((r) => r.pid === k)?.executable || '')) try { process.kill(k); } catch {}
-        return { ok: false, killed: true, rootPid: pid, remaining: left };
+        return { ok: false, killed: true, rootPid: pid, remaining: left, left: left.map((k) => { const r = rows.find((x) => x.pid === k); return r ? { pid: k, creationDate: r.creationDate, executable: r.executable } : { pid: k }; }) };
       };
       // A retry of a leftover whose kill leaves a child: that child is recorded, so the next retry does not unblock the card
       // just because the old root is gone.
@@ -362,51 +364,49 @@ const { execFile, execFileSync } = require('node:child_process');
         await E14.api.claimWorkspace(L.dir, { label: 'after' }); await E14.api.releaseClaim(L.dir);
         assert.ok(!L.t.preparing, 'cleared once the child is gone');
       }
-      // Stop's kill fails and the command then ends (its last child too) while the stuck record is still being written (a
-      // slow process list): the finalizer waits for that one transition, so the card is never released half-recorded and
-      // the transition never writes back onto a card a claim has already cleared.
+      // Stop's kill fails and the command then ends while its child lives: the finalizer and the kill share one stuck
+      // transition, so a claim right after the registry entry goes already sees the recorded child and is refused; once the
+      // child has ended the claim goes through and no late transition writes back onto the card.
       {
-        let slow = false;
-        const E15 = makeEnv(() => '', { RT: root, execFile,
-          processSnapshot: async () => { if (slow) await new Promise((r) => setTimeout(r, 5000)); return processSnapshot(); },
-          killProcessTree: async (pid) => { const r = await rootOnly(pid); slow = true; return r; } });
-        const { w, t, making } = await liveSetup(E15, 'race-stuck', 'ping -n 3 127.0.0.1 > nul 2>&1'); // its ping ends in ~2 s
-        making.catch(() => {}); // it rejects once stuck; awaited below
+        const E15 = makeEnv(() => '', { RT: root, execFile, processSnapshot, killProcessTree: rootOnly });
+        const { w, t, making } = await liveSetup(E15, 'race-stuck', 'ping -n 6 127.0.0.1 > nul 2>&1'); // its ping ends in ~5 s
         trees.push({ path: t.worktree.path, branch: t.worktree.branch });
-        const began = Date.now(), stopping = E15.api.stopAndDrain(w).catch((e) => e);
+        const pid = t.worktree.setupProc.pid, child = (await processSnapshot()).find((r) => r.parent === pid && /ping/i.test(r.executable || '')).pid;
+        const stopping = E15.api.stopAndDrain(w).catch((e) => e);
         for (let i = 0; i < 1000 && E15.api.settingUp(w); i++) await new Promise((r) => setTimeout(r, 10));
-        const freed = Date.now() - began;
-        const claimed = await E15.api.claimWorkspace(t.workdir, { label: 'in between' }).then(() => 'granted', (e) => e.message);
+        await assert.rejects(E15.api.claimWorkspace(t.workdir, { label: 'in between' }), /無法確認已停止/, 'a claim right after sees the recorded child');
+        assert.ok(t.preparing && t.worktree.setupLeft?.some((p) => p.pid === child && p.creationDate), 'the child is on the record');
         assert.ok(/無法確認已停止/.test((await stopping)?.message || ''), 'Stop is refused');
-        await making.catch(() => {});
-        await new Promise((r) => setTimeout(r, Math.max(0, 6500 - (Date.now() - began)))); // any late write has happened
-        assert.ok(freed >= 4500, 'the registry was held until the processes were recorded');
-        assert.ok(claimed === 'granted' && !t.preparing && !t.worktree.setupKillError && !t.worktree.setupLeft, 'once granted, nothing wrote the stuck record back onto the card');
-        slow = false; await E15.api.releaseClaim(t.workdir);
+        await making.catch(() => {}); for (let i = 0; i < 600 && alive(child); i++) await new Promise((r) => setTimeout(r, 20));
+        await E15.api.claimWorkspace(t.workdir, { label: 'after' });
+        await new Promise((r) => setTimeout(r, 1000)); // any late write has happened
+        assert.ok(!t.preparing && !t.worktree.setupKillError && !t.worktree.setupLeft, 'once granted, nothing wrote the stuck record back onto the card');
+        await E15.api.releaseClaim(t.workdir);
       }
-      // PID reuse: a recorded child's PID now belongs to another program, and a fresh PID the kill reports was created after
-      // the kill began. Neither is (re)identified, so no retry ever kills them.
+      // PID reuse and a late child: a recorded PID now belongs to another program and the kill reports it with that program's
+      // identity: the record keeps the original one, so no retry kills it. A child the setup made after the kill began is in
+      // the kill's own snapshot: it is recorded with that identity and keeps the card blocked while it lives.
       {
         const reused = await straySpawn(); // holds the PID the record says was the setup's child (an older process)
-        let late = null; const hit = [];
+        let born = null, L16; const hit = [];
         const E16 = makeEnv(() => '', { RT: root, processSnapshot, execFile, killProcessTree: async (pid) => {
-          if (pid !== L16.p.pid) { hit.push(pid); return { ok: false, killed: false, rootPid: pid, remaining: [pid] }; }
-          if (late) return { ok: false, killed: false, rootPid: pid, remaining: [reused.pid] };
-          late = await straySpawn(); // a process that appears after the first kill began, at a PID that kill reports
-          return { ok: false, killed: false, rootPid: pid, remaining: [reused.pid, late.pid] };
+          if (pid !== L16.p.pid) { hit.push(pid); return { ok: false, killed: false, rootPid: pid, remaining: [pid], left: await ids(pid) }; }
+          born ||= await straySpawn(); // made by the setup after the kill began; the kill's snapshot shows it
+          return { ok: false, killed: false, rootPid: pid, remaining: [reused.pid, born.pid], left: await ids(reused.pid, born.pid) };
         } });
-        const L16 = await leftover(E16.env, 'reuse');
+        L16 = await leftover(E16.env, 'reuse');
         L16.t.worktree.setupLeft = [{ pid: reused.pid, creationDate: '/Date(1000)/', executable: 'C:\\Windows\\system32\\PING.EXE' }];
         E16.api.loadRun(L16.w, { id: 'restart16', status: 'paused', tasks: [L16.t], activity: [], convs: {} });
         for (let i = 0; i < 300 && !L16.t.worktree.setupKillError; i++) await new Promise((r) => setTimeout(r, 20));
         assert.ok(L16.t.worktree.setupLeft.find((p) => p.pid === reused.pid)?.creationDate === '/Date(1000)/', 'a recorded PID keeps its original identity');
-        assert.ok(!L16.t.worktree.setupLeft.some((p) => p.pid === late.pid), 'a PID created after the kill began is not recorded');
-        await assert.rejects(E16.api.claimWorkspace(L16.dir, { label: 'retry' }), /無法確認已停止/, 'still blocked while the setup command lives');
-        assert.ok(!hit.includes(reused.pid) && !hit.includes(late.pid) && alive(reused.pid) && alive(late.pid), 'no unrelated process was killed');
+        assert.ok(L16.t.worktree.setupLeft.some((p) => p.pid === born.pid && p.creationDate), 'the late child is recorded with its identity');
         L16.p.kill(); await gone(L16.p.pid);
+        await assert.rejects(E16.api.claimWorkspace(L16.dir, { label: 'retry' }), /無法確認已停止/, 'still blocked while the late child lives');
+        assert.ok(!hit.includes(reused.pid) && alive(reused.pid), 'the reused PID was not killed');
+        born.kill(); await gone(born.pid);
         await E16.api.claimWorkspace(L16.dir, { label: 'after' }); await E16.api.releaseClaim(L16.dir);
-        assert.ok(!L16.t.preparing && !hit.includes(reused.pid) && !hit.includes(late.pid), 'cleared without touching them');
-        reused.kill(); late.kill(); await gone(reused.pid, late.pid);
+        assert.ok(!L16.t.preparing && !hit.includes(reused.pid) && alive(reused.pid), 'cleared without touching the reused PID');
+        reused.kill(); await gone(reused.pid);
       }
       // Output over the old 16 MiB buffer: the command runs to its own end (Node used to kill cmd.exe alone, leaving its
       // children) and only the tail is kept.
