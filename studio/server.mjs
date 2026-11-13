@@ -1843,13 +1843,16 @@ async function claimWorkspace(dir, who = {}) {
   // A worktree being made or set up for this tree is no executing step, and it may not be on any card yet: the registry
   // knows its folders from before `git worktree add`, whatever the project's state. Its job is paused (the card will not
   // start after) and its command awaited. The entries are taken first: one that ends meanwhile leaves the registry.
+  for (const w of S.workspaces) for (const t of w.tasks) if (t.preparing && !preparing.has(t.id)) leftSetup(w, t).promise.catch(() => {}); // a failed restart cleanup: try again
   const making = [...preparing.values()].filter((e) => e.keys.has(info.key));
   for (const e of making) {
     if (e.w.run?.active) pause(e.w);
     if (e.w.run && S.workspaces.includes(e.w)) jobs.add(e.w);
     log(e.w, 'studio', 'system', `外部接手（${labelText}）等「${e.t.title}」的 worktree 準備完成（建立和設定指令最多約 10 分鐘）。`);
   }
-  await Promise.all(making.map((e) => e.promise.catch(() => {})));
+  const settled = await Promise.allSettled(making.map((e) => e.promise));
+  const stuck = settled.findIndex((r, i) => r.status === 'rejected' && making[i].leftover);
+  if (stuck >= 0) throw new Error(`「${making[stuck].t.title}」在 Studio 重開前沒跑完的 worktree 設定指令無法確認已停止（${settled[stuck].reason.message}），暫時不能接手；可稍後再試`);
   for (const w of jobs) {
     if (w.run.active) pause(w);
     await drainExecution(w);
@@ -1982,16 +1985,45 @@ async function stopPreparing(w, why) {
   for (const e of mine) { e.stopped = why; if (e.child?.pid) await killProcessTree(e.child.pid).catch(() => {}); }
   await Promise.all(mine.map((e) => e.promise.catch(() => {})));
 }
-// A restart: Studio closed while a setup command ran, and on Windows that command outlives it. It is ended only while the
-// saved identity (PID, creation time, executable) still matches, so a reused PID is never touched.
+// A restart: Studio closed while a setup command ran, and on Windows that command outlives it. The card stays preparing
+// (blocked) until a fresh snapshot shows the command gone; it is killed only while the saved identity still matches, so a
+// reused PID is never touched. Identity: PID + creation time + executable, or (saved before the snapshot came back)
+// PID + cmd.exe running this very command line.
+const sameSetup = (r, p) => r.pid === p.pid && (p.creationDate
+  ? String(r.creationDate) === String(p.creationDate) && String(r.executable || '').toLowerCase() === String(p.executable || '').toLowerCase()
+  : /(^|\\)cmd\.exe$/i.test(r.executable || '') && String(r.command || '').includes(p.command));
 async function killLeftSetup(w, t) {
   const p = t.worktree?.setupProc;
-  if (!p) return;
-  delete t.worktree.setupProc;
-  try {
-    const same = (await processSnapshot()).some((r) => r.pid === p.pid && String(r.creationDate) === String(p.creationDate) && String(r.executable || '').toLowerCase() === String(p.executable || '').toLowerCase());
-    if (same) { await killProcessTree(p.pid); log(w, 'studio', 'system', `Studio 重開前沒跑完的 worktree 設定指令（PID ${p.pid}）已終止。`); }
-  } catch (err) { log(w, 'studio', 'system', `無法確認重開前的 worktree 設定指令（PID ${p.pid}）是否還在：${err.message}`); }
+  if (p) {
+    if ((await processSnapshot()).some((r) => sameSetup(r, p))) {
+      const res = await killProcessTree(p.pid);
+      if (!res?.ok || (await processSnapshot()).some((r) => sameSetup(r, p))) throw new Error(`PID ${p.pid} 終止失敗或仍在執行`);
+      log(w, 'studio', 'system', `Studio 重開前沒跑完的 worktree 設定指令（PID ${p.pid}）已終止。`);
+    }
+    delete t.worktree.setupProc; delete t.worktree.setupKillError;
+  }
+  t.preparing = false;
+  if (t.worktree) t.worktree.setupIgnored = []; // nothing it left is trusted at cleanup
+  t.wakeNote = [t.wakeNote, 'NOTE: Studio closed while this worktree was being prepared; its setup command did not finish. Check that dependencies are installed before you start.'].filter(Boolean).join('\n\n');
+}
+// The restart cleanup as a preparation: a claim, Resume and Close wait for it like for any other. A failure keeps the card
+// preparing with the identity and the error, and the next Resume or claim tries again.
+function leftSetup(w, t) {
+  if (preparing.has(t.id)) return preparing.get(t.id);
+  const e = { w, t, leftover: true, keys: new Set([treeKey(w.project), ...(t.workdir ? [treeKey(t.workdir)] : [])]), child: null, stopped: '' };
+  e.promise = killLeftSetup(w, t).catch((err) => {
+    if (t.worktree) t.worktree.setupKillError = err.message;
+    log(w, 'studio', 'system', `Studio 重開前沒跑完的 worktree 設定指令無法確認已停止（${err.message}）；「${t.title}」保持阻擋，按「繼續」或外部接手時會再試。`);
+    throw err;
+  }).finally(() => { preparing.delete(t.id); saveRun(w, w.run?.paused ? 'paused' : 'running'); });
+  preparing.set(t.id, e);
+  return e;
+}
+// Leftover setups of these cards ended (trying again where an earlier try failed); throws while one cannot be confirmed.
+async function endLeftSetups(w, cards) {
+  const left = cards.filter((t) => t.preparing && !preparing.has(t.id) || preparing.get(t.id)?.leftover).map((t) => leftSetup(w, t));
+  const failed = (await Promise.allSettled(left.map((e) => e.promise))).find((r) => r.status === 'rejected');
+  if (failed) throw new Error('Studio 重開前沒跑完的 worktree 設定指令無法確認已停止：' + failed.reason.message + '；可稍後再試');
 }
 async function makeWorktree(w, t, e) {
   const info = await workspaceOf(w.project);
@@ -2013,6 +2045,8 @@ async function makeWorktree(w, t, e) {
   if (w.worktreeSetup && !e.stopped) {
     const why = await worktreeSetup(w.worktreeSetup, dir, (child) => {
       e.child = child;
+      t.worktree.setupProc = { pid: child.pid, command: w.worktreeSetup }; // at once: a restart can find it even before the snapshot below
+      saveRun(w, w.run?.paused ? 'paused' : 'running');
       // kept with the card so a restarted Studio can end a command that outlived it
       processSnapshot().then((rows) => { const p = rows.find((x) => x.pid === child.pid); if (p && t.preparing && t.worktree) { t.worktree.setupProc = { pid: p.pid, creationDate: p.creationDate, executable: p.executable }; saveRun(w, w.run?.paused ? 'paused' : 'running'); } }, () => {});
     });
@@ -3074,7 +3108,8 @@ function loadRun(w, r) {
   for (const t of r.tasks) if (t.status === 'WORKING') Object.assign(t, { status: 'INTERRUPTED', result: '已中斷', resumed: true });
   for (const t of r.tasks) Object.assign(t, { hold: false, interrupted: false }, t.forcedReadOnly ? { role: 'review', writes: false, briefed: '' } : {});
   // Studio closed while a worktree was being made or set up: nothing of the setup is trusted at cleanup, and the worker is told.
-  for (const t of r.tasks.filter((x) => x.preparing)) { killLeftSetup(w, t); t.preparing = false; if (t.worktree) t.worktree.setupIgnored = []; t.wakeNote = [t.wakeNote, 'NOTE: Studio closed while this worktree was being prepared; its setup command may not have finished. Check that dependencies are installed before you start.'].filter(Boolean).join('\n\n'); }
+  // Studio closed while a worktree was being prepared: the card stays blocked until its setup command is confirmed gone.
+  for (const t of r.tasks.filter((x) => x.preparing)) leftSetup(w, t).promise.catch(() => {});
   w.tasks = r.tasks;
   w.activity = r.activity;
   w.run = { id: r.id, startedAt: r.startedAt, project: r.project, leader: r.leader, request: r.request, convs: r.convs || {}, phase: r.phase || 'working', leaderGen: 0, rounds: r.rounds || 0, ask: r.ask || null, notes: r.notes || [], goal: r.goal, refs: r.refs, context: r.context, continues: r.continues, active: false, paused: true, stopped: false, summarizing: false };
@@ -3100,6 +3135,7 @@ async function resume(w, id, opts = {}) {
   if (!run?.paused) throw new Error('沒有暫停中的工作');
   if (busyConvs(run).length || w.executingSteps?.size) throw new Error('Agent 還在停下中，請幾秒後再按繼續');
   await drainExecution(w); // restart may have left an orphan conversation
+  await endLeftSetups(w, w.tasks);
   if (!isDir(run.project)) throw new Error('專案資料夾不存在：' + run.project);
   if (!available(w.leader)) throw new Error(`Leader ${agentName(w.leader)} 目前不可用`);
   // Is the tree still this job's? (Somebody else may hold it now: another agent after a handoff, an external session.)
@@ -3242,7 +3278,7 @@ function openWorkspace(p) {
 
 function closeWorkspace(w) {
   if (w.run?.active) throw new Error('這個專案的團隊還在工作，請先暫停或停止');
-  if ([...preparing.values()].some((e) => e.w === w)) throw new Error('這個專案有工作卡的 worktree 正在準備（設定指令還在跑），請等它完成或先按停止');
+  if ([...preparing.values()].some((e) => e.w === w) || w.tasks.some((t) => t.preparing)) throw new Error('這個專案有工作卡的 worktree 正在準備（設定指令還在跑），請等它完成或先按停止');
   S.workspaces = S.workspaces.filter((x) => x !== w); // a paused job stays in 歷史紀錄
   saveSettings();
 }

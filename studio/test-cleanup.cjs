@@ -124,13 +124,36 @@ const { execFile, execFileSync } = require('node:child_process');
       trees.push(await making);
     }
     {
-      const { spawn } = require('node:child_process'), left = spawn('cmd.exe', ['/d', '/c', 'ping -n 60 127.0.0.1 > nul'], { windowsHide: true });
-      const proc = (await processSnapshot()).find((p) => p.pid === left.pid);
-      const w = newW(); w.project = repo;
-      const t = { id: 'left', title: 'left', agent: 'codex', writes: true, status: 'PAUSED', after: [], preparing: true, workdir: path.join(root, 'x'), worktree: { path: path.join(root, 'x'), setupProc: { pid: proc.pid, creationDate: proc.creationDate, executable: proc.executable } } };
-      E.api.loadRun(w, { id: 'restart', status: 'paused', tasks: [t], activity: [], convs: {} });
-      for (let i = 0; i < 500 && alive(left.pid); i++) await new Promise((r) => setTimeout(r, 20));
-      assert.ok(!alive(left.pid) && !t.preparing && !t.worktree.setupProc, 'a restart ends the setup command the closed Studio left running');
+      const { spawn } = require('node:child_process');
+      const leftover = async (env, id) => { // a setup command a closed Studio left running in a real worktree
+        const dir = path.join(root, 'left-' + id); git('worktree', 'add', '-q', dir); trees.push({ path: dir });
+        const p = spawn('cmd.exe', ['/d', '/c', 'ping -n 60 127.0.0.1 > nul'], { windowsHide: true });
+        const proc = (await processSnapshot()).find((x) => x.pid === p.pid);
+        const w = newW(); w.project = repo; env.S.workspaces.length = 0; env.S.workspaces.push(w);
+        const t = { id, title: id, agent: 'codex', writes: true, status: 'WAITING', after: [], preparing: true, workdir: dir, worktree: { path: dir, setupProc: { pid: proc.pid, creationDate: proc.creationDate, executable: proc.executable } } };
+        return { w, t, p, dir };
+      };
+      // Resumed and claimed right after the restart: the card stays blocked and the claim returns only once the old command is gone.
+      const L = await leftover(E.env, 'left');
+      E.api.loadRun(L.w, { id: 'restart', status: 'paused', tasks: [L.t], activity: [], convs: {} });
+      assert.ok(L.t.preparing, 'still blocked while the old command is being ended');
+      L.w.run.active = true; L.w.run.paused = false; E.api.pump(L.w);
+      assert.ok(L.t.status === 'WAITING' && !L.w.executingSteps?.has(L.t.id), 'the card does not start before the old command has ended');
+      L.w.run.active = false; L.w.run.paused = true;
+      await E.api.claimWorkspace(L.dir, { label: 'right after restart' });
+      assert.ok(!alive(L.p.pid) && !L.t.preparing && !L.t.worktree.setupProc, 'the claim returned only after the old setup command was ended');
+      await E.api.releaseClaim(L.dir);
+      // The kill fails: everything stays blocked, the identity is kept for a retry, and nothing says it was ended.
+      const E2 = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree: async () => ({ ok: false, killed: false }), execFile });
+      const F = await leftover(E2.env, 'stuck');
+      E2.api.loadRun(F.w, { id: 'restart2', status: 'paused', tasks: [F.t], activity: [], convs: {} });
+      for (let i = 0; i < 500 && !F.t.worktree.setupKillError; i++) await new Promise((r) => setTimeout(r, 20));
+      assert.ok(F.t.preparing && F.t.worktree.setupProc?.pid === F.p.pid && F.t.worktree.setupKillError, 'a failed kill keeps the card blocked and the identity for a retry');
+      assert.ok(!E2.env.logs.some((l) => l.text.includes('已終止')) && E2.env.logs.some((l) => l.text.includes('無法確認已停止')), 'a failed kill is not reported as ended');
+      await assert.rejects(E2.api.resume(F.w), /無法確認已停止/, 'Resume retries and refuses while it cannot be ended');
+      await assert.rejects(E2.api.claimWorkspace(F.dir, { label: 'too early' }), /無法確認已停止/, 'a claim retries and refuses while it cannot be ended');
+      await assert.rejects(Promise.resolve().then(() => E2.api.closeWorkspace(F.w)), /準備/, 'the project cannot be closed meanwhile');
+      F.p.kill();
     }
     // retry budget: a timed retry finishes a cleanup whose branch deletion failed; three temporary failures stop it; 保留 / 重試清理
     if (git('remote')) git('remote', 'remove', 'origin');
