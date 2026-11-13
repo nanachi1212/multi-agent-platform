@@ -9,13 +9,15 @@ const { execFile, execFileSync } = require('node:child_process');
   git('init', '-qb', 'main'); git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.invalid');
   fs.writeFileSync(path.join(repo, '.gitignore'), 'ignored.txt\ncache/\nnode_modules/\n'); git('add', '.'); git('commit', '-qm', 'base');
   const initial = git('rev-parse', 'HEAD'), trees = [];
-  let scenario, prHead, moved, calls;
-  const E = makeEnv(() => '', { RT: root, execFile: (cmd, args, opts, cb) => {
+  let scenario, prHead, moved, calls, afterAdd;
+  const { processSnapshot } = await import('./codex-runtime.mjs'), { killProcessTree } = await import('./runtime-registry.mjs');
+  const E = makeEnv(() => '', { RT: root, processSnapshot, killProcessTree, execFile: (cmd, args, opts, cb) => {
     calls.push([cmd, ...args]);
     if (cmd === 'gh') return cb(null, JSON.stringify([{ number: 1, headRefOid: prHead }]));
     if (scenario === 'status-error' && args.includes('status') || scenario === 'remove-error' && args.includes('remove') || scenario === 'ref-error' && args.includes('update-ref')) return cb(new Error('injected failure'), '', 'injected failure');
-    execFile(cmd, args, opts, (err, out, stderr) => {
+    return execFile(cmd, args, opts, (err, out, stderr) => {
       if (!err && scenario === 'moved-ref' && args.includes('remove')) git('update-ref', 'refs/heads/' + trees.at(-1).branch, moved);
+      if (!err && afterAdd && args.includes('worktree') && args.includes('add')) { afterAdd(args.at(-2)); return setTimeout(() => cb(err, out, stderr), 3000); } // the folder exists, Studio records it only after the claim looked
       cb(err, out, stderr);
     });
   } });
@@ -97,6 +99,38 @@ const { execFile, execFileSync } = require('node:child_process');
       await E.api.releaseClaim(t.workdir);
       w.run.active = false; const r = await making; trees.push(r, await making2);
       assert.ok(!t.preparing && t.worktree.setupIgnored, 'ready after setup'); }
+    // The whole life of a setup command is tracked: a claim right after `git worktree add` (before Studio records the
+    // folder), Stop, closing the project, and a restart all find it.
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const prepCard = (id, cmd) => { const w = newW(); w.project = repo; w.run.project = repo; w.run.active = false; w.worktreeSetup = cmd;
+      E.env.S.workspaces.length = 0; E.env.S.workspaces.push(w); const t = { id, title: id, agent: 'codex', writes: true, status: 'WAITING', after: [] }; w.tasks.push(t); return { w, t }; };
+    {
+      const { w, t } = prepCard('gap', 'ping -n 3 127.0.0.1 > nul');
+      let claimed, claimedWhilePreparing;
+      afterAdd = (dir) => { afterAdd = null; claimed = E.api.claimWorkspace(dir, { label: 'early' }).then((v) => { claimedWhilePreparing = t.preparing; return v; }); };
+      const r = await E.api.useWorktree(w, t.id); trees.push(r);
+      assert.ok(await claimed && claimedWhilePreparing === false, 'a claim made before Studio recorded the worktree still waits for the setup command');
+      await E.api.releaseClaim(r.path);
+    }
+    {
+      const { w, t } = prepCard('stopped', 'ping -n 60 127.0.0.1 > nul');
+      w.run.paused = true; const making = E.api.useWorktree(w, t.id);
+      for (let i = 0; i < 300 && !t.worktree?.setupProc; i++) await new Promise((r) => setTimeout(r, 20)); // the command runs
+      await assert.rejects(Promise.resolve().then(() => E.api.closeWorkspace(w)), /準備/, 'a project cannot be closed while its worktree is being prepared');
+      const pid = t.worktree.setupProc?.pid, began = Date.now();
+      await E.api.stopAndDrain(w);
+      assert.ok(!t.preparing && Date.now() - began < 30e3 && !alive(pid), 'Stop ends the setup command before it reports stopped');
+      trees.push(await making);
+    }
+    {
+      const { spawn } = require('node:child_process'), left = spawn('cmd.exe', ['/d', '/c', 'ping -n 60 127.0.0.1 > nul'], { windowsHide: true });
+      const proc = (await processSnapshot()).find((p) => p.pid === left.pid);
+      const w = newW(); w.project = repo;
+      const t = { id: 'left', title: 'left', agent: 'codex', writes: true, status: 'PAUSED', after: [], preparing: true, workdir: path.join(root, 'x'), worktree: { path: path.join(root, 'x'), setupProc: { pid: proc.pid, creationDate: proc.creationDate, executable: proc.executable } } };
+      E.api.loadRun(w, { id: 'restart', status: 'paused', tasks: [t], activity: [], convs: {} });
+      for (let i = 0; i < 500 && alive(left.pid); i++) await new Promise((r) => setTimeout(r, 20));
+      assert.ok(!alive(left.pid) && !t.preparing && !t.worktree.setupProc, 'a restart ends the setup command the closed Studio left running');
+    }
     // retry budget: a timed retry finishes a cleanup whose branch deletion failed; three temporary failures stop it; 保留 / 重試清理
     if (git('remote')) git('remote', 'remove', 'origin');
     const fresh = async (id) => { const w = newW(); w.project = repo; w.run.project = repo; w.run.active = false; E.env.S.workspaces.length = 0; E.env.S.workspaces.push(w);
