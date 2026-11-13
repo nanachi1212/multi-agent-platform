@@ -1025,7 +1025,9 @@ function officeHtml(w) {
       <select data-finisher style="width:auto;padding:4px 8px;font-size:13px" title="CI 跑完後，merge／同步 main／清分支改由這位接手，省下強模型的額度（等 CI 本身不花額度，Studio 自己查）"><option value="">原成員自己收尾</option>${S.agents.filter((a) => a.id !== w.leader && w.workers.includes(a.id)).map((a) => `<option value="${a.id}" ${w.finisher === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><label class="hint" style="font-size:13px;margin-left:8px;display:inline-flex;align-items:center;gap:4px" title="打勾＝每張卡用多少 token 都不會被 Studio 停下來（沒有煞車，用量自己留意）；取消打勾可以設定上限"><input type="checkbox" data-token-unlimited ${w.tokenCap ? '' : 'checked'}> 不限制 token</label>
       <input data-token-cap type="number" min="1" step="10000" value="${w.tokenCap || ''}" ${w.tokenCap ? '' : 'disabled'} placeholder="每張卡上限" style="width:104px;padding:4px 8px;font-size:13px" title="一張卡用超過這個數就停下來交給工頭（在每一步之間檢查，正在跑的那一步不會中斷；AI 沒回報用量就無法計算）">
       <span class="hint" style="font-size:13px;margin-left:8px">驗證用後端 port：</span>
-      <input data-backend-port type="number" min="1" max="65535" value="${w.backendPort || ''}" placeholder="無" style="width:72px;padding:4px 8px;font-size:13px" title="專案有自己的後端服務時填它的 port（例如 3018）：成員會請 Studio 代管啟動，卡片在等它時 Studio 會自動檢查 health 並安全恢復；留空＝不用">${w.afterDone === 'auto' ? `<span class="tag pz">🔁 自動中 ${w.autoRounds || 0}${w.autoMax ? '/' + w.autoMax : ''}</span>` : ''}</div>
+      <input data-backend-port type="number" min="1" max="65535" value="${w.backendPort || ''}" placeholder="無" style="width:72px;padding:4px 8px;font-size:13px" title="專案有自己的後端服務時填它的 port（例如 3018）：成員會請 Studio 代管啟動，卡片在等它時 Studio 會自動檢查 health 並安全恢復；留空＝不用">
+      <span class="hint" style="font-size:13px;margin-left:8px">worktree 建好後執行：</span>
+      <input data-wt-setup value="${esc(w.worktreeSetup || '')}" placeholder="無，例如 npm ci" style="width:140px;padding:4px 8px;font-size:13px" title="工作卡改用獨立 worktree 時，建好後先在那個資料夾跑這個指令（例如 npm ci），10 分鐘內要結束；失敗只記在活動紀錄，卡片照樣開始。留空＝不跑">${w.afterDone === 'auto' ? `<span class="tag pz">🔁 自動中 ${w.autoRounds || 0}${w.autoMax ? '/' + w.autoMax : ''}</span>` : ''}</div>
     ${leaseHtml(w)}
     ${workspaceLine(w)}
     ${runtimeHtml(w)}
@@ -1450,6 +1452,8 @@ document.addEventListener('change', (e) => {
   if (am) return post('/api/auto-max', { ws: ws(), max: am.value }).catch(() => {});
   const bp = e.target.closest('input[data-backend-port]');
   if (bp) return post('/api/backend-port', { ws: ws(), port: bp.value }).catch(() => {});
+  const ws2 = e.target.closest('input[data-wt-setup]');
+  if (ws2) return post('/api/worktree-setup', { ws: ws(), command: ws2.value }).catch(() => {});
   const fb = e.target.closest('select[data-fallback]');
   if (fb) return post('/api/fallback', { ws: ws(), agent: fb.value }).catch(() => {});
   const fi = e.target.closest('select[data-finisher]');

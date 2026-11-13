@@ -20,8 +20,9 @@ const { execFile, execFileSync } = require('node:child_process');
     });
   } });
   try {
-    for (scenario of ['clean', 'dirty', 'ignored', 'status-error', 'remove-error', 'ref-error', 'moved-ref', 'old-pr', 'squash-pr', 'dirty-remote', 'outside', 'include', 'include-edited']) {
+    for (scenario of ['clean', 'setup', 'dirty', 'ignored', 'status-error', 'remove-error', 'ref-error', 'moved-ref', 'old-pr', 'squash-pr', 'dirty-remote', 'outside', 'include', 'include-edited', 'setup-include']) {
       calls = []; const w = newW(); w.project = repo; w.run.project = repo; w.run.active = false;
+      if (scenario.startsWith('setup')) w.worktreeSetup = 'echo made> ignored.txt'; // setup-include: overwrites the .worktreeinclude copy
       const t = { id: scenario, title: scenario, agent: 'codex', writes: true, status: 'PAUSED', after: [] }; w.tasks.push(t);
       if (scenario === 'include') { // once: an ignored file and folder, and the include list itself (tracked, like Orca's)
         fs.mkdirSync(path.join(repo, 'deps')); fs.writeFileSync(path.join(repo, 'deps', 'x.txt'), 'dep');
@@ -30,6 +31,8 @@ const { execFile, execFileSync } = require('node:child_process');
         git('add', '.'); git('commit', '-qm', 'include list');
       }
       const { path: dir, branch } = await E.api.useWorktree(w, t.id); trees.push({ path: dir, branch });
+      if (scenario === 'setup') assert.deepStrictEqual([fs.readFileSync(path.join(dir, 'ignored.txt'), 'utf8').trim(), t.worktree.setupIgnored, t.hold, E.env.logs.at(-1).text.includes('設定指令已完成')], ['made', ['!! ignored.txt'], false, true], 'the setup command ran in the worktree before the card');
+      if (scenario === 'setup-include') assert.deepStrictEqual(t.worktree.setupIgnored, [], 'a .worktreeinclude path is never the setup command\'s');
       if (scenario.startsWith('include')) {
         prHead = git('-C', dir, 'rev-parse', 'HEAD');
         assert.strictEqual(fs.readFileSync(path.join(dir, 'ignored.txt'), 'utf8'), 'secret', 'the ignored file is copied');
@@ -49,7 +52,8 @@ const { execFile, execFileSync } = require('node:child_process');
       if (scenario === 'outside') t.worktree.path = repo;
       await E.api.cleanupWorktree(w, t);
       assert.ok(!calls.some((c) => c.includes('--force') || c.includes('-D')), 'production cleanup never uses force');
-      if (['clean', 'squash-pr', 'include'].includes(scenario)) {
+      if (scenario === 'setup-include') assert.deepStrictEqual([fs.readFileSync(path.join(dir, 'ignored.txt'), 'utf8').trim(), t.worktree.cleanupError], ['made', '仍有修改、未追蹤或忽略的檔案'], 'a changed copy still stops cleanup');
+      if (['clean', 'setup', 'squash-pr', 'include'].includes(scenario)) {
         assert.strictEqual(t.worktree.cleaned, true, scenario + ': ' + t.worktree.cleanupError); assert.ok(!fs.existsSync(dir)); assert.strictEqual(git('branch', '--list', branch), '');
         if (scenario === 'include') assert.deepStrictEqual([fs.readFileSync(path.join(repo, 'deps', 'x.txt'), 'utf8'), fs.readFileSync(path.join(repo, 'ignored.txt'), 'utf8')], ['dep', 'secret'], 'removing the link and the copy never touches the primary checkout');
       } else {
@@ -88,7 +92,7 @@ const { execFile, execFileSync } = require('node:child_process');
     assert.ok(c.t.worktree.kept && E.env.logs.at(-1).text.includes('保留'));
     scenario = 'clean'; await E.api.worktreeCleanupAction(c.w, c.t.id, 'retry');
     assert.ok(c.t.worktree.cleaned && !c.t.worktree.kept && !fs.existsSync(c.path), '重試清理 runs now with a fresh budget');
-    console.log('worktree cleanup: dirty/ignored files, failed checks/removal, current PR HEAD, squash merge, moved ref, path containment, .worktreeinclude copy/link and its removal, retry budget, keep / retry: PASS');
+    console.log('worktree cleanup: dirty/ignored files, failed checks/removal, current PR HEAD, squash merge, moved ref, path containment, .worktreeinclude copy/link and its removal, worktree setup command, retry budget, keep / retry: PASS');
   } finally {
     for (const wt of trees) if (fs.existsSync(wt.path)) git('worktree', 'remove', '--force', wt.path);
     fs.rmSync(root, { recursive: true, force: true });
