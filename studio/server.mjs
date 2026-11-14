@@ -1936,6 +1936,8 @@ async function handoffExcerpt(cid, from) {
   const left = items.length - out.length;
   return (left ? `(${left} earlier messages left out)\n` : '') + out.join('\n\n');
 }
+// Separate from t.hold: fallback deliberately holds a card before requesting a handoff.
+const ownershipTransitions = new WeakSet();
 async function handoffWriter(w, toAgent, taskId, extraNote = '') {
   if (!AGENTS[toAgent]) throw new Error('未知的 Agent');
   if (!available(toAgent)) throw new Error(`${agentName(toAgent)} 目前不可用`);
@@ -1944,20 +1946,36 @@ async function handoffWriter(w, toAgent, taskId, extraNote = '') {
   const held = S.leases.find((l) => l.mode === 'write' && l.jobId === run.id && ['ACTIVE', 'RESERVED'].includes(leaseState(l)));
   const t = taskId ? w.tasks.find((x) => x.id === taskId) : held && w.tasks.find((x) => x.id === held.cardId);
   if (!t) throw new Error('目前沒有人在這個工作區寫入，不需要交接（直接把工作卡改派即可）');
+  if (t.status === 'DONE') throw new Error('這張工作卡已完成，不能改派或交接');
+  if (ownershipTransitions.has(t)) throw new Error('這張卡正在交接或切換寫入權，請稍後再試');
   if (t.preparing) throw new Error('這張卡的 worktree 還在準備中（建立或設定指令），完成後才能交接');
   if (run.stopped) throw new Error('這件工作已經停止，不能交接');
   const from = t.agent;
   if (from === toAgent) throw new Error(`${agentName(toAgent)} 已經是這張卡的寫入者`);
+  const generation = t.leaseGeneration || 0, workdir = t.workdir;
+  ownershipTransitions.add(t);
+  try {
   // PAUSED is a visible state, not proof that the old turn has stopped.
   t.hold = true;
   if (t.status === 'WORKING' || w.executingSteps?.has(t.id)) t.interrupted = true;
   saveRun(w, run.paused ? 'paused' : 'running');
   try { await drainExecution(w, [t]); }
-  catch (e) { t.hold = false; t.interrupted = false; throw e; }
+  catch (e) {
+    t.stopUnconfirmed = true;
+    if (w.run === run && run.active) pause(w); // a failed stop must not let another pump retry this card
+    if (w.run === run) saveRun(w, run.stopped ? 'stopped' : 'paused');
+    throw e;
+  }
+  const assertCurrent = () => {
+    if (w.run !== run || run.stopped || !w.tasks.includes(t) || t.agent !== from || (t.leaseGeneration || 0) !== generation || t.workdir !== workdir || t.preparing)
+      throw new Error('等待期間工作或卡片已變更，取消交接');
+  };
+  assertCurrent();
   // 4-5. the old agent gives up the lease; the card (with its conversation, history) goes to the new agent
   const prior = await handoffExcerpt(run.convs[workKey(t)], from);
   const info = await workspaceOf(t.workdir || w.project);
   withLeaseTransaction(() => {
+  assertCurrent(); // no await between validation and publishing the replacement owner
   const holder = writerOf(info.key);
   if (holder && !sameCard(holder, w, t)) throw new Error('工作區已由另一個 Agent 接手');
   for (const l of S.leases) if (l.jobId === run.id && l.cardId === t.id && l.owner.agent === from && (l.generation || 0) === (t.leaseGeneration || 0)) { l.revoked = true; retire(l, `交接給 ${agentName(toAgent)}`); }
@@ -1975,6 +1993,7 @@ async function handoffWriter(w, toAgent, taskId, extraNote = '') {
   if (run.active) pump(w);
   saveRun(w, run.paused ? 'paused' : 'running'); // the record now says who owns the card
   return { ok: true, card: t.title, from, to: toAgent };
+  } finally { ownershipTransitions.delete(t); t.hold = false; t.interrupted = false; }
 }
 
 // ----- parallel work the right way: an own worktree (own branch, own lease) -----
@@ -1982,6 +2001,8 @@ const slugOf = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replac
 async function useWorktree(w, taskId) {
   const t = w.tasks.find((x) => x.id === taskId);
   if (!t || !isWriter(t)) throw new Error('只有會修改檔案的工作卡才需要獨立 worktree');
+  if (ownershipTransitions.has(t)) throw new Error('這張卡正在交接或切換寫入權，請稍後再試');
+  if (t.stopUnconfirmed || t.runtimeStopPending) throw new Error('Agent 還在停下中，請先完成暫停');
   if (t.workdir) throw new Error('這張卡已經在獨立 worktree 裡');
   if (['WORKING', 'DONE'].includes(t.status) || w.executingSteps?.has(t.id)) throw new Error('這張卡已經開始或已完成');
   if (t.preparing) throw new Error('這張卡的 worktree 正在準備中');
@@ -2022,10 +2043,31 @@ async function stopPreparing(w, why) {
   await Promise.all(mine.map(killSetup));
   await Promise.all(mine.map((e) => e.promise.catch(() => {})));
 }
+// Start one identity query at spawn, before Stop can run. Stop waits for this same query;
+// it never learns a replacement identity from a later retry of an unknown/reused PID.
+function rememberSetupProcess(e, child) {
+  const { w, t } = e;
+  e.child = child;
+  t.worktree.setupProc = { pid: child.pid, command: w.worktreeSetup };
+  e.identity = processSnapshot().then((rows) => {
+    const p = rows.find((x) => x.pid === child.pid);
+    if (!p?.creationDate || !p.executable || child.exitCode != null || child.signalCode != null) return null;
+    const identity = { pid: p.pid, creationDate: p.creationDate, executable: p.executable };
+    if (!e.stuck && t.preparing && t.worktree?.setupProc?.pid === child.pid) {
+      t.worktree.setupProc = identity;
+      saveRun(w, w.run?.paused ? 'paused' : 'running');
+    }
+    return identity;
+  }).catch(() => null); // unknown remains blocked while its PID is alive
+  saveRun(w, w.run?.paused ? 'paused' : 'running'); // durable even before the identity query settles
+}
 // Ends a running setup command with everything it started (Stop, closing, the 10-minute limit).
 async function killSetup(e) {
   if (!e.child?.pid || e.killing) return;
-  e.killing = killProcessTree(e.child.pid).catch(() => ({ ok: false, remaining: [e.child.pid] }));
+  e.killing = (async () => {
+    const identity = e.identity ? await e.identity : e.t.worktree?.setupProc;
+    return killProcessTree(e.child.pid, processSnapshot, identity || { pid: e.child.pid });
+  })().catch(() => ({ ok: false, remaining: [e.child.pid] }));
   const k = await e.killing;
   if (!k.ok) await setupStuck(e, k);
 }
@@ -2073,7 +2115,7 @@ async function killLeftSetup(w, t) {
     if (odd) throw new Error(`PID ${odd.pid} 仍在執行，但無法確認是不是當時的設定指令（沒有記到建立時間），所以沒有終止它；請自行確認並結束該程序，或等它結束後再試`);
     const live = procs.filter((p) => rows.some((r) => sameSetup(r, p)));
     if (live.length) {
-      const res = await Promise.all(live.map((p) => killProcessTree(p.pid).catch(() => ({ ok: false, remaining: [p.pid] }))));
+      const res = await Promise.all(live.map((p) => killProcessTree(p.pid, processSnapshot, p).catch(() => ({ ok: false, remaining: [p.pid] }))));
       // what this kill reported as still there is recorded before refusing: the next try checks it too
       if (res.some((r) => !r?.ok)) { recordLeft(t, res.flatMap(leftOf)); throw new Error(`PID ${live.map((p) => p.pid).join('、')} 終止失敗或仍在執行`); }
       if ((await processSnapshot()).some((r) => live.some((p) => sameSetup(r, p)))) throw new Error(`PID ${live.map((p) => p.pid).join('、')} 終止失敗或仍在執行`);
@@ -2122,13 +2164,7 @@ async function makeWorktree(w, t, e) {
   Object.assign(t, { workdir: dir, worktree: { path: dir, branch, base, repoPath: info.path, included: inc.entries }, blocked: null, blockReason: '', blockLogged: '' });
   log(w, 'studio', 'system', `「${t.title}」改在獨立 worktree 做（branch ${branch}）：不會碰到主資料夾的寫入者。${inc.text ? ' .worktreeinclude：' + inc.text + '。' : ''}`);
   if (w.worktreeSetup && !e.stopped) {
-    const why = await worktreeSetup(w.worktreeSetup, dir, () => { e.stopped ||= '超過 10 分鐘沒有結束'; return killSetup(e); }, (child) => {
-      e.child = child;
-      t.worktree.setupProc = { pid: child.pid, command: w.worktreeSetup }; // at once: a restart can find it even before the snapshot below
-      saveRun(w, w.run?.paused ? 'paused' : 'running');
-      // kept with the card so a restarted Studio can end a command that outlived it
-      processSnapshot().then((rows) => { const p = rows.find((x) => x.pid === child.pid); if (p && t.preparing && t.worktree) { t.worktree.setupProc = { pid: p.pid, creationDate: p.creationDate, executable: p.executable }; saveRun(w, w.run?.paused ? 'paused' : 'running'); } }, () => {});
-    });
+    const why = await worktreeSetup(w.worktreeSetup, dir, () => { e.stopped ||= '超過 10 分鐘沒有結束'; return killSetup(e); }, (child) => rememberSetupProcess(e, child));
     // Stuck (a kill failed): the card is the retry's now, and it may already be cleared and running; this late result of
     // the command touches nothing (above all no setupIgnored list that would let cleanup delete files).
     if (e.stuck) return { path: dir, branch };
@@ -2177,6 +2213,7 @@ async function useReadOnly(w, taskId) {
   if (w.tasks.some((x) => x !== t && workKey(x) === workKey(t) && (x.status === 'WORKING' || w.executingSteps?.has(x.id)))) throw new Error('這位成員正在用同一個對話執行另一張卡；請先完成暫停');
   const run = w.run;
   if (!run || run.stopped) throw new Error('這件工作已經停止，不能切換唯讀');
+  ownershipTransitions.add(t);
   t.hold = true;
   try {
     await drainExecution(w, [t]);
@@ -2185,7 +2222,7 @@ async function useReadOnly(w, taskId) {
     await releaseLock(w, t);
     Object.assign(t, { role: 'review', writes: false, forcedReadOnly: true, briefed: '', blocked: null, blockReason: '', blockLogged: '',
       instructions: t.instructions + '\n\nNOTE: this card is now READ-ONLY. Review / analysis / report only; do not perform earlier instructions that require writes or test/build commands. Report GO, GO WITH CHANGES or NO-GO with evidence from reading.' });
-  } finally { t.hold = false; }
+  } finally { ownershipTransitions.delete(t); t.hold = false; }
   log(w, 'studio', 'system', `「${t.title}」改成唯讀 Review：只讀、不修改，可以和寫入者同時進行。`);
   saveRun(w, run.paused ? 'paused' : 'running');
   pump(w);
@@ -3228,6 +3265,7 @@ async function resume(w, id, opts = {}) {
       if (settingUp(w)) throw new Error('這個專案目前的工作還有卡片的 worktree 在準備（設定指令還在跑），請等它完成或按 Stop 再切換');
       if (w.run?.id !== id) {
         if (w.run?.active) throw new Error('這個專案有進行中的工作，請先暫停或停止');
+        if (stillStopping(w)) throw new Error('Agent 還在停下中，不能切換歷史工作');
         loadRun(w, r);
       }
       return resumeJob(w, opts);
@@ -3292,6 +3330,7 @@ async function resumeJob(w, opts) {
 async function reassign(w, taskId, agent) {
   const t = w.tasks.find((x) => x.id === taskId);
   if (!t) throw new Error('找不到這項工作');
+  if (t.status === 'DONE') throw new Error('這張工作卡已完成，不能改派或交接');
   if (w.run?.stopped) throw new Error('這件工作已經停止，不能改派');
   if (w.executingSteps?.has(t.id) || t.status === 'WORKING' || t.stopUnconfirmed) throw new Error('Agent 還在停下中，請先完成暫停');
   if (isWriter(t)) return handoffWriter(w, agent, taskId);
@@ -3397,8 +3436,14 @@ function removeRecent(p) {
 
 function readProjectProgress(w) {
   const file = path.join(w.project, '.ai-workspace', 'progress.md');
-  if (!fs.existsSync(file)) return { exists: false, text: '' };
-  return { exists: true, text: fs.readFileSync(file, 'utf8'), file };
+  try { return { exists: true, text: fs.readFileSync(file, 'utf8'), file }; }
+  catch (error) {
+    if (error?.code === 'ENOENT') return { exists: false, text: '' };
+    // Keep one unreadable optional file from breaking every project's state. Never return
+    // the raw exception message: it can contain file contents or other private details.
+    const code = ['EACCES', 'EPERM', 'EISDIR', 'ENOTDIR', 'EIO', 'EMFILE', 'ENFILE', 'EBUSY', 'ELOOP', 'ENAMETOOLONG'].includes(error?.code) ? error.code : 'IO_ERROR';
+    return { exists: false, text: '', file, error: `無法讀取專案進度（${code}）` };
+  }
 }
 
 function browseFolder() {

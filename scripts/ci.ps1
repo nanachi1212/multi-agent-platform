@@ -25,6 +25,12 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Studio runtime checks failed' }
     & node studio/lifecycle-check.cjs
     if ($LASTEXITCODE -ne 0) { throw 'Studio lifecycle checks failed' }
+    foreach ($file in @('studio/test-ui-safety.cjs', 'studio/test-runtime-identity.cjs', 'studio/test-audit-lifecycle.cjs', 'studio/test-progress-read.cjs', 'studio/test-lease-recovery.cjs')) {
+        & node --check $file
+        if ($LASTEXITCODE -ne 0) { throw "Audit regression syntax failed: $file" }
+        & node $file
+        if ($LASTEXITCODE -ne 0) { throw "Audit regression failed: $file" }
+    }
     & git diff --check
     if ($LASTEXITCODE -ne 0) { throw 'Git whitespace check failed' }
     Write-Host "Studio CI $Mode PASS"

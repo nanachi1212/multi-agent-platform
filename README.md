@@ -69,7 +69,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 **省額度**
 - 工頭不讀檔、不查 repo、不跑指令，只規劃與確認；調查和動手都交給成員。Claude Code 只在 Codex 和 Antigravity 做不了時才拿到工作卡。
 - 模型策略（每個專案）：💰 省額度（預設，普通卡 Sonnet／Luna，困難卡自動升級 Opus／Sol）、⚖️ 均衡、🚀 品質優先、🛠️ 自訂。工頭固定用強的那檔（它負責規劃和拍板，回合少但錯了最貴）；成員的普通卡用便宜的，工頭自己判斷普通或困難，普通卡失敗會自動改用強模型重試一次。
-- 每張卡 token 上限（每個專案，預設 30 萬，0 = 不限）：一張卡用超過就停下來標成失敗，交給工頭決定要不要換方法重試。只在每一步之間檢查，正在跑的那一步不會中斷；AI 沒回報用量的卡無法計算。
+- 每張卡 token 上限（每個專案，預設 0 = 不限）：一張卡用超過就停下來標成失敗，交給工頭決定要不要換方法重試。只在每一步之間檢查，正在跑的那一步不會中斷；AI 沒回報用量的卡無法計算。
 - 員工卡顯示 Claude（5 小時＋每週）與 Codex（每週）的額度條。Claude 額度只在 Studio 啟動和按「更新」時讀取一次。
 - **收尾者**：每個專案可指定一位便宜成員（例如本地模型）。CI 跑完後，merge／同步 main／清分支改由它接手，原成員的額度留給寫程式；等 CI 本身不花額度（Studio 自己用 `gh` 查）。
 - **撤出成員**：員工卡上「⏏ 撤出，卡改派給…」。額度用完時把它移出這個專案，手上未完成的卡（正在寫入的會先停下再交接）改派給你選的人。
@@ -165,7 +165,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 **Saving quota**
 - The Leader does not read files, search the repo or run commands; it only plans and checks, and sends investigation and work to workers. Claude Code gets a card only when Codex and Antigravity cannot do it.
 - Model strategy per project: 💰 save (default; normal cards Sonnet / Luna, hard cards auto-upgrade to Opus / Sol), ⚖️ balanced, 🚀 quality, 🛠️ custom. The Leader always runs on the strong tier (it plans and signs off: few turns, costly mistakes); worker cards use the normal tier unless the Leader marks them hard, and a failed normal card is retried once on the strong model.
-- Token cap per card (per project, default 300k, 0 = none): a card over it is stopped and marked failed; the Leader decides whether to retry another way. Checked between steps only (a running step is not cut), and only for agents that report usage.
+- Token cap per card (per project, default 0 = none): a card over it is stopped and marked failed; the Leader decides whether to retry another way. Checked between steps only (a running step is not cut), and only for agents that report usage.
 - Seat cards show Claude (5-hour + weekly) and Codex (weekly) usage bars. Claude usage is read only at Studio start and on refresh.
 - **Finisher**: per project, a cheap agent (e.g. a local model) that takes a card over once its CI is done and does the merge / sync main / cleanup chain, so the strong model's quota goes to coding. Waiting for CI itself costs nothing (Studio polls `gh`).
 - **Withdraw**: "⏏ 撤出，卡改派給…" on a seat card removes an agent from the project (e.g. its quota is gone) and moves its unfinished cards (a writing card is stopped first, then handed over) to the agent you pick.

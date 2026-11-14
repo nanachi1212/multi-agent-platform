@@ -18,6 +18,57 @@ export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, A
   // Serialize admission and persistence between processes; malformed/live locks fail closed.
   let inTransaction = false;
   let pendingUnlockToken = null;
+  const pendingRecoveryUnlocks = new Map();
+  const locked = () => new Error('Workspace lease store is locked');
+  // A recovery guard is immutable while owned. Never unlink somebody else's stale guard:
+  // two reclaimers could otherwise both read a dead owner, then one delete the other's new lock.
+  // Instead they compete for the same successor path derived from that dead owner's token.
+  // A fully written file is published with linkSync (atomic create-if-absent), so a crash cannot
+  // expose an empty recovery guard. Old/unknown empty guards still fail closed.
+  function takeRecoveryGate(base) {
+    const seen = new Set();
+    let file = base;
+    for (let depth = 0; depth < 64 && !seen.has(file); depth++) {
+      seen.add(file);
+      const token = crypto.randomUUID(), candidate = base + '.candidate-' + token;
+      const owner = { pid: process.pid, instance: INSTANCE, token };
+      let published = false;
+      try {
+        fs.writeFileSync(candidate, JSON.stringify(owner), { flag: 'wx', flush: true });
+        try { fs.linkSync(candidate, file); published = true; }
+        catch (e) {
+          if (e.code !== 'EEXIST') throw new Error('Workspace lease recovery requires atomic hard-link support: ' + (e.code || e.message), { cause: e });
+        }
+      } finally {
+        // An unpublished candidate is never a lock. A transient Windows handle may leave this
+        // uniquely named harmless file behind; do not overturn successful guard publication.
+        try { fs.unlinkSync(candidate); } catch (e) {
+          if (!['ENOENT', 'EPERM', 'EBUSY'].includes(e.code)) console.error('Workspace lease recovery candidate cleanup deferred: ' + e.message);
+        }
+      }
+      if (published) return { file, token };
+      let prior;
+      try { prior = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { throw locked(); }
+      if (!Number.isInteger(prior?.pid) || prior.pid <= 0 || typeof prior.token !== 'string'
+          || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(prior.token)) throw locked();
+      // A completed transaction may retain its own guard after transient unlink failure.
+      if (prior.pid === process.pid && prior.instance === INSTANCE && pendingRecoveryUnlocks.get(file) === prior.token) {
+        pendingRecoveryUnlocks.delete(file); return { file, token: prior.token };
+      }
+      if (pidAlive(prior.pid)) throw locked();
+      file = base + '.' + prior.token;
+    }
+    throw locked(); // malformed cyclic or excessively deep chains are not ownership proof
+  }
+  function dropRecoveryGate(gate) {
+    try { fs.unlinkSync(gate.file); pendingRecoveryUnlocks.delete(gate.file); }
+    catch (e) {
+      // This is our immutable guard; leaving it is safe and can be retried by exact token.
+      // Cleanup must not throw after the main fd was acquired (or mask the original error).
+      pendingRecoveryUnlocks.set(gate.file, gate.token);
+      if (!['ENOENT', 'EPERM', 'EBUSY'].includes(e.code)) console.error('Workspace lease recovery guard cleanup deferred: ' + e.message);
+    }
+  }
   function withLeaseTransaction(fn) {
     if (inTransaction) return fn();
     const f = leasesFile() + '.lock';
@@ -38,13 +89,12 @@ export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, A
       }
       if (!fd) {
         if (!owner.pid || pidAlive(owner.pid)) throw new Error('Workspace lease store is locked');
-        let recovery;
-        try { recovery = fs.openSync(f + '.reclaim', 'wx'); } catch { throw new Error('Workspace lease store is locked'); }
+        const recovery = takeRecoveryGate(f + '.reclaim');
         try {
           const current = JSON.parse(fs.readFileSync(f, 'utf8'));
-          if (!current.pid || pidAlive(current.pid)) throw new Error('Workspace lease store is locked');
+          if (!Number.isInteger(current.pid) || current.pid <= 0 || pidAlive(current.pid)) throw locked();
           fs.unlinkSync(f); fd = fs.openSync(f, 'wx');
-        } finally { fs.closeSync(recovery); fs.unlinkSync(f + '.reclaim'); }
+        } finally { dropRecoveryGate(recovery); }
       }
     }
     let snapshot;
