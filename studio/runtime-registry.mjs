@@ -59,10 +59,11 @@ export async function getProcessInfo(pid) {
 
 // Windows reuses PIDs, so ParentProcessId alone can adopt an unrelated process (reports/evidence/INCIDENT-w1-pid-reuse.md).
 // processTree follows only children created at or after their parent. A failed snapshot throws: it is not an empty tree.
-export async function getChildPids(parentPid, snapshot = processSnapshot) {
+export async function getChildPids(parentPid, snapshot = processSnapshot, expectedIdentity = null) {
   if (!parentPid || !isPidAlive(parentPid)) return [];
   const rows = await snapshot();
   const root = rows.find((p) => p.pid === parentPid);
+  if (root && expectedIdentity && !sameIdentity(root, { ...expectedIdentity, pid: parentPid })) throw new Error('Root process identity changed');
   return root ? processTree(rows, root).slice(1).map((p) => p.pid) : [];
 }
 
@@ -77,6 +78,7 @@ const sameIdentity = (a, b) => a.pid === b.pid && String(a.creationDate) === Str
 export async function killIdentities(list, snapshot = processSnapshot) {
   const verified = [];
   for (const old of list) {
+    if (!old?.creationDate || !old?.executable) throw new Error('Process identity is unconfirmed');
     // ponytail: one snapshot per kill (~1 s each) so an earlier kill cannot free a PID this loop then reuses; batch if trees get large
     if (!(await snapshot()).some((p) => sameIdentity(p, old))) continue;
     verified.push(old.pid);
@@ -91,19 +93,32 @@ export async function killIdentities(list, snapshot = processSnapshot) {
  * Children are killed only if a fresh snapshot, taken after the root died, still shows the same creation time and executable.
  * NEVER kills by process name (no Stop-Process -Name python).
  */
-export async function killProcessTree(rootPid, snapshot = processSnapshot) {
+export async function killProcessTree(rootPid, snapshot = processSnapshot, expectedIdentity = null) {
   if (!rootPid || !isPidAlive(rootPid)) return { ok: true, killed: false };
   let children, root;
+  const expected = expectedIdentity ? { ...expectedIdentity, pid: rootPid } : null;
+  const unconfirmed = () => ({ ok: false, killed: false, rootPid, children: [], remaining: [rootPid],
+    left: [expected?.creationDate && expected?.executable ? expected : { pid: rootPid }] });
   try {
     const rows = await snapshot(); root = rows.find((p) => p.pid === rootPid);
-    children = root ? processTree(rows, root).slice(1) : [];
-  } catch (e) { return { ok: false, killed: false, rootPid, children: [], remaining: [rootPid], left: [{ pid: rootPid }] }; } // unknown tree: kill nothing
+    // A successful query without the root is not permission to kill its bare PID. In particular,
+    // keep a caller's saved identity: a later snapshot must never adopt a recycled root.
+    if (!root?.creationDate || !root.executable || expected && !sameIdentity(root, expected)) return unconfirmed();
+    children = processTree(rows, root).slice(1);
+  } catch (e) { return unconfirmed(); } // unknown tree: kill nothing, retain the caller's identity
   // `left`: what is still there, with the identity from this snapshot, taken before anything was killed (a later snapshot
   // could show a reused PID); a PID it did not show has no identity.
   const known = [root, ...children].filter(Boolean);
   const idOf = (pid) => { const p = known.find((x) => x.pid === pid); return p?.creationDate ? { pid, creationDate: p.creationDate, executable: p.executable } : { pid }; };
 
-  try { process.kill(rootPid, 'SIGKILL'); } catch (e) {} // already exited
+  // Revalidate the root immediately before killing it, just as killIdentities does for children.
+  // On an ambiguous/missing root keep the saved tree for recovery, but kill nothing.
+  try {
+    if (!(await snapshot()).some((p) => sameIdentity(p, root))) {
+      return { ok: false, killed: false, rootPid, children: [], remaining: known.map((p) => p.pid), left: known.map((p) => idOf(p.pid)) };
+    }
+  } catch (e) { return { ok: false, killed: false, rootPid, children: [], remaining: known.map((p) => p.pid), left: known.map((p) => idOf(p.pid)) }; }
+  try { process.kill(rootPid, 'SIGKILL'); } catch (e) {} // already exited, or still alive and reported below
   let victims = [];
   try { victims = await killIdentities(children, snapshot); }
   catch (e) { const remaining = [rootPid, ...children.map((p) => p.pid)].filter(isPidAlive); return { ok: false, killed: true, rootPid, children: [], remaining, left: remaining.map(idOf) }; }
@@ -186,7 +201,7 @@ export async function cleanupRuntime(runtime, { rtDir = null, customRuntimes = n
   const verified = await verifyRuntimeProcess(runtime);
   if (!verified.ok) return { ok: false, reason: verified.reason || 'Runtime owner is unknown' };
   if (verified.alive) {
-    const killed = await killProcessTree(runtime.root_pid);
+    const killed = await killProcessTree(runtime.root_pid, processSnapshot, runtime.process_identity);
     if (!killed.ok) return { ok: false, reason: `Runtime processes have not stopped: ${killed.remaining.join(', ')}` };
   }
   if (runtime.temp_dir && isSafeTempDir(runtime.temp_dir)) {
@@ -357,12 +372,17 @@ export async function checkPortOwnership(port, { desiredJobId, desiredDataDir, r
   }
 
   const runtimes = customRuntimes || loadRuntimes(runtimesFile(rtDir));
-  let matched = runtimes.find((r) => r.status === 'running' && r.created_by === 'studio'
-    && (r.root_pid === occupantPid || (r.child_pids && r.child_pids.includes(occupantPid))));
-  if (matched) {
-    const verified = await verifyRuntimeProcess(matched);
-    const descendants = matched.root_pid === occupantPid ? [] : await getChildPids(matched.root_pid).catch(() => []);
-    if (!verified.ok || !verified.alive || matched.root_pid !== occupantPid && !descendants.includes(occupantPid)) matched = null;
+  // Managed runtimes are registered before their listener children exist. The saved child list
+  // is only a hint, not the admission gate: check the current tree for a runtime assigned this port.
+  const candidates = runtimes.filter((r) => r.status === 'running' && r.created_by === 'studio'
+    && (r.port === port || r.root_pid === occupantPid || r.child_pids?.includes(occupantPid)));
+  let matched = null;
+  for (const candidate of candidates) {
+    const verified = await verifyRuntimeProcess(candidate);
+    if (!verified.ok || !verified.alive) continue;
+    const descendants = candidate.root_pid === occupantPid ? []
+      : await getChildPids(candidate.root_pid, processSnapshot, candidate.process_identity).catch(() => []);
+    if (candidate.root_pid === occupantPid || descendants.includes(occupantPid)) { matched = candidate; break; }
   }
 
   if (matched) {

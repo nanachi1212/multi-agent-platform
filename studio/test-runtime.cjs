@@ -341,7 +341,7 @@ async function runRuntimeTests() {
     const row = (pid, parent, s, exe = 'node.exe') => ({ pid, parent, executable: exe, command: '', creationDate: new Date(s * 1000).toISOString() });
     const before = [row(root.pid, 1, 100), row(reused.pid, root.pid, 200), row(same.pid, root.pid, 200)];
     let calls = 0;
-    const result = await registry.killProcessTree(root.pid, async () => ++calls === 1 ? before
+    const result = await registry.killProcessTree(root.pid, async () => ++calls <= 2 ? before
       : [row(reused.pid, 1, 999), row(same.pid, 1, 200, 'NODE.EXE')]); // reused PID: new creation time
     assert.deepStrictEqual(result.children, [same.pid]);
     assert.ok(registry.isPidAlive(reused.pid), 'a reused child PID is never killed');

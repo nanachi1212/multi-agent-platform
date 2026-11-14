@@ -715,10 +715,13 @@ async function showStepDiff(n) {
   workDiff = { n, text: r.ok ? j.text || '（沒有差異）' : j.error || '讀取失敗' };
   loadWork();
 }
+let workLoadSeq = 0;
 async function loadWork() {
   if (!workOpen || !$('workDlg').open) return;
-  const r = await fetch('/api/card/detail', { method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify({ ws:workOpen.ws, taskId:workOpen.id }) });
+  const target = workOpen, seq = ++workLoadSeq;
+  const r = await fetch('/api/card/detail', { method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify({ ws:target.ws, taskId:target.id }) });
   const d = await r.json().catch(() => ({}));
+  if (seq !== workLoadSeq || workOpen !== target || !$('workDlg').open) return;
   if (!r.ok) { $('workBody').innerHTML = `<div class="empty">${esc(d.error || '讀取失敗')}</div>`; return; }
   workLogOpen = !!$('workLog')?.open;
   $('workTitle').textContent = `${name(d.agent)} · ${d.title}`;
@@ -749,16 +752,16 @@ function askFlag(t) {
   if (q.state === 'answered') return `<div class="ask-flag done"><b>💬 AI 已回覆</b>（${hhmm(q.answeredAt)}）\n${esc(q.answer)}</div>`;
   return `<div class="ask-flag bad"><b>💬 詢問沒送達</b>${q.answer ? '\n' + esc(q.answer) : ''}</div>`;
 }
-function boardHtml(tasks, agents, editable) {
+function boardHtml(tasks, agents, editable, workspace = null) {
   if (!tasks.length) return '<div class="empty">還沒有工作卡。在上面說你要什麼、按「交給團隊」，工頭會拆成工作卡派給成員。</div>';
   const avail = agents.filter((a) => a.status === 'available');
-  const w = S.workspaces.find((x) => x.project === curPath()) || {};
+  const w = workspace || S.workspaces.find((x) => x.project === curPath()) || {};
   return `<div class="board">${LANES.map(([st, label]) => {
     const list = tasks.filter((t) => st.includes(t.status));
     return `<div class="lane${laneFolded(st.join(',')) ? ' folded' : ''}"><div class="lane-h" data-fold="${st.join(',')}" title="點一下收起／展開這一欄">${label}<span class="n">${list.length}</span></div>${list.map((t) => {
       const blk = cardBlockedReason(t);
       const ws = formatWorkspace(w, t);
-      const rts = runtimesOf(w, t);
+      const rts = w.historical ? [] : runtimesOf(w, t);
       const tagHtml = blk ? '<span class="tag bad">Blocked</span>' : (t.status === 'PAUSED' || t.status === 'INTERRUPTED' || PARKED.includes(t.status) ? `<span class="tag ${t.status === 'NEEDS_USER' ? 'bad' : 'pz'}">${STEP_WORD[t.status]}</span>` : '');
       return `
       <div class="card${t.asks?.length ? ' has-ask' : ''}" style="--c:${look(t.agent).c}">
@@ -774,10 +777,10 @@ function boardHtml(tasks, agents, editable) {
         <div class="res" style="font-size:12px;opacity:0.85">📁 <b>Workspace</b> ${esc(ws.fullLine)}</div>
         <div class="res" style="font-size:12px;opacity:0.85">⚡ <b>Runtime</b> ${rts.length ? esc(rts.map(formatRuntimeItem).join(' · ')) : '—'}</div>
         ${t.blocked && editable ? blockedHtml(w, t) : ''}
-        ${t.worktree ? `<div class="res">🌿 獨立 worktree：${esc(t.worktree.branch)}${t.worktree.cleaned ? '（已清掉）' : t.worktree.kept ? '（保留，不自動清理）' : ''}${!t.worktree.cleaned && t.worktree.cleanupError ? `<br>清理未完成：${esc(t.worktree.cleanupError)}${t.worktree.retryAt ? `（${hhmm(t.worktree.retryAt)} 自動再試）` : ''}${t.status === 'DONE' ? ` <button class="btn small ghost" data-wt-cleanup="retry" data-wt-task="${t.id}">重試清理</button>` : ''}${t.worktree.kept ? '' : ` <button class="btn small ghost" data-wt-cleanup="keep" data-wt-task="${t.id}">保留</button>`}` : ''}</div>` : ''}
+        ${t.worktree ? `<div class="res">🌿 獨立 worktree：${esc(t.worktree.branch)}${t.worktree.cleaned ? '（已清掉）' : t.worktree.kept ? '（保留，不自動清理）' : ''}${!t.worktree.cleaned && t.worktree.cleanupError ? `<br>清理未完成：${esc(t.worktree.cleanupError)}${t.worktree.retryAt ? `（${hhmm(t.worktree.retryAt)} 自動再試）` : ''}${editable && t.status === 'DONE' ? ` <button class="btn small ghost" data-wt-cleanup="retry" data-wt-task="${t.id}">重試清理</button>` : ''}${!editable || t.worktree.kept ? '' : ` <button class="btn small ghost" data-wt-cleanup="keep" data-wt-task="${t.id}">保留</button>`}` : ''}</div>` : ''}
         ${t.handoffs?.length ? `<div class="res">🤝 交接：${t.handoffs.map((h) => esc(name(h.from)) + ' → ' + esc(name(h.to))).join('、')}</div>` : ''}
         ${t.detail ? `<details class="tech"><summary>查看技術細節</summary><pre>${esc(t.detail)}</pre></details>` : ''}
-        ${editable && st !== 'WORKING' && st !== 'DONE' ? `<div class="re"><select data-task="${t.id}">${avail.map((a) => `<option value="${a.id}" ${a.id === t.agent ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><button class="btn small" data-reassign="${t.id}">改派</button></div>` : ''}
+        ${editable && t.status !== 'WORKING' && t.status !== 'DONE' ? `<div class="re"><select data-task="${t.id}">${avail.map((a) => `<option value="${a.id}" ${a.id === t.agent ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><button class="btn small" data-reassign="${t.id}">改派</button></div>` : ''}
       </div>`;
     }).join('')}</div>`;
   }).join('')}</div>`;
@@ -826,7 +829,7 @@ function formatWorkspace(w, task = null) {
   const repo = w?.wsInfo?.repo || (wr?.repo) || (w?.project ? base(w.project) : '—');
   const branch = task?.worktree?.branch || w?.wsInfo?.branch || wr?.branch || '—';
   const worktree = task?.workdir || (task?.worktree?.path) || w?.wsInfo?.path || w?.project || '—';
-  const leaseStatus = task ? (task.writes === false ? 'READ' : (wr && (wr.cardId === task.id || wr.card === task.title)) ? (wr.state || 'ACTIVE') : (wr ? wr.state : 'FREE')) : (wr?.state || (wr ? 'ACTIVE' : 'FREE'));
+  const leaseStatus = w?.historical ? '—' : task ? (task.writes === false ? 'READ' : (wr && (wr.cardId === task.id || wr.card === task.title)) ? (wr.state || 'ACTIVE') : (wr ? wr.state : 'FREE')) : (wr?.state || (wr ? 'ACTIVE' : 'FREE'));
   const writerStr = wr ? `${wr.owner} / ${repo} / ${branch}` : '—';
   return {
     writer: wr?.owner || '—',
@@ -1037,7 +1040,7 @@ function officeHtml(w) {
     ${!running && !paused && ['open', 'wait', 'need'].includes(w.pstate?.level) ? '<div class="hint" style="border-top:1px dashed var(--line);padding-top:10px;font-weight:700">或者，開始新的工作</div>' : ''}
     ${running || paused ? `<div class="ask">工作進行中，想補充或修改指示？</div>
     <textarea id="instruction" placeholder="例如：按鈕改成藍色。或：先不要 merge，等我看過。\n工頭會決定要轉告哪位成員、取消或追加哪些工作卡。">${esc(drafts['i:' + w.project] || '')}</textarea>
-    <div class="row"><span class="hint">${paused ? '工作暫停中：指示會先保留，按「繼續」後交給工頭' : r?.notes || r?.noting ? '⏳ 工頭正在看你的指示…' : '正在工作的成員做完手上這一步就會收到'}</span><span class="err" id="err"></span><span class="spacer"></span>
+    <div class="row"><span class="hint">${paused ? '工作暫停中：指示會先保留，按「繼續」後交給工頭' : r?.notes || r?.noting ? '⏳ 工頭正在看你的指示…' : '正在工作的成員做完手上這一步就會收到'}</span><span class="spacer"></span>
       <select id="deliverSel" class="hint" title="排隊：成員做完手上這一步才收到。插話：直接送進成員正在做的這一步、不停下（Claude、Codex 才支援，其他成員自動改成排隊）。立刻打斷：成員馬上停下（這一步可能做到一半），等工頭看完再接著做。"><option value="queue">🕒 這一步做完再轉達</option><option value="steer">💬 插話（不打斷）</option><option value="interrupt">⚡ 立刻打斷</option></select>
       <button class="btn primary" id="instructBtn">📣 告訴工頭</button></div>
     <div class="hint" style="border-top:1px dashed var(--line);padding-top:10px;font-weight:700">新的工作要等這件做完才能交辦</div>` : ''}
@@ -1120,7 +1123,7 @@ function nowHtml(w, att) {
     <dl class="wf">
       <dt>目前進度</dt><dd>${esc(progress)}</dd>
       <dt>Workspace</dt><dd>${esc(formatWorkspace(w).fullLine)}</dd>
-      <dt>Runtime</dt><dd>${runtimesOf(w).map(formatRuntimeItem).join(' · ') || '—'}</dd>
+      <dt>Runtime</dt><dd>${esc(runtimesOf(w).map(formatRuntimeItem).join(' · ') || '—')}</dd>
       <dt>Token</dt><dd>${r.usage ? esc(`工頭 ${fmtTok(r.usage.lead.in + r.usage.lead.out)} · 成員 ${fmtTok(r.usage.work.in + r.usage.work.out)}　（${Object.entries(r.usage.agents).map(([id, u]) => name(id) + ' ' + fmtTok(u.in + u.out)).join('、')}）`) : '還沒有回報（有些 AI 不回報用量）'}</dd>
       <dt>正在等待</dt><dd>${waits.length ? esc(waits.join('\n')) : '—'}</dd>
       <dt>接下來</dt><dd>${esc(next)}</dd>
@@ -1312,8 +1315,11 @@ function render() {
 }
 
 // On a project page the list shows only that project's runs.
+let historyLoadSeq = 0;
 async function loadHistory(view) {
+  const seq = ++historyLoadSeq;
   const list = (await (await fetch('/api/history')).json()).filter((h) => !view || sameP(h.project, view));
+  if (seq !== historyLoadSeq || view !== (W()?.project || '')) return;
   if (view && histCount !== list.length) { histCount = list.length; if ($('office')) $('office')._html = ''; render(); }
   $('histHead').textContent = view ? `歷史紀錄 · ${W()?.name || base(view)}` : '歷史紀錄（全部專案）';
   $('history').innerHTML = list.length ? list.map((h) => `
@@ -1330,7 +1336,7 @@ async function openHistory(id) {
   $('histTitle').textContent = fmt(r.startedAt) + ' 的工作紀錄';
   $('histMeta').innerHTML = `<div><b>需求：</b>${esc(r.request)}</div>
     <div class="sub" style="margin:6px 0 0">專案 ${esc(r.project)} · 工頭 ${esc(name(r.leader))} · ${STATUS[r.status] || r.status}</div>`;
-  $('histBoard').innerHTML = boardHtml(r.tasks, S.agents, false);
+  $('histBoard').innerHTML = boardHtml(r.tasks, S.agents, false, { project: r.project, historical: true });
   $('histChat').innerHTML = chatHtml(r.activity);
   const ow = S.workspaces.find((x) => sameP(x.project, r.project));
   $('histResume').hidden = !((r.status === 'paused' || r.status === 'running') && !ow?.run?.active && !ow?.run?.paused);
@@ -1548,8 +1554,12 @@ document.addEventListener('click', (e) => {
     return post('/api/answer', { ws: ws(), taskId: b.dataset.for || '', text }).catch(() => {});
   }
   if (b.id === 'start') {
-    const p = ws();
-    return post('/api/start', { ws: p, request: $('request').value }).then(() => { drafts[p] = ''; $('request').value = ''; b.blur(); }).catch(() => {});
+    const p = ws(), request = $('request').value;
+    return post('/api/start', { ws: p, request }).then(() => {
+      if (drafts[p] === request) drafts[p] = '';
+      if (ws() === p && $('request')?.value === request) $('request').value = '';
+      b.blur();
+    }).catch(() => {});
   }
   if (b.hasAttribute('data-recheck')) return post('/api/check');
   if (b.dataset.stepDiff) return showStepDiff(Number(b.dataset.stepDiff));
