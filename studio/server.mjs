@@ -2389,14 +2389,14 @@ async function checkWorkspaces() {
 }
 
 async function runCard(w, t) {
-  const run = w.run;
+  const run = w.run, epoch = run.lifecycleEpoch || 0;
   if (reviewAuthors(w, t).has(t.agent)) {
     Object.assign(t, { status: 'FAILED', result: `沒有獨立審查者：${agentName(t.agent)} 寫了這張卡要審的東西，不能自審；請工頭安排其他成員。` });
     log(w, 'studio', 'system', `「${t.title}」${t.result}`);
     return wakeWaiters(w, t);
   }
   const note = t.wakeNote;
-  const startAgent = t.agent;
+  const startAgent = t.agent, generation = t.leaseGeneration || 0;
   t.status = 'WORKING';
   t.workingSince = nowIso(); // this work spell (shown as 已執行)
   t.firstStartedAt ||= t.workingSince;
@@ -2425,6 +2425,10 @@ ${STATUS_RULES}`;
     if (!(note && knowsTask)) t.briefed = workKey(t);
     const cid = await conv(w, t.agent, false, t.hard, t.workdir, roOf(t));
     // A step stopped by 立刻打斷 ends early (maybe with an error): park the card until the Leader has read the note.
+    // hold also makes turn() throw Halt. Recover that interruption only while this execution still owns the card.
+    const interrupted = () => t.interrupted && w.run === run && (run.lifecycleEpoch || 0) === epoch
+      && run.active && !run.paused && !run.stopped && w.tasks.includes(t)
+      && t.agent === startAgent && (t.leaseGeneration || 0) === generation && !t.preparing;
     const capErr = () => Object.assign(new Error(`這張卡已用 ${cardTokens(t)} tokens，超過上限 ${w.tokenCap}`), { cap: true });
     const step = async (text) => {
       if (overCap(w, t)) throw capErr(); // no further step for a card over its budget
@@ -2432,13 +2436,14 @@ ${STATUS_RULES}`;
       try {
         if (askBusy.has(cid)) { // a progress question is being answered: Stop / Pause / 打斷 / handoff meanwhile cancelled that turn, not this step
           await askBusy.get(cid);
-          if (t.interrupted) return '';
+          if (interrupted()) return '';
           if (run.stopped || run.paused) throw new Halt(run.stopped ? '已停止' : '已暫停');
         }
         return await turn(t.agent, cid, text, { w, lead: !isWriter(t), bill: t, timeout: CARD_STALL_MS, allowStart: () => t.agent === startAgent && !t.hold && !t.preparing && run.active });
-      } catch (e) { if (t.interrupted && !(e instanceof Halt)) return ''; throw e; } finally { cardStep.delete(cid); t.stepEndAt = Date.now(); }
+      } catch (e) { if (!e.stopUnconfirmed && interrupted()) return ''; throw e; } finally { cardStep.delete(cid); t.stepEndAt = Date.now(); }
     };
     const park = () => {
+      if (!interrupted()) throw new Halt('執行已停止'); // ownership can change after a successful step resolves, too
       Object.assign(t, { status: 'WAITING', interrupted: false, resumed: true,
         wakeNote: 'The user stopped your previous step midway to give you a new instruction. First check the current state of the files (your last step may be half done), then continue the task.'
           + (t.notes?.length ? '\nNew instruction from the user (via the leader): ' + t.notes.splice(0).join('\n') : '') }); // the note may arrive before the stop
