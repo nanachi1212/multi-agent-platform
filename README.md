@@ -82,6 +82,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 
 - 「模型策略」搭配真的 Codex、以及困難卡實際自動升級，目前只用模擬回覆驗證過；其餘功能已在真實專案（PDF 編輯器、股票面板）上使用。
 - 本機 CI：`.\scripts\ci.ps1 -Mode Auto`（語法與模擬 AI lifecycle／租約測試）；真實 provider 操作另行驗證。
+- **W1 程序隔離尚未通過**：提供 [AionCore managed-spawn 部分修補與無模型驗證入口](docs/w1-managed-spawn.md)，只封閉 managed-process 指派 Job 的競態，不處理 Store PowerShell activation 逃逸；不自動替換正式依賴。真實 Claude cancel／restart／session 恢復仍待額度重置後驗收。
 - 測試用 Studio：設定 `STUDIO_RUNTIME` 指向另一個資料夾，就會用自己的設定、歷史、租約和 AionCore 資料，不碰你平常的 `runtime/`（AionCore 程式共用）。例如 PowerShell：`$env:STUDIO_RUNTIME="$env:TEMP\studio-test"; $env:STUDIO_PORT=4859; node studio/server.mjs`。只拿拋棄式專案測：兩個 Studio 的租約互相看不到。
 - 「告訴工頭」預設不會中途打斷成員正在做的那一步；「💬 插話」只把話送進去、不停下（Claude／Codex），要停下請用「立刻打斷」。
 - AionCore 在 Antigravity 工作時，會在專案裡寫一個 `.agents/` 資料夾。
@@ -178,6 +179,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 
 - The model strategy with real Codex, and a hard card actually auto-upgrading, were verified with scripted replies only; everything else has been used on real projects (a PDF editor, a stock panel).
 - Local CI: `.\scripts\ci.ps1 -Mode Auto` (syntax and scripted lifecycle/lease checks). Live providers are verified separately.
+- **W1 process isolation remains open**: the [managed-spawn partial patch and no-model gate](docs/w1-managed-spawn.md) close only AionCore's spawn-to-Job race. They do not fix Store PowerShell activation escape or replace the production dependency. Live Claude cancel, restart and session-resume acceptance remains pending quota reset.
 - Test Studio: set `STUDIO_RUNTIME` to another folder and Studio uses its own settings, history, leases and AionCore data there, never your normal `runtime/` (the AionCore program is shared). PowerShell example: `$env:STUDIO_RUNTIME="$env:TEMP\studio-test"; $env:STUDIO_PORT=4859; node studio/server.mjs`. Use disposable projects only: the two Studios cannot see each other's leases.
 - "告訴工頭" does not cut into a worker's current step by default; "💬 插話" adds the note to it without stopping it (Claude / Codex); use "立刻打斷" to stop it.
 - AionCore writes an `.agents/` folder into the project when Antigravity works there.

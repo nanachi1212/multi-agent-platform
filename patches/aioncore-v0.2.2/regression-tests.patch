@@ -1,0 +1,570 @@
+diff --git a/crates/aionui-process/examples/w1_managed_smoke.rs b/crates/aionui-process/examples/w1_managed_smoke.rs
+new file mode 100644
+index 0000000..6f69072
+--- /dev/null
++++ b/crates/aionui-process/examples/w1_managed_smoke.rs
+@@ -0,0 +1,55 @@
++//! Explicit native smoke executable. Never starts an agent or contacts a model.
++#[cfg(not(windows))]
++fn main() {
++    eprintln!("This smoke requires Windows.");
++    std::process::exit(1);
++}
++
++#[cfg(windows)]
++#[tokio::main(flavor = "current_thread")]
++async fn main() {
++    use aionui_common::CommandSpec;
++    use aionui_process::ManagedProcess;
++    use aionui_runtime::Builder;
++    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
++    use std::time::Duration;
++    use windows_sys::Win32::Foundation::FILETIME;
++    use windows_sys::Win32::System::Threading::{
++        GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
++    };
++
++    let shell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
++        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
++    let process = ManagedProcess::spawn(
++        CommandSpec {
++            command: shell,
++            args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 1; exit 42"]
++                .into_iter().map(String::from).collect(),
++            env: vec![], cwd: None,
++        }, &[],
++    ).await.expect("actual production-cfg managed spawn");
++    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process.pid()) };
++    assert!(!raw.is_null(), "retain live shell identity");
++    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
++    let mut created: FILETIME = unsafe { core::mem::zeroed() };
++    let mut exit: FILETIME = unsafe { core::mem::zeroed() };
++    let mut kernel: FILETIME = unsafe { core::mem::zeroed() };
++    let mut user: FILETIME = unsafe { core::mem::zeroed() };
++    assert_ne!(unsafe { GetProcessTimes(handle.as_raw_handle(), &mut created, &mut exit, &mut kernel, &mut user) }, 0);
++    let mut name = [0u16; 32768]; let mut length = name.len() as u32;
++    assert_ne!(unsafe { QueryFullProcessImageNameW(raw, 0, name.as_mut_ptr(), &mut length) }, 0);
++    let status = tokio::time::timeout(Duration::from_secs(5), process.wait_for_exit())
++        .await.expect("suspended child was resumed").expect("exit status available");
++    assert_eq!(status.code(), Some(42));
++    println!("W1_MANAGED_SMOKE {}", serde_json::json!({
++        "pid":process.pid(), "created":(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64).to_string(),
++        "image":String::from_utf16_lossy(&name[..length as usize]), "exitCode":status.code(), "modelRequests":0
++    }));
++    drop(process);
++    let mut ordinary = Builder::clean_cli("cmd.exe");
++    ordinary.args(["/d", "/c", "echo W1-short-ok"]);
++    let output = tokio::time::timeout(Duration::from_secs(5), ordinary.output()).await.unwrap().unwrap();
++    assert!(output.status.success());
++    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "W1-short-ok");
++    println!("W1_ORDINARY_SMOKE PASS");
++}
+diff --git a/crates/aionui-process/src/process.rs b/crates/aionui-process/src/process.rs
+index ea9dc53..4e5968e 100644
+--- a/crates/aionui-process/src/process.rs
++++ b/crates/aionui-process/src/process.rs
+@@ -187,6 +187,8 @@ impl ManagedProcess {
+             .id()
+             .ok_or_else(|| ProcessError::internal("spawned child has no pid"))?;
+         let process_group_id = tracked_process_group_id(pid);
++        #[cfg(all(test, windows))]
++        windows_spawn_tests::before_assign(pid);
+ 
+         // Windows (batch B): the child was spawned CREATE_SUSPENDED. Assign it to
+         // a Job Object (subtree containment) and resume it BEFORE we touch its
+@@ -526,6 +528,11 @@ pub(crate) mod job_windows {
+     unsafe impl Sync for JobObject {}
+ 
+     impl JobObject {
++        #[cfg(test)]
++        pub(super) fn test_handle(&self) -> HANDLE {
++            self.job
++        }
++
+         /// Create a job, set `KILL_ON_JOB_CLOSE`, assign the (suspended) child to
+         /// it, then resume the child's threads. The child MUST have been spawned
+         /// with `CREATE_SUSPENDED` (runtime's `configure_platform_spawn`) so it
+@@ -537,6 +544,8 @@ pub(crate) mod job_windows {
+         /// the child's threads for resume (std/tokio expose no primary-thread
+         /// handle, hence the toolhelp walk).
+         pub(crate) fn assign_and_resume(child_raw: RawHandle, pid: u32) -> Result<Self, String> {
++            #[cfg(test)]
++            let child_raw = super::windows_spawn_tests::assignment_handle(child_raw);
+             // SAFETY: CreateJobObjectW with null attrs/name returns a job handle
+             // or null on failure.
+             let job = unsafe { CreateJobObjectW(core::ptr::null(), core::ptr::null()) };
+@@ -625,7 +634,11 @@ pub(crate) mod job_windows {
+                     let th = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                     if !th.is_null() {
+                         // SAFETY: th is a valid thread handle; resume + close it.
+-                        let rc = unsafe { ResumeThread(th) };
++                        #[cfg(test)]
++                        let target = super::windows_spawn_tests::resume_handle(th);
++                        #[cfg(not(test))]
++                        let target = th;
++                        let rc = unsafe { ResumeThread(target) };
+                         unsafe { CloseHandle(th) };
+                         if rc == u32::MAX {
+                             return Err(std::io::Error::last_os_error());
+@@ -717,3 +730,7 @@ mod tests {
+         );
+     }
+ }
++
++#[cfg(all(test, windows))]
++#[path = "windows_spawn_tests.rs"]
++mod windows_spawn_tests;
+diff --git a/crates/aionui-process/src/windows_spawn_tests.rs b/crates/aionui-process/src/windows_spawn_tests.rs
+new file mode 100644
+index 0000000..e9a5ef4
+--- /dev/null
++++ b/crates/aionui-process/src/windows_spawn_tests.rs
+@@ -0,0 +1,448 @@
++//! Local/CI native fixtures only. No agent protocol or model requests.
++use super::*;
++use std::cell::RefCell;
++use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
++use std::path::{Path, PathBuf};
++use std::process::{Command, Stdio};
++use std::time::Instant;
++use windows_sys::Win32::Foundation::{FILETIME, HANDLE};
++use windows_sys::Win32::System::JobObjects::IsProcessInJob;
++use windows_sys::Win32::System::Threading::{
++    GetCurrentProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
++    PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
++};
++
++const CHILD_TEST: &str = "process::windows_spawn_tests::fixture_entry";
++struct Gate {
++    directory: PathBuf,
++    ran_before_assign: bool,
++    reject_assignment: bool,
++    reject_resume: bool,
++    child: Option<Seen>,
++}
++thread_local! { static GATE: RefCell<Option<Gate>> = const { RefCell::new(None) }; }
++
++pub(super) fn before_assign(pid: u32) {
++    GATE.with(|slot| {
++        if let Some(gate) = slot.borrow_mut().as_mut() {
++            gate.child = Some(Seen::open(pid, None).expect("retain exact spawned child"));
++            if !gate.reject_assignment && !gate.reject_resume {
++                // Force the formerly racy interleaving, without relying on machine load.
++                let until = Instant::now() + Duration::from_secs(2);
++                while Instant::now() < until && !gate.directory.join("root.json").exists() {
++                    std::thread::sleep(Duration::from_millis(10));
++                }
++                gate.ran_before_assign = gate.directory.join("root.json").exists();
++            }
++        }
++    });
++}
++pub(super) fn assignment_handle(raw: RawHandle) -> RawHandle {
++    GATE.with(|slot| {
++        if slot.borrow().as_ref().is_some_and(|g| g.reject_assignment) {
++            core::ptr::null_mut()
++        } else {
++            raw
++        }
++    })
++}
++pub(super) fn resume_handle(raw: HANDLE) -> HANDLE {
++    GATE.with(|slot| {
++        if slot.borrow().as_ref().is_some_and(|g| g.reject_resume) {
++            core::ptr::null_mut()
++        } else {
++            raw
++        }
++    })
++}
++
++fn creation(handle: HANDLE) -> u64 {
++    let mut created: FILETIME = unsafe { core::mem::zeroed() };
++    let mut exit: FILETIME = unsafe { core::mem::zeroed() };
++    let mut kernel: FILETIME = unsafe { core::mem::zeroed() };
++    let mut user: FILETIME = unsafe { core::mem::zeroed() };
++    assert_ne!(
++        unsafe { GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user) },
++        0
++    );
++    ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64
++}
++struct Seen {
++    pid: u32,
++    created: u64,
++    handle: OwnedHandle,
++    image: String,
++}
++impl Seen {
++    fn open(pid: u32, expected: Option<u64>) -> Option<Self> {
++        let raw = unsafe {
++            OpenProcess(
++                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
++                0,
++                pid,
++            )
++        };
++        if raw.is_null() {
++            return None;
++        }
++        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
++        let created = creation(raw);
++        assert!(
++            expected.is_none_or(|old| old == created),
++            "PID reused; never adopt replacement"
++        );
++        let mut name = [0u16; 32768];
++        let mut length = name.len() as u32;
++        if unsafe { QueryFullProcessImageNameW(raw, 0, name.as_mut_ptr(), &mut length) } == 0 {
++            let error = std::io::Error::last_os_error();
++            if unsafe { WaitForSingleObject(raw, 0) } == 0 {
++                return None; // exact identity already exited; do not invent image/job evidence
++            }
++            panic!("cannot query live fixture image: {error}");
++        }
++        Some(Self {
++            pid,
++            created,
++            handle,
++            image: String::from_utf16_lossy(&name[..length as usize]),
++        })
++    }
++    fn raw(&self) -> HANDLE {
++        self.handle.as_raw_handle()
++    }
++    fn alive(&self) -> bool {
++        unsafe { WaitForSingleObject(self.raw(), 0) == 258 }
++    }
++    fn in_job(&self, job: HANDLE) -> bool {
++        let mut result = 0;
++        assert_ne!(unsafe { IsProcessInJob(self.raw(), job, &mut result) }, 0);
++        result != 0
++    }
++    fn row(&self, role: &str, job: HANDLE) -> serde_json::Value {
++        serde_json::json!({"role":role,"pid":self.pid,"created":self.created.to_string(),"image":self.image,"alive":self.alive(),"in_owned_job":self.in_job(job),"in_any_job":self.in_job(core::ptr::null_mut())})
++    }
++}
++impl Drop for Seen {
++    fn drop(&mut self) {
++        if self.alive() {
++            let killed = unsafe { TerminateProcess(self.raw(), 99) };
++            assert!(
++                killed != 0 || unsafe { WaitForSingleObject(self.raw(), 2000) } == 0,
++                "own fixture did not terminate"
++            );
++            assert_eq!(unsafe { WaitForSingleObject(self.raw(), 2000) }, 0);
++        }
++    }
++}
++fn fixture_command(role: &str, directory: &Path) -> Command {
++    let mut command = Command::new(std::env::current_exe().unwrap());
++    command
++        .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
++        .env("W1_ROLE", role)
++        .env("W1_DIRECTORY", directory)
++        .stdin(Stdio::null())
++        .stdout(Stdio::null())
++        .stderr(Stdio::null());
++    command
++}
++#[test]
++#[ignore = "finite child fixture; invoked by native process tests, never by a model"]
++fn fixture_entry() {
++    let directory = PathBuf::from(std::env::var_os("W1_DIRECTORY").expect("fixture directory"));
++    let role = std::env::var("W1_ROLE").expect("fixture role");
++    let marker =
++        serde_json::json!({"pid":std::process::id(),"created":creation(unsafe { GetCurrentProcess() }).to_string()});
++    let pending = directory.join(format!("{role}.pending"));
++    std::fs::write(&pending, marker.to_string()).unwrap();
++    std::fs::rename(pending, directory.join(format!("{role}.json"))).unwrap();
++    match role.as_str() {
++        "root" => {
++            for next in ["imm", "mid", "sleeper"] {
++                fixture_command(next, &directory).spawn().unwrap();
++            }
++            if std::env::var_os("W1_ROOT_EARLY").is_some() {
++                std::thread::sleep(Duration::from_millis(500));
++                std::process::exit(0);
++            }
++        }
++        "imm" => {
++            fixture_command("igc", &directory).spawn().unwrap();
++            std::process::exit(0);
++        }
++        "mid" => {
++            fixture_command("leaf", &directory).spawn().unwrap();
++            std::thread::sleep(Duration::from_millis(300));
++            std::process::exit(0);
++        }
++        _ => {}
++    }
++    std::thread::sleep(Duration::from_secs(16));
++    std::process::exit(0);
++}
++fn spec(directory: &Path) -> CommandSpec {
++    CommandSpec {
++        command: std::env::current_exe().unwrap(),
++        args: vec![
++            "--exact".into(),
++            CHILD_TEST.into(),
++            "--ignored".into(),
++            "--nocapture".into(),
++        ],
++        env: vec![
++            aionui_common::EnvVar {
++                name: "W1_ROLE".into(),
++                value: "root".into(),
++            },
++            aionui_common::EnvVar {
++                name: "W1_DIRECTORY".into(),
++                value: directory.display().to_string(),
++            },
++        ],
++        cwd: Some(directory.display().to_string()),
++    }
++}
++fn collect(directory: &Path, parent_may_exit: bool) -> Vec<(String, Seen)> {
++    let until = Instant::now() + Duration::from_secs(4);
++    let roles = ["root", "mid", "imm", "sleeper", "leaf", "igc"];
++    while Instant::now() < until && !roles.iter().all(|r| directory.join(format!("{r}.json")).exists()) {
++        std::thread::sleep(Duration::from_millis(10));
++    }
++    roles
++        .iter()
++        .filter_map(|role| {
++            let marker: serde_json::Value = serde_json::from_slice(
++                &std::fs::read(directory.join(format!("{role}.json"))).expect("fixture marker before natural TTL"),
++            )
++            .unwrap();
++            let pid = marker["pid"].as_u64().unwrap() as u32;
++            let created = marker["created"].as_str().unwrap().parse().unwrap();
++            let seen = Seen::open(pid, Some(created));
++            if !["mid", "imm"].contains(role) && !(parent_may_exit && *role == "root") {
++                assert!(seen.is_some(), "live fixture identity missing");
++            }
++            seen.map(|p| (role.to_string(), p))
++        })
++        .collect()
++}
++
++#[tokio::test]
++async fn managed_child_cannot_execute_before_job_assignment() {
++    let directory = tempfile::tempdir().unwrap();
++    GATE.with(|slot| {
++        *slot.borrow_mut() = Some(Gate {
++            directory: directory.path().into(),
++            ran_before_assign: false,
++            reject_assignment: false,
++            reject_resume: false,
++            child: None,
++        })
++    });
++    let result = ManagedProcess::spawn(spec(directory.path()), &[]).await;
++    let gate = GATE.with(|slot| slot.borrow_mut().take().unwrap());
++    let process = result.expect("managed fixture spawn");
++    let members = collect(directory.path(), false);
++    let job = process.job.as_ref().unwrap().test_handle();
++    let before: Vec<_> = members.iter().map(|(r, p)| p.row(r, job)).collect();
++    let all_owned = members.iter().all(|(_, p)| p.in_job(job));
++    drop(process);
++    tokio::time::sleep(Duration::from_millis(300)).await;
++    println!(
++        "W1_RACE {}",
++        serde_json::json!({"ran_before_assign":gate.ran_before_assign,"before":before,"surviving_pids":members.iter().filter(|(_,p)| p.alive()).map(|(_,p)| p.pid).collect::<Vec<_>>()})
++    );
++    // Retained fixture handles also clean up the deliberately reproduced old leak.
++    assert!(
++        !gate.ran_before_assign,
++        "child executed and spawned descendants before owned Job assignment"
++    );
++    assert!(all_owned, "a descendant escaped during the pre-assignment window");
++    assert!(
++        members.iter().all(|(_, p)| !p.alive()),
++        "owned Job close left fixture descendants"
++    );
++}
++
++#[tokio::test]
++async fn failed_assignment_reaps_child_before_returning() {
++    let directory = tempfile::tempdir().unwrap();
++    GATE.with(|slot| {
++        *slot.borrow_mut() = Some(Gate {
++            directory: directory.path().into(),
++            ran_before_assign: false,
++            reject_assignment: true,
++            reject_resume: false,
++            child: None,
++        })
++    });
++    let result = ManagedProcess::spawn(spec(directory.path()), &[]).await;
++    let gate = GATE.with(|slot| slot.borrow_mut().take().unwrap());
++    assert!(
++        matches!(&result, Err(ProcessError::Internal(message)) if message.contains("AssignProcessToJobObject")),
++        "assignment error must surface"
++    );
++    assert!(
++        !gate.child.as_ref().unwrap().alive(),
++        "failed spawn returned with a suspended child still alive"
++    );
++    assert!(
++        !directory.path().join("root.json").exists(),
++        "failed containment must not run child code"
++    );
++}
++
++#[tokio::test]
++async fn failed_resume_reaps_child_before_returning() {
++    let directory = tempfile::tempdir().unwrap();
++    GATE.with(|slot| {
++        *slot.borrow_mut() = Some(Gate {
++            directory: directory.path().into(),
++            ran_before_assign: false,
++            reject_assignment: false,
++            reject_resume: true,
++            child: None,
++        })
++    });
++    let result = ManagedProcess::spawn(spec(directory.path()), &[]).await;
++    let gate = GATE.with(|slot| slot.borrow_mut().take().unwrap());
++    assert!(
++        matches!(&result, Err(ProcessError::Internal(message)) if message.contains("resume failed")),
++        "resume error must surface"
++    );
++    assert!(
++        !gate.child.as_ref().unwrap().alive(),
++        "resume failure returned while the child was alive"
++    );
++    assert!(
++        !directory.path().join("root.json").exists(),
++        "failed resume must not run child code"
++    );
++}
++
++#[tokio::test]
++async fn ordinary_runtime_command_still_completes() {
++    let mut builder = Builder::clean_cli("cmd.exe");
++    builder.args(["/d", "/c", "echo W1-ordinary-command"]);
++    let output = builder.output();
++    let result = tokio::time::timeout(Duration::from_secs(5), output)
++        .await
++        .expect("unpaired commands must not be suspended")
++        .unwrap();
++    assert!(result.status.success());
++    assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "W1-ordinary-command");
++}
++
++#[tokio::test]
++async fn parent_early_exit_does_not_release_job_descendants() {
++    let directory = tempfile::tempdir().unwrap();
++    let mut command = spec(directory.path());
++    command.env.push(aionui_common::EnvVar {
++        name: "W1_ROOT_EARLY".into(),
++        value: "1".into(),
++    });
++    let process = ManagedProcess::spawn(command, &[]).await.unwrap();
++    let members = collect(directory.path(), true);
++    tokio::time::sleep(Duration::from_secs(1)).await;
++    assert!(process.exit_status().is_some(), "fixture parent must have exited");
++    assert!(
++        members
++            .iter()
++            .filter(|(r, _)| ["leaf", "igc"].contains(&r.as_str()))
++            .all(|(_, p)| p.in_job(process.job.as_ref().unwrap().test_handle()))
++    );
++    println!(
++        "W1_EARLY_PARENT {}",
++        serde_json::to_string(
++            &members
++                .iter()
++                .map(|(r, p)| p.row(r, process.job.as_ref().unwrap().test_handle()))
++                .collect::<Vec<_>>()
++        )
++        .unwrap()
++    );
++    drop(process);
++    tokio::time::sleep(Duration::from_millis(300)).await;
++    assert!(
++        members.iter().all(|(_, p)| !p.alive()),
++        "Job close after parent exit must clear descendants"
++    );
++}
++
++#[tokio::test]
++#[ignore = "explicit no-model shell matrix; packaged shells are a remaining limitation, not a passing W1 gate"]
++async fn shell_containment_matrix() {
++    let mut shells = vec![(
++        "classic",
++        PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/WindowsPowerShell/v1.0/powershell.exe"),
++    )];
++    for (label, key) in [("store-direct", "W1_STORE_SHELL"), ("store-alias", "W1_STORE_ALIAS")] {
++        if let Some(path) = std::env::var_os(key) {
++            shells.push((label, path.into()));
++        } else {
++            println!("W1_NOT_TESTED {label}: package unavailable");
++        }
++    }
++    let mut report = Vec::new();
++    for (label, shell) in shells {
++        for early in [false, true] {
++            let directory = tempfile::Builder::new().prefix("W1 空白-").tempdir().unwrap();
++            let script = directory.path().join("fixture.ps1");
++            let exe = std::env::current_exe()
++                .unwrap()
++                .display()
++                .to_string()
++                .replace('\'', "''");
++            let dir = directory.path().display().to_string().replace('\'', "''");
++            // UTF-8 BOM is required by classic Windows PowerShell for non-ASCII paths.
++            std::fs::write(&script, format!("\u{feff}$p=[Diagnostics.Process]::GetCurrentProcess()\n[IO.File]::WriteAllText('{dir}/shell.json',(@{{pid=$PID;created=$p.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()}}|ConvertTo-Json -Compress))\n$env:W1_ROLE='root'\n$env:W1_DIRECTORY='{dir}'\n& '{exe}' --exact {CHILD_TEST} --ignored --nocapture\n")).unwrap();
++            let mut command = CommandSpec {
++                command: shell.clone(),
++                args: vec![
++                    "-NoLogo".into(),
++                    "-NoProfile".into(),
++                    "-NonInteractive".into(),
++                    "-ExecutionPolicy".into(),
++                    "Bypass".into(),
++                    "-File".into(),
++                    script.display().to_string(),
++                ],
++                env: vec![],
++                cwd: Some(dir),
++            };
++            if early {
++                command.env.push(aionui_common::EnvVar {
++                    name: "W1_ROOT_EARLY".into(),
++                    value: "1".into(),
++                });
++            }
++            let launched = Instant::now();
++            let process = ManagedProcess::spawn(command, &[]).await.unwrap();
++            let members = collect(directory.path(), early);
++            let marker: serde_json::Value =
++                serde_json::from_slice(&std::fs::read(directory.path().join("shell.json")).unwrap()).unwrap();
++            let shell_process = Seen::open(
++                marker["pid"].as_u64().unwrap() as u32,
++                Some(marker["created"].as_str().unwrap().parse().unwrap()),
++            );
++            let job = process.job.as_ref().unwrap().test_handle();
++            let shell_identity = shell_process.as_ref().map(|p| p.row("shell", job));
++            let before: Vec<_> = members.iter().map(|(r, p)| p.row(r, job)).collect();
++            if early {
++                tokio::time::sleep(Duration::from_secs(1)).await;
++            }
++            drop(process);
++            tokio::time::sleep(Duration::from_secs(6)).await;
++            let survivors: Vec<_> = members
++                .iter()
++                .filter(|(_, p)| p.alive())
++                .map(|(r, p)| serde_json::json!({"role":r,"pid":p.pid,"created":p.created.to_string()}))
++                .collect();
++            let observed_ms = launched.elapsed().as_millis();
++            assert!(observed_ms < 15_000, "fixture TTL could explain an exit; matrix case is invalid");
++            if label == "classic" {
++                assert!(survivors.is_empty(), "classic containment regression");
++            }
++            report.push(serde_json::json!({"shell":label,"parent_early_exit":early,"shell_identity":shell_identity,"before":before,"survivors":survivors,"observed_ms":observed_ms,"fixture_ttl_ms":16000,"full_w1_pass":false}));
++        }
++    }
++    println!("W1_MATRIX {}", serde_json::to_string(&report).unwrap());
++}

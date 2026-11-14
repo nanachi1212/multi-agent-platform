@@ -1,0 +1,135 @@
+--- a/crates/aionui-runtime/src/spawn.rs
++++ b/crates/aionui-runtime/src/spawn.rs
+@@ -214,6 +214,18 @@
+         self.inner.spawn()
+     }
+ 
++    /// Spawn a Windows managed child without running its primary thread.
++    ///
++    /// The caller must assign containment and resume it, or kill AND reap it
++    /// on every failure. Ordinary commands deliberately keep using `spawn` /
++    /// `output`: suspending callers without a paired resume would hang them.
++    #[cfg(windows)]
++    pub fn spawn_suspended(mut self) -> io::Result<Child> {
++        const CREATE_SUSPENDED: u32 = 0x0000_0004;
++        self.inner.creation_flags(CREATE_SUSPENDED);
++        self.inner.spawn()
++    }
++
+     /// Run to completion and collect stdout/stderr.
+     pub async fn output(mut self) -> io::Result<std::process::Output> {
+         self.inner.output().await
+--- a/crates/aionui-process/src/process.rs
++++ b/crates/aionui-process/src/process.rs
+@@ -179,8 +179,11 @@
+             builder.current_dir(cwd);
+         }
+ 
+-        let mut child = builder
+-            .spawn()
++        #[cfg(windows)]
++        let child = builder.spawn_suspended();
++        #[cfg(not(windows))]
++        let child = builder.spawn();
++        let mut child = child
+             .map_err(|e| ProcessError::internal(format!("spawn '{}' failed: {e}", spec.command.display())))?;
+ 
+         let pid = child
+@@ -197,21 +200,20 @@
+         #[cfg(windows)]
+         let job = {
+             // raw_handle() is valid while the child is alive (it is, suspended).
+-            match child.raw_handle() {
+-                Some(raw) => match job_windows::JobObject::assign_and_resume(raw, pid) {
+-                    Ok(j) => Some(j),
+-                    Err(e) => {
+-                        // Tear down the suspended child (kill_on_drop SIGKILLs it
+-                        // when `child` drops at end of scope) and error out (S7).
+-                        let _ = child.start_kill();
+-                        return Err(ProcessError::internal(format!("windows job containment: {e}")));
+-                    }
+-                },
+-                None => {
+-                    let _ = child.start_kill();
+-                    return Err(ProcessError::internal(
+-                        "windows: child has no raw handle for job assignment",
+-                    ));
++            let assigned = match child.raw_handle() {
++                Some(raw) => job_windows::JobObject::assign_and_resume(raw, pid),
++                None => Err("child has no raw handle for job assignment".to_owned()),
++            };
++            match assigned {
++                Ok(job) => Some(job),
++                Err(error) => {
++                    // Do not return a failed spawn while a suspended child is
++                    // still alive. kill().await also reaps the direct child.
++                    let message = match child.kill().await {
++                        Ok(()) => format!("windows job containment: {error}"),
++                        Err(cleanup) => format!("windows job containment: {error}; child cleanup failed: {cleanup}"),
++                    };
++                    return Err(ProcessError::internal(message));
+                 }
+             }
+         };
+@@ -535,7 +537,7 @@
+ 
+         /// Create a job, set `KILL_ON_JOB_CLOSE`, assign the (suspended) child to
+         /// it, then resume the child's threads. The child MUST have been spawned
+-        /// with `CREATE_SUSPENDED` (runtime's `configure_platform_spawn`) so it
++        /// with `CREATE_SUSPENDED` (`Builder::spawn_suspended`) so it
+         /// has not yet run any instruction — closing the assign-vs-fork race.
+         ///
+         /// `child_raw` is tokio's `Child::raw_handle()` — we use it read-only for
+@@ -628,27 +630,40 @@
+             if unsafe { Thread32First(snap, &mut entry) } == 0 {
+                 return Err(std::io::Error::last_os_error());
+             }
++            let mut resumed = 0;
+             loop {
+                 if entry.th32OwnerProcessID == pid {
+                     // SAFETY: open the thread for suspend/resume by tid.
+                     let th = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+-                    if !th.is_null() {
+-                        // SAFETY: th is a valid thread handle; resume + close it.
+-                        #[cfg(test)]
+-                        let target = super::windows_spawn_tests::resume_handle(th);
+-                        #[cfg(not(test))]
+-                        let target = th;
+-                        let rc = unsafe { ResumeThread(target) };
+-                        unsafe { CloseHandle(th) };
+-                        if rc == u32::MAX {
+-                            return Err(std::io::Error::last_os_error());
+-                        }
++                    if th.is_null() {
++                        return Err(std::io::Error::last_os_error());
+                     }
++                    // Capture a resume error before CloseHandle can replace it.
++                    #[cfg(test)]
++                    let target = super::windows_spawn_tests::resume_handle(th);
++                    #[cfg(not(test))]
++                    let target = th;
++                    let rc = unsafe { ResumeThread(target) };
++                    let error = (rc == u32::MAX).then(std::io::Error::last_os_error);
++                    unsafe { CloseHandle(th) };
++                    if let Some(error) = error {
++                        return Err(error);
++                    }
++                    if rc != 1 {
++                        return Err(std::io::Error::other("managed child thread was not suspended exactly once"));
++                    }
++                    resumed += 1;
+                 }
+                 // SAFETY: entry stays valid; Thread32Next advances or signals end.
+                 if unsafe { Thread32Next(snap, &mut entry) } == 0 {
+-                    break; // no more threads
++                    if std::io::Error::last_os_error().raw_os_error() != Some(18) {
++                        return Err(std::io::Error::last_os_error());
++                    }
++                    break;
+                 }
++            }
++            if resumed == 0 {
++                return Err(std::io::Error::other("managed child has no resumable thread"));
+             }
+             Ok(())
+         })();
