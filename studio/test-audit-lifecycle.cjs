@@ -73,7 +73,45 @@ function setup(overrides = {}) {
       await kill({ child: { pid: 123 }, t: { worktree: { setupProc: identity } } });
       assert.equal(got.pid, 123); assert.equal(got.read, snapshot); assert.equal(got.expected, identity);
     }
+    // Stop can arrive as soon as setupProc.pid is saved, before the spawn-time query returns.
+    const setupLifecycle = new Function('processSnapshot', 'saveRun', 'killProcessTree', 'setupStuck',
+      region('function rememberSetupProcess(e, child)', '// A kill that did not end') + '\nreturn { rememberSetupProcess, killSetup };');
     const original = { pid: 123, creationDate: 'original', executable: 'cmd.exe' };
+    for (const mode of ['known', 'query-failed', 'missing', 'unknown', 'exited']) {
+      const capture = deferred(); let snapshots = 0, kills = 0, stuck = 0, received;
+      const api = setupLifecycle(() => { snapshots++; return capture.promise; }, () => {}, async (pid, snapshot, expected) => {
+        kills++; received = expected;
+        return expected.creationDate ? { ok: true } : { ok: false, remaining: [pid] };
+      }, async () => { stuck++; });
+      const e = { w: { run: { paused: true }, worktreeSetup: 'fixture' }, t: { preparing: true, worktree: {} } };
+      const child = { pid: original.pid, exitCode: null, signalCode: null };
+      api.rememberSetupProcess(e, child);
+      assert.equal(snapshots, 1, 'the only identity capture starts synchronously with spawn');
+      assert.equal(e.t.worktree.setupProc.creationDate, undefined, 'the immediate durable record is PID-only');
+      const stopping = api.killSetup(e); await api.killSetup(e);
+      await Promise.resolve(); assert.equal(kills, 0, 'concurrent early Stop waits for the existing capture');
+      if (mode === 'query-failed') capture.resolve(Promise.reject(new Error('CIM unavailable')));
+      else {
+        if (mode === 'exited') child.exitCode = 0; // even a row for the same recycled PID must not be adopted
+        capture.resolve(mode === 'missing' ? [] : mode === 'unknown' ? [{ pid: original.pid }] : [original]);
+      }
+      await stopping;
+      assert.equal(snapshots, 1, 'Stop never starts a fresh identity query'); assert.equal(kills, 1);
+      assert.deepEqual(received, mode === 'known' ? original : { pid: original.pid });
+      assert.equal(stuck, mode === 'known' ? 0 : 1, 'unknown/failed/exited captures remain conservatively blocked');
+      assert.equal(e.t.preparing, true);
+    }
+    // Once captured, a later card-field change is not authority to adopt another process with the same PID.
+    let savedIdentity;
+    const saved = setupLifecycle(async () => [original], () => {}, async (pid, snapshot, expected) => {
+      savedIdentity = expected; return { ok: true };
+    }, () => {});
+    const savedEntry = { w: { run: { paused: true } }, t: { preparing: true, worktree: {} } };
+    saved.rememberSetupProcess(savedEntry, { pid: original.pid, exitCode: null, signalCode: null });
+    await savedEntry.identity;
+    savedEntry.t.worktree.setupProc = { ...original, creationDate: 'reused' };
+    await saved.killSetup(savedEntry); assert.deepEqual(savedIdentity, original);
+
     let alive = true, expectedProc;
     const leftover = setup({ processSnapshot: async () => alive ? [original] : [],
       killProcessTree: async (pid, snapshot, expected) => { expectedProc = expected; alive = false; return { ok: true }; } });

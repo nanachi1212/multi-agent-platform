@@ -50,3 +50,9 @@
 - 程序身分快照與 `process.kill(pid)` 仍是兩個操作，並非 Windows process handle 級的原子身分終止；不可宣稱杜絕所有 PID 重用競爭。
 
 使用者後續授權建立 PR，並在 Windows CI 全綠且無重大問題後合併；實際遠端 CI／合併結果另以 GitHub 為準。本文件只記已執行的雲端驗證，不預填未發生的成功。
+
+## 第一輪 Windows CI 回饋
+
+PR #57 的 `dd7cfbb` 在 `test-cleanup` 的早期 Stop 情境失敗：spawn 後先保存 PID，首次身分查詢仍在執行；Stop 立即帶著不完整身分終止，被新增的安全檢查拒絕。測試隨後刪工作目錄遇 EBUSY，並有尚未接錯誤處理的 promise 拒絕。
+
+修正為 spawn 時保存唯一的身分查詢 promise；Stop 等待該次已發起查詢後才使用原身分，不另以新查詢重新認定未知 PID。查詢失敗、資料不完整或 child 已退出仍保守處理；不移除身分驗證。新增可控延遲回歸，並讓 Windows 測試及早處理 promise 拒絕，以免清理錯誤遮蔽真正原因。完整 Windows CI 需以修正後新 head 重跑確認。

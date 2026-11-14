@@ -116,12 +116,23 @@ const { execFile, execFileSync } = require('node:child_process');
     {
       const { w, t } = prepCard('stopped', 'ping -n 60 127.0.0.1 > nul');
       w.run.paused = true; const making = E.api.useWorktree(w, t.id);
-      for (let i = 0; i < 300 && !t.worktree?.setupProc; i++) await new Promise((r) => setTimeout(r, 20)); // the command runs
-      await assert.rejects(Promise.resolve().then(() => E.api.closeWorkspace(w)), /準備/, 'a project cannot be closed while its worktree is being prepared');
-      const pid = t.worktree.setupProc?.pid, began = Date.now();
-      await E.api.stopAndDrain(w);
-      assert.ok(!t.preparing && Date.now() - began < 30e3 && !alive(pid), 'Stop ends the setup command before it reports stopped');
-      trees.push(await making);
+      making.catch(() => {}); // observe immediately; assertions below still await and report the original failure
+      for (let i = 0; i < 300 && !t.worktree?.setupProc; i++) await new Promise((r) => setTimeout(r, 20)); // deliberately wait only for PID, not identity
+      if (t.worktree) trees.push({ path: t.worktree.path, branch: t.worktree.branch });
+      try {
+        assert.ok(t.worktree?.setupProc?.pid, 'setup process started');
+        await assert.rejects(Promise.resolve().then(() => E.api.closeWorkspace(w)), /準備/, 'a project cannot be closed while its worktree is being prepared');
+        const pid = t.worktree.setupProc.pid, began = Date.now();
+        await E.api.stopAndDrain(w);
+        assert.ok(!t.preparing && Date.now() - began < 30e3 && !alive(pid), 'early Stop waits for the spawn identity query, then ends the setup tree');
+        await making;
+      } finally {
+        // A regression must not leave this fixture's verified processes holding the directory open.
+        for (const p of [t.worktree?.setupProc, ...(t.worktree?.setupLeft || [])]) {
+          if (p?.creationDate && p.executable && alive(p.pid)) await killProcessTree(p.pid, processSnapshot, p);
+        }
+        await making.catch(() => {});
+      }
     }
     {
       const { spawn } = require('node:child_process');

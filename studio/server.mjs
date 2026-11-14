@@ -2043,10 +2043,31 @@ async function stopPreparing(w, why) {
   await Promise.all(mine.map(killSetup));
   await Promise.all(mine.map((e) => e.promise.catch(() => {})));
 }
+// Start one identity query at spawn, before Stop can run. Stop waits for this same query;
+// it never learns a replacement identity from a later retry of an unknown/reused PID.
+function rememberSetupProcess(e, child) {
+  const { w, t } = e;
+  e.child = child;
+  t.worktree.setupProc = { pid: child.pid, command: w.worktreeSetup };
+  e.identity = processSnapshot().then((rows) => {
+    const p = rows.find((x) => x.pid === child.pid);
+    if (!p?.creationDate || !p.executable || child.exitCode != null || child.signalCode != null) return null;
+    const identity = { pid: p.pid, creationDate: p.creationDate, executable: p.executable };
+    if (!e.stuck && t.preparing && t.worktree?.setupProc?.pid === child.pid) {
+      t.worktree.setupProc = identity;
+      saveRun(w, w.run?.paused ? 'paused' : 'running');
+    }
+    return identity;
+  }).catch(() => null); // unknown remains blocked while its PID is alive
+  saveRun(w, w.run?.paused ? 'paused' : 'running'); // durable even before the identity query settles
+}
 // Ends a running setup command with everything it started (Stop, closing, the 10-minute limit).
 async function killSetup(e) {
   if (!e.child?.pid || e.killing) return;
-  e.killing = killProcessTree(e.child.pid, processSnapshot, e.t.worktree?.setupProc || { pid: e.child.pid }).catch(() => ({ ok: false, remaining: [e.child.pid] }));
+  e.killing = (async () => {
+    const identity = e.identity ? await e.identity : e.t.worktree?.setupProc;
+    return killProcessTree(e.child.pid, processSnapshot, identity || { pid: e.child.pid });
+  })().catch(() => ({ ok: false, remaining: [e.child.pid] }));
   const k = await e.killing;
   if (!k.ok) await setupStuck(e, k);
 }
@@ -2143,13 +2164,7 @@ async function makeWorktree(w, t, e) {
   Object.assign(t, { workdir: dir, worktree: { path: dir, branch, base, repoPath: info.path, included: inc.entries }, blocked: null, blockReason: '', blockLogged: '' });
   log(w, 'studio', 'system', `「${t.title}」改在獨立 worktree 做（branch ${branch}）：不會碰到主資料夾的寫入者。${inc.text ? ' .worktreeinclude：' + inc.text + '。' : ''}`);
   if (w.worktreeSetup && !e.stopped) {
-    const why = await worktreeSetup(w.worktreeSetup, dir, () => { e.stopped ||= '超過 10 分鐘沒有結束'; return killSetup(e); }, (child) => {
-      e.child = child;
-      t.worktree.setupProc = { pid: child.pid, command: w.worktreeSetup }; // at once: a restart can find it even before the snapshot below
-      saveRun(w, w.run?.paused ? 'paused' : 'running');
-      // kept with the card so a restarted Studio can end a command that outlived it
-      processSnapshot().then((rows) => { const p = rows.find((x) => x.pid === child.pid); if (p && t.preparing && t.worktree) { t.worktree.setupProc = { pid: p.pid, creationDate: p.creationDate, executable: p.executable }; saveRun(w, w.run?.paused ? 'paused' : 'running'); } }, () => {});
-    });
+    const why = await worktreeSetup(w.worktreeSetup, dir, () => { e.stopped ||= '超過 10 分鐘沒有結束'; return killSetup(e); }, (child) => rememberSetupProcess(e, child));
     // Stuck (a kill failed): the card is the retry's now, and it may already be cleared and running; this late result of
     // the command touches nothing (above all no setupIgnored list that would let cleanup delete files).
     if (e.stuck) return { path: dir, branch };
