@@ -91,6 +91,9 @@ async function run() {
   assert.equal(input.value, 'new unsent text', 'completion must not clear newer same-project draft');
   assert.equal(p.drafts['/A'], 'new unsent text');
   assert.equal((html.match(/id="err"/g) || []).length, 1, 'one shared error element');
+  assert.equal((html.match(/>收尾者：<\/span>/g) || []).length, 1, 'finisher label occurs once');
+  assert.equal((html.match(/>備援者：<\/span>/g) || []).length, 1, 'fallback has its own label');
+  assert.ok(!html.includes('const anyActive ='), 'unused helper removed');
   console.log('UI safety regressions: PASS');
 }
 module.exports = run;

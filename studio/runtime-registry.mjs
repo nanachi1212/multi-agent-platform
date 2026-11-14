@@ -112,11 +112,18 @@ export async function killProcessTree(rootPid, snapshot = processSnapshot, expec
   const idOf = (pid) => { const p = known.find((x) => x.pid === pid); return p?.creationDate ? { pid, creationDate: p.creationDate, executable: p.executable } : { pid }; };
 
   // Revalidate the root immediately before killing it, just as killIdentities does for children.
-  // On an ambiguous/missing root keep the saved tree for recovery, but kill nothing.
+  // Use this same snapshot to retain newly born descendants that still connect to the verified root.
+  // Never replace an earlier identity for a PID: an ambiguous/reused member keeps the whole stop blocked.
   try {
-    if (!(await snapshot()).some((p) => sameIdentity(p, root))) {
-      return { ok: false, killed: false, rootPid, children: [], remaining: known.map((p) => p.pid), left: known.map((p) => idOf(p.pid)) };
+    const rows = await snapshot();
+    if (!rows.some((p) => sameIdentity(p, root))) throw new Error('Root process identity changed');
+    const fresh = processTree(rows, root).slice(1);
+    for (const p of fresh) {
+      const old = known.find((x) => x.pid === p.pid);
+      if (!p.creationDate || !p.executable || old && !sameIdentity(old, p)) throw new Error('Child process identity is unconfirmed');
     }
+    for (const p of fresh) if (!known.some((old) => old.pid === p.pid)) known.push(p);
+    children = known.slice(1); // retain earlier descendants too, even if their parent has already exited
   } catch (e) { return { ok: false, killed: false, rootPid, children: [], remaining: known.map((p) => p.pid), left: known.map((p) => idOf(p.pid)) }; }
   try { process.kill(rootPid, 'SIGKILL'); } catch (e) {} // already exited, or still alive and reported below
   let victims = [];

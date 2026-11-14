@@ -51,6 +51,37 @@ const path = require('node:path');
     }, root);
     assert.equal(denied.ok, false); assert.deepEqual(killed, []);
 
+    // The already-required root recheck also captures children born since the first snapshot.
+    const late = row(303, root.pid), grandchild = row(404, late.pid), unrelated = row(505, 1);
+    reset(root.pid, child.pid, late.pid, grandchild.pid, unrelated.pid); let windowCalls = 0;
+    const expanded = await killProcessTree(root.pid, async () => ++windowCalls === 1 ? [root, child]
+      : [root, child, late, grandchild, unrelated].filter(p => alive.has(p.pid)), root);
+    assert.equal(expanded.ok, true); assert.deepEqual(killed, [root.pid, child.pid, late.pid, grandchild.pid]);
+    assert.ok(alive.has(unrelated.pid), 'the second snapshot never adopts an unrelated sibling');
+
+    // A reused child PID in the second tree must not overwrite its first-snapshot identity.
+    for (const changed of [{ ...child, creationDate: new Date(999000).toISOString() }, { ...child, executable: 'other.exe' }]) {
+      reset(root.pid, child.pid); let calls = 0;
+      const result = await killProcessTree(root.pid, async () => ++calls === 1 ? [root, child] : [root, changed], root);
+      assert.equal(result.ok, false); assert.deepEqual(killed, []);
+      assert.deepEqual(result.left.find(p => p.pid === child.pid), {
+        pid: child.pid, creationDate: child.creationDate, executable: child.executable
+      }, 'the original child identity survives a conflicting later snapshot');
+    }
+    for (const unknown of [{ ...late, creationDate: '' }, { ...late, executable: '' }]) {
+      reset(root.pid, child.pid, late.pid); let calls = 0;
+      const result = await killProcessTree(root.pid, async () => ++calls === 1 ? [root, child] : [root, child, unknown], root);
+      assert.equal(result.ok, false); assert.deepEqual(killed, [], 'unknown late descendants block rather than being killed');
+    }
+    // A child retained from the first tree still gets its identity rechecked if its parent exits meanwhile.
+    reset(root.pid, child.pid, grandchild.pid); let orphanCalls = 0;
+    const orphan = { ...grandchild, parent: child.pid };
+    const retained = await killProcessTree(root.pid, async () => {
+      if (++orphanCalls === 1) return [root, child, orphan];
+      alive.delete(child.pid); return [root, orphan].filter(p => alive.has(p.pid));
+    }, root);
+    assert.equal(retained.ok, true); assert.deepEqual(killed, [root.pid, orphan.pid]);
+
     reset(root.pid, child.pid);
     const stopped = await killProcessTree(root.pid, async () => [root, child].filter(p => alive.has(p.pid)), root);
     assert.equal(stopped.ok, true); assert.deepEqual(killed, [root.pid, child.pid]);
@@ -87,5 +118,5 @@ const path = require('node:path');
   assert.equal((await check(3020, options)).owner, 'unknown', 'unverified parent cannot claim child');
   verified = true;
   assert.equal((await check(3020, { ...options, desiredJobId: 'another-job' })).status, 'blocked');
-  console.log('Runtime identity: missing/reused roots, per-kill revalidation, and live child listener ownership: PASS');
+  console.log('Runtime identity: missing/reused roots, late descendants, per-kill revalidation, and live child listener ownership: PASS');
 })().catch(error => { console.error(error); process.exitCode = 1; });

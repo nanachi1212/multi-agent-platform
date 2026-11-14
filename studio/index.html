@@ -472,7 +472,6 @@ const curPath = () => { const m = location.hash.match(/^#p=(.+)$/); return m ? d
 const W = () => S.workspaces.find((w) => w.project === curPath()) || null;
 const go = (p) => { location.hash = p ? 'p=' + encodeURIComponent(p) : ''; };
 const sameP = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
-const anyActive = () => S.workspaces.some((w) => w.run?.active);
 window.addEventListener('hashchange', () => S && render());
 
 // [dot class, label, pill class] for a project tab / card.
@@ -1022,8 +1021,7 @@ function officeHtml(w) {
       </select>${w.afterDone === 'auto' ? `<span class="hint" style="font-size:13px;margin-left:6px">連續最多</span>
       <input data-auto-max type="number" min="0" step="1" value="${w.autoMax ?? 5}" style="width:56px;padding:4px 8px;font-size:13px" title="自動連續做幾件後停下等你；0＝不限，一直做到工頭沒有下一步、失敗、需要你決定，或你按暫停／Stop／改回「完成就停」"><span class="hint" style="font-size:13px">件（0＝不限）</span>` : ''}<span class="hint" style="font-size:13px;margin-left:8px">交付：</span>
       <select data-delivery style="width:auto;padding:4px 8px;font-size:13px" title="需求清楚、沒有高風險時，AI 要做到哪裡才停">${[['auto', '🚚 自動做到 merge'], ['pr', '✋ 做到 PR 就停（merge 等我）']].map(([k, t]) => `<option value="${k}" ${(w.delivery || 'auto') === k ? 'selected' : ''}>${t}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">模型策略：</span>
-      <select data-strategy style="width:auto;padding:4px 8px;font-size:13px" title="工頭自己判斷普通卡／困難卡；普通卡失敗會自動改用強模型重試一次">${STRATEGY.map(([k, t]) => `<option value="${k}" ${(w.strategy || 'save') === k ? 'selected' : ''}>${t}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">收尾者：</span>
-      <span class="hint" style="font-size:13px;margin-left:8px">備援：</span>
+      <select data-strategy style="width:auto;padding:4px 8px;font-size:13px" title="工頭自己判斷普通卡／困難卡；普通卡失敗會自動改用強模型重試一次">${STRATEGY.map(([k, t]) => `<option value="${k}" ${(w.strategy || 'save') === k ? 'selected' : ''}>${t}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">備援者：</span>
       <select data-fallback style="width:auto;padding:4px 8px;font-size:13px" title="成員額度用完或被限流時，它的卡自動改派給這位（例如本地模型）"><option value="">不自動換人</option>${S.agents.filter((a) => a.id !== w.leader).map((a) => `<option value="${a.id}" ${w.fallback === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><span class="hint" style="font-size:13px;margin-left:8px">收尾者：</span>
       <select data-finisher style="width:auto;padding:4px 8px;font-size:13px" title="CI 跑完後，merge／同步 main／清分支改由這位接手，省下強模型的額度（等 CI 本身不花額度，Studio 自己查）"><option value="">原成員自己收尾</option>${S.agents.filter((a) => a.id !== w.leader && w.workers.includes(a.id)).map((a) => `<option value="${a.id}" ${w.finisher === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select><label class="hint" style="font-size:13px;margin-left:8px;display:inline-flex;align-items:center;gap:4px" title="打勾＝每張卡用多少 token 都不會被 Studio 停下來（沒有煞車，用量自己留意）；取消打勾可以設定上限"><input type="checkbox" data-token-unlimited ${w.tokenCap ? '' : 'checked'}> 不限制 token</label>
       <input data-token-cap type="number" min="1" step="10000" value="${w.tokenCap || ''}" ${w.tokenCap ? '' : 'disabled'} placeholder="每張卡上限" style="width:104px;padding:4px 8px;font-size:13px" title="一張卡用超過這個數就停下來交給工頭（在每一步之間檢查，正在跑的那一步不會中斷；AI 沒回報用量就無法計算）">
@@ -1239,10 +1237,11 @@ function renderProject(w, force) {
   box.innerHTML = chatHtml(w.activity);
   if (atBottom) box.scrollTop = box.scrollHeight;
 
-  $('progressBox').hidden = !w.progress?.exists;
-  $('progressBox').parentElement.style.gridTemplateColumns = w.progress?.exists ? '' : '1fr';
+  const showProgress = !!(w.progress?.exists || w.progress?.error);
+  $('progressBox').hidden = !showProgress;
+  $('progressBox').parentElement.style.gridTemplateColumns = showProgress ? '' : '1fr';
   $('progressTitle').title = w.progress?.file || '';
-  $('progress').textContent = w.progress?.text || '';
+  $('progress').textContent = w.progress?.error || w.progress?.text || '';
 }
 
 // The office: one desk per AI employee. Working = typing; waiting = hourglass; needs you = hand up;

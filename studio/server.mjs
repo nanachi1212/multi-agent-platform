@@ -3421,8 +3421,14 @@ function removeRecent(p) {
 
 function readProjectProgress(w) {
   const file = path.join(w.project, '.ai-workspace', 'progress.md');
-  if (!fs.existsSync(file)) return { exists: false, text: '' };
-  return { exists: true, text: fs.readFileSync(file, 'utf8'), file };
+  try { return { exists: true, text: fs.readFileSync(file, 'utf8'), file }; }
+  catch (error) {
+    if (error?.code === 'ENOENT') return { exists: false, text: '' };
+    // Keep one unreadable optional file from breaking every project's state. Never return
+    // the raw exception message: it can contain file contents or other private details.
+    const code = ['EACCES', 'EPERM', 'EISDIR', 'ENOTDIR', 'EIO', 'EMFILE', 'ENFILE', 'EBUSY', 'ELOOP', 'ENAMETOOLONG'].includes(error?.code) ? error.code : 'IO_ERROR';
+    return { exists: false, text: '', file, error: `無法讀取專案進度（${code}）` };
+  }
 }
 
 function browseFolder() {
