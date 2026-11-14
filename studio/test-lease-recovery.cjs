@@ -87,6 +87,31 @@ const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { re
     assert.deepEqual(JSON.parse(fs.readFileSync(changed.lock)), liveOwner);
     assert.ok(!fs.existsSync(changed.gate));
 
+    // A previous reclaimer can publish the main path with open('wx'), drop its recovery
+    // guard, and pause before writing its owner. A later reclaimer that already observed
+    // the old dead owner must treat this new incomplete/unknown owner as contention.
+    for (const contents of ['', '{', 'null', '[]', '{}', '42', '"owner"', '{"pid":0}', '{"pid":-1}', '{"pid":1.5}', '{"pid":"2147483000"}']) {
+      let mainPath, entered = false;
+      const incomplete = make({ ...fs, linkSync(src, dst) {
+        fs.linkSync(src, dst);
+        if (dst === mainPath + '.reclaim') put(mainPath, contents);
+      } }); mainPath = incomplete.lock; stale(incomplete);
+      assert.throws(() => incomplete.api.withLeaseTransaction(() => { entered = true; }), /Workspace lease store is locked/);
+      assert.equal(entered, false, 'unknown replacement must never enter a transaction');
+      assert.equal(fs.readFileSync(mainPath, 'utf8'), contents, 'unknown replacement is not deleted');
+      assert.ok(!fs.existsSync(incomplete.gate), 'our recovery guard is released on rejection');
+      // The first observation has the same contract, including JSON null/scalar owners.
+      assert.throws(() => incomplete.api.withLeaseTransaction(() => { entered = true; }), /Workspace lease store is locked/);
+      assert.equal(entered, false);
+      assert.equal(fs.readFileSync(mainPath, 'utf8'), contents);
+      assert.ok(!fs.existsSync(incomplete.gate), 'unknown initial owner does not start recovery');
+    }
+
+    // Do not hide corruption of the lease data itself behind the retryable lock error.
+    const corrupt = make(); put(path.join(corrupt.rt, 'studio', 'leases.json'), '{');
+    assert.throws(() => corrupt.api.loadLeases(), SyntaxError);
+    assert.ok(!fs.existsSync(corrupt.lock));
+
     // A normal claimant can win the atomic main lock after stale unlink, before reclaimer open.
     let racingMain, inserted = false;
     const overtaken = make({ ...fs, unlinkSync(file) {

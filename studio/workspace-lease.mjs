@@ -20,6 +20,15 @@ export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, A
   let pendingUnlockToken = null;
   const pendingRecoveryUnlocks = new Map();
   const locked = () => new Error('Workspace lease store is locked');
+  function readMainOwner(file) {
+    let owner;
+    // The main path is exclusively created before its owner is written. Both the first
+    // observation and the recovery recheck can see this window (or a removed lock).
+    // Unknown ownership is contention, never permission to unlink or enter a transaction.
+    try { owner = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { throw locked(); }
+    if (!Number.isInteger(owner?.pid) || owner.pid <= 0) throw locked();
+    return owner;
+  }
   // A recovery guard is immutable while owned. Never unlink somebody else's stale guard:
   // two reclaimers could otherwise both read a dead owner, then one delete the other's new lock.
   // Instead they compete for the same successor path derived from that dead owner's token.
@@ -78,8 +87,7 @@ export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, A
     try { fd = fs.openSync(f, 'wx'); }
     catch (e) {
       if (e.code !== 'EEXIST') throw e;
-      let owner;
-      try { owner = JSON.parse(fs.readFileSync(f, 'utf8')); } catch { throw new Error('Workspace lease store is locked'); }
+      const owner = readMainOwner(f);
       // A previous transaction in this same Studio may have committed but encountered a
       // transient Windows EPERM/EBUSY while deleting its lock file. Reclaim only our exact
       // random token; every other live lock continues to fail closed.
@@ -91,8 +99,8 @@ export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, A
         if (!owner.pid || pidAlive(owner.pid)) throw new Error('Workspace lease store is locked');
         const recovery = takeRecoveryGate(f + '.reclaim');
         try {
-          const current = JSON.parse(fs.readFileSync(f, 'utf8'));
-          if (!Number.isInteger(current.pid) || current.pid <= 0 || pidAlive(current.pid)) throw locked();
+          const current = readMainOwner(f);
+          if (pidAlive(current.pid)) throw locked();
           fs.unlinkSync(f); fd = fs.openSync(f, 'wx');
         } finally { dropRecoveryGate(recovery); }
       }
