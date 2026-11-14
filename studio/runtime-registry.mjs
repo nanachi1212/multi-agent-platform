@@ -138,33 +138,44 @@ export async function killProcessTree(rootPid, snapshot = processSnapshot, expec
   return { ok: remaining.length === 0, killed: true, rootPid, children: victims, remaining, left: remaining.map(idOf) };
 }
 
+// Runtime readiness and smoke requests always connect to IPv4 loopback. A listener
+// on another local address is not evidence of ownership of that endpoint.
 export async function getPortOccupant(port) {
   if (!port || typeof port !== 'number') return null;
   if (process.platform === 'win32') {
     try {
-      const psCmd = `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -Property LocalPort, OwningProcess | ConvertTo-Json -Compress`;
+      const psCmd = `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -Property LocalAddress, LocalPort, OwningProcess | ConvertTo-Json -Compress`;
       const out = await execPowerShell(psCmd);
       if (out && out.trim()) {
         const data = JSON.parse(out.trim());
-        const pid = Array.isArray(data) ? data[0].OwningProcess : data.OwningProcess;
-        if (pid && typeof pid === 'number') return pid;
+        if ([].concat(data).some((row) => typeof row?.LocalAddress !== 'string' || !Number.isInteger(row.OwningProcess) || row.OwningProcess <= 0)) throw new Error('Unconfirmed listener metadata');
+        const listeners = [].concat(data).filter((row) => ['127.0.0.1', '0.0.0.0', '::', '::ffff:127.0.0.1'].includes(row.LocalAddress));
+        const pids = [...new Set(listeners.map((row) => row.OwningProcess))];
+        // An IPv6 wildcard can be dual-stack. Do not guess which listener serves IPv4.
+        if (pids.length > 1) throw new Error('Ambiguous loopback listeners');
+        if (pids.length === 1 && Number.isInteger(pids[0]) && pids[0] > 0) return pids[0];
+        if (!listeners.length) return null;
       }
     } catch (e) {}
 
     try {
       const stdout = await execCmd('netstat', ['-ano', '-p', 'tcp']);
+      const pids = new Set();
       for (const line of stdout.split(/\r?\n/)) {
         const parts = line.trim().split(/\s+/);
         if (parts[0] === 'TCP' && parts[3] === 'LISTENING') {
           const addr = parts[1];
           const p = parseInt(addr.split(':').pop(), 10);
-          if (p === port) {
+          const host = addr.slice(0, addr.lastIndexOf(':')).replace(/^\[|\]$/g, '');
+          if (p === port && ['127.0.0.1', '0.0.0.0', '::', '::ffff:127.0.0.1'].includes(host)) {
             const pid = parseInt(parts[4], 10);
-            if (pid) return pid;
+            if (pid) pids.add(pid);
           }
         }
       }
-    } catch (e) {}
+      if (pids.size > 1) throw new Error('Ambiguous loopback listeners');
+      return pids.size === 1 ? [...pids][0] : null;
+    } catch (e) { throw new Error('Cannot confirm loopback port ownership: ' + e.message, { cause: e }); }
   }
   return null;
 }
@@ -373,7 +384,9 @@ export async function cleanupStaleRuntimes({ rtDir = null, customRuntimes = null
 }
 
 export async function checkPortOwnership(port, { desiredJobId, desiredDataDir, rtDir = null, customRuntimes = null } = {}) {
-  const occupantPid = await getPortOccupant(port);
+  let occupantPid;
+  try { occupantPid = await getPortOccupant(port); }
+  catch (error) { return { status: 'blocked', available: false, owner: 'unknown', port, reason: `Blocked: ${error.message}` }; }
   if (!occupantPid) {
     return { status: 'free', available: true, port };
   }

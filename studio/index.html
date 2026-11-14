@@ -1328,8 +1328,11 @@ async function loadHistory(view) {
     </button>`).join('') : '<div class="empty">完成的工作會保存在這裡。</div>';
 }
 
+let historyOpenSeq = 0;
 async function openHistory(id) {
+  const seq = ++historyOpenSeq;
   const r = await (await fetch('/api/history/' + id)).json();
+  if (seq !== historyOpenSeq) return;
   histOpenId = id;
   histOpenProject = r.project;
   $('histTitle').textContent = fmt(r.startedAt) + ' 的工作紀錄';
@@ -1341,14 +1344,20 @@ async function openHistory(id) {
   $('histResume').hidden = !((r.status === 'paused' || r.status === 'running') && !ow?.run?.active && !ow?.run?.paused);
   $('histDlg').showModal();
 }
+let refreshSeq = 0, refreshAppliedSeq = 0;
 async function refresh() {
+  const seq = ++refreshSeq;
   try {
     const res = await fetch('/api/state');
     const txt = await res.text();
+    if (seq < refreshAppliedSeq) return;
+    if (!res.ok) throw new Error('State request failed');
+    const next = JSON.parse(txt);
+    refreshAppliedSeq = seq;
     if (txt === last && Date.now() - lastRender < 30000) return; // re-render now and then so reset bars move
-    last = txt; S = JSON.parse(txt); render(); lastRender = Date.now();
+    last = txt; S = next; render(); lastRender = Date.now();
     handleNotices();
-  } catch { document.title = '無法連到 Studio（視窗是否已關閉？）'; }
+  } catch { if (seq >= refreshAppliedSeq) document.title = '無法連到 Studio（視窗是否已關閉？）'; }
 }
 
 // ---------- Notifications: the server sends the Windows toast; open pages add a sound ----------
@@ -1401,7 +1410,12 @@ $('pauseResume').onclick = () => {
 };
 $('renameWs').onclick = () => { const n = prompt('這個專案的顯示名稱（留空 = 用資料夾名稱）', W()?.name || ''); if (n !== null) post('/api/workspace/rename', { ws: ws(), name: n }); };
 $('closeWs').onclick = () => post('/api/workspace/close', { ws: ws() }).then(() => go(''));
-$('histClose').onclick = () => $('histDlg').close();
+function closeHistory() {
+  historyOpenSeq++;
+  $('histDlg').close();
+}
+$('histClose').onclick = closeHistory;
+$('histDlg').addEventListener('cancel', () => { historyOpenSeq++; });
 $('workClose').onclick = () => $('workDlg').close();
 $('workAsk').onclick = () => askWork('');
 $('workSend').onclick = () => { const q = $('workQ').value.trim(); if (!q) return; $('workQ').value = ''; askWork(q); };
@@ -1420,7 +1434,7 @@ $('extSave').onclick = async () => {
   const b = $('extSave'); b.disabled = true;
   try { await extCall('/api/external/save', extForm()); $('extDlg').close(); refresh(); } catch { /* shown in the dialog */ } finally { b.disabled = false; }
 };
-$('histResume').onclick = () => post('/api/resume', { id: histOpenId }).then(() => { $('histDlg').close(); go(histOpenProject); });
+$('histResume').onclick = () => post('/api/resume', { id: histOpenId }).then(() => { closeHistory(); go(histOpenProject); });
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter' || !e.ctrlKey) return;
   if (e.target.id === 'request' && !$('start').disabled) $('start').click();
@@ -1538,8 +1552,12 @@ document.addEventListener('click', (e) => {
     if (x) { b.disabled = true; return post('/api/start', { ws: ws(), request: x.request, continue: true }).catch(() => {}); }
   }
   if (b.id === 'instructBtn') {
-    const p = ws();
-    return post('/api/instruct', { ws: p, text: $('instruction').value, interrupt: $('deliverSel')?.value === 'interrupt', steer: $('deliverSel')?.value === 'steer' }).then(() => { drafts['i:' + p] = ''; $('office')._html = ''; render(); }).catch(() => {});
+    const p = ws(), text = $('instruction').value;
+    return post('/api/instruct', { ws: p, text, interrupt: $('deliverSel')?.value === 'interrupt', steer: $('deliverSel')?.value === 'steer' }).then(() => {
+      if (drafts['i:' + p] === text) drafts['i:' + p] = '';
+      if (ws() === p && $('instruction')?.value === text) $('instruction').value = '';
+      $('office')._html = ''; render();
+    }).catch(() => {});
   }
   if (b.hasAttribute('data-continue-state') || b.hasAttribute('data-refresh-state')) {
     b.disabled = true; b.textContent = b.hasAttribute('data-refresh-state') ? '讀取中…' : '核對狀態中…';

@@ -40,7 +40,7 @@ const { region } = require('./lifecycle-harness.cjs');
     fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'reused', creationDate: 'old', executable: me.executable }));
     (await claimRuntime(rt))(); // live PID, different creation time: a reused PID is not the old Studio
     fs.writeFileSync(lock, JSON.stringify({ pid: 2147483000, token: 'dead' })); fs.writeFileSync(reclaimLock, JSON.stringify({ pid: 2147483000 }));
-    (await claimRuntime(rt))(); assert.ok(!fs.existsSync(reclaimLock), 'abandoned reclaim lock is recovered');
+    (await claimRuntime(rt))(); assert.deepEqual(JSON.parse(fs.readFileSync(reclaimLock, 'utf8')), { pid: 2147483000 }, 'dead recovery predecessor stays immutable after successor recovery');
     fs.writeFileSync(lock, JSON.stringify({ pid: 2147483000, token: 'dead' })); fs.writeFileSync(reclaimLock, JSON.stringify({ pid: process.pid, creationDate: me.creationDate, executable: me.executable }));
     await assert.rejects(claimRuntime(rt), /接手/); fs.unlinkSync(reclaimLock); fs.unlinkSync(lock);
     for (const text of ['{', '{}', '{"pid":null}']) {

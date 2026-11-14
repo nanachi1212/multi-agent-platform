@@ -479,21 +479,23 @@ async function sendSteer(w, agent, convId) {
   }
 }
 async function turn(agent, convId, text, { w, lead = false, check = false, allowStart, ask = false, timeout = 25 * 60e3, progressEvery = 30000, bill = lead && !check ? 'lead' : null } = {}) {
-  const run = w?.run;
-  if (!check && (run?.stopped || run?.paused || allowStart && !allowStart())) throw new Halt('執行已停止');
+  const run = w?.run, epoch = run?.lifecycleEpoch || 0;
+  const halted = () => run && (w.run !== run || (run.lifecycleEpoch || 0) !== epoch || run.stopped || run.paused) || allowStart && !allowStart();
+  if (!check && halted()) throw new Halt('執行已停止');
   if (!run) bill = null;
   const usage0 = bill ? await usageOf(convId) : null;
   if (agent === 'codex') {
     try { await codexRuntime.prepare(convId); }
     catch (e) { throw Object.assign(e, { stopUnconfirmed: true }); }
   }
+  if (!check && halted()) throw new Halt('執行已停止'); // usage / runtime preparation may have crossed Pause or Stop
   const sent = await sendMessage(convId, text);
   active.set(convId, sent.turn_id);
   convActivity.set(convId, { at: Date.now(), tool: '', confirm: false }); // a fresh turn starts with fresh activity
   if (!check) S.agents[agent].working++;
   let confirmedIdle = false;
   try {
-    if (!check && (run?.stopped || run?.paused || allowStart && !allowStart())) throw new Halt('執行已停止');
+    if (!check && halted()) throw new Halt('執行已停止');
     let mark = '', markAt = Date.now(), checkedAt = 0, tool = '', extended = 0, graceUntil = 0;
     for (const t0 = Date.now(); ;) {
       await sleep(1500);
@@ -537,8 +539,9 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
     if (bill) chargeUsage(run, agent, bill === 'lead' ? null : bill, usageDelta(usage0, await usageOf(convId)));
     if (agent === 'codex' && !(await codexRuntime.stop(convId).catch(() => false))) throw Object.assign(new Error('Codex 工具程序尚未確認停止，保留寫入租約'), { stopUnconfirmed: true });
   }
-  if (!check && (run?.stopped || run?.paused)) throw new Halt(run.stopped ? '已停止' : '已暫停');
+  if (!check && halted()) throw new Halt('執行已停止');
   const items = (await api('GET', `/api/conversations/${convId}/messages`)).items || [];
+  if (!check && halted()) throw new Halt('執行已停止'); // response retrieval is also asynchronous
   const after = items.slice(items.findIndex((m) => m.id === sent.msg_id) + 1);
   // A failed tool call mid-turn is normal (agents retry); only a failed text reply means the turn failed.
   const texts = after.filter((m) => m.type === 'text' && m.position === 'left' && (ask || !isAskAnswer(m))); // a progress answer is never a card's result
@@ -723,8 +726,12 @@ const dirTag = (d) => (d ? '@' + crypto.createHash('sha1').update(String(d)).dig
 const roOf = (t) => (!isWriter(t) ? true : t.role === 'check' ? 'chk' : false);
 const workKey = (t) => t.agent + ':work' + (t.hard ? ':hard' : '') + (roOf(t) ? ':' + (roOf(t) === true ? 'ro' : roOf(t)) : '') + dirTag(t.workdir);
 async function conv(w, agent, lead, hard = false, workdir = '', ro = false) {
+  const run = w.run, epoch = run.lifecycleEpoch || 0;
   const key = agent + (lead ? ':lead' : ':work') + (hard ? ':hard' : '') + (ro ? ':' + (ro === true ? 'ro' : ro) : '') + dirTag(workdir);
-  return (w.run.convs[key] ??= await createConv(agent, workdir || w.run.project, lead || (ro === true && RO_MODE(agent)), tierCfg(w, agent, hard || lead)));
+  if (run.convs[key]) return run.convs[key];
+  const cid = await createConv(agent, workdir || run.project, lead || (ro === true && RO_MODE(agent)), tierCfg(w, agent, hard || lead));
+  if (w.run !== run || (run.lifecycleEpoch || 0) !== epoch || run.paused || run.stopped) throw new Halt('對話建立期間工作已停止或變更');
+  return (run.convs[key] ??= cid);
 }
 // This run's conversations that have a turn in progress (other projects keep working).
 const busyConvs = (run) => Object.values(run.convs).filter((c) => active.has(c));
@@ -1108,7 +1115,7 @@ function deleteRoutine(w, id) {
 }
 
 // A job that ended can still be winding down (steps draining, runtimes stopping): no new job starts until that is done.
-const stillStopping = (w) => !!(w.executingSteps?.size || w.recoverySteps?.size || w.runtimeStarts?.size || w.tasks.some((t) => t.stopUnconfirmed || t.runtimeStopPending));
+const stillStopping = (w) => !!(w.leaderSteps?.size || w.executingSteps?.size || w.recoverySteps?.size || w.runtimeStarts?.size || w.tasks.some((t) => t.stopUnconfirmed || t.runtimeStopPending));
 
 // A routine's optional precheck (Orca's --precheck): one command run in the project folder before the routine starts.
 // Exit code 0 = go; anything else, or no answer within 30 s, = this slot is skipped and the team costs nothing.
@@ -1138,7 +1145,7 @@ function runRoutines(now = new Date()) {
     };
     if (!r.precheck) { go(); continue; }
     precheck(w, r).then((why) => {
-      if (!w.routines.includes(r) || !r.on) return; // deleted or switched off while the check ran
+      if (!S.workspaces.includes(w) || !w.routines.includes(r) || !r.on) return; // closed, deleted or switched off while the check ran
       if (why) { // the slot is used up (lastAt is set): a skipped routine is not re-checked every 30 s
         r.lastResult = '略過：' + why;
         log(w, 'studio', 'system', `⏰ 定時工作（${r.time}）這次略過：${why}。`);
@@ -1294,8 +1301,26 @@ async function startJob(w, request, cont, inherit) {
   planPhase(w);
 }
 
-async function planPhase(w) {
+async function planPhase(w) { return leaderStep(w, (run, epoch) => planPhaseStep(w, run, epoch)); }
+// Leader operations include conversation creation and final response reads, not just active turns.
+// Track them before their first await so Pause/Stop and job replacement cannot lose an old operation.
+const leaderCurrent = (w, run, epoch) => w.run === run && run.active && !run.paused && !run.stopped && (run.lifecycleEpoch || 0) === epoch;
+function leaderStep(w, work) {
   const run = w.run;
+  if (!run) return Promise.resolve();
+  const epoch = run.lifecycleEpoch || 0;
+  w.leaderSteps ||= new Set();
+  let resolve, reject;
+  const step = new Promise((yes, no) => { resolve = yes; reject = no; });
+  w.leaderSteps.add(step);
+  step.finally(() => w.leaderSteps.delete(step)).catch(() => {});
+  // Keep phase/noting/asking changes synchronous: a second pump must see the operation already in progress.
+  try { Promise.resolve(leaderCurrent(w, run, epoch) ? work(run, epoch) : undefined).then(resolve, reject); }
+  catch (error) { reject(error); }
+  return step;
+}
+
+async function planPhaseStep(w, run, epoch) {
   run.phase = 'planning';
   const gen = run.leaderGen, lead = run.leader;
   try {
@@ -1304,12 +1329,12 @@ async function planPhase(w) {
     const cid = await conv(w, lead, true);
     const tryPlan = (x) => { try { const p = parsePlan(x, workers); return p.subtasks.length ? p : null; } catch { return null; } };
     let reply = await turn(lead, cid, planPrompt(run, workers, w.delivery, missionNote(w)), { w, lead: true });
-    if (run.leaderGen !== gen) return; // a new Leader took over and plans again
+    if (!leaderCurrent(w, run, epoch) || run.leaderGen !== gen) return; // a new Leader took over and plans again
     let plan = tryPlan(reply);
     if (!plan) {
       log(w, 'studio', 'system', '工頭的工作清單格式不對，正在請它重新整理…', reply);
       reply = await turn(lead, cid, FIX_JSON, { w, lead: true });
-      if (run.leaderGen !== gen) return;
+      if (!leaderCurrent(w, run, epoch) || run.leaderGen !== gen) return;
       plan = tryPlan(reply);
     }
     if (!plan) throw Object.assign(new Error('工頭這次沒有成功建立工作清單。Studio 保留了目前進度，按「↻ 接著上次的工作」可以再試一次。'), { detail: reply });
@@ -1319,7 +1344,7 @@ async function planPhase(w) {
     pump(w);
     processNotes(w);
   } catch (e) {
-    if (run.leaderGen !== gen || e instanceof Halt) return; // pause: resume() plans again; stop: stop() already saved
+    if (!leaderCurrent(w, run, epoch) || run.leaderGen !== gen || e instanceof Halt) return; // pause: resume() plans again; stop: stop() already saved
     log(w, 'studio', 'system', e.detail ? e.message : '工頭這次沒有完成派工。Studio 保留了目前進度，可以再試一次。', e.detail || e.message);
     finish(w, 'failed');
   }
@@ -1813,12 +1838,13 @@ async function cleanupCardRuntimes(w, cards, jobId = w.run.id, convs = w.run?.co
 
 async function drainExecution(w, cards = w.tasks) {
   const pending = cards.map((t) => w.executingSteps?.get(t.id)).filter(Boolean);
+  const leaders = cards === w.tasks ? [...w.leaderSteps || []] : [];
   const cids = [...new Set([...(cards === w.tasks ? busyConvs(w.run) : []), ...cards.map((t) => w.run.convs[workKey(t)]).filter(Boolean)])];
   const stopped = await Promise.all(cids.map((cid) => stopTurn(cid)));
   if (stopped.some((ok) => !ok)) throw new Error('Agent 還沒有真的停下來；保留寫入租約');
   let timer;
   try {
-    await Promise.race([Promise.all(pending.map((step) => step.done)), new Promise((_, reject) => {
+    await Promise.race([Promise.all([...pending.map((step) => step.done), ...leaders]), new Promise((_, reject) => {
       timer = setTimeout(() => reject(new Error('Agent 還在停下中；保留寫入租約')), 20000);
     })]);
   } finally { clearTimeout(timer); }
@@ -2589,8 +2615,9 @@ function applyStatus(w, t, st, reply) {
 const MAX_LEADER_ASKS = 2; // per card; the next question hands the whole card to the leader (docs/multi-model-principles.md 4: when unsure, go up)
 // A worker's question about HOW to do its task goes to the leader, not the user. The leader answers from the request and
 // the cards (no files, no commands) or turns it into a plain-language question for the user. The card keeps its lease.
-async function askLeader(w, t, question, options = []) {
-  const run = w.run, lead = run.leader, gen = run.leaderGen, who = agentName(t.agent);
+async function askLeader(w, t, question, options = []) { return leaderStep(w, (run, epoch) => askLeaderStep(w, run, epoch, t, question, options)); }
+async function askLeaderStep(w, run, epoch, t, question, options = []) {
+  const lead = run.leader, gen = run.leaderGen, who = agentName(t.agent);
   t.leaderAsks = (t.leaderAsks || 0) + 1;
   log(w, t.agent, 'worker', `問工頭：${question}${options.length ? '（' + options.join(' / ') + '）' : ''}`);
   if (t.leaderAsks > MAX_LEADER_ASKS) {
@@ -2623,7 +2650,7 @@ Reply with ONLY one JSON object, no markdown fences, one of:
     const cid = await conv(w, lead, true);
     for (const text of [prompt, FIX_JSON]) {
       reply = await turn(lead, cid, text, { w, lead: true });
-      if (run.leaderGen !== gen || w.run !== run) return;
+      if (!leaderCurrent(w, run, epoch) || run.leaderGen !== gen) return;
       try { d = parseJson(reply); } catch { d = null; }
       if (typeof d?.answer === 'string' && d.answer.trim() || typeof d?.needs_user === 'string' && d.needs_user.trim()) break;
       d = null;
@@ -2802,8 +2829,8 @@ function instruct(w, text, interrupt = false, steer = false) {
 
 const NOTE_SHAPE = `{"message":"<one sentence to the user, in the user's language>","tell":[{"card":"<card id>","note":"<what that worker must change>"}],"cancel":["<card id>"],"add":[${SUBTASK_SHAPE}]}`;
 
-async function processNotes(w) {
-  const run = w.run;
+async function processNotes(w) { return leaderStep(w, (run, epoch) => processNotesStep(w, run, epoch)); }
+async function processNotesStep(w, run, epoch) {
   // Planning and the final check read the notes themselves when they end (see planPhase / summarize).
   if (!run?.active || run.noting || run.asking || run.phase !== 'working' || run.summarizing || !run.notes?.length) return;
   run.noting = true;
@@ -2832,7 +2859,7 @@ ${SUBTASK_RULES}`;
     let d = null;
     for (const text of [prompt, FIX_JSON]) {
       const reply = await turn(lead, cid, text, { w, lead: true });
-      if (run.leaderGen !== gen) return;
+      if (!leaderCurrent(w, run, epoch) || run.leaderGen !== gen) return;
       try { d = parseJson(reply); break; } catch { log(w, 'studio', 'system', '工頭的回覆格式不對，正在請它重新整理…', reply); }
     }
     if (!d) {
@@ -2865,11 +2892,11 @@ ${SUBTASK_RULES}`;
     const subs = workers.length ? parseSubtasks(d.add, workers) : [];
     if (subs.length) addCards(w, subs, lead);
   } catch (e) {
-    if (run.leaderGen !== gen || e instanceof Halt) return;
+    if (!leaderCurrent(w, run, epoch) || run.leaderGen !== gen || e instanceof Halt) return;
     log(w, 'studio', 'system', '工頭這次沒能處理你的指示，請再送一次。', e.message);
   } finally {
     run.noting = false;
-    for (const t of w.tasks) t.hold = false; // interrupted cards continue now
+    if (w.run === run) for (const t of w.tasks) t.hold = false; // interrupted cards continue now
   }
   pump(w);
   processNotes(w); // more notes may have arrived meanwhile
@@ -3085,8 +3112,8 @@ async function continueProject(w) {
 // ---------- The Leader checks the whole request ----------
 const MAX_ROUNDS = 3; // extra card rounds before the Leader must ask the user
 
-async function summarize(w, userAnswer = '') {
-  const run = w.run;
+async function summarize(w, userAnswer = '') { return leaderStep(w, (run, epoch) => summarizeStep(w, run, epoch, userAnswer)); }
+async function summarizeStep(w, run, epoch, userAnswer = '') {
   run.summarizing = true;
   run.phase = 'summarizing';
   run.ask = null;
@@ -3116,7 +3143,7 @@ A FAILED card with a technical reason (timeout, conversation busy, provider erro
 When done, also give 1 to 3 small, valuable next steps for this project in "next", best first, based on what you just saw (empty list if nothing is worth doing).${w.afterDone === 'auto' ? ' The first one may start automatically without the user: it must not need a decision from the user and must not be destructive (no deleting data, no force push, no release or deploy).' : ''}`}
 Rules for new subtasks:
 ${SUBTASK_RULES}`, { w, lead: true });
-    if (run.leaderGen !== gen) return;
+    if (!leaderCurrent(w, run, epoch) || run.leaderGen !== gen) return;
     const parseSummary = (text) => {
       const d = parseJson(text);
       if (!d || Array.isArray(d) || !(typeof d.needs_user === 'string' && d.needs_user.trim()
@@ -3128,7 +3155,7 @@ ${SUBTASK_RULES}`, { w, lead: true });
     try { d = parseSummary(reply); } catch {
       log(w, 'studio', 'system', '工頭的回覆格式不對，正在請它重新整理…', reply);
       const again = await turn(lead, await conv(w, lead, true), FIX_JSON, { w, lead: true });
-      if (run.leaderGen !== gen) return;
+      if (!leaderCurrent(w, run, epoch) || run.leaderGen !== gen) return;
       try { d = parseSummary(again); } catch { log(w, 'studio', 'system', '工頭這次沒有成功確認整體結果。', again); }
     }
     run.summarizing = false;
@@ -3150,7 +3177,7 @@ ${SUBTASK_RULES}`, { w, lead: true });
     if (run.suggestions.length) log(w, lead, 'leader', '建議的下一步：\n' + run.suggestions.map((x, i) => `${i + 1}. ${x.title}${x.why ? '：' + x.why : ''}`).join('\n'));
     finish(w, 'done');
   } catch (e) {
-    if (run.leaderGen !== gen || e instanceof Halt) return;
+    if (!leaderCurrent(w, run, epoch) || run.leaderGen !== gen || e instanceof Halt) return;
     run.summarizing = false;
     log(w, 'studio', 'system', '工頭這次沒有完成整體確認。Studio 保留了目前進度，可以按「↻ 接著上次的工作」再試。', e.message);
     finish(w, 'failed');
@@ -3203,6 +3230,7 @@ function continueCard(w, taskId) {
 function stop(w) {
   const run = w.run;
   if (!run?.active && !run?.paused) return;
+  run.lifecycleEpoch = (run.lifecycleEpoch || 0) + 1;
   run.stopped = true;
   busyConvs(run).forEach(cancelTurn);
   for (const t of w.tasks) if (['WAITING', 'PAUSED', 'INTERRUPTED', ...PARKED].includes(t.status)) { t.status = 'FAILED'; t.result = '已停止'; }
@@ -3215,6 +3243,7 @@ function stop(w) {
 function pause(w) {
   const run = w.run;
   if (!run?.active) throw new Error('目前沒有進行中的工作');
+  run.lifecycleEpoch = (run.lifecycleEpoch || 0) + 1;
   run.paused = true;
   run.active = false;
   busyConvs(run).forEach(cancelTurn);
@@ -3277,7 +3306,7 @@ async function resumeJob(w, opts) {
   const run = w?.run;
   if (run?.stopped && !run.paused) throw new Error('這件工作已經停止，不能繼續；按「▶ 接著處理」開新的一輪');
   if (!run?.paused) throw new Error('沒有暫停中的工作');
-  if (busyConvs(run).length || w.executingSteps?.size) throw new Error('Agent 還在停下中，請幾秒後再按繼續');
+  if (busyConvs(run).length || w.leaderSteps?.size || w.executingSteps?.size) throw new Error('Agent 還在停下中，請幾秒後再按繼續');
   await drainExecution(w); // restart may have left an orphan conversation
   await endLeftSetups(w, w.tasks);
   if (!isDir(run.project)) throw new Error('專案資料夾不存在：' + run.project);
