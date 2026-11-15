@@ -37,14 +37,14 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
     extTurns++; return extTurns === 1 ? 'Started nightly build.\nSTATUS: WAITING_EXTERNAL: the nightly build' : extTurns === 2 ? 'Still running.\nSTATUS: WAITING_EXTERNAL: the nightly build' : 'Build fine.\nSTATUS: DONE';
   }));
   w = newW(); env.S.workspaces.push(w);
-  await api.planPhase(w); await settle();
+  await api.planPhase(w); await until(() => w.tasks.map((t) => t.status).join() === 'NEEDS_USER,WAITING_EXTERNAL', 'both cards parked');
   assert.deepStrictEqual(w.tasks.map((t) => t.status), ['NEEDS_USER', 'WAITING_EXTERNAL']);
   assert.deepStrictEqual(w.tasks[0].ask, { question: '要 A 還是 B？', options: ['A', 'B'] });
   assert.strictEqual(w.tasks[1].wait.manual, false, 'no PR → the worker is asked to look itself before the user is');
   assert.ok(w.tasks[1].wait.pokeAt > Date.now() && !env.notices.some((n) => n.title.includes('需要你按「繼續」')), 'self-check scheduled, user not bothered yet');
   assert.ok(env.notices.some((n) => n.title.includes('需要你處理')));
   assert.strictEqual(w.run.active, true, 'run stays open while cards wait');
-  w.tasks[1].wait.pokeAt = 1; api.watchExternal(); await settle();
+  w.tasks[1].wait.pokeAt = 1; api.watchExternal(); await until(() => w.tasks[1].pokes === 1 && extTurns === 2 && w.tasks[1].status === 'WAITING_EXTERNAL', 'one self-check');
   assert.deepStrictEqual([extTurns, w.tasks[1].status, w.tasks[1].pokes], [2, 'WAITING_EXTERNAL', 1], 'the worker looked once and still waits');
   assert.ok(env.prompts.at(-1).text.includes('check 1 of 3'), 'the poke says which check it is');
   api.answer(w, w.tasks[0].id, 'B'); api.continueCard(w, w.tasks[1].id); await until(() => w.run.result === 'done', 'job done');
@@ -73,7 +73,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
   // 4) Plan fails twice → plain message, run fails, no JSON in the message
   ({ env, api } = makeEnv(() => 'I cannot do JSON today'));
   w = newW(); env.S.workspaces.push(w);
-  await api.planPhase(w); await settle();
+  await api.planPhase(w); await until(() => w.run.result === 'failed', 'plan failed');
   const last = env.logs.filter((l) => l.who === 'studio').at(-1);
   assert.ok(last.text.startsWith('工頭這次沒有成功建立工作清單') && last.detail.includes('I cannot do JSON'));
   assert.strictEqual(w.run.result, 'failed');
@@ -114,7 +114,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
       w.autoRounds = 5; api.autoNext(w, w.run);
       assert.strictEqual(env.started.length, 1, 'stops after 5 in a row');
       assert.ok(env.notices.some((n) => n.title.includes('自動持續開發先停下')));
-      w.autoMax = 0; w.autoRounds = 99; api.autoNext(w, w.run); await settle();
+      w.autoMax = 0; w.autoRounds = 99; api.autoNext(w, w.run); await until(() => env.started.length === 2, 'second auto start');
       assert.strictEqual(env.started.length, 2, 'autoMax 0 = no limit');
     }
   }
@@ -199,7 +199,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
     await api.planPhase(w);
     await new Promise((r) => setTimeout(r, 30));
     api.instruct(w, '改藍色', false, true);
-    for (let i = 0; i < 100 && w.run.result !== 'done'; i++) await settle();
+    await until(() => w.run.result === 'done', 'job done', 30000);
     assert.strictEqual(w.run.result, 'done', 'job finished');
     const byTitle = (x) => w.tasks.find((t) => t.title === x);
     assert.deepStrictEqual([steered, byTitle('impl').result, !!byTitle('impl').interrupted], [['use blue'], 'Blue mid-step.', false], 'Codex got it inside its step, not stopped');
@@ -297,7 +297,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
     throw Object.assign(new Error('逾時：25 分鐘沒有任何新進度，Studio 已停止這一步'), { timeout: true });
   }));
   w = newW(); env.S.workspaces.push(w);
-  await api.planPhase(w); await settle();
+  await api.planPhase(w); await until(() => w.run.result, 'job ended');
   assert.strictEqual(w.tasks[0].status, 'FAILED'); assert.strictEqual(w.tasks[0].escalated, undefined, 'a timeout is not retried on the strong model');
   assert.ok(w.tasks[0].result.startsWith('沒有完成：25 分鐘沒有任何新進度'));
   const check12 = env.prompts.find((p) => p.text.includes('Every current card has ended')).text;
@@ -1159,13 +1159,13 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
     w.run = { result: 'stopped' }; w.executingSteps = new Set(['old-step']); api.runRoutines(at(16, 12));
     assert.deepStrictEqual([env.started.length, r.lastAt], [0, ''], 'the last job is still winding down: the slot is not used up');
     w.executingSteps.clear();
-    w.run = null; api.runRoutines(at(16, 12)); api.runRoutines(at(16, 12, 1)); await settle();
+    w.run = null; api.runRoutines(at(16, 12)); api.runRoutines(at(16, 12, 1)); await until(() => env.started.length === 1, 'routine started');
     assert.deepStrictEqual(env.started, [{ request: '檢查資料', cont: undefined }], 'missed slots collapse into one run');
     assert.deepStrictEqual([r.lastAt, r.lastResult, w.autoRounds], [at(16, 12).toISOString(), '', 0]);
     assert.ok(env.events.some((e) => e.type === 'routine.start' && e.routine === r.id) && env.notices.some((n) => n.title.includes('定時工作開始')));
     ({ env, api } = makeEnv(() => 'STATUS: DONE', { start: async () => { throw new Error('Leader Codex 目前不可用'); } }));
     w = { ...newW(), run: null, routines: [{ ...r, lastAt: '', lastResult: '' }] }; env.S.workspaces.push(w);
-    api.runRoutines(at(16, 12)); await settle();
+    api.runRoutines(at(16, 12)); await until(() => w.routines[0].lastResult, 'routine failure recorded');
     assert.strictEqual(w.routines[0].lastResult, 'Leader Codex 目前不可用');
     assert.ok(env.notices.some((n) => n.title.includes('定時工作沒有開始')) && env.events.some((e) => e.type === 'routine.error'));
     api.runRoutines(at(16, 13)); await settle();
@@ -1389,7 +1389,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
     assert.ok(!env.notices.some((n) => n.kind === 'ask'), 'the user was not bothered');
     mode = 'user'; env.prompts.length = 0; env.notices.length = 0;
     w = newW(); env.S.workspaces.push(w);
-    await api.planPhase(w); await settle(); await settle();
+    await api.planPhase(w); await until(() => w.tasks[0]?.status === 'NEEDS_USER', 'question for the user');
     t = w.tasks[0];
     assert.deepStrictEqual([t.status, t.ask], ['NEEDS_USER', { question: '要共用元件還是只改這一頁？', options: ['共用', '只改這頁'] }], 'the leader turned it into a plain question');
     assert.ok(env.notices.some((n) => n.title.includes('需要你處理')));
@@ -1411,7 +1411,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
       return 'Hmm.\nSTATUS: ASK_LEADER: and now?';
     }));
     w = newW(); env.S.workspaces.push(w);
-    await api.planPhase(w); for (let i = 0; i < 6; i++) await settle();
+    await api.planPhase(w); await until(() => w.run.result === 'done', 'job done');
     t = w.tasks[0];
     assert.deepStrictEqual([t.status, t.agent, t.ledByLeader, t.leaderAsks], ['DONE', 'claude', true, 3], 'the third question hands the card to the leader');
     assert.ok(env.logs.some((l) => l.text.includes('已經問了工頭 2 次')));
