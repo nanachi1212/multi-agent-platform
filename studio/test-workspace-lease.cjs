@@ -96,6 +96,14 @@ module.exports = async function run({ makeEnv, mkTmp, region }) {
     const fence = H.env.S.leases.find((l) => l.revoked), aged = { ...fence, id: 'aged', releasedAt: new Date(Date.now() - 31 * 24 * 3600e3).toISOString() };
     H.env.S.leases.push(aged); H.api.saveLeases();
     assert.ok(H.env.S.leases.includes(fence) && !H.env.S.leases.includes(aged), 'revocation fences are kept 30 days, then dropped');
+    // STOP on a job whose write lease was released over 30 days ago: the fence starts counting at STOP, not at the old release.
+    const SP = await store(tmp('lease-stop-'), 'stop-fence'), spi = { key: 'stop-tree', path: 'stop-tree', repo: '', branch: 'main' };
+    const sw = { project: 'stop-tree', tasks: [], run: { id: 'stop-job', stopped: false } }, st = { id: 'stop-card', agent: 'codex', title: 'old card' };
+    const spl = SP.api.acquireWrite(sw, st, spi).lease; SP.api.retire(spl, 'done'); spl.releasedAt = new Date(Date.now() - 31 * 24 * 3600e3).toISOString();
+    const snapshot = structuredClone(sw);
+    sw.run.stopped = true; SP.api.releaseJobLeases(sw, 'STOP');
+    assert.ok(SP.S.leases.some((l) => l.id === spl.id && l.jobStopped), 'STOP fence on an old released lease is kept');
+    assert.equal(SP.api.acquireWrite(snapshot, st, spi).ok, false, 'pre-STOP snapshot cannot take the write lease again');
     console.log('lease C/D durable handoff revocation, same branch/worktree and retained conversation: PASS');
 
     // A failed stop confirmation cannot publish an external claim or move ownership.

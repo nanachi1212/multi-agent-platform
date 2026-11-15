@@ -128,7 +128,7 @@ export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, A
       const f = leasesFile(), tmp = f + '.' + INSTANCE + '.tmp';
       // Revocation/STOP records fence stale job snapshots even after the new owner has finished; after 30 days they are dropped.
       const fenceUntil = Date.now() - 30 * 24 * 3600e3;
-      S.leases = S.leases.filter((l) => l.status !== 'RELEASED' || ((l.revoked || l.jobStopped) && !(Date.parse(l.releasedAt) < fenceUntil)))
+      S.leases = S.leases.filter((l) => l.status !== 'RELEASED' || ((l.revoked || l.jobStopped) && !(Date.parse(l.fencedAt || l.releasedAt) < fenceUntil)))
         .concat(S.leases.filter((l) => l.status === 'RELEASED' && !l.revoked && !l.jobStopped).slice(-80));
       // flush in place: this module gets its fs injected and no imports (tests load it with new Function), so it cannot use state-files' writeJson
       try { fs.writeFileSync(tmp, JSON.stringify(S.leases, null, 1), { flush: true }); fs.renameSync(tmp, f); }
@@ -192,7 +192,7 @@ export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, A
     return withLeaseTransaction(() => {
     for (const l of S.leases) {
       if (l.jobId !== w.run?.id || l.owner.kind !== 'studio') continue;
-      if (w.run?.stopped) l.jobStopped = true;
+      if (w.run?.stopped && !l.jobStopped) Object.assign(l, { jobStopped: true, fencedAt: nowIso() }); // the 30-day fence counts from STOP, not from an older release
       if (l.status === 'RELEASED') continue;
       if (l.mode === 'write' && (w.executingSteps?.has(l.cardId) || w.tasks.some((t) => t.id === l.cardId && (t.status === 'WORKING' || t.stopUnconfirmed || t.runtimeStopPending)))) continue;
       retire(l, reason);
