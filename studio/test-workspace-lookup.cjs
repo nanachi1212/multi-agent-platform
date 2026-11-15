@@ -9,7 +9,7 @@ const calls = [];
 const git = (cwd, ...args) => new Promise((res) => { calls.push(args); execFile('git', ['-c', 'safe.directory=*', ...args], { cwd, windowsHide: true }, (e, out) => res(e ? { err: 'x' } : { out: String(out) })); });
 const canonPath = (p) => path.resolve(p).toLowerCase(), treeKey = canonPath;
 const lookup = new Function('git', 'originRepo', 'canonPath', 'treeKey', code + '\nreturn workspaceLookup;')(git, async () => '', canonPath, treeKey);
-const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-lookup-'));
+const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ws-lookup-'))); // CI's temp path is an 8.3 short name; git reports the long one
 const g = (cwd, ...a) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { cwd, stdio: 'pipe' });
 (async () => {
   try {
