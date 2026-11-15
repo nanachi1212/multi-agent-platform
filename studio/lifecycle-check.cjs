@@ -18,7 +18,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
     return 'STATUS: DONE';
   });
   let w = newW(); env.S.workspaces.push(w);
-  await api.planPhase(w); await settle(); await settle();
+  await api.planPhase(w); await until(() => w.run.result === 'done', 'job done');
   assert.deepStrictEqual(w.tasks.map((t) => t.status), ['DONE', 'DONE', 'DONE'], JSON.stringify(w.tasks.map((t) => [t.title, t.status])));
   assert.strictEqual(implTurns, 2, 'impl was woken once after the review');
   const wakePrompt = env.prompts.find((p) => p.agent === 'codex' && p.text.startsWith('Update from Multi-Agent Studio'));
@@ -47,7 +47,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
   w.tasks[1].wait.pokeAt = 1; api.watchExternal(); await settle();
   assert.deepStrictEqual([extTurns, w.tasks[1].status, w.tasks[1].pokes], [2, 'WAITING_EXTERNAL', 1], 'the worker looked once and still waits');
   assert.ok(env.prompts.at(-1).text.includes('check 1 of 3'), 'the poke says which check it is');
-  api.answer(w, w.tasks[0].id, 'B'); api.continueCard(w, w.tasks[1].id); await settle(); await settle();
+  api.answer(w, w.tasks[0].id, 'B'); api.continueCard(w, w.tasks[1].id); await until(() => w.run.result === 'done', 'job done');
   assert.deepStrictEqual(w.tasks.map((t) => t.status), ['DONE', 'DONE']);
   assert.strictEqual(w.tasks[0].result, 'Used B.');
   assert.strictEqual(w.run.result, 'done');
@@ -62,7 +62,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
     return 'ok\nSTATUS: DONE';
   }));
   w = newW(); env.S.workspaces.push(w);
-  await api.planPhase(w); await settle(); await settle();
+  await api.planPhase(w); await until(() => w.run.result === 'done', 'job done');
   assert.deepStrictEqual(w.tasks.map((t) => [t.title, t.status]), [['impl', 'DONE'], ['verify', 'DONE']]);
   assert.strictEqual(w.run.result, 'done');
   const fixLog = env.logs.find((l) => l.text.includes('格式不對'));
@@ -90,7 +90,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
     return 'Finished without the review.\nSTATUS: DONE';
   }));
   w = newW(); env.S.workspaces.push(w);
-  await api.planPhase(w); await settle(); await settle();
+  await api.planPhase(w); await until(() => w.run.result === 'done', 'job done');
   assert.strictEqual(w.tasks[0].status, 'DONE');
   assert.ok(env.prompts.some((p) => p.text.startsWith('Your last reply had no STATUS line')));
   assert.ok(env.prompts.some((p) => p.text.includes('has no open card in this job')));
@@ -136,7 +136,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
   w = newW(); env.S.workspaces.push(w);
   await api.planPhase(w);
   api.instruct(w, '改用藍色，不要寫文件');
-  await settle(); await settle();
+  await until(() => w.run.result === 'done', 'job done');
   const byTitle = (x) => w.tasks.find((t) => t.title === x);
   assert.ok(env.prompts.some((p) => p.agent === 'codex' && p.text.includes('use blue instead of red')), 'working worker got the note in the same task');
   assert.deepStrictEqual([byTitle('impl').status, byTitle('impl').result], ['DONE', 'Switched to blue.']);
@@ -163,7 +163,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
   await api.planPhase(w);
   await new Promise((r) => setTimeout(r, 30));
   api.instruct(w, '改藍色', true);
-  await settle(); await settle();
+  await until(() => w.run.result === 'done', 'job done');
   assert.ok(stopped, 'the working step saw the interrupt');
   assert.ok(env.prompts.some((p) => p.agent === 'codex' && p.text.includes('Task: impl')), 'hard card ran');
   assert.deepStrictEqual([w.tasks[0].status, w.tasks[0].result, w.tasks[0].hard], ['DONE', 'Blue now.', true]);
@@ -230,7 +230,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
     return 'done on the strong model\nSTATUS: DONE';
   }));
   w = newW(); env.S.workspaces.push(w);
-  await api.planPhase(w); await settle(); await settle();
+  await api.planPhase(w); await until(() => w.run.result === 'done', 'job done');
   const workerCids = env.prompts.filter((p) => p.agent === 'codex').map((p) => p.cid);
   assert.deepStrictEqual(workerCids, ['codex:work', 'codex:work:hard'], 'retry runs on the hard conversation');
   assert.deepStrictEqual([w.tasks[0].status, w.tasks[0].escalated, w.run.result], ['DONE', true, 'done']);
@@ -287,7 +287,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
     return 'ok' + String.fromCharCode(10) + 'STATUS: DONE';
   }));
   w = newW(); w.run.convs = { 'codex:work': 'old-conv' }; env.S.workspaces.push(w);
-  await api.planPhase(w); await settle(); await settle();
+  await api.planPhase(w); await until(() => w.run.result === 'done', 'job done');
   assert.deepStrictEqual([w.tasks[0].status, w.tasks[0].convReset, w.tasks[0].escalated], ['DONE', true, undefined]);
   assert.ok(env.logs.some((l) => l.text.includes('改開一個新的對話')));
   // a card that timed out: friendly result, raw reason kept, and the 工頭's final-check prompt carries it
@@ -312,7 +312,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
       return 'ok' + String.fromCharCode(10) + 'STATUS: DONE';
     }));
     w = Object.assign(newW(), { delivery: mode }); env.S.workspaces.push(w);
-    await api.planPhase(w); await settle(); await settle();
+    await api.planPhase(w); await until(() => w.run.result === 'done', 'job done');
     const plan = env.prompts.find((p) => p.text.includes('LEADER (foreman)')).text;
     const work = env.prompts.find((p) => p.text.includes('Task: ship')).text;
     const check = env.prompts.find((p) => p.text.includes('Every current card has ended')).text;
@@ -1378,7 +1378,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
       return 'STATUS: DONE';
     }));
     w = newW(); env.S.workspaces.push(w);
-    await api.planPhase(w); await settle(); await settle();
+    await api.planPhase(w); await until(() => w.run.result === 'done', 'job done');
     let t = w.tasks[0];
     assert.deepStrictEqual([t.status, t.leaderAsks, leaderAsks, w.run.result], ['DONE', 1, 1, 'done'], 'answered and continued');
     const ask = env.prompts.find((p) => askPrompt(p.text));
@@ -1393,11 +1393,11 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
     t = w.tasks[0];
     assert.deepStrictEqual([t.status, t.ask], ['NEEDS_USER', { question: '要共用元件還是只改這一頁？', options: ['共用', '只改這頁'] }], 'the leader turned it into a plain question');
     assert.ok(env.notices.some((n) => n.title.includes('需要你處理')));
-    api.answer(w, t.id, '共用'); await settle(); await settle();
+    api.answer(w, t.id, '共用'); await until(() => w.run.result === 'done', 'job done');
     assert.deepStrictEqual([t.status, w.run.result], ['DONE', 'done'], 'the user answer reaches the worker');
     mode = 'garbage'; env.prompts.length = 0;
     w = newW(); env.S.workspaces.push(w);
-    await api.planPhase(w); await settle(); await settle();
+    await api.planPhase(w); await until(() => w.run.result === 'done', 'job done');
     t = w.tasks[0];
     const fallback = env.prompts.find((p) => p.agent === 'codex' && p.text.startsWith('Update from Multi-Agent Studio'));
     assert.ok(fallback.text.includes('could not answer') && t.status === 'DONE', 'two bad leader replies: the worker decides itself');
