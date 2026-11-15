@@ -1,4 +1,5 @@
-param([ValidateSet('Auto', 'Full')][string]$Mode = 'Auto')
+# One suite; -Mode Auto is kept so existing callers keep working.
+param([ValidateSet('Auto')][string]$Mode = 'Auto')
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Push-Location -LiteralPath $repoRoot

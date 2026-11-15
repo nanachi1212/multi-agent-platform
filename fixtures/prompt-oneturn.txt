@@ -1,5 +1,0 @@
-You are in a disposable test repository on Windows. Do exactly this:
-1. Read src/add.mjs.
-2. Edit src/add.mjs so it also exports a function `sub(a, b)` that returns a - b. Do not change any other file. Do not run shell commands.
-3. When finished, your final message must be exactly one JSON object and nothing else (no Markdown fence, no prose):
-{"type":"Result","changed_files":["src/add.mjs"],"summary":"<one short sentence>"}
