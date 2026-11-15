@@ -9,6 +9,8 @@ const { apiAllowed, cardToken } = new Function('crypto', 'API_TOKEN', code + '\n
 assert.equal(apiAllowed('GET /api/state', API_TOKEN, {}), true, 'the page pass opens everything');
 for (const route of ['GET /api/state', 'POST /api/routine/save', 'POST /api/answer', 'POST /api/resume', 'POST /api/runtime/start', 'POST /api/workspace/release-claim'])
   for (const pass of [undefined, '', 'b'.repeat(64), API_TOKEN.slice(1)]) assert.equal(apiAllowed(route, pass, { cardId: 'c1' }), false, route + ' without the pass');
+assert.equal(apiAllowed('GET /api/state', 'é'.repeat(64)), false, 'a non-ASCII pass is refused, not an error');
+assert.ok(!/api-token/.test(src) && /const API_TOKEN = crypto\.randomBytes\(32\)/.test(src), 'the pass is never written to the shared runtime folder');
 assert.equal(apiAllowed('POST /api/workspace/claim', undefined, {}), true, 'an outside claim (stop writing) stays open');
 const card = cardToken('c1');
 assert.notEqual(card, API_TOKEN);

@@ -23,16 +23,13 @@ const AION = path.join(ROOT, 'runtime', 'aioncore', 'aioncore.exe');
 const AION_URL = 'https://github.com/iOfficeAI/AionCore/releases/download/v0.2.2/aioncore-v0.2.2-x86_64-pc-windows-msvc.zip';
 const AION_ZIP_SHA256 = 'd1ed8d1da869230c18701747d07e8f068db5b8c9442e65261304aeb4c27eacf6';
 let PORT = Number(process.env.STUDIO_PORT || 4848); // moves up when the port is taken (see server.listen)
-// API pass (security F2/F3): any local program can reach 127.0.0.1, so /api needs this secret. It is kept in the runtime folder
-// so a page that already has it keeps working after a restart; the browser gets it once, in the URL fragment Studio opens.
-const API_TOKEN = (() => {
-  const f = path.join(RT, 'api-token');
-  try { const t = fs.readFileSync(f, 'utf8').trim(); if (/^[0-9a-f]{64}$/.test(t)) return t; } catch {}
-  const t = crypto.randomBytes(32).toString('hex'); fs.writeFileSync(f, t, { flush: true }); return t;
-})();
+// API pass (security F2/F3): any local program can reach 127.0.0.1, so /api needs this secret. It lives only in memory and is new
+// at every start (the runtime folder is readable by other accounts, e.g. the Codex sandbox users); the browser gets it in the URL
+// fragment Studio opens and keeps it for later tabs.
+const API_TOKEN = crypto.randomBytes(32).toString('hex');
 // A worker only gets a pass for its own card's runtime start: it never opens the rest of the API.
 const cardToken = (cardId) => crypto.createHmac('sha256', API_TOKEN).update('runtime-start:' + cardId).digest('hex');
-const sameSecret = (a, b) => typeof a === 'string' && a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+const sameSecret = (a, b) => { if (typeof a !== 'string') return false; const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && crypto.timingSafeEqual(x, y); };
 // An outside claim only makes Studio stop writing, so it stays open for the documented curl use; releasing one needs the pass.
 const OPEN_ROUTES = new Set(['POST /api/workspace/claim']);
 const apiAllowed = (route, pass, b) => sameSecret(pass, API_TOKEN) || OPEN_ROUTES.has(route)
@@ -3826,14 +3823,14 @@ const server = http.createServer(async (req, res) => {
   const record = req.method === 'POST' && !READ_POSTS.has(route);
   let b = {};
   const pass = req.headers['x-studio-token'];
+  const noPass = () => send(401, { error: '沒有 Studio 通行碼：請從 Studio 視窗印出的網址開啟這一頁' });
+  // refuse before reading the body, except where the body names the card a worker pass is for; refusals are not logged (no event spam)
+  if (route !== 'POST /api/runtime/start' && !apiAllowed(route, pass)) return noPass();
   try {
     let raw = '';
     for await (const c of req) raw += c;
     b = raw ? JSON.parse(raw) : {};
-    if (!apiAllowed(route, pass, b)) {
-      if (record) event('api', { route, error: 'missing or wrong pass' });
-      return send(401, { error: '沒有 Studio 通行碼：請從 Studio 視窗印出的網址開啟這一頁' });
-    }
+    if (!apiAllowed(route, pass, b)) return noPass();
     send(200, (await fn(b)) ?? { ok: true });
     if (record) event('api', { route, ...pickEventFields(b) });
   } catch (e) {
