@@ -86,6 +86,8 @@ export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, A
     let fd;
     try { fd = fs.openSync(f, 'wx'); }
     catch (e) {
+      // Windows reports EPERM/EBUSY while another holder's lock file is still being deleted: that is contention, so fail closed as locked.
+      if (['EPERM', 'EBUSY'].includes(e.code)) throw new Error('Workspace lease store is locked', { cause: e });
       if (e.code !== 'EEXIST') throw e;
       const owner = readMainOwner(f);
       // A previous transaction in this same Studio may have committed but encountered a
