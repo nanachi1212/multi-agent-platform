@@ -23,6 +23,20 @@ const AION = path.join(ROOT, 'runtime', 'aioncore', 'aioncore.exe');
 const AION_URL = 'https://github.com/iOfficeAI/AionCore/releases/download/v0.2.2/aioncore-v0.2.2-x86_64-pc-windows-msvc.zip';
 const AION_ZIP_SHA256 = 'd1ed8d1da869230c18701747d07e8f068db5b8c9442e65261304aeb4c27eacf6';
 let PORT = Number(process.env.STUDIO_PORT || 4848); // moves up when the port is taken (see server.listen)
+// API pass (security F2/F3): any local program can reach 127.0.0.1, so /api needs this secret. It is kept in the runtime folder
+// so a page that already has it keeps working after a restart; the browser gets it once, in the URL fragment Studio opens.
+const API_TOKEN = (() => {
+  const f = path.join(RT, 'api-token');
+  try { const t = fs.readFileSync(f, 'utf8').trim(); if (/^[0-9a-f]{64}$/.test(t)) return t; } catch {}
+  const t = crypto.randomBytes(32).toString('hex'); fs.writeFileSync(f, t, { flush: true }); return t;
+})();
+// A worker only gets a pass for its own card's runtime start: it never opens the rest of the API.
+const cardToken = (cardId) => crypto.createHmac('sha256', API_TOKEN).update('runtime-start:' + cardId).digest('hex');
+const sameSecret = (a, b) => typeof a === 'string' && a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+// An outside claim only makes Studio stop writing, so it stays open for the documented curl use; releasing one needs the pass.
+const OPEN_ROUTES = new Set(['POST /api/workspace/claim']);
+const apiAllowed = (route, pass, b) => sameSecret(pass, API_TOKEN) || OPEN_ROUTES.has(route)
+  || (route === 'POST /api/runtime/start' && !!b?.cardId && sameSecret(pass, cardToken(String(b.cardId))));
 // Studio's Codex gets its own home so its sessions never show up in the user's own Codex history.
 const CODEX_HOME = process.env.STUDIO_CODEX_HOME ? path.resolve(process.env.STUDIO_CODEX_HOME) : path.join(RT, 'studio', 'codex-home');
 // Codex reads global rules from its home's AGENTS.md, so the user's own one is copied into Studio's home at each start.
@@ -2446,7 +2460,7 @@ ${note}
 Continue the task. End your reply with a short summary (1-3 sentences).
 ${STATUS_RULES}` : `You are a WORKER in "Multi-Agent Studio". Your leader (${agentName(run.leader)}) assigned you this task.
 Work only inside this folder: ${t.workdir || run.project}
-${w.backendPort ? `If you must run this project's backend on port ${w.backendPort} for validation, let Studio own the process so it can verify and recover it: POST JSON to http://127.0.0.1:${PORT}/api/runtime/start with ws (project path), cardId (${t.id}), executable (absolute path), args (string array), cwd (inside this workspace), dataDir (an existing directory inside this workspace), port (${w.backendPort}), smokePath, and noCredentialsConfirmed:true only when restart needs no account credentials. For isolated smoke/test runs, set purpose to "smoke" or "test"; Studio allocates DATA_DIR and PORT, ignores dataDir and treats port as a preference. The command must honor those environment variables; use the returned runtime.port. Never register or stop an unknown process. A listener is not ready until Studio confirms process alive + reachable port + GET /health HTTP 200 + application ready.\n` : ''}${note ? `\nNOTE FROM STUDIO:\n${note}\n` : ''}${t.resumed ? '\nYou were interrupted while doing this task earlier. First check the current state of the project folder, then finish the task without redoing work that is already done.\n' : ''}
+${w.backendPort ? `If you must run this project's backend on port ${w.backendPort} for validation, let Studio own the process so it can verify and recover it: POST JSON to http://127.0.0.1:${PORT}/api/runtime/start with header x-studio-token: ${cardToken(t.id)} (valid only for this card's runtime start) and ws (project path), cardId (${t.id}), executable (absolute path), args (string array), cwd (inside this workspace), dataDir (an existing directory inside this workspace), port (${w.backendPort}), smokePath, and noCredentialsConfirmed:true only when restart needs no account credentials. For isolated smoke/test runs, set purpose to "smoke" or "test"; Studio allocates DATA_DIR and PORT, ignores dataDir and treats port as a preference. The command must honor those environment variables; use the returned runtime.port. Never register or stop an unknown process. A listener is not ready until Studio confirms process alive + reachable port + GET /health HTTP 200 + application ready.\n` : ''}${note ? `\nNOTE FROM STUDIO:\n${note}\n` : ''}${t.resumed ? '\nYou were interrupted while doing this task earlier. First check the current state of the project folder, then finish the task without redoing work that is already done.\n' : ''}
 Task: ${t.title}
 Instructions:
 ${t.instructions}
@@ -3811,10 +3825,15 @@ const server = http.createServer(async (req, res) => {
   const route = `${req.method} ${req.url}`;
   const record = req.method === 'POST' && !READ_POSTS.has(route);
   let b = {};
+  const pass = req.headers['x-studio-token'];
   try {
     let raw = '';
     for await (const c of req) raw += c;
     b = raw ? JSON.parse(raw) : {};
+    if (!apiAllowed(route, pass, b)) {
+      if (record) event('api', { route, error: 'missing or wrong pass' });
+      return send(401, { error: '沒有 Studio 通行碼：請從 Studio 視窗印出的網址開啟這一頁' });
+    }
     send(200, (await fn(b)) ?? { ok: true });
     if (record) event('api', { route, ...pickEventFields(b) });
   } catch (e) {
@@ -3850,7 +3869,7 @@ server.on('error', (e) => {
   server.listen(++PORT, '127.0.0.1');
 });
 server.on('listening', () => {
-  const url = `http://127.0.0.1:${PORT}`;
+  const url = `http://127.0.0.1:${PORT}/#t=${API_TOKEN}`; // the fragment never reaches a server or a log; the page keeps it
   console.log(`Multi-Agent Studio 已啟動：${url}  （關閉此視窗即停止）`);
   if (!process.env.STUDIO_NO_OPEN) spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore' });
 });

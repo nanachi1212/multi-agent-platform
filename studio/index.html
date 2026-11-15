@@ -442,6 +442,14 @@
 </dialog>
 
 <script>
+// Studio's API pass arrives once as #t=... in the URL Studio opens; keep it for later visits and send it with every /api call.
+{
+  const m = location.hash.match(/^#t=([0-9a-f]{64})$/);
+  if (m) { try { localStorage.setItem('studioToken', m[1]); } catch {} history.replaceState(null, '', location.pathname); }
+  let pass = m?.[1] || ''; try { pass ||= localStorage.getItem('studioToken') || ''; } catch {}
+  const plain = window.fetch.bind(window);
+  window.fetch = (u, o = {}) => String(u).startsWith('/api') ? plain(u, { ...o, headers: { ...o.headers, 'x-studio-token': pass } }) : plain(u, o);
+}
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
 const LOOK = { claude: { c:'#d97757', ab:'CC' }, codex: { c:'#10a37f', ab:'CX' }, antigravity: { c:'#4285f4', ab:'AG' } };
@@ -1346,6 +1354,7 @@ async function refresh() {
     const res = await fetch('/api/state');
     const txt = await res.text();
     if (seq < refreshAppliedSeq) return;
+    if (res.status === 401) { document.title = '沒有 Studio 通行碼'; if (!$('noPass')) document.body.insertAdjacentHTML('afterbegin', '<p id="noPass" style="padding:16px;font-size:16px">這一頁沒有 Studio 通行碼。請關掉這頁，從 Studio 視窗印出的網址（或重新啟動 Studio 自動開的頁面）進入。</p>'); return; }
     if (!res.ok) throw new Error('State request failed');
     const next = JSON.parse(txt);
     refreshAppliedSeq = seq;
