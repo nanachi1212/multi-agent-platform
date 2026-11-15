@@ -19,8 +19,12 @@ assert.ok(/http:\/\/127\.0\.0\.1:\$\{PORT\}\/#t=\$\{API_TOKEN\}/.test(src), 'Stu
 assert.ok(src.includes('x-studio-token: ${cardToken(t.id)}'), 'workers are told their card pass');
 
 // the page keeps the pass from #t= and sends it with /api calls only
-const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
-const block = html.slice(html.indexOf('{\n  const m = location.hash.match(/^#t='), html.indexOf('const $ = (id)'));
+const html = process.env.API_TOKEN_HTML ?? fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+// CI checks out CRLF; look for the block by its own text, not by a line break
+const start = html.indexOf('const m = location.hash.match(/^#t=');
+const block = '{' + html.slice(start, html.indexOf('const $ = (id)'));
+assert.ok(start > 0, 'found the page pass block');
+assert.ok(block.includes('x-studio-token'), 'found the page pass block');
 const store = new Map(), calls = [];
 const win = { fetch: (u, o) => { calls.push([u, o]); return Promise.resolve(); } };
 let replaced = null;
