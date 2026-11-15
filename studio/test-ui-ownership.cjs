@@ -15,7 +15,7 @@ module.exports = async function () {
     console,
     S: { workspaces: [], agents: [], runtimes: [] },
     STEP_WORD: { WAITING: '待做', WORKING: '工作中', DONE: '已完成', PAUSED: '已暫停', INTERRUPTED: '已中斷', FAILED: '失敗', WAITING_EXTERNAL: '等待外部結果', WAITING_AGENT: '等待其他 AI', NEEDS_USER: '需要 Nana' },
-    PARKED: ['WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'],
+    PARKED: ['WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'], stepsOpen: true,
     ICON: { DONE: '✅', WORKING: '⏳', WAITING: '🕒', PAUSED: '⏸️' },
     esc: (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
     base: (p) => path.basename(String(p || '')),

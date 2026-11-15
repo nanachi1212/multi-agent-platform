@@ -127,7 +127,8 @@ export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, A
       // Revocation/STOP records fence stale job snapshots even after the new owner has finished.
       S.leases = S.leases.filter((l) => l.status !== 'RELEASED' || l.revoked || l.jobStopped)
         .concat(S.leases.filter((l) => l.status === 'RELEASED' && !l.revoked && !l.jobStopped).slice(-80));
-      try { fs.writeFileSync(tmp, JSON.stringify(S.leases, null, 1)); fs.renameSync(tmp, f); }
+      // flush in place: this module gets its fs injected and no imports (tests load it with new Function), so it cannot use state-files' writeJson
+      try { fs.writeFileSync(tmp, JSON.stringify(S.leases, null, 1), { flush: true }); fs.renameSync(tmp, f); }
       finally { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); }
     });
   }

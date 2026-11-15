@@ -794,7 +794,7 @@ function chatHtml(activity) {
 
 // Re-render only when the markup changed, so open drop-downs keep their scroll position.
 const setHtml = (el, html) => { if (el._html !== html) { el._html = html; el.innerHTML = html; } };
-let doneOpen = false;
+let doneOpen = false, stepsOpen = true; // stepsOpen: 每張工作卡的進度 stays as the user left it (open by default)
 const ICON = { DONE:'✅', WORKING:'⏳', WAITING:'🕒', PAUSED:'⏸️', INTERRUPTED:'⏸️', FAILED:'❌', WAITING_EXTERNAL:'🟡', WAITING_AGENT:'🤝', ASK_LEADER:'🙋', NEEDS_USER:'🔴' };
 const STEP_WORD = { DONE:'已完成', WORKING:'工作中', WAITING:'待做', PAUSED:'已暫停', INTERRUPTED:'已中斷', FAILED:'失敗', WAITING_EXTERNAL:'等待外部結果', WAITING_AGENT:'等待其他 AI', ASK_LEADER:'在問工頭', NEEDS_USER:'需要 Nana' };
 const prShort = (pr) => (/^\d+$/.test(String(pr)) ? '#' + pr : '#' + String(pr).split('/').pop());
@@ -959,7 +959,7 @@ function attention(w) {
   }
   if (r.stopped) return { ic:'⏹️', cls:'', text:'已停止' };
   if (r.result === 'done') return { ic:'✅', cls:'ok', text:'已完成' };
-  return { ic:'❌', cls:'bad', need:true, text:'這次沒有完成：看一下結果，或按「↻ 接著上次的工作」' };
+  return { ic:'❌', cls:'bad', need:true, text:'這次沒有完成：看一下結果，或在下方輸入「繼續」再按「▶ 交給團隊」' };
 }
 
 // KPI "這次完成的工作卡" that opens a list of every card with its full result.
@@ -1118,7 +1118,7 @@ function nowHtml(w, att) {
       <dt>接下來</dt><dd>${esc(next)}</dd>
       <dt>你現在</dt><dd>${you}</dd>
     </dl>
-    <details class="rules" ${r.active || r.paused ? 'open' : ''}><summary>每張工作卡的進度 ▾</summary><div class="steps" style="margin-top:6px">
+    <details class="rules" id="stepsDrop" ${stepsOpen ? 'open' : ''}><summary>每張工作卡的進度 ▾</summary><div class="steps" style="margin-top:6px">
       ${step('📝', r.continues ? '你要團隊接著上次的工作' : '你交辦了工作', firstLine.slice(0, 140))}
       ${step(planned ? '✅' : r.active ? '⏳' : '🕒', planned ? `工頭 ${esc(name(r.leader))} 拆成 ${ts.length} 張工作卡` : `工頭 ${esc(name(r.leader))} 拆工作中`, '', !planned && r.active)}
       ${ts.map((t) => {
@@ -1224,7 +1224,7 @@ function renderProject(w, force) {
 
   const box = $('chat');
   const atBottom = force || box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
-  box.innerHTML = chatHtml(w.activity);
+  setHtml(box, chatHtml(w.activity)); // unchanged chat keeps opened 查看技術細節
   if (atBottom) box.scrollTop = box.scrollHeight;
 
   const showProgress = !!(w.progress?.exists || w.progress?.error);
@@ -1330,7 +1330,7 @@ async function openHistory(id) {
   $('histBoard').innerHTML = boardHtml(r.tasks, S.agents, false, { project: r.project, historical: true });
   $('histChat').innerHTML = chatHtml(r.activity);
   const ow = S.workspaces.find((x) => sameP(x.project, r.project));
-  $('histResume').hidden = !((r.status === 'paused' || r.status === 'running') && !ow?.run?.active && !ow?.run?.paused);
+  $('histResume').hidden = !((r.status === 'paused' || r.status === 'interrupted') && !ow?.run?.active && !ow?.run?.paused);
   $('histDlg').showModal();
 }
 let refreshSeq = 0, refreshAppliedSeq = 0;
@@ -1435,7 +1435,7 @@ document.addEventListener('input', (e) => {
   if (e.target.matches('input[data-rt-request]') && ws()) drafts['rt:' + ws()] = e.target.value;
   if (e.target.matches('input[data-rt-precheck]') && ws()) drafts['rtp:' + ws()] = e.target.value;
 });
-document.addEventListener('toggle', (e) => { if (e.target.id === 'doneDrop') doneOpen = e.target.open; if (e.target.id === 'goalDrop') goalOpen = e.target.open; }, true);
+document.addEventListener('toggle', (e) => { if (e.target.id === 'doneDrop') doneOpen = e.target.open; if (e.target.id === 'goalDrop') goalOpen = e.target.open; if (e.target.id === 'stepsDrop') stepsOpen = e.target.open; }, true);
 document.addEventListener('change', (e) => {
   const ho = e.target.closest('select[data-handoff]');
   if (ho) {
