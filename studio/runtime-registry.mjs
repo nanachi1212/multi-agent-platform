@@ -156,10 +156,14 @@ export async function getPortOccupant(port) {
         if (pids.length === 1 && Number.isInteger(pids[0]) && pids[0] > 0) return pids[0];
         if (!listeners.length) return null;
       }
-    } catch (e) {}
+    } catch (e) {
+      // A confirmed ambiguity is an answer, not a query failure: do not let the fallback pick one.
+      if (e.message === 'Ambiguous loopback listeners') throw new Error('Cannot confirm loopback port ownership: ' + e.message, { cause: e });
+    }
 
     try {
-      const stdout = await execCmd('netstat', ['-ano', '-p', 'tcp']);
+      // No `-p tcp`: that lists IPv4 only and would hide a dual-stack `[::]` listener.
+      const stdout = await execCmd('netstat', ['-ano']);
       const pids = new Set();
       for (const line of stdout.split(/\r?\n/)) {
         const parts = line.trim().split(/\s+/);
