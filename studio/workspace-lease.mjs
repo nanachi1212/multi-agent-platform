@@ -86,6 +86,8 @@ export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, A
     let fd;
     try { fd = fs.openSync(f, 'wx'); }
     catch (e) {
+      // Windows reports EPERM/EBUSY while another holder's lock file is still being deleted: that is contention, so fail closed as locked.
+      if (['EPERM', 'EBUSY'].includes(e.code)) throw new Error('Workspace lease store is locked', { cause: e });
       if (e.code !== 'EEXIST') throw e;
       const owner = readMainOwner(f);
       // A previous transaction in this same Studio may have committed but encountered a
@@ -124,10 +126,12 @@ export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, A
   function saveLeases() {
     return withLeaseTransaction(() => {
       const f = leasesFile(), tmp = f + '.' + INSTANCE + '.tmp';
-      // Revocation/STOP records fence stale job snapshots even after the new owner has finished.
-      S.leases = S.leases.filter((l) => l.status !== 'RELEASED' || l.revoked || l.jobStopped)
+      // Revocation/STOP records fence stale job snapshots even after the new owner has finished; after 30 days they are dropped.
+      const fenceUntil = Date.now() - 30 * 24 * 3600e3;
+      S.leases = S.leases.filter((l) => l.status !== 'RELEASED' || ((l.revoked || l.jobStopped) && !(Date.parse(l.releasedAt) < fenceUntil)))
         .concat(S.leases.filter((l) => l.status === 'RELEASED' && !l.revoked && !l.jobStopped).slice(-80));
-      try { fs.writeFileSync(tmp, JSON.stringify(S.leases, null, 1)); fs.renameSync(tmp, f); }
+      // flush in place: this module gets its fs injected and no imports (tests load it with new Function), so it cannot use state-files' writeJson
+      try { fs.writeFileSync(tmp, JSON.stringify(S.leases, null, 1), { flush: true }); fs.renameSync(tmp, f); }
       finally { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); }
     });
   }

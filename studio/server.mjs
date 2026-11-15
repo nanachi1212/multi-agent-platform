@@ -23,6 +23,17 @@ const AION = path.join(ROOT, 'runtime', 'aioncore', 'aioncore.exe');
 const AION_URL = 'https://github.com/iOfficeAI/AionCore/releases/download/v0.2.2/aioncore-v0.2.2-x86_64-pc-windows-msvc.zip';
 const AION_ZIP_SHA256 = 'd1ed8d1da869230c18701747d07e8f068db5b8c9442e65261304aeb4c27eacf6';
 let PORT = Number(process.env.STUDIO_PORT || 4848); // moves up when the port is taken (see server.listen)
+// API pass (security F2/F3): any local program can reach 127.0.0.1, so /api needs this secret. It lives only in memory and is new
+// at every start (the runtime folder is readable by other accounts, e.g. the Codex sandbox users); the browser gets it in the URL
+// fragment Studio opens and keeps it for later tabs.
+const API_TOKEN = crypto.randomBytes(32).toString('hex');
+// A worker only gets a pass for its own card's runtime start: it never opens the rest of the API.
+const cardToken = (cardId) => crypto.createHmac('sha256', API_TOKEN).update('runtime-start:' + cardId).digest('hex');
+const sameSecret = (a, b) => { if (typeof a !== 'string') return false; const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && crypto.timingSafeEqual(x, y); };
+// An outside claim only makes Studio stop writing, so it stays open for the documented curl use; releasing one needs the pass.
+const OPEN_ROUTES = new Set(['POST /api/workspace/claim']);
+const apiAllowed = (route, pass, b) => sameSecret(pass, API_TOKEN) || OPEN_ROUTES.has(route)
+  || (route === 'POST /api/runtime/start' && !!b?.cardId && sameSecret(pass, cardToken(String(b.cardId))));
 // Studio's Codex gets its own home so its sessions never show up in the user's own Codex history.
 const CODEX_HOME = process.env.STUDIO_CODEX_HOME ? path.resolve(process.env.STUDIO_CODEX_HOME) : path.join(RT, 'studio', 'codex-home');
 // Codex reads global rules from its home's AGENTS.md, so the user's own one is copied into Studio's home at each start.
@@ -134,28 +145,44 @@ function saveSettings() {
   writeJson(SETTINGS, { leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external, acp: S.acp });
 }
 
+// ponytail: reads the newest 200 history files once, then saveRun keeps the cache current in place; index them if history grows large.
+let histCache = { rev: -1, items: [], rows: new Map() };
+const historyStatus = (r) => (r.status === 'running' && resumable(r) ? 'interrupted' : r.status);
+const histRow = (r) => ({ id: r.id, startedAt: r.startedAt, status: historyStatus(r), project: r.project, leader: r.leader, request: String(r.request).slice(0, 120), done: r.tasks.filter((t) => t.status === 'DONE').length, total: r.tasks.length });
+
 function saveRun(w, status) {
   const run = w.run;
   if (!run) return;
   // phase + convs let a paused run continue in the same agent conversations after a Studio restart.
   const rec = { leadTier: run.leadTier, usage: run.usage, treeStamps: run.treeStamps, treeStamp: run.treeStamp, leftAt: run.leftAt, extMod: run.extMod, claimedBy: run.claimedBy, id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, notes: run.notes, suggestions: run.suggestions, convs: run.convs, tasks: w.tasks, activity: w.activity };
   writeJson(path.join(HISTORY, run.id + '.json'), rec);
-  S.historyRev++;
+  // Replace this record in the cache instead of re-reading every file; the page refetches the list only when a listed field changed.
+  if (histCache.rev !== S.historyRev) { S.historyRev++; return; }
+  const items = histCache.items, i = items.findIndex((x) => x.id === run.id), copy = JSON.parse(JSON.stringify(rec)); // a copy, as on disk: rec shares live arrays
+  // Compare with the row last listed, not the cached record: a resumed job (loadRun) shares and mutates that record's tasks.
+  const row = JSON.stringify(histRow(copy)), changed = histCache.rows.get(run.id) !== row;
+  histCache.rows.set(run.id, row);
+  if (i >= 0) items[i] = copy;
+  else {
+    const at = items.findIndex((x) => x.id + '.json' < run.id + '.json'); // same newest-first order as the file listing
+    items.splice(at < 0 ? items.length : at, 0, copy);
+    if (items.length > 200) items.length = 200;
+  }
+  if (changed) histCache.rev = ++S.historyRev;
 }
 
-// ponytail: re-reads the newest 200 history files whenever one changes; index them if history grows large.
-let histCache = { rev: -1, items: [] };
 function historyItems() {
   if (histCache.rev === S.historyRev) return histCache.items;
   const items = !isDir(HISTORY) ? [] : fs.readdirSync(HISTORY).filter((f) => f.endsWith('.json')).sort().reverse().slice(0, 200).flatMap((f) => {
     try { return [JSON.parse(fs.readFileSync(path.join(HISTORY, f), 'utf8'))]; } catch { return []; }
   });
-  histCache = { rev: S.historyRev, items };
+  histCache = { rev: S.historyRev, items, rows: new Map(items.map((r) => [r.id, JSON.stringify(histRow(r))])) };
   return items;
 }
 
+// A "running" record that is no longer live is shown as interrupted (list and detail alike).
 function listHistory() {
-  return historyItems().slice(0, 50).map((r) => ({ id: r.id, startedAt: r.startedAt, status: r.status === 'running' && resumable(r) ? 'interrupted' : r.status, project: r.project, leader: r.leader, request: String(r.request).slice(0, 120), done: r.tasks.filter((t) => t.status === 'DONE').length, total: r.tasks.length }));
+  return historyItems().slice(0, 50).map(histRow);
 }
 
 // Cards finished today, and the latest finished card per agent (current board + history).
@@ -214,7 +241,16 @@ async function ensureAion() {
   await new Promise((res, rej) => execFile('tar', ['-xf', zip, '-C', path.dirname(AION)], (e) => (e ? rej(e) : res())));
 }
 
-let aionProcess;
+let aionProcess, aionGone = '', aionClosing = false;
+// AionCore ended by itself after it was ready (not because Studio is closing): say so once in the server log,
+// and show it where agent errors already show (the seats' status note). Every later AionCore call fails with it.
+function aionExited(code, signal) {
+  if (aionClosing || aionGone) return;
+  aionGone = 'AionCore 已停止，請重新啟動 Studio';
+  console.error(`AionCore 在就緒後自己結束了（exit code ${code ?? '—'}${signal ? '，signal ' + signal : ''}）；之後的 AI 操作都會失敗，請重新啟動 Studio。`);
+  event('aioncore.exit', { code, signal });
+  for (const a of Object.values(S.agents)) Object.assign(a, { status: 'unavailable', note: aionGone, checkTok: {} });
+}
 const codexRuntime = createCodexRuntimeGuard({ rtDir: RT, api, owner: () => aionProcess });
 async function startAion() {
   await ensureAion();
@@ -224,11 +260,17 @@ async function startAion() {
   fs.mkdirSync(CODEX_HOME, { recursive: true });
   syncCodexRules();
   const logFile = fs.createWriteStream(path.join(RT, 'studio', 'aioncore.out.txt'));
-  const p = spawn(AION, ['--local', '--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)],
-    { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, CODEX_HOME } });
+  // No --local (security F2/F3): that mode turns AionCore's login off, so any local program could drive the agents through its port.
+  // The built-in user (the same system_default_user --local used, so old conversations stay) gets a new random password each start.
+  const pass = crypto.randomBytes(24).toString('hex');
+  await new Promise((res, rej) => {
+    const c = execFile(AION, ['--data-dir', data, 'user', 'set-password', '--password-stdin'], { windowsHide: true }, (e, out, err) => (e ? rej(new Error('AionCore 設定登入密碼失敗：' + (err || e.message))) : res()));
+    c.stdin.end(pass + '\n');
+  });
+  const args = ['--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)];
+  const p = spawn(AION, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, CODEX_HOME } });
   if (p.pid) {
     aionProcess = await getProcessInfo(p.pid);
-    const args = ['--local', '--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)];
     registerRuntime({
       job_id: 'studio_core',
       purpose: 'helper',
@@ -241,10 +283,10 @@ async function startAion() {
       rtDir: RT
     });
   }
-  process.on('exit', () => p.kill());
+  process.on('exit', () => { aionClosing = true; p.kill(); });
   await new Promise((res, rej) => {
     let buf = '';
-    p.on('exit', (c) => rej(new Error('AionCore 結束，exit code ' + c)));
+    p.on('exit', (c, sig) => (BASE ? aionExited(c, sig) : rej(new Error('AionCore 結束，exit code ' + c))));
     p.stdout.on('data', (d) => {
       logFile.write(d);
       if (BASE) return;
@@ -253,15 +295,26 @@ async function startAion() {
       if (m && /AIONCORE_READY/.test(buf)) { BASE = 'http://127.0.0.1:' + m[1]; res(); }
     });
   });
+  aionAuth = await aionLogin(pass);
+}
+// Bearer token for every call; writes also need the CSRF cookie echoed in a header.
+let aionAuth = {};
+async function aionLogin(password) {
+  const r = await fetch(BASE + '/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'admin', password }), signal: AbortSignal.timeout(API_TIMEOUT_MS) });
+  const j = await r.json().catch(() => ({}));
+  const csrf = r.headers.getSetCookie().map((c) => c.split(';')[0]).find((c) => c.startsWith('aionui-csrf-token='))?.slice('aionui-csrf-token='.length);
+  if (!r.ok || !j.token || !csrf) throw new Error('AionCore 登入失敗：' + r.status);
+  return { authorization: 'Bearer ' + j.token, cookie: 'aionui-csrf-token=' + csrf, 'x-csrf-token': csrf };
 }
 
 // Every AionCore call answers promptly (turns are polled, not awaited); the slowest seen in the spikes was ~8 s (create).
 const API_TIMEOUT_MS = 30e3;
 async function api(method, p, body) {
+  if (aionGone) throw new Error(aionGone);
   const signal = AbortSignal.timeout(API_TIMEOUT_MS);
   // AionCore may still act on a request it never answered: the stop is unconfirmed, so the write lease stays.
   const timedOut = () => Object.assign(new Error(`AionCore ${method} ${p} 逾時：${API_TIMEOUT_MS / 1000} 秒沒有回應`), { stopUnconfirmed: true });
-  const r = await fetch(BASE + p, { method, headers: { 'content-type': 'application/json' }, body: body && JSON.stringify(body), signal })
+  const r = await fetch(BASE + p, { method, headers: { 'content-type': 'application/json', ...aionAuth }, body: body && JSON.stringify(body), signal })
     .catch((e) => { throw signal.aborted ? timedOut() : e; });
   const j = await r.json().catch(() => { if (signal.aborted) throw timedOut(); return {}; });
   if (!r.ok || j.success === false) throw new Error(`AionCore ${method} ${p} → ${r.status} ${JSON.stringify(j).slice(0, 300)}`);
@@ -291,7 +344,7 @@ async function createAgentConv(agent, ws, lead, cfg) {
 
 // AionCore pushes each agent's model / effort catalog as `acp_config_option` events on its WebSocket.
 function watchCatalogs() {
-  const ws = new WebSocket(BASE.replace('http', 'ws') + '/ws');
+  const ws = new WebSocket(BASE.replace('http', 'ws') + '/ws', { headers: { authorization: aionAuth.authorization } });
   ws.onmessage = (e) => {
     let d;
     try { d = JSON.parse(e.data).data; } catch { return; }
@@ -319,8 +372,8 @@ function setAgentCfg(w, agent, model, effort, hardModel = '', hardEffort = '') {
   saveSettings();
 }
 
-// Model strategy per project. The Leader marks hard cards; normal cards (and every Leader turn) use the
-// normal tier, hard cards the hard tier, and a normal card that fails is retried once on the hard tier.
+// Model strategy per project. The Leader marks hard cards; normal cards use the
+// normal tier, hard cards and every Leader turn the hard tier, and a normal card that fails is retried once on the hard tier.
 // Patterns match the catalogs the agents report (first match = newest). 'custom' = the seat-card settings.
 const STRATEGIES = {
   save: { claude: [['^sonnet$', 'medium'], ['^opus$', 'high']], codex: [['luna', 'medium'], ['sol', 'high']] },
@@ -1167,7 +1220,7 @@ function refreshCodexLimits() {
     const dir = path.join(CODEX_HOME, 'sessions');
     if (!isDir(dir)) return;
     const newest = fs.readdirSync(dir, { recursive: true }).filter((f) => String(f).endsWith('.jsonl'))
-      .map((f) => path.join(dir, String(f))).sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0];
+      .map((f) => path.join(dir, String(f))).map((f) => [fs.statSync(f).mtimeMs, f]).reduce((a, b) => (b[0] > a[0] ? b : a), [-1])[1];
     if (!newest) return;
     const line = fs.readFileSync(newest, 'utf8').split('\n').reverse().find((l) => l.includes('"rate_limits":{'));
     if (!line) return;
@@ -1267,7 +1320,7 @@ function workContext(job) {
 const CONTINUE_RE = /^\s*(繼續|继续|接著|接着|接續|continue|resume|把剩下|剩下的)/i;
 
 async function start(w, request, cont = false, inherit = false) {
-  // "繼續…" / the 接著上次的工作 button continue the latest job instead of starting from zero.
+  // "繼續…" / the ▶ 接著處理 button continue the latest job instead of starting from zero.
   cont = cont || CONTINUE_RE.test(request);
   if (cont && w.run?.paused) return resume(w); // the paused job itself picks up where it stopped
   return launching(w, () => startJob(w, request, cont, inherit));
@@ -1337,7 +1390,7 @@ async function planPhaseStep(w, run, epoch) {
       if (!leaderCurrent(w, run, epoch) || run.leaderGen !== gen) return;
       plan = tryPlan(reply);
     }
-    if (!plan) throw Object.assign(new Error('工頭這次沒有成功建立工作清單。Studio 保留了目前進度，按「↻ 接著上次的工作」可以再試一次。'), { detail: reply });
+    if (!plan) throw Object.assign(new Error('工頭這次沒有成功建立工作清單。Studio 保留了目前進度，在下方輸入「繼續」再按「▶ 交給團隊」可以再試一次。'), { detail: reply });
     log(w, lead, 'leader', plan.message || `已拆成 ${plan.subtasks.length} 項工作`);
     addCards(w, plan.subtasks, lead);
     run.phase = 'working';
@@ -1444,19 +1497,27 @@ function accessRules(t) {
 }
 
 // ----- identity of a working tree -----
-const pidAlive = (pid) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; } };
+const pidAlive = isPidAlive; // the one implementation (runtime-registry): unsure counts as alive
 const canonPath = (p) => { let r = String(p || ''); try { r = fs.realpathSync.native(r); } catch { r = path.resolve(r); } return r.replace(/[\\/]+$/, ''); };
 const treeKey = (p) => { const c = canonPath(p).split('/').join('\\'); return process.platform === 'win32' ? c.toLowerCase() : c; };
 
 // The physical working tree a folder belongs to: key (same for any spelling of the path), top folder, branch, repository.
-async function workspaceOf(dir) {
+// Calls for the same folder while a lookup is running share it; each caller gets its own copy.
+// ponytail: no TTL cache: agents switch branches inside their own turns, so a finished lookup is never reused.
+const workspaceLookups = new Map();
+function workspaceOf(dir) {
+  let p = workspaceLookups.get(dir);
+  if (!p) { p = workspaceLookup(dir).finally(() => workspaceLookups.delete(dir)); workspaceLookups.set(dir, p); }
+  return p.then((info) => ({ ...info }));
+}
+async function workspaceLookup(dir) {
   const top = (await git(dir, 'rev-parse', '--show-toplevel')).out?.trim();
   const base = top || dir;
   return { key: treeKey(base), path: canonPath(base), isGit: !!top,
     branch: top ? (await git(dir, 'rev-parse', '--abbrev-ref', 'HEAD')).out?.trim() || '' : '', repo: top ? await originRepo(dir) || canonPath((await git(dir, 'rev-parse', '--path-format=absolute', '--git-common-dir')).out?.trim() || top) : '' };
 }
 
-const { mergeLeasesFromDisk, saveLeases, loadLeases, withLeaseTransaction, leaseState, writerOf, retire, ownerName, sameCard, leaseView, newLease, acquireWrite, acquireRead, cardLeases, releaseCardLeases, reserveCardLeases, releaseJobLeases, reserveJobLeases, beatLeases } = createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, AGENTS, nowIso, pidAlive, LEASE_RESERVED_TTL_MS });
+const { mergeLeasesFromDisk, saveLeases, loadLeases, withLeaseTransaction, leaseState, writerOf, retire, sameCard, leaseView, newLease, acquireWrite, acquireRead, cardLeases, releaseCardLeases, reserveCardLeases, releaseJobLeases, reserveJobLeases, beatLeases } = createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, AGENTS, nowIso, pidAlive, LEASE_RESERVED_TTL_MS });
 
 function releaseLease(id) {
   return withLeaseTransaction(() => {
@@ -2412,7 +2473,7 @@ ${note}
 Continue the task. End your reply with a short summary (1-3 sentences).
 ${STATUS_RULES}` : `You are a WORKER in "Multi-Agent Studio". Your leader (${agentName(run.leader)}) assigned you this task.
 Work only inside this folder: ${t.workdir || run.project}
-${w.backendPort ? `If you must run this project's backend on port ${w.backendPort} for validation, let Studio own the process so it can verify and recover it: POST JSON to http://127.0.0.1:${PORT}/api/runtime/start with ws (project path), cardId (${t.id}), executable (absolute path), args (string array), cwd (inside this workspace), dataDir (an existing directory inside this workspace), port (${w.backendPort}), smokePath, and noCredentialsConfirmed:true only when restart needs no account credentials. For isolated smoke/test runs, set purpose to "smoke" or "test"; Studio allocates DATA_DIR and PORT, ignores dataDir and treats port as a preference. The command must honor those environment variables; use the returned runtime.port. Never register or stop an unknown process. A listener is not ready until Studio confirms process alive + reachable port + GET /health HTTP 200 + application ready.\n` : ''}${note ? `\nNOTE FROM STUDIO:\n${note}\n` : ''}${t.resumed ? '\nYou were interrupted while doing this task earlier. First check the current state of the project folder, then finish the task without redoing work that is already done.\n' : ''}
+${w.backendPort ? `If you must run this project's backend on port ${w.backendPort} for validation, let Studio own the process so it can verify and recover it: POST JSON to http://127.0.0.1:${PORT}/api/runtime/start with header x-studio-token: ${cardToken(t.id)} (valid only for this card's runtime start) and ws (project path), cardId (${t.id}), executable (absolute path), args (string array), cwd (inside this workspace), dataDir (an existing directory inside this workspace), port (${w.backendPort}), smokePath, and noCredentialsConfirmed:true only when restart needs no account credentials. For isolated smoke/test runs, set purpose to "smoke" or "test"; Studio allocates DATA_DIR and PORT, ignores dataDir and treats port as a preference. The command must honor those environment variables; use the returned runtime.port. Never register or stop an unknown process. A listener is not ready until Studio confirms process alive + reachable port + GET /health HTTP 200 + application ready.\n` : ''}${note ? `\nNOTE FROM STUDIO:\n${note}\n` : ''}${t.resumed ? '\nYou were interrupted while doing this task earlier. First check the current state of the project folder, then finish the task without redoing work that is already done.\n' : ''}
 Task: ${t.title}
 Instructions:
 ${t.instructions}
@@ -3184,7 +3245,7 @@ ${SUBTASK_RULES}`, { w, lead: true });
   } catch (e) {
     if (!leaderCurrent(w, run, epoch) || run.leaderGen !== gen || e instanceof Halt) return;
     run.summarizing = false;
-    log(w, 'studio', 'system', '工頭這次沒有完成整體確認。Studio 保留了目前進度，可以按「↻ 接著上次的工作」再試。', e.message);
+    log(w, 'studio', 'system', '工頭這次沒有完成整體確認。Studio 保留了目前進度，可以在下方輸入「繼續」再按「▶ 交給團隊」再試。', e.message);
     finish(w, 'failed');
   }
 }
@@ -3209,7 +3270,8 @@ function answer(w, taskId, text) {
     log(w, 'user', 'user', `回覆「${t.title}」：${text}`);
     if (t.takeover) { // "may Studio write over what was changed meanwhile?"
       Object.assign(t, { takeover: false, ask: null });
-      if (/^先不要|暫停/.test(text)) { t.status = 'WAITING'; log(w, 'studio', 'system', '不接手：先暫停，等你處理好再按「繼續」。'); return pause(w); }
+      // only the option 「先不要（暫停）」 or a reply that starts with 暫停 pauses; 「不要暫停，繼續」 does not
+      if (/^(先不要|暫停)/.test(text)) { t.status = 'WAITING'; log(w, 'studio', 'system', '不接手：先暫停，等你處理好再按「繼續」。'); return pause(w); }
       Object.assign(t, { status: 'WAITING', trust: true });
       return pump(w);
     }
@@ -3514,7 +3576,7 @@ async function recoverBackendWaitStep(w, t) {
     && t.status === 'WAITING_EXTERNAL' && t.wait === wait && (t.leaseGeneration || 0) === generation;
   const canProceed = () => {
     if (!current()) return false;
-    loadLeases();
+    mergeLeasesFromDisk();
     const holder = writerOf(treeKey(t.workdir || w.project));
     return !!holder && sameCard(holder, w, t) && holder.instance === INSTANCE && !holder.revoked && !holder.jobStopped;
   };
@@ -3631,7 +3693,7 @@ async function startManagedRuntimeStep(body) {
   if (!task || !w.run?.active || w.run.paused || w.run.stopped || task.hold || task.status !== 'WORKING' || !isWriter(task)) throw new Error('runtime 必須綁定持有 write lease 的進行中工作卡');
   const run = w.run, generation = task.leaseGeneration || 0;
   const authorized = () => {
-    loadLeases();
+    mergeLeasesFromDisk();
     const lease = writerOf(treeKey(task.workdir || w.project));
     return w.run === run && run.active && !run.paused && !run.stopped && !task.hold && task.status === 'WORKING'
       && (task.leaseGeneration || 0) === generation && lease?.instance === INSTANCE && sameCard(lease, w, task) && !lease.revoked && !lease.jobStopped;
@@ -3677,21 +3739,16 @@ const routes = {
       const r = w.run;
       const key = w.wsKey || treeKey(w.project), live = S.leases.filter((l) => l.key === key && l.status !== 'RELEASED' && leaseState(l) !== 'RELEASED');
       const lease = { writer: live.filter((l) => l.mode === 'write').map(leaseView)[0] || null, readers: live.filter((l) => l.mode === 'read').map(leaseView) };
-      const wr = lease.writer;
-      const readers = (lease.readers || []).map((x) => x.owner).join(', ') || '—';
-      const repo = w.wsInfo?.repo || wr?.repo || path.basename(w.project);
-      const branch = w.wsInfo?.branch || wr?.branch || '—';
-      const writerStr = wr ? `${wr.owner} / ${repo} / ${branch}` : '—';
-      const workspace_summary = `Writer: ${writerStr} · Readers: ${readers} · branch: ${branch} · worktree: ${w.wsInfo?.path || w.project} · lease: ${wr?.state || (wr ? 'ACTIVE' : 'FREE')}`;
       const tasks = (w.tasks || []).map((t) => {
         const why = t.wait?.recoveryReason || (t.blocked?.owner && `workspace currently owned by ${t.blocked.owner}`) || t.blockReason || t.wait?.error;
         const blocked_reason = why ? 'Blocked：' + String(why).trim().replace(/^Blocked\s*[:：]?\s*/i, '') : null;
         return { ...t, blocked_reason, ...(t.status === 'WORKING' ? { activity: convActivity.get(convOf(w, t)) || null } : {}) };
       });
-      return { wsInfo: w.wsInfo, lease, workspace_summary, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, worktreeSetup: w.worktreeSetup, tokenCap: w.tokenCap, mission: w.mission, routines: w.routines, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
+      return { wsInfo: w.wsInfo, lease, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, worktreeSetup: w.worktreeSetup, tokenCap: w.tokenCap, mission: w.mission, routines: w.routines, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
         run: r && { usage: r.usage || null, extMod: r.extMod, claimedBy: r.claimedBy, id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
     });
-    return { ...S, runtimes: S.runtimes, ...teamStats(), agents: Object.values(S.agents), workspaces };
+    const { leases, ...state } = S; // the page shows each project's lease (above), never the raw list
+    return { ...state, runtimes: S.runtimes, ...teamStats(), agents: Object.values(S.agents), workspaces };
   },
   // Project-scoped calls name their project in `ws` (its folder path).
   'POST /api/pause': (b) => pauseAndDrain(wsOf(b.ws)),
@@ -3761,12 +3818,10 @@ const routes = {
     if (!runtime) throw new Error('找不到這個 Studio runtime');
     return checkBackendReadiness({ ...runtime, rtDir: RT }, { isPidAlive });
   },
-  'POST /api/runtime/check-port': (b) => checkPortOwnership(Number(b.port), { desiredJobId: b.jobId, desiredDataDir: b.dataDir, rtDir: RT }),
-  'POST /api/runtime/cleanup-stale': () => cleanupStaleRuntimes({ rtDir: RT }),
 };
 
 // The event log keeps only ids and settings from a request body: never free text (requests, notes) or secrets (API keys).
-const READ_POSTS = new Set(['POST /api/limits/refresh', 'POST /api/check', 'POST /api/card/detail', 'POST /api/card/diff', 'POST /api/external/models', 'POST /api/runtime/readiness', 'POST /api/runtime/check-port']);
+const READ_POSTS = new Set(['POST /api/limits/refresh', 'POST /api/check', 'POST /api/card/detail', 'POST /api/card/diff', 'POST /api/external/models', 'POST /api/runtime/readiness']);
 const EVENT_FIELDS = ['ws', 'path', 'taskId', 'agent', 'to', 'id', 'mode', 'strategy', 'max', 'cap', 'port', 'on', 'interrupt', 'time', 'days'];
 const pickEventFields = (b) => Object.fromEntries(EVENT_FIELDS.map((k) => [k, b?.[k]]).filter(([, v]) => v != null && (typeof v !== 'object' || Array.isArray(v))));
 
@@ -3777,16 +3832,21 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) return send(200, fs.readFileSync(path.join(import.meta.dirname, 'index.html')), 'text/html; charset=utf-8');
   if (req.method === 'GET' && req.url === '/favicon.ico') return send(200, fs.readFileSync(path.join(import.meta.dirname, 'assets', 'morandi', 'app-icon.ico')), 'image/x-icon');
   const hist = req.method === 'GET' && req.url.match(/^\/api\/history\/([\w-]+)$/);
-  const fn = hist ? () => readHistory(hist[1]) : routes[`${req.method} ${req.url}`];
+  const fn = hist ? () => { const r = readHistory(hist[1]); return { ...r, status: historyStatus(r) }; } : routes[`${req.method} ${req.url}`];
   if (!fn) return send(404, { error: 'not found' });
   if (req.method === 'POST' && !String(req.headers['content-type']).startsWith('application/json')) return send(415, { error: 'json only' });
   const route = `${req.method} ${req.url}`;
   const record = req.method === 'POST' && !READ_POSTS.has(route);
   let b = {};
+  const pass = req.headers['x-studio-token'];
+  const noPass = () => send(401, { error: '沒有 Studio 通行碼：請從 Studio 視窗印出的網址開啟這一頁' });
+  // refuse before reading the body, except where the body names the card a worker pass is for; refusals are not logged (no event spam)
+  if (route !== 'POST /api/runtime/start' && !apiAllowed(route, pass)) return noPass();
   try {
     let raw = '';
     for await (const c of req) raw += c;
     b = raw ? JSON.parse(raw) : {};
+    if (!apiAllowed(route, pass, b)) return noPass();
     send(200, (await fn(b)) ?? { ok: true });
     if (record) event('api', { route, ...pickEventFields(b) });
   } catch (e) {
@@ -3822,7 +3882,7 @@ server.on('error', (e) => {
   server.listen(++PORT, '127.0.0.1');
 });
 server.on('listening', () => {
-  const url = `http://127.0.0.1:${PORT}`;
+  const url = `http://127.0.0.1:${PORT}/#t=${API_TOKEN}`; // the fragment never reaches a server or a log; the page keeps it
   console.log(`Multi-Agent Studio 已啟動：${url}  （關閉此視窗即停止）`);
   if (!process.env.STUDIO_NO_OPEN) spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore' });
 });

@@ -119,4 +119,36 @@ const path = require('node:path');
   verified = true;
   assert.equal((await check(3020, { ...options, desiredJobId: 'another-job' })).status, 'blocked');
   console.log('Runtime identity: missing/reused roots, late descendants, per-kill revalidation, and live child listener ownership: PASS');
+
+  // One "process alive" check for registry and server: only ESRCH means gone; unsure or a non-number PID counts as alive.
+  const { isPidAlive } = await import('./runtime-registry.mjs');
+  const server = fs.readFileSync(path.join(__dirname, 'server.mjs'), 'utf8');
+  assert.match(server, /^const pidAlive = isPidAlive;/m, 'server.mjs uses the registry implementation');
+  assert.equal(isPidAlive(process.pid), true); assert.equal(isPidAlive('not-a-pid'), true);
+  for (const none of [0, null, undefined, -5]) assert.equal(isPidAlive(none), false);
+  const kill0 = process.kill;
+  try {
+    for (const [code, want] of [['ESRCH', false], ['EPERM', true], ['EINVAL', true]]) {
+      process.kill = () => { throw Object.assign(new Error(code), { code }); };
+      assert.equal(isPidAlive(4242), want, code);
+    }
+  } finally { process.kill = kill0; }
+  console.log('isPidAlive: one conservative implementation: PASS');
+
+  // AionCore ending by itself after ready is logged once and shown on the seats; Studio closing is not reported.
+  const aionSrc = server.slice(server.indexOf('let aionProcess, aionGone'), server.indexOf('const codexRuntime'));
+  for (const closing of [false, true]) {
+    const events = [], errors = [], agents = { codex: { status: 'available', note: '' } }, realError = console.error;
+    console.error = (m) => errors.push(m);
+    try {
+      const env = new Function('S', 'event', aionSrc + (closing ? 'aionClosing = true;' : '') + 'return { aionExited, gone: () => aionGone };')({ agents }, (t, d) => events.push(t));
+      env.aionExited(3, null); env.aionExited(3, null);
+      assert.equal(events.length, closing ? 0 : 1); assert.equal(errors.length, closing ? 0 : 1);
+      assert.equal(agents.codex.status, closing ? 'available' : 'unavailable');
+      if (!closing) { assert.match(agents.codex.note, /AionCore 已停止，請重新啟動 Studio/); assert.match(errors[0], /exit code 3/); }
+    } finally { console.error = realError; }
+  }
+  assert.match(server, /p\.on\('exit', \(c, sig\) => \(BASE \? aionExited\(c, sig\)/, 'exit after ready goes to aionExited');
+  assert.match(server, /async function api\(method, p, body\) \{\r?\n  if \(aionGone\) throw new Error\(aionGone\);/);
+  console.log('AionCore exit after ready is reported, Studio shutdown is not: PASS');
 })().catch(error => { console.error(error); process.exitCode = 1; });

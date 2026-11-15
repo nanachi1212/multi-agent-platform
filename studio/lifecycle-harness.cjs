@@ -22,10 +22,11 @@ function makeEnv(script, overrides = {}) {
   const logs = [], notices = [], prompts = [];
   const env = {
     createWorkspaceLeaseStore, process,
+    isPidAlive: require('./runtime-registry.mjs').isPidAlive, // the real one: server.mjs pidAlive is this function
     processSnapshot: async () => [], killProcessTree: async () => ({ ok: true, killed: false }),
     listRuntimes: () => [], cleanupJobRuntimes: async () => ({ cleaned: 0, blocked: [] }),
     AGENTS: { claude: { name: 'Claude Code' }, codex: { name: 'Codex' }, antigravity: { name: 'Antigravity' } },
-    S: { workspaces: [], leases: [] }, RT: mkTmp('studio-rt-'), PORT: 4848, api: async () => ({ items: [] }), stopTurn: async () => true, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 20))), crypto: nodeCrypto, logs, notices, prompts,
+    S: { workspaces: [], leases: [] }, RT: mkTmp('studio-rt-'), PORT: 4848, cardToken: (id) => 'card-pass-' + id, api: async () => ({ items: [] }), stopTurn: async () => true, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 20))), crypto: nodeCrypto, logs, notices, prompts,
     log: (w, who, role, text, detail) => logs.push({ who, role, text, detail }),
     events: [], event: (type, data) => env.events.push({ type, ...data }),
     setWorker: (w, agent, on) => { w.workers = on ? [...new Set([...w.workers, agent])] : w.workers.filter((x) => x !== agent); },

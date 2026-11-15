@@ -45,9 +45,10 @@ Windows 優先的多 AI 協作平台。**Multi-Agent Studio** 是一個本機網
 - **交接（Handoff）**：專案頁「改由…接手」。流程：停下現在的寫入者 → 保存這張卡、對話、進度 → 等它真的停住（沒停住就不交接）→ 放下它的租約 → 新的 Agent 取得租約、從目前的資料夾和 branch 接續。新的 Agent 會收到舊 Agent 在這張卡對話的最後一段原文（約 1.2 萬字以內，較早的省略並註明），不是 AI 寫的摘要。舊 Agent 的對話和紀錄保留，但不再是寫入者，也不會因為恢復或重開而拿回來。
 - **重開安全**：重開後 Studio 不會因為看到暫停／中斷的工作就直接恢復寫入。要「繼續」前會重新檢查租約：資料夾已經由另一個 Agent 或外部接手時，顯示「工作區已由另一個 Agent 接手，本工作保持暫停」；租約還是自己的才允許。Studio 當掉留下的租約不會永遠鎖死：確認 Studio 持有者行程不在後，活躍租約才判定 `STALE`，才能被安全接手；持有者明確還活著時，不會被搶。
 - **外部 Agent／非 Studio 的修改**：另一個 AI 視窗或你自己要改這個資料夾時，宣告接手（專案頁「外部 Agent／我要自己改」，或用 API）：Studio 會停下並暫停自己的寫入、等它真的停住（worktree 正在建立或跑設定指令時，也等那個指令結束）、放下自己的租約，租約改成外部持有；原本的 Studio 工作保持暫停，重開也不會自己恢復。做完用「外部已歸還」或 release-claim。宣告時可帶 `pid` 作為資訊；外部租約狀態為 `EXTERNAL`，即使行程退出或 Studio 重開也保留，必須明確 release-claim 才歸還。
+- **本機 API 通行碼**：`/api` 只接受帶 `x-studio-token` 的請求，避免同一台電腦上的其他程式或沙箱 Agent 冒用你的身分下指令（Studio 開的頁面會自動帶）。通行碼每次啟動 Studio 都會換新、只放在記憶體，不寫進檔案；Studio 自動開的網頁會記住它，自己打開 `http://127.0.0.1:4848` 看到「沒有通行碼」時，請從 Studio 視窗印出的網址進入一次（`#t=` 後面那串就是通行碼）。宣告外部接手（claim）不需要通行碼，歸還（release-claim）需要。
 ```
 curl -X POST http://127.0.0.1:4848/api/workspace/claim -H "content-type: application/json" -d "{\"path\":\"E:\\\\CodexProject\\\\MyProject\",\"label\":\"Claude 視窗\",\"pid\":1234}"
-curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type: application/json" -d "{\"path\":\"E:\\\\CodexProject\\\\MyProject\"}"
+curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type: application/json" -H "x-studio-token: <Studio 視窗網址中 #t= 後面那串>" -d "{\"path\":\"E:\\\\CodexProject\\\\MyProject\"}"
 ```
 - **來源不明的修改**：持有租約的 Agent 沒有在執行、資料夾卻被改動，或寫入期間出現另一個程式的鎖定檔，Studio 會標記 `EXTERNAL_MODIFICATION_DETECTED`、停止寫入並暫停，**不會 reset、不會 stash、不會覆蓋**；你確認後按「確認接手並繼續」。（Agent 執行當中的修改，無法分辨是它自己改的還是別人改的，所以規則要求 Agent 的檔案修改都在自己的回合內完成、不要留下會改檔案的背景程序。）成員每一步結束要用 `FILES:` 回報它改了哪些檔；Studio 比對這一步前後的檔案快照，有變動卻不在清單的檔會寫進活動紀錄與事件（只記錄，不阻擋、不改檔）。
 - 租約之外，另有一個放在 git 目錄的 `studio-writer.lock` 供不認識 Studio 的程式查看，以及每次停止寫入時記下的資料夾指紋（HEAD、branch、未提交檔案）：自動恢復前比對，幾秒前才被改過就等、離開期間被改過就先問你。
@@ -133,15 +134,16 @@ A separate `STUDIO_RUNTIME` also gets a fresh, unauthenticated Codex home by def
 - **Handoff**: "改由…接手" on the project page. Flow: stop the current writer → save its card, conversation and progress → wait until it has really stopped (no handoff if it has not) → release its lease → the new agent takes the lease and continues from the current folder and branch. The new agent gets the last part of the old agent's conversation on the card as quoted messages (about 12,000 characters; older ones are left out and counted), not an AI-written summary. The old agent's conversation and history stay, but it is no longer the writer and cannot get the role back by resume or restart.
 - **Restart safety**: after a restart Studio never resumes writing just because it sees a paused / interrupted job. Before "continue" it re-checks the lease: if another agent or an external party now holds the tree it says "the workspace was taken over by another agent, this job stays paused"; only the lease's own owner may resume. A lease left by a crashed Studio never locks forever: when the Studio holder process is confirmed gone its active lease is `STALE` and can be reclaimed; a holder that is clearly alive is never taken over.
 - **External agents / non-Studio edits**: when another AI window or you want to edit the folder, declare it (project page button, or the API): Studio stops and pauses its own writers, waits until they really stopped (and until a worktree being made or set up has finished its command), gives up its lease and records the external owner; the paused Studio job stays paused and a restart does not revive it. Give it back with "外部已歸還" or release-claim. A claim can carry a `pid` for reference. Its `EXTERNAL` ownership survives process exit and Studio restart and requires explicit release-claim.
+- **Local API pass**: `/api` only accepts requests with `x-studio-token`, so other programs or sandboxed agents on the same PC cannot act as you (the page Studio opens sends it). The pass is new at every Studio start and kept only in memory, never in a file; the page Studio opens remembers it. A page opened without it asks you to use the URL printed in the Studio window once (the part after `#t=` is the pass). A claim needs no pass; release-claim does.
 ```
 curl -X POST http://127.0.0.1:4848/api/workspace/claim -H "content-type: application/json" -d "{\"path\":\"E:\\\\CodexProject\\\\MyProject\",\"label\":\"Claude window\",\"pid\":1234}"
-curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type: application/json" -d "{\"path\":\"E:\\\\CodexProject\\\\MyProject\"}"
+curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type: application/json" -H "x-studio-token: <the part after #t= in the URL the Studio window prints>" -d "{\"path\":\"E:\\\\CodexProject\\\\MyProject\"}"
 ```
 - **Unknown changes**: if the lease holder is not executing but the folder changed, or another program's lock file appears while it writes, Studio flags `EXTERNAL_MODIFICATION_DETECTED`, stops writing and pauses; it does **not** reset, stash or overwrite; after you confirm, press "確認接手並繼續". (Changes made while an agent is executing cannot be told apart from its own, so the rules require agents to finish all file changes inside their own turn and leave no background process that edits files.) Every worker step ends with a `FILES:` line naming the files it changed; Studio compares the tree before and after the step and records any changed file missing from that list in the activity and events (recorded only: nothing is blocked or touched).
 - Besides the lease there is a `studio-writer.lock` in the git dir for programs that know nothing about Studio, and a fingerprint of the tree (HEAD, branch, uncommitted files) taken whenever Studio stops writing: compared before an automatic resume (files changed seconds ago → wait; changed while away → ask you).
 - **Pause vs stop**: pause = workers stop now (the current step may be half done), card and conversation are kept, the lease becomes `RESERVED` (the work still belongs to its owner), Studio never resumes it by itself (not even after a restart), you press "繼續", and the lease is re-checked first. Stop = this job ends for good: execution is terminated, the lease is released, unfinished cards fail, no "繼續", no revival after a restart; cards, conversations and records are kept, use "▶ 接著處理" to start a new round.
 
-**Project memory and handoff**
+**Workflow (hands-off)**
 - Every worker reply states a status: done / waiting for something external (e.g. CI) / waiting for another agent / asking the leader / needs your decision. A turn ending is not "done".
 - A worker's question about HOW to do its task (two reasonable ways, a missing detail) goes to the Leader, not to you: the Leader answers from the request and the cards (no files, no commands) and the answer returns to the worker's own conversation; only when the Leader judges it a product decision that only you can make does it ask you, in plain words. At most 2 questions per card; the third hands the whole card to the Leader.
 - Waiting cards continue by themselves when the awaited agent finishes, when a GitHub PR's CI finishes (`gh`, checked every minute), or when you answer. A wait Studio cannot check (e.g. a nightly build): the worker is asked to look itself every 5 minutes, 3 times, before the card says "needs you to press continue"; it is never a fake background wait. A failed PR status query is retried twice first.
@@ -156,7 +158,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 
 **Control mid-job**
 - "📣 告訴工頭" sends new instructions while a job runs: the Leader decides which worker to tell, which cards to cancel or add. Three ways to send it: "🕒 這一步做完再轉達" (default, after the current step), "💬 插話" (steer: goes into the step Claude / Codex is doing, without stopping it; other agents, or a step that ends first, get it after the step) and "⚡ 立刻打斷" (the working workers stop at once and continue after reading it). When a project keeps its agent rules in another agent's file (e.g. only CLAUDE.md, but the card goes to Codex), the brief asks the worker to read that file; Studio never copies or creates rules files.
-- After a job is done: ① stop (default), ② suggest 1–3 next steps, ③ auto-continue (opt-in with a confirmation, max 5 in a row).
+- After a job is done: ① stop (default), ② suggest 1–3 next steps, ③ auto-continue (opt-in with a confirmation; default max 5 in a row, configurable, 0 = no limit).
 
 **Long-term goal and routines** (project page, "🎯 長期目標・⏰ 定時工作")
 - Long-term goal: one paragraph per project. The Leader's plan, every card brief and the final check carry it, so agents know why the work matters; they still do only what the request asks.
@@ -194,6 +196,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 - [Workspace lease API and lifecycle](docs/workspace-lease.md)
 - [Runtime ownership and backend recovery](docs/runtime-ownership.md)
 - [Multi-model collaboration principles](docs/multi-model-principles.md) (Traditional Chinese)
+- [Orca comparison: what to borrow and what not](docs/orca-comparison.md) (Traditional Chinese)
 
 ### License
 

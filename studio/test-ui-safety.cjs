@@ -16,7 +16,7 @@ async function run() {
     S: { agents: [], workspaces: [], runtimes: [] }, curPath: () => '/A', esc,
     laneFolded: () => false, cardBlockedReason: () => '', formatWorkspace: () => ({ fullLine: 'A' }),
     runtimesOf: () => [], askFlag: () => '', look: () => ({ c: '#fff' }), workState: () => null,
-    ASKABLE: [], PARKED: [], STEP_WORD: {}, name: (x) => x, workButtons: () => '',
+    ASKABLE: [], PARKED: [], STEP_WORD: {}, stepsOpen: true, name: (x) => x, workButtons: () => '',
     usageLine: () => '', fmtTok: () => '', hhmm: () => '', blockedHtml: () => '', waitLine: () => '', ICON: {}
   };
   vm.createContext(s);
@@ -34,6 +34,10 @@ async function run() {
   const rendered = s.nowHtml({ name: 'A', tasks: [], activity: [], run: { active: true, phase: 'planning', request: 'x', leader: 'a' } }, {});
   assert.ok(!rendered.includes(payload), 'runtime errors must not insert raw markup');
   assert.ok(rendered.includes(esc(payload)), 'runtime error remains visible as text');
+  assert.ok(rendered.includes('id="stepsDrop" open'), 'card progress is open by default');
+  s.stepsOpen = false;
+  assert.ok(!/id="stepsDrop" open/.test(s.nowHtml({ name: 'A', tasks: [], activity: [], run: { active: true, phase: 'planning', request: 'x', leader: 'a' } }, {})), 'a redraw keeps card progress closed after the user closed it');
+  s.stepsOpen = true;
 
   const els = { workDlg: { open: true }, workBody: {}, workTitle: {}, workAsk: {} }, pending = [];
   const r = {

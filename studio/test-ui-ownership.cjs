@@ -15,7 +15,7 @@ module.exports = async function () {
     console,
     S: { workspaces: [], agents: [], runtimes: [] },
     STEP_WORD: { WAITING: '待做', WORKING: '工作中', DONE: '已完成', PAUSED: '已暫停', INTERRUPTED: '已中斷', FAILED: '失敗', WAITING_EXTERNAL: '等待外部結果', WAITING_AGENT: '等待其他 AI', NEEDS_USER: '需要 Nana' },
-    PARKED: ['WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'],
+    PARKED: ['WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'], stepsOpen: true,
     ICON: { DONE: '✅', WORKING: '⏳', WAITING: '🕒', PAUSED: '⏸️' },
     esc: (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
     base: (p) => path.basename(String(p || '')),
@@ -167,9 +167,12 @@ module.exports = async function () {
   }
 
   // 2. Verify server.mjs /api/state response mapping
-  // Read server.mjs to ensure GET /api/state builds workspace_summary and blocked_reason
+  // Read server.mjs to ensure GET /api/state sends no unread workspace_summary / raw lease list, and builds blocked_reason
   const serverCode = fs.readFileSync(path.join(__dirname, 'server.mjs'), 'utf8');
-  assert.ok(serverCode.includes('workspace_summary'), 'server.mjs must provide workspace_summary');
+  const stateRoute = serverCode.match(/'GET \/api\/state': \(\) => \{[\s\S]*?\n  \},/)?.[0] || '';
+  assert.ok(stateRoute.includes('workspaces'), 'GET /api/state route found');
+  assert.ok(!serverCode.includes('workspace_summary') && !html.includes('workspace_summary'), 'workspace_summary is neither sent nor read');
+  assert.ok(/const \{ leases, \.\.\.state \} = S;/.test(stateRoute) && stateRoute.includes('...state,') && !stateRoute.includes('...S,'), 'GET /api/state leaves out S.leases');
   assert.ok(serverCode.includes('blocked_reason'), 'server.mjs must compute blocked_reason for tasks');
 
   console.log('UI & API Workspace/Runtime/Blocked: PASS');

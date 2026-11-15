@@ -38,6 +38,12 @@ module.exports = async function run({ makeEnv, mkTmp, region }) {
     const R = repo(), E = setup(R.d), info = await E.api.workspaceOf(R.d);
     fs.mkdirSync(path.join(R.d, 'sub'));
     assert.equal((await E.api.workspaceOf(path.join(R.d, 'sub'))).key, info.key);
+    { // concurrent lookups share one git query, but a finished lookup is never reused
+      const [a, b] = await Promise.all([E.api.workspaceOf(R.d), E.api.workspaceOf(R.d)]);
+      assert.deepEqual(a, b); assert.notStrictEqual(a, b, 'each caller gets its own copy');
+      R.git('checkout', '-qb', 'moved'); assert.equal((await E.api.workspaceOf(R.d)).branch, 'moved', 'a later lookup sees the new branch');
+      R.git('checkout', '-q', 'main'); R.git('branch', '-qD', 'moved');
+    }
     const first = E.api.acquireWrite(E.w, E.t, info); assert.equal(first.ok, true);
     const other = { ...E.t, id: 'other', agent: 'claude' };
     assert.equal(E.api.acquireWrite(E.w, other, info).ok, false, 'A second writer refused');
@@ -87,6 +93,9 @@ module.exports = async function run({ makeEnv, mkTmp, region }) {
     assert.ok(H.env.S.leases.find((l) => l.owner.agent === 'codex').revoked);
     assert.equal(H.t.agent, 'codex'); assert.equal(H.t.handoffs.length, 2);
     assert.equal(H.w.run.convs['codex:work'], 'old-conversation');
+    const fence = H.env.S.leases.find((l) => l.revoked), aged = { ...fence, id: 'aged', releasedAt: new Date(Date.now() - 31 * 24 * 3600e3).toISOString() };
+    H.env.S.leases.push(aged); H.api.saveLeases();
+    assert.ok(H.env.S.leases.includes(fence) && !H.env.S.leases.includes(aged), 'revocation fences are kept 30 days, then dropped');
     console.log('lease C/D durable handoff revocation, same branch/worktree and retained conversation: PASS');
 
     // A failed stop confirmation cannot publish an external claim or move ownership.
@@ -124,6 +133,14 @@ module.exports = async function run({ makeEnv, mkTmp, region }) {
     const L = setup(repo().d); L.api.loadRun(L.w, { id: 'paused', status: 'paused', project: L.w.project, tasks: [{ id: 'queued', status: 'WAITING' }], activity: [] });
     assert.equal(L.w.run.active, false); assert.equal(L.w.run.paused, true); L.api.pump(L.w); assert.equal(L.env.prompts.length, 0);
     console.log('lease D/E startup preserves pause and does not revive jobs older than STOP: PASS');
+
+    // History list and detail show the same status: a no-longer-live "running" record is interrupted in both.
+    const historyStatus = new Function('S', region('const resumable =', '\nfunction loadRun') + region('const historyStatus =', '\nconst histRow') + 'return historyStatus;')({ workspaces: [{ run: { id: 'live', active: true } }] });
+    assert.deepEqual(['dead', 'live'].map((id) => historyStatus({ id, status: 'running' })), ['interrupted', 'running']);
+    assert.equal(historyStatus({ id: 'p', status: 'paused' }), 'paused');
+    assert.match(region('const hist = req.method', 'if (!fn)'), /historyStatus\(r\)/, 'the /api/history/:id detail uses the same status as the list');
+    assert.match(region('const histRow =', 'project: r.project'), /status: historyStatus\(r\)/);
+    console.log('history list and detail share the interrupted status: PASS');
 
     // G: explicit external ownership persists even when its optional PID exits; readers pass.
     const G = setup(repo().d);

@@ -4,6 +4,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { processSnapshot, processTree } from './codex-runtime.mjs';
+import { writeJson } from './state-files.mjs'; // circular with state-files.mjs: only functions cross, none run at load
 
 // ---------- System Process & Port Helpers (Windows-first) ----------
 
@@ -25,19 +26,21 @@ function execCmd(cmd, args) {
   });
 }
 
+// The one "is this process alive" check (server.mjs uses it too). Unsure counts as alive: only ESRCH means gone,
+// and a PID that is not a number (a bad record) counts as alive. No PID, or a number <= 0, is not a process.
 export function isPidAlive(pid) {
-  if (!pid || typeof pid !== 'number' || pid <= 0) return false;
+  if (!pid || (typeof pid === 'number' && pid <= 0)) return false;
   try {
     process.kill(pid, 0);
     return true;
   } catch (e) {
-    return e.code === 'EPERM';
+    return e.code !== 'ESRCH';
   }
 }
 
 export async function getProcessInfo(pid) {
   if (!isPidAlive(pid)) return { pid, exists: false, command: '', executable: '' };
-  if (process.platform === 'win32') {
+  if (process.platform === 'win32' && Number.isInteger(pid)) { // only a real number goes into the PowerShell filter
     try {
       const psCmd = `Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" -ErrorAction SilentlyContinue | Select-Object -Property ProcessId, Name, ExecutablePath, CommandLine, CreationDate | ConvertTo-Json -Compress`;
       const out = await execPowerShell(psCmd);
@@ -156,10 +159,14 @@ export async function getPortOccupant(port) {
         if (pids.length === 1 && Number.isInteger(pids[0]) && pids[0] > 0) return pids[0];
         if (!listeners.length) return null;
       }
-    } catch (e) {}
+    } catch (e) {
+      // A confirmed ambiguity is an answer, not a query failure: do not let the fallback pick one.
+      if (e.message === 'Ambiguous loopback listeners') throw new Error('Cannot confirm loopback port ownership: ' + e.message, { cause: e });
+    }
 
     try {
-      const stdout = await execCmd('netstat', ['-ano', '-p', 'tcp']);
+      // No `-p tcp`: that lists IPv4 only and would hide a dual-stack `[::]` listener.
+      const stdout = await execCmd('netstat', ['-ano']);
       const pids = new Set();
       for (const line of stdout.split(/\r?\n/)) {
         const parts = line.trim().split(/\s+/);
@@ -246,13 +253,15 @@ export function loadRuntimes(filePath) {
   return data;
 }
 
+// Every Codex turn adds a codex_session record, so cleaned ones are trimmed to the newest few on each write.
+// Only cleaned codex_session records: a cleaned backend record is the "latest replacement" fence (recoverBackendWaitStep).
+// ponytail: fixed cap of 50 cleaned Codex records, oldest dropped first.
+const CLEANED_CODEX_KEEP = 50;
+const cleanedCodex = (r) => r.purpose === 'codex_session' && r.status === 'cleaned';
 export function saveRuntimes(filePath, runtimes) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const temp = filePath + '.' + crypto.randomUUID() + '.tmp';
-  try {
-    fs.writeFileSync(temp, JSON.stringify(runtimes, null, 2), { encoding: 'utf8', flag: 'wx' });
-    fs.renameSync(temp, filePath);
-  } finally { if (fs.existsSync(temp)) fs.unlinkSync(temp); }
+  let extra = runtimes.filter(cleanedCodex).length - CLEANED_CODEX_KEEP;
+  if (extra > 0) runtimes = runtimes.filter((r) => !(cleanedCodex(r) && extra-- > 0));
+  writeJson(filePath, runtimes); // the same flushed atomic write as settings and history
 }
 
 export function registerRuntime({
