@@ -167,9 +167,12 @@ module.exports = async function () {
   }
 
   // 2. Verify server.mjs /api/state response mapping
-  // Read server.mjs to ensure GET /api/state builds workspace_summary and blocked_reason
+  // Read server.mjs to ensure GET /api/state sends no unread workspace_summary / raw lease list, and builds blocked_reason
   const serverCode = fs.readFileSync(path.join(__dirname, 'server.mjs'), 'utf8');
-  assert.ok(serverCode.includes('workspace_summary'), 'server.mjs must provide workspace_summary');
+  const stateRoute = serverCode.match(/'GET \/api\/state': \(\) => \{[\s\S]*?\n  \},/)?.[0] || '';
+  assert.ok(stateRoute.includes('workspaces'), 'GET /api/state route found');
+  assert.ok(!serverCode.includes('workspace_summary') && !html.includes('workspace_summary'), 'workspace_summary is neither sent nor read');
+  assert.ok(/const \{ leases, \.\.\.state \} = S;/.test(stateRoute) && stateRoute.includes('...state,') && !stateRoute.includes('...S,'), 'GET /api/state leaves out S.leases');
   assert.ok(serverCode.includes('blocked_reason'), 'server.mjs must compute blocked_reason for tasks');
 
   console.log('UI & API Workspace/Runtime/Blocked: PASS');

@@ -10,7 +10,7 @@ const { region } = require('./lifecycle-harness.cjs');
     const SETTINGS = path.join(rt, 'studio', 'settings.json'), HISTORY = path.join(rt, 'studio', 'history');
     const S = { workspaces: [], leader: 'codex', recent: [], agentCfg: {}, historyRev: 0 };
     const { saveSettings, saveRun } = new Function('S', 'fs', 'path', 'SETTINGS', 'HISTORY', 'writeJson',
-      region('function saveSettings()', '// ponytail: re-reads') + '\nreturn { saveSettings, saveRun };')(S, fs, path, SETTINGS, HISTORY, writeJson);
+      region('function saveSettings()', 'function historyItems()') + '\nreturn { saveSettings, saveRun };')(S, fs, path, SETTINGS, HISTORY, writeJson);
     const w = { run: { id: 'job', request: 'original' }, tasks: [], activity: [] };
     saveSettings(); saveRun(w, 'paused');
     const saved = fs.readFileSync(SETTINGS, 'utf8'), history = fs.readFileSync(path.join(HISTORY, 'job.json'), 'utf8');
@@ -26,6 +26,22 @@ const { region } = require('./lifecycle-harness.cjs');
     saveSettings(); saveRun(w, 'running');
     assert.strictEqual(JSON.parse(fs.readFileSync(SETTINGS, 'utf8')).leader, 'claude');
     assert.ok(!fs.readdirSync(path.dirname(SETTINGS)).some((f) => f.endsWith('.tmp')));
+    { // history cache: a log line rewrites the file but keeps the list cache; only a listed field advances historyRev
+      const H2 = path.join(rt, 'studio', 'history2'), S2 = { historyRev: 0, workspaces: [] };
+      const mk = () => new Function('S', 'fs', 'path', 'HISTORY', 'writeJson', 'isDir', 'resumable',
+        region('// ponytail: reads the newest 200', 'function listHistory()') + '\nreturn { saveRun, historyItems };')(S2, fs, path, H2, writeJson, (d) => fs.existsSync(d), (r) => r.status === 'paused');
+      const h = mk(), job = { run: { id: 'job', request: 'r' }, tasks: [{ status: 'WORKING' }], activity: [] };
+      h.saveRun(job, 'running'); const items = h.historyItems(), rev = S2.historyRev;
+      job.activity.push({ text: 'log' }); h.saveRun(job, 'running');
+      assert.strictEqual(S2.historyRev, rev, 'log-only save keeps historyRev');
+      assert.strictEqual(h.historyItems(), items, 'log-only save keeps the cache'); assert.strictEqual(items[0].activity.length, 1, 'cache updated in place');
+      assert.strictEqual(JSON.parse(fs.readFileSync(path.join(H2, 'job.json'), 'utf8')).activity.length, 1, 'every save still reaches disk');
+      job.activity.push({ text: 'log2' }); assert.strictEqual(items[0].activity.length, 1, 'cache is a copy, not the live arrays');
+      job.tasks[0].status = 'DONE'; h.saveRun(job, 'running'); assert.strictEqual(S2.historyRev, rev + 1, 'listed field change advances historyRev');
+      h.saveRun({ run: { id: 'job2', request: 'n' }, tasks: [], activity: [] }, 'paused'); assert.strictEqual(S2.historyRev, rev + 2, 'new record advances historyRev');
+      assert.deepEqual(h.historyItems().map((r) => r.id), ['job2', 'job']); S2.historyRev = 99;
+      assert.deepEqual(mk().historyItems(), JSON.parse(JSON.stringify(items)), 'cache matches a fresh read of the files');
+    }
     const release = await claimRuntime(rt), lock = path.join(rt, 'studio', 'instance.lock');
     await assert.rejects(claimRuntime(rt), /重複啟動/);
     const child = spawnSync(process.execPath, [path.join(__dirname, 'server.mjs')], {

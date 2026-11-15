@@ -38,6 +38,12 @@ module.exports = async function run({ makeEnv, mkTmp, region }) {
     const R = repo(), E = setup(R.d), info = await E.api.workspaceOf(R.d);
     fs.mkdirSync(path.join(R.d, 'sub'));
     assert.equal((await E.api.workspaceOf(path.join(R.d, 'sub'))).key, info.key);
+    { // concurrent lookups share one git query, but a finished lookup is never reused
+      const [a, b] = await Promise.all([E.api.workspaceOf(R.d), E.api.workspaceOf(R.d)]);
+      assert.deepEqual(a, b); assert.notStrictEqual(a, b, 'each caller gets its own copy');
+      R.git('checkout', '-qb', 'moved'); assert.equal((await E.api.workspaceOf(R.d)).branch, 'moved', 'a later lookup sees the new branch');
+      R.git('checkout', '-q', 'main'); R.git('branch', '-qD', 'moved');
+    }
     const first = E.api.acquireWrite(E.w, E.t, info); assert.equal(first.ok, true);
     const other = { ...E.t, id: 'other', agent: 'claude' };
     assert.equal(E.api.acquireWrite(E.w, other, info).ok, false, 'A second writer refused');

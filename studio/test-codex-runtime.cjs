@@ -63,6 +63,16 @@ const path = require('node:path');
     const ambiguous = setup();
     await assert.rejects(ambiguous.guard.create(async () => { ambiguous.context.rows.push(ambiguous.p(20), ambiguous.p(21)); return 'c'; }), /2 candidates/);
     assert.equal(listRuntimes({ rtDir: ambiguous.rtDir }).length, 0, 'ambiguous session attribution cannot admit a tool turn');
-    console.log('Codex runtime: session ownership, native restart, subprocess exit proof, PID reuse, query failure and retry: PASS');
+    { // registry trims cleaned Codex sessions to the newest 50; live, stopping and backend records all stay
+      const { saveRuntimes, loadRuntimes, runtimesFile } = await import('./runtime-registry.mjs');
+      const rtDir = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-codex-trim-')); dirs.push(rtDir);
+      const rec = (i, purpose, status) => ({ runtime_id: 'r' + i, purpose, status });
+      const all = [rec('b', 'dev_backend', 'cleaned'), ...Array.from({ length: 60 }, (_, i) => rec(i, 'codex_session', 'cleaned')), rec('s', 'codex_session', 'stopping'), rec('x', 'codex_session', 'running')];
+      saveRuntimes(runtimesFile(rtDir), all);
+      const ids = loadRuntimes(runtimesFile(rtDir)).map((r) => r.runtime_id);
+      assert.equal(ids.length, 53); assert.ok(!ids.includes('r9') && ids.includes('r10') && ids.includes('r59'), 'oldest cleaned Codex records dropped first');
+      assert.ok(['rb', 'rs', 'rx'].every((id) => ids.includes(id)), 'non-terminal and backend records are never trimmed');
+    }
+    console.log('Codex runtime: session ownership, native restart, subprocess exit proof, PID reuse, query failure and retry, cleaned-record cap: PASS');
   } finally { for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 })().catch((e) => { console.error(e); process.exitCode = 1; });
