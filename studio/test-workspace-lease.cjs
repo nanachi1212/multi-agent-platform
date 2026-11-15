@@ -93,6 +93,9 @@ module.exports = async function run({ makeEnv, mkTmp, region }) {
     assert.ok(H.env.S.leases.find((l) => l.owner.agent === 'codex').revoked);
     assert.equal(H.t.agent, 'codex'); assert.equal(H.t.handoffs.length, 2);
     assert.equal(H.w.run.convs['codex:work'], 'old-conversation');
+    const fence = H.env.S.leases.find((l) => l.revoked), aged = { ...fence, id: 'aged', releasedAt: new Date(Date.now() - 31 * 24 * 3600e3).toISOString() };
+    H.env.S.leases.push(aged); H.api.saveLeases();
+    assert.ok(H.env.S.leases.includes(fence) && !H.env.S.leases.includes(aged), 'revocation fences are kept 30 days, then dropped');
     console.log('lease C/D durable handoff revocation, same branch/worktree and retained conversation: PASS');
 
     // A failed stop confirmation cannot publish an external claim or move ownership.

@@ -126,8 +126,9 @@ export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, A
   function saveLeases() {
     return withLeaseTransaction(() => {
       const f = leasesFile(), tmp = f + '.' + INSTANCE + '.tmp';
-      // Revocation/STOP records fence stale job snapshots even after the new owner has finished.
-      S.leases = S.leases.filter((l) => l.status !== 'RELEASED' || l.revoked || l.jobStopped)
+      // Revocation/STOP records fence stale job snapshots even after the new owner has finished; after 30 days they are dropped.
+      const fenceUntil = Date.now() - 30 * 24 * 3600e3;
+      S.leases = S.leases.filter((l) => l.status !== 'RELEASED' || ((l.revoked || l.jobStopped) && !(Date.parse(l.releasedAt) < fenceUntil)))
         .concat(S.leases.filter((l) => l.status === 'RELEASED' && !l.revoked && !l.jobStopped).slice(-80));
       // flush in place: this module gets its fs injected and no imports (tests load it with new Function), so it cannot use state-files' writeJson
       try { fs.writeFileSync(tmp, JSON.stringify(S.leases, null, 1), { flush: true }); fs.renameSync(tmp, f); }

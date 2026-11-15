@@ -1,2 +1,0 @@
-Run exactly this one shell command and wait for it to finish, then reply with only the word DONE:
-node -e "setTimeout(()=>{},15000)"
