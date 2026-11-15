@@ -1511,10 +1511,13 @@ function workspaceOf(dir) {
   return p.then((info) => ({ ...info }));
 }
 async function workspaceLookup(dir) {
-  const top = (await git(dir, 'rev-parse', '--show-toplevel')).out?.trim();
+  // One git call answers all three; it fails on a repo with no commit yet (HEAD), which then takes the step-by-step path.
+  const one = (await git(dir, 'rev-parse', '--show-toplevel', '--path-format=absolute', '--git-common-dir', '--abbrev-ref', 'HEAD')).out?.trim().split(/\r?\n/);
+  const top = one ? one[0] : (await git(dir, 'rev-parse', '--show-toplevel')).out?.trim();
   const base = top || dir;
-  return { key: treeKey(base), path: canonPath(base), isGit: !!top,
-    branch: top ? (await git(dir, 'rev-parse', '--abbrev-ref', 'HEAD')).out?.trim() || '' : '', repo: top ? await originRepo(dir) || canonPath((await git(dir, 'rev-parse', '--path-format=absolute', '--git-common-dir')).out?.trim() || top) : '' };
+  const branch = one ? one[2] : top ? (await git(dir, 'rev-parse', '--abbrev-ref', 'HEAD')).out?.trim() || '' : '';
+  const commonDir = async () => (one ? one[1] : (await git(dir, 'rev-parse', '--path-format=absolute', '--git-common-dir')).out?.trim());
+  return { key: treeKey(base), path: canonPath(base), isGit: !!top, branch, repo: top ? await originRepo(dir) || canonPath((await commonDir()) || top) : '' };
 }
 
 const { mergeLeasesFromDisk, saveLeases, loadLeases, withLeaseTransaction, leaseState, writerOf, retire, sameCard, leaseView, newLease, acquireWrite, acquireRead, cardLeases, releaseCardLeases, reserveCardLeases, releaseJobLeases, reserveJobLeases, beatLeases } = createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, AGENTS, nowIso, pidAlive, LEASE_RESERVED_TTL_MS });
