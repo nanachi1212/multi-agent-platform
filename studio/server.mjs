@@ -136,7 +136,8 @@ function saveSettings() {
 
 // ponytail: reads the newest 200 history files once, then saveRun keeps the cache current in place; index them if history grows large.
 let histCache = { rev: -1, items: [], rows: new Map() };
-const histRow = (r) => ({ id: r.id, startedAt: r.startedAt, status: r.status === 'running' && resumable(r) ? 'interrupted' : r.status, project: r.project, leader: r.leader, request: String(r.request).slice(0, 120), done: r.tasks.filter((t) => t.status === 'DONE').length, total: r.tasks.length });
+const historyStatus = (r) => (r.status === 'running' && resumable(r) ? 'interrupted' : r.status);
+const histRow = (r) => ({ id: r.id, startedAt: r.startedAt, status: historyStatus(r), project: r.project, leader: r.leader, request: String(r.request).slice(0, 120), done: r.tasks.filter((t) => t.status === 'DONE').length, total: r.tasks.length });
 
 function saveRun(w, status) {
   const run = w.run;
@@ -168,6 +169,7 @@ function historyItems() {
   return items;
 }
 
+// A "running" record that is no longer live is shown as interrupted (list and detail alike).
 function listHistory() {
   return historyItems().slice(0, 50).map(histRow);
 }
@@ -228,7 +230,16 @@ async function ensureAion() {
   await new Promise((res, rej) => execFile('tar', ['-xf', zip, '-C', path.dirname(AION)], (e) => (e ? rej(e) : res())));
 }
 
-let aionProcess;
+let aionProcess, aionGone = '', aionClosing = false;
+// AionCore ended by itself after it was ready (not because Studio is closing): say so once in the server log,
+// and show it where agent errors already show (the seats' status note). Every later AionCore call fails with it.
+function aionExited(code, signal) {
+  if (aionClosing || aionGone) return;
+  aionGone = 'AionCore 已停止，請重新啟動 Studio';
+  console.error(`AionCore 在就緒後自己結束了（exit code ${code ?? '—'}${signal ? '，signal ' + signal : ''}）；之後的 AI 操作都會失敗，請重新啟動 Studio。`);
+  event('aioncore.exit', { code, signal });
+  for (const a of Object.values(S.agents)) Object.assign(a, { status: 'unavailable', note: aionGone, checkTok: {} });
+}
 const codexRuntime = createCodexRuntimeGuard({ rtDir: RT, api, owner: () => aionProcess });
 async function startAion() {
   await ensureAion();
@@ -255,10 +266,10 @@ async function startAion() {
       rtDir: RT
     });
   }
-  process.on('exit', () => p.kill());
+  process.on('exit', () => { aionClosing = true; p.kill(); });
   await new Promise((res, rej) => {
     let buf = '';
-    p.on('exit', (c) => rej(new Error('AionCore 結束，exit code ' + c)));
+    p.on('exit', (c, sig) => (BASE ? aionExited(c, sig) : rej(new Error('AionCore 結束，exit code ' + c))));
     p.stdout.on('data', (d) => {
       logFile.write(d);
       if (BASE) return;
@@ -272,6 +283,7 @@ async function startAion() {
 // Every AionCore call answers promptly (turns are polled, not awaited); the slowest seen in the spikes was ~8 s (create).
 const API_TIMEOUT_MS = 30e3;
 async function api(method, p, body) {
+  if (aionGone) throw new Error(aionGone);
   const signal = AbortSignal.timeout(API_TIMEOUT_MS);
   // AionCore may still act on a request it never answered: the stop is unconfirmed, so the write lease stays.
   const timedOut = () => Object.assign(new Error(`AionCore ${method} ${p} 逾時：${API_TIMEOUT_MS / 1000} 秒沒有回應`), { stopUnconfirmed: true });
@@ -1281,7 +1293,7 @@ function workContext(job) {
 const CONTINUE_RE = /^\s*(繼續|继续|接著|接着|接續|continue|resume|把剩下|剩下的)/i;
 
 async function start(w, request, cont = false, inherit = false) {
-  // "繼續…" / the 接著上次的工作 button continue the latest job instead of starting from zero.
+  // "繼續…" / the ▶ 接著處理 button continue the latest job instead of starting from zero.
   cont = cont || CONTINUE_RE.test(request);
   if (cont && w.run?.paused) return resume(w); // the paused job itself picks up where it stopped
   return launching(w, () => startJob(w, request, cont, inherit));
@@ -1351,7 +1363,7 @@ async function planPhaseStep(w, run, epoch) {
       if (!leaderCurrent(w, run, epoch) || run.leaderGen !== gen) return;
       plan = tryPlan(reply);
     }
-    if (!plan) throw Object.assign(new Error('工頭這次沒有成功建立工作清單。Studio 保留了目前進度，按「↻ 接著上次的工作」可以再試一次。'), { detail: reply });
+    if (!plan) throw Object.assign(new Error('工頭這次沒有成功建立工作清單。Studio 保留了目前進度，在下方輸入「繼續」再按「▶ 交給團隊」可以再試一次。'), { detail: reply });
     log(w, lead, 'leader', plan.message || `已拆成 ${plan.subtasks.length} 項工作`);
     addCards(w, plan.subtasks, lead);
     run.phase = 'working';
@@ -1458,7 +1470,7 @@ function accessRules(t) {
 }
 
 // ----- identity of a working tree -----
-const pidAlive = (pid) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; } };
+const pidAlive = isPidAlive; // the one implementation (runtime-registry): unsure counts as alive
 const canonPath = (p) => { let r = String(p || ''); try { r = fs.realpathSync.native(r); } catch { r = path.resolve(r); } return r.replace(/[\\/]+$/, ''); };
 const treeKey = (p) => { const c = canonPath(p).split('/').join('\\'); return process.platform === 'win32' ? c.toLowerCase() : c; };
 
@@ -3206,7 +3218,7 @@ ${SUBTASK_RULES}`, { w, lead: true });
   } catch (e) {
     if (!leaderCurrent(w, run, epoch) || run.leaderGen !== gen || e instanceof Halt) return;
     run.summarizing = false;
-    log(w, 'studio', 'system', '工頭這次沒有完成整體確認。Studio 保留了目前進度，可以按「↻ 接著上次的工作」再試。', e.message);
+    log(w, 'studio', 'system', '工頭這次沒有完成整體確認。Studio 保留了目前進度，可以在下方輸入「繼續」再按「▶ 交給團隊」再試。', e.message);
     finish(w, 'failed');
   }
 }
@@ -3231,7 +3243,8 @@ function answer(w, taskId, text) {
     log(w, 'user', 'user', `回覆「${t.title}」：${text}`);
     if (t.takeover) { // "may Studio write over what was changed meanwhile?"
       Object.assign(t, { takeover: false, ask: null });
-      if (/^先不要|暫停/.test(text)) { t.status = 'WAITING'; log(w, 'studio', 'system', '不接手：先暫停，等你處理好再按「繼續」。'); return pause(w); }
+      // only the option 「先不要（暫停）」 or a reply that starts with 暫停 pauses; 「不要暫停，繼續」 does not
+      if (/^(先不要|暫停)/.test(text)) { t.status = 'WAITING'; log(w, 'studio', 'system', '不接手：先暫停，等你處理好再按「繼續」。'); return pause(w); }
       Object.assign(t, { status: 'WAITING', trust: true });
       return pump(w);
     }
@@ -3792,7 +3805,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) return send(200, fs.readFileSync(path.join(import.meta.dirname, 'index.html')), 'text/html; charset=utf-8');
   if (req.method === 'GET' && req.url === '/favicon.ico') return send(200, fs.readFileSync(path.join(import.meta.dirname, 'assets', 'morandi', 'app-icon.ico')), 'image/x-icon');
   const hist = req.method === 'GET' && req.url.match(/^\/api\/history\/([\w-]+)$/);
-  const fn = hist ? () => readHistory(hist[1]) : routes[`${req.method} ${req.url}`];
+  const fn = hist ? () => { const r = readHistory(hist[1]); return { ...r, status: historyStatus(r) }; } : routes[`${req.method} ${req.url}`];
   if (!fn) return send(404, { error: 'not found' });
   if (req.method === 'POST' && !String(req.headers['content-type']).startsWith('application/json')) return send(415, { error: 'json only' });
   const route = `${req.method} ${req.url}`;

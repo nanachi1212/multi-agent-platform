@@ -22,6 +22,7 @@ function makeEnv(script, overrides = {}) {
   const logs = [], notices = [], prompts = [];
   const env = {
     createWorkspaceLeaseStore, process,
+    isPidAlive: require('./runtime-registry.mjs').isPidAlive, // the real one: server.mjs pidAlive is this function
     processSnapshot: async () => [], killProcessTree: async () => ({ ok: true, killed: false }),
     listRuntimes: () => [], cleanupJobRuntimes: async () => ({ cleaned: 0, blocked: [] }),
     AGENTS: { claude: { name: 'Claude Code' }, codex: { name: 'Codex' }, antigravity: { name: 'Antigravity' } },

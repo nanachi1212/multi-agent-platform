@@ -131,6 +131,14 @@ module.exports = async function run({ makeEnv, mkTmp, region }) {
     assert.equal(L.w.run.active, false); assert.equal(L.w.run.paused, true); L.api.pump(L.w); assert.equal(L.env.prompts.length, 0);
     console.log('lease D/E startup preserves pause and does not revive jobs older than STOP: PASS');
 
+    // History list and detail show the same status: a no-longer-live "running" record is interrupted in both.
+    const historyStatus = new Function('S', region('const resumable =', '\nfunction loadRun') + region('const historyStatus =', '\nconst histRow') + 'return historyStatus;')({ workspaces: [{ run: { id: 'live', active: true } }] });
+    assert.deepEqual(['dead', 'live'].map((id) => historyStatus({ id, status: 'running' })), ['interrupted', 'running']);
+    assert.equal(historyStatus({ id: 'p', status: 'paused' }), 'paused');
+    assert.match(region('const hist = req.method', 'if (!fn)'), /historyStatus\(r\)/, 'the /api/history/:id detail uses the same status as the list');
+    assert.match(region('const histRow =', 'project: r.project'), /status: historyStatus\(r\)/);
+    console.log('history list and detail share the interrupted status: PASS');
+
     // G: explicit external ownership persists even when its optional PID exits; readers pass.
     const G = setup(repo().d);
     const claim = await G.api.claimWorkspace(G.w.project, { label: 'external', pid: 2147483000, description: 'manual edit', session: 'session-1' });

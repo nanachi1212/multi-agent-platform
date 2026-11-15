@@ -26,6 +26,23 @@ async function run() {
   assert.equal(els.histDlg.opens, 1, 'Escape cancels pending modal response');
   const reopened = h.openHistory('D'); reply(4, 'D'); await reopened;
   assert.equal(h.histOpenId, 'D', 'close then new open is not cancelled by a delayed close event');
+  const statusReply = (i, status) => pending[i]({ json: async () => ({ project: 'E', startedAt: 'E', request: 'E', status, tasks: [], activity: [] }) });
+  const interrupted = h.openHistory('E'); statusReply(5, 'interrupted'); await interrupted;
+  assert.equal(els.histResume.hidden, false, 'an interrupted record (detail matches the list) can be continued');
+  const live = h.openHistory('F'); statusReply(6, 'running'); await live;
+  assert.equal(els.histResume.hidden, true, 'a still-running (live) job has no resume button');
+  // Redraws keep what the user opened or closed: chat via setHtml, card progress via its remembered state.
+  const renderProject = fn(html, 'renderProject');
+  assert.match(renderProject, /setHtml\(box, chatHtml\(w\.activity\)\)/); assert.doesNotMatch(renderProject, /box\.innerHTML/);
+  // A rebuild (new chat message) re-opens the technical details the user had open, matched by text.
+  const setHtml = new Function(html.slice(html.indexOf('const setHtml ='), html.indexOf('let doneOpen')) + 'return setHtml;')();
+  const detail = (text, open) => ({ open, querySelector: () => ({ textContent: text }) });
+  let shown = [detail('A', true), detail('B', false)];
+  const chatBox = { _html: 'old', querySelectorAll: (q) => (q.includes('[open]') ? shown.filter((d) => d.open).map((d) => d.querySelector()) : shown),
+    set innerHTML(v) { shown = [detail('A', false), detail('B', false), detail('C', false)]; } };
+  setHtml(chatBox, 'new');
+  assert.deepEqual(shown.map((d) => d.open), [true, false, false], 'only the detail that was open is re-opened');
+  assert.match(html, /id="stepsDrop" \$\{stepsOpen \? 'open' : ''\}/); assert.match(html, /stepsDrop'\) stepsOpen = e\.target\.open/);
 
   const responses = [], renders = [];
   const r = { refreshSeq: 0, refreshAppliedSeq: 0, last: '', lastRender: 0, S: null,

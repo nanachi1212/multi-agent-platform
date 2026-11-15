@@ -406,7 +406,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
   assert.ok(await waitFor(() => w.run.result === 'done'), 'a stale lock is ignored');
 
   // c) an automatic wake (CI result) after somebody committed meanwhile: Studio asks before writing
-  for (const answerIs of ['接手', '暫停']) {
+  for (const answerIs of ['接手', '暫停', '不要暫停，繼續']) { // free text that only mentions 暫停 is not a pause
     repo = mkRepo(); let turns = 0;
     ({ env, api } = repoEnv(repo, stdScript('ship', () => (++turns === 1 ? 'PR open' + String.fromCharCode(10) + 'STATUS: WAITING_EXTERNAL: the nightly build' : 'ok' + String.fromCharCode(10) + 'STATUS: DONE'))));
     w = mkW(repo); env.S.workspaces.push(w);
@@ -417,8 +417,8 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
     assert.ok(await waitFor(() => w.tasks[0].status === 'NEEDS_USER' && w.tasks[0].takeover), 'asks before writing over changes');
     assert.deepStrictEqual(w.tasks[0].ask.options, ['確認接手，繼續', '先不要（暫停）']);
     assert.strictEqual(turns, 1, 'no second turn before the user decides');
-    api.answer(w, w.tasks[0].id, answerIs === '接手' ? '確認接手，繼續' : '先不要（暫停）');
-    if (answerIs === '接手') { assert.ok(await waitFor(() => w.run.result === 'done'), 'continues after 確認接手'); assert.strictEqual(turns, 2); }
+    api.answer(w, w.tasks[0].id, answerIs === '接手' ? '確認接手，繼續' : answerIs === '暫停' ? '先不要（暫停）' : answerIs);
+    if (answerIs !== '暫停') { assert.ok(await waitFor(() => w.run.result === 'done'), 'continues after 確認接手'); assert.strictEqual(turns, 2); }
     else { assert.ok(await waitFor(() => w.run.paused === true), '先不要 pauses'); assert.strictEqual(turns, 1); }
   }
   // d) somebody is editing right now (file changed after Studio left): wait
