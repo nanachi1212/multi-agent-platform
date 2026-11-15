@@ -134,28 +134,42 @@ function saveSettings() {
   writeJson(SETTINGS, { leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external, acp: S.acp });
 }
 
+// ponytail: reads the newest 200 history files once, then saveRun keeps the cache current in place; index them if history grows large.
+let histCache = { rev: -1, items: [], rows: new Map() };
+const histRow = (r) => ({ id: r.id, startedAt: r.startedAt, status: r.status === 'running' && resumable(r) ? 'interrupted' : r.status, project: r.project, leader: r.leader, request: String(r.request).slice(0, 120), done: r.tasks.filter((t) => t.status === 'DONE').length, total: r.tasks.length });
+
 function saveRun(w, status) {
   const run = w.run;
   if (!run) return;
   // phase + convs let a paused run continue in the same agent conversations after a Studio restart.
   const rec = { leadTier: run.leadTier, usage: run.usage, treeStamps: run.treeStamps, treeStamp: run.treeStamp, leftAt: run.leftAt, extMod: run.extMod, claimedBy: run.claimedBy, id: run.id, startedAt: run.startedAt, finishedAt: new Date().toISOString(), status, phase: run.phase, project: run.project, leader: run.leader, request: run.request, goal: run.goal, refs: run.refs, context: run.context, continues: run.continues, rounds: run.rounds, ask: run.ask, notes: run.notes, suggestions: run.suggestions, convs: run.convs, tasks: w.tasks, activity: w.activity };
   writeJson(path.join(HISTORY, run.id + '.json'), rec);
-  S.historyRev++;
+  // Replace this record in the cache instead of re-reading every file; the page refetches the list only when a listed field changed.
+  if (histCache.rev !== S.historyRev) { S.historyRev++; return; }
+  const items = histCache.items, i = items.findIndex((x) => x.id === run.id), copy = JSON.parse(JSON.stringify(rec)); // a copy, as on disk: rec shares live arrays
+  // Compare with the row last listed, not the cached record: a resumed job (loadRun) shares and mutates that record's tasks.
+  const row = JSON.stringify(histRow(copy)), changed = histCache.rows.get(run.id) !== row;
+  histCache.rows.set(run.id, row);
+  if (i >= 0) items[i] = copy;
+  else {
+    const at = items.findIndex((x) => x.id + '.json' < run.id + '.json'); // same newest-first order as the file listing
+    items.splice(at < 0 ? items.length : at, 0, copy);
+    if (items.length > 200) items.length = 200;
+  }
+  if (changed) histCache.rev = ++S.historyRev;
 }
 
-// ponytail: re-reads the newest 200 history files whenever one changes; index them if history grows large.
-let histCache = { rev: -1, items: [] };
 function historyItems() {
   if (histCache.rev === S.historyRev) return histCache.items;
   const items = !isDir(HISTORY) ? [] : fs.readdirSync(HISTORY).filter((f) => f.endsWith('.json')).sort().reverse().slice(0, 200).flatMap((f) => {
     try { return [JSON.parse(fs.readFileSync(path.join(HISTORY, f), 'utf8'))]; } catch { return []; }
   });
-  histCache = { rev: S.historyRev, items };
+  histCache = { rev: S.historyRev, items, rows: new Map(items.map((r) => [r.id, JSON.stringify(histRow(r))])) };
   return items;
 }
 
 function listHistory() {
-  return historyItems().slice(0, 50).map((r) => ({ id: r.id, startedAt: r.startedAt, status: r.status === 'running' && resumable(r) ? 'interrupted' : r.status, project: r.project, leader: r.leader, request: String(r.request).slice(0, 120), done: r.tasks.filter((t) => t.status === 'DONE').length, total: r.tasks.length }));
+  return historyItems().slice(0, 50).map(histRow);
 }
 
 // Cards finished today, and the latest finished card per agent (current board + history).
@@ -1449,7 +1463,15 @@ const canonPath = (p) => { let r = String(p || ''); try { r = fs.realpathSync.na
 const treeKey = (p) => { const c = canonPath(p).split('/').join('\\'); return process.platform === 'win32' ? c.toLowerCase() : c; };
 
 // The physical working tree a folder belongs to: key (same for any spelling of the path), top folder, branch, repository.
-async function workspaceOf(dir) {
+// Calls for the same folder while a lookup is running share it; each caller gets its own copy.
+// ponytail: no TTL cache: agents switch branches inside their own turns, so a finished lookup is never reused.
+const workspaceLookups = new Map();
+function workspaceOf(dir) {
+  let p = workspaceLookups.get(dir);
+  if (!p) { p = workspaceLookup(dir).finally(() => workspaceLookups.delete(dir)); workspaceLookups.set(dir, p); }
+  return p.then((info) => ({ ...info }));
+}
+async function workspaceLookup(dir) {
   const top = (await git(dir, 'rev-parse', '--show-toplevel')).out?.trim();
   const base = top || dir;
   return { key: treeKey(base), path: canonPath(base), isGit: !!top,
@@ -3677,21 +3699,16 @@ const routes = {
       const r = w.run;
       const key = w.wsKey || treeKey(w.project), live = S.leases.filter((l) => l.key === key && l.status !== 'RELEASED' && leaseState(l) !== 'RELEASED');
       const lease = { writer: live.filter((l) => l.mode === 'write').map(leaseView)[0] || null, readers: live.filter((l) => l.mode === 'read').map(leaseView) };
-      const wr = lease.writer;
-      const readers = (lease.readers || []).map((x) => x.owner).join(', ') || '—';
-      const repo = w.wsInfo?.repo || wr?.repo || path.basename(w.project);
-      const branch = w.wsInfo?.branch || wr?.branch || '—';
-      const writerStr = wr ? `${wr.owner} / ${repo} / ${branch}` : '—';
-      const workspace_summary = `Writer: ${writerStr} · Readers: ${readers} · branch: ${branch} · worktree: ${w.wsInfo?.path || w.project} · lease: ${wr?.state || (wr ? 'ACTIVE' : 'FREE')}`;
       const tasks = (w.tasks || []).map((t) => {
         const why = t.wait?.recoveryReason || (t.blocked?.owner && `workspace currently owned by ${t.blocked.owner}`) || t.blockReason || t.wait?.error;
         const blocked_reason = why ? 'Blocked：' + String(why).trim().replace(/^Blocked\s*[:：]?\s*/i, '') : null;
         return { ...t, blocked_reason, ...(t.status === 'WORKING' ? { activity: convActivity.get(convOf(w, t)) || null } : {}) };
       });
-      return { wsInfo: w.wsInfo, lease, workspace_summary, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, worktreeSetup: w.worktreeSetup, tokenCap: w.tokenCap, mission: w.mission, routines: w.routines, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
+      return { wsInfo: w.wsInfo, lease, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, worktreeSetup: w.worktreeSetup, tokenCap: w.tokenCap, mission: w.mission, routines: w.routines, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
         run: r && { usage: r.usage || null, extMod: r.extMod, claimedBy: r.claimedBy, id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
     });
-    return { ...S, runtimes: S.runtimes, ...teamStats(), agents: Object.values(S.agents), workspaces };
+    const { leases, ...state } = S; // the page shows each project's lease (above), never the raw list
+    return { ...state, runtimes: S.runtimes, ...teamStats(), agents: Object.values(S.agents), workspaces };
   },
   // Project-scoped calls name their project in `ws` (its folder path).
   'POST /api/pause': (b) => pauseAndDrain(wsOf(b.ws)),

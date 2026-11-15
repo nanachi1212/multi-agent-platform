@@ -250,7 +250,14 @@ export function loadRuntimes(filePath) {
   return data;
 }
 
+// Every Codex turn adds a codex_session record, so cleaned ones are trimmed to the newest few on each write.
+// Only cleaned codex_session records: a cleaned backend record is the "latest replacement" fence (recoverBackendWaitStep).
+// ponytail: fixed cap of 50 cleaned Codex records, oldest dropped first.
+const CLEANED_CODEX_KEEP = 50;
+const cleanedCodex = (r) => r.purpose === 'codex_session' && r.status === 'cleaned';
 export function saveRuntimes(filePath, runtimes) {
+  let extra = runtimes.filter(cleanedCodex).length - CLEANED_CODEX_KEEP;
+  if (extra > 0) runtimes = runtimes.filter((r) => !(cleanedCodex(r) && extra-- > 0));
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const temp = filePath + '.' + crypto.randomUUID() + '.tmp';
   try {
