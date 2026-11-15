@@ -140,7 +140,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 - Besides the lease there is a `studio-writer.lock` in the git dir for programs that know nothing about Studio, and a fingerprint of the tree (HEAD, branch, uncommitted files) taken whenever Studio stops writing: compared before an automatic resume (files changed seconds ago → wait; changed while away → ask you).
 - **Pause vs stop**: pause = workers stop now (the current step may be half done), card and conversation are kept, the lease becomes `RESERVED` (the work still belongs to its owner), Studio never resumes it by itself (not even after a restart), you press "繼續", and the lease is re-checked first. Stop = this job ends for good: execution is terminated, the lease is released, unfinished cards fail, no "繼續", no revival after a restart; cards, conversations and records are kept, use "▶ 接著處理" to start a new round.
 
-**Project memory and handoff**
+**Workflow (hands-off)**
 - Every worker reply states a status: done / waiting for something external (e.g. CI) / waiting for another agent / asking the leader / needs your decision. A turn ending is not "done".
 - A worker's question about HOW to do its task (two reasonable ways, a missing detail) goes to the Leader, not to you: the Leader answers from the request and the cards (no files, no commands) and the answer returns to the worker's own conversation; only when the Leader judges it a product decision that only you can make does it ask you, in plain words. At most 2 questions per card; the third hands the whole card to the Leader.
 - Waiting cards continue by themselves when the awaited agent finishes, when a GitHub PR's CI finishes (`gh`, checked every minute), or when you answer. A wait Studio cannot check (e.g. a nightly build): the worker is asked to look itself every 5 minutes, 3 times, before the card says "needs you to press continue"; it is never a fake background wait. A failed PR status query is retried twice first.
@@ -155,7 +155,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 
 **Control mid-job**
 - "📣 告訴工頭" sends new instructions while a job runs: the Leader decides which worker to tell, which cards to cancel or add. Three ways to send it: "🕒 這一步做完再轉達" (default, after the current step), "💬 插話" (steer: goes into the step Claude / Codex is doing, without stopping it; other agents, or a step that ends first, get it after the step) and "⚡ 立刻打斷" (the working workers stop at once and continue after reading it). When a project keeps its agent rules in another agent's file (e.g. only CLAUDE.md, but the card goes to Codex), the brief asks the worker to read that file; Studio never copies or creates rules files.
-- After a job is done: ① stop (default), ② suggest 1–3 next steps, ③ auto-continue (opt-in with a confirmation, max 5 in a row).
+- After a job is done: ① stop (default), ② suggest 1–3 next steps, ③ auto-continue (opt-in with a confirmation; default max 5 in a row, configurable, 0 = no limit).
 
 **Long-term goal and routines** (project page, "🎯 長期目標・⏰ 定時工作")
 - Long-term goal: one paragraph per project. The Leader's plan, every card brief and the final check carry it, so agents know why the work matters; they still do only what the request asks.
@@ -192,6 +192,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 - [Workspace lease API and lifecycle](docs/workspace-lease.md)
 - [Runtime ownership and backend recovery](docs/runtime-ownership.md)
 - [Multi-model collaboration principles](docs/multi-model-principles.md) (Traditional Chinese)
+- [Orca comparison: what to borrow and what not](docs/orca-comparison.md) (Traditional Chinese)
 
 ### License
 

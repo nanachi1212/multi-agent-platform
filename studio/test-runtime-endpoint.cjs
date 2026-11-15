@@ -18,6 +18,7 @@ const fs = require('node:fs'), path = require('node:path');
   assert.equal(await query(new Error('CIM unavailable'), netstat)(3020), 202);
   const ambiguous = [row('::', 101), row('127.0.0.1', 202)];
   await assert.rejects(query(ambiguous, netstat.replace('[::1]', '[::]'))(3020), /Cannot confirm/);
+  await assert.rejects(query(ambiguous, netstat)(3020), /Cannot confirm/, 'a confirmed ambiguity is not overridden by the fallback');
   await assert.rejects(query(new Error('CIM failed'), new Error('netstat failed'))(3020), /Cannot confirm/);
   const runtime = { runtime_id: 'managed', root_pid: 101, process_identity: { creationDate: 'new', executable: 'node.exe' },
     child_pids: [], status: 'running', created_by: 'studio', port: 3020, job_id: 'job', data_dir: path.resolve('data') };

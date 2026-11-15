@@ -319,8 +319,8 @@ function setAgentCfg(w, agent, model, effort, hardModel = '', hardEffort = '') {
   saveSettings();
 }
 
-// Model strategy per project. The Leader marks hard cards; normal cards (and every Leader turn) use the
-// normal tier, hard cards the hard tier, and a normal card that fails is retried once on the hard tier.
+// Model strategy per project. The Leader marks hard cards; normal cards use the
+// normal tier, hard cards and every Leader turn the hard tier, and a normal card that fails is retried once on the hard tier.
 // Patterns match the catalogs the agents report (first match = newest). 'custom' = the seat-card settings.
 const STRATEGIES = {
   save: { claude: [['^sonnet$', 'medium'], ['^opus$', 'high']], codex: [['luna', 'medium'], ['sol', 'high']] },
@@ -1167,7 +1167,7 @@ function refreshCodexLimits() {
     const dir = path.join(CODEX_HOME, 'sessions');
     if (!isDir(dir)) return;
     const newest = fs.readdirSync(dir, { recursive: true }).filter((f) => String(f).endsWith('.jsonl'))
-      .map((f) => path.join(dir, String(f))).sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0];
+      .map((f) => path.join(dir, String(f))).map((f) => [fs.statSync(f).mtimeMs, f]).reduce((a, b) => (b[0] > a[0] ? b : a), [-1])[1];
     if (!newest) return;
     const line = fs.readFileSync(newest, 'utf8').split('\n').reverse().find((l) => l.includes('"rate_limits":{'));
     if (!line) return;
@@ -1456,7 +1456,7 @@ async function workspaceOf(dir) {
     branch: top ? (await git(dir, 'rev-parse', '--abbrev-ref', 'HEAD')).out?.trim() || '' : '', repo: top ? await originRepo(dir) || canonPath((await git(dir, 'rev-parse', '--path-format=absolute', '--git-common-dir')).out?.trim() || top) : '' };
 }
 
-const { mergeLeasesFromDisk, saveLeases, loadLeases, withLeaseTransaction, leaseState, writerOf, retire, ownerName, sameCard, leaseView, newLease, acquireWrite, acquireRead, cardLeases, releaseCardLeases, reserveCardLeases, releaseJobLeases, reserveJobLeases, beatLeases } = createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, AGENTS, nowIso, pidAlive, LEASE_RESERVED_TTL_MS });
+const { mergeLeasesFromDisk, saveLeases, loadLeases, withLeaseTransaction, leaseState, writerOf, retire, sameCard, leaseView, newLease, acquireWrite, acquireRead, cardLeases, releaseCardLeases, reserveCardLeases, releaseJobLeases, reserveJobLeases, beatLeases } = createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, AGENTS, nowIso, pidAlive, LEASE_RESERVED_TTL_MS });
 
 function releaseLease(id) {
   return withLeaseTransaction(() => {
@@ -3514,7 +3514,7 @@ async function recoverBackendWaitStep(w, t) {
     && t.status === 'WAITING_EXTERNAL' && t.wait === wait && (t.leaseGeneration || 0) === generation;
   const canProceed = () => {
     if (!current()) return false;
-    loadLeases();
+    mergeLeasesFromDisk();
     const holder = writerOf(treeKey(t.workdir || w.project));
     return !!holder && sameCard(holder, w, t) && holder.instance === INSTANCE && !holder.revoked && !holder.jobStopped;
   };
@@ -3631,7 +3631,7 @@ async function startManagedRuntimeStep(body) {
   if (!task || !w.run?.active || w.run.paused || w.run.stopped || task.hold || task.status !== 'WORKING' || !isWriter(task)) throw new Error('runtime 必須綁定持有 write lease 的進行中工作卡');
   const run = w.run, generation = task.leaseGeneration || 0;
   const authorized = () => {
-    loadLeases();
+    mergeLeasesFromDisk();
     const lease = writerOf(treeKey(task.workdir || w.project));
     return w.run === run && run.active && !run.paused && !run.stopped && !task.hold && task.status === 'WORKING'
       && (task.leaseGeneration || 0) === generation && lease?.instance === INSTANCE && sameCard(lease, w, task) && !lease.revoked && !lease.jobStopped;
@@ -3761,12 +3761,10 @@ const routes = {
     if (!runtime) throw new Error('找不到這個 Studio runtime');
     return checkBackendReadiness({ ...runtime, rtDir: RT }, { isPidAlive });
   },
-  'POST /api/runtime/check-port': (b) => checkPortOwnership(Number(b.port), { desiredJobId: b.jobId, desiredDataDir: b.dataDir, rtDir: RT }),
-  'POST /api/runtime/cleanup-stale': () => cleanupStaleRuntimes({ rtDir: RT }),
 };
 
 // The event log keeps only ids and settings from a request body: never free text (requests, notes) or secrets (API keys).
-const READ_POSTS = new Set(['POST /api/limits/refresh', 'POST /api/check', 'POST /api/card/detail', 'POST /api/card/diff', 'POST /api/external/models', 'POST /api/runtime/readiness', 'POST /api/runtime/check-port']);
+const READ_POSTS = new Set(['POST /api/limits/refresh', 'POST /api/check', 'POST /api/card/detail', 'POST /api/card/diff', 'POST /api/external/models', 'POST /api/runtime/readiness']);
 const EVENT_FIELDS = ['ws', 'path', 'taskId', 'agent', 'to', 'id', 'mode', 'strategy', 'max', 'cap', 'port', 'on', 'interrupt', 'time', 'days'];
 const pickEventFields = (b) => Object.fromEntries(EVENT_FIELDS.map((k) => [k, b?.[k]]).filter(([, v]) => v != null && (typeof v !== 'object' || Array.isArray(v))));
 
