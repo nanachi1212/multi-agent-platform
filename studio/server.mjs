@@ -260,11 +260,17 @@ async function startAion() {
   fs.mkdirSync(CODEX_HOME, { recursive: true });
   syncCodexRules();
   const logFile = fs.createWriteStream(path.join(RT, 'studio', 'aioncore.out.txt'));
-  const p = spawn(AION, ['--local', '--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)],
-    { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, CODEX_HOME } });
+  // No --local (security F2/F3): that mode turns AionCore's login off, so any local program could drive the agents through its port.
+  // The built-in user (the same system_default_user --local used, so old conversations stay) gets a new random password each start.
+  const pass = crypto.randomBytes(24).toString('hex');
+  await new Promise((res, rej) => {
+    const c = execFile(AION, ['--data-dir', data, 'user', 'set-password', '--password-stdin'], { windowsHide: true }, (e, out, err) => (e ? rej(new Error('AionCore 設定登入密碼失敗：' + (err || e.message))) : res()));
+    c.stdin.end(pass + '\n');
+  });
+  const args = ['--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)];
+  const p = spawn(AION, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, CODEX_HOME } });
   if (p.pid) {
     aionProcess = await getProcessInfo(p.pid);
-    const args = ['--local', '--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)];
     registerRuntime({
       job_id: 'studio_core',
       purpose: 'helper',
@@ -289,6 +295,16 @@ async function startAion() {
       if (m && /AIONCORE_READY/.test(buf)) { BASE = 'http://127.0.0.1:' + m[1]; res(); }
     });
   });
+  aionAuth = await aionLogin(pass);
+}
+// Bearer token for every call; writes also need the CSRF cookie echoed in a header.
+let aionAuth = {};
+async function aionLogin(password) {
+  const r = await fetch(BASE + '/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'admin', password }), signal: AbortSignal.timeout(API_TIMEOUT_MS) });
+  const j = await r.json().catch(() => ({}));
+  const csrf = r.headers.getSetCookie().map((c) => c.split(';')[0]).find((c) => c.startsWith('aionui-csrf-token='))?.slice('aionui-csrf-token='.length);
+  if (!r.ok || !j.token || !csrf) throw new Error('AionCore 登入失敗：' + r.status);
+  return { authorization: 'Bearer ' + j.token, cookie: 'aionui-csrf-token=' + csrf, 'x-csrf-token': csrf };
 }
 
 // Every AionCore call answers promptly (turns are polled, not awaited); the slowest seen in the spikes was ~8 s (create).
@@ -298,7 +314,7 @@ async function api(method, p, body) {
   const signal = AbortSignal.timeout(API_TIMEOUT_MS);
   // AionCore may still act on a request it never answered: the stop is unconfirmed, so the write lease stays.
   const timedOut = () => Object.assign(new Error(`AionCore ${method} ${p} 逾時：${API_TIMEOUT_MS / 1000} 秒沒有回應`), { stopUnconfirmed: true });
-  const r = await fetch(BASE + p, { method, headers: { 'content-type': 'application/json' }, body: body && JSON.stringify(body), signal })
+  const r = await fetch(BASE + p, { method, headers: { 'content-type': 'application/json', ...aionAuth }, body: body && JSON.stringify(body), signal })
     .catch((e) => { throw signal.aborted ? timedOut() : e; });
   const j = await r.json().catch(() => { if (signal.aborted) throw timedOut(); return {}; });
   if (!r.ok || j.success === false) throw new Error(`AionCore ${method} ${p} → ${r.status} ${JSON.stringify(j).slice(0, 300)}`);
@@ -328,7 +344,7 @@ async function createAgentConv(agent, ws, lead, cfg) {
 
 // AionCore pushes each agent's model / effort catalog as `acp_config_option` events on its WebSocket.
 function watchCatalogs() {
-  const ws = new WebSocket(BASE.replace('http', 'ws') + '/ws');
+  const ws = new WebSocket(BASE.replace('http', 'ws') + '/ws', { headers: { authorization: aionAuth.authorization } });
   ws.onmessage = (e) => {
     let d;
     try { d = JSON.parse(e.data).data; } catch { return; }

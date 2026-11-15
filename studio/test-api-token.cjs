@@ -20,6 +20,13 @@ for (const route of ['POST /api/routine/save', 'POST /api/answer', 'POST /api/re
 assert.ok(/http:\/\/127\.0\.0\.1:\$\{PORT\}\/#t=\$\{API_TOKEN\}/.test(src), 'Studio opens the page with the pass in the fragment');
 assert.ok(src.includes('x-studio-token: ${cardToken(t.id)}'), 'workers are told their card pass');
 
+// AionCore runs with its login on: no --local, a fresh password each start, and every call / the WebSocket carry the session
+const aionStart = src.slice(src.indexOf('async function startAion'), src.indexOf('async function api('));
+assert.ok(!aionStart.includes("'--local'"), 'AionCore is not started in --local (no login) mode');
+assert.ok(/'user', 'set-password', '--password-stdin'/.test(aionStart) && /aionAuth = await aionLogin\(pass\)/.test(aionStart), 'Studio sets a new password and logs in');
+assert.ok(/headers: \{ 'content-type': 'application\/json', \.\.\.aionAuth \}/.test(src), 'every AionCore call carries the login and CSRF headers');
+assert.ok(src.includes("'/ws', { headers: { authorization: aionAuth.authorization } })"), 'the catalog WebSocket logs in too');
+
 // the page keeps the pass from #t= and sends it with /api calls only
 const html = process.env.API_TOKEN_HTML ?? fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 // CI checks out CRLF; look for the block by its own text, not by a line break
