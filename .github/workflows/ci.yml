@@ -18,3 +18,25 @@ jobs:
       - name: scripts/ci.ps1 -Mode Auto
         shell: pwsh
         run: .\scripts\ci.ps1 -Mode Auto
+
+  w1-managed-spawn:
+    name: W1 managed-spawn partial fix (no models)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      RUSTUP_TOOLCHAIN: 1.95.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: Prove old failure and patched native behavior
+        shell: pwsh
+        run: .\scripts\test-w1-managed-spawn.ps1 -EvidenceDir "${{ runner.temp }}\w1-evidence"
+      - name: Preserve native results and explicit W1 limitations
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: w1-managed-spawn-evidence
+          path: ${{ runner.temp }}/w1-evidence
+          if-no-files-found: error
