@@ -23,6 +23,17 @@ const AION = path.join(ROOT, 'runtime', 'aioncore', 'aioncore.exe');
 const AION_URL = 'https://github.com/iOfficeAI/AionCore/releases/download/v0.2.2/aioncore-v0.2.2-x86_64-pc-windows-msvc.zip';
 const AION_ZIP_SHA256 = 'd1ed8d1da869230c18701747d07e8f068db5b8c9442e65261304aeb4c27eacf6';
 let PORT = Number(process.env.STUDIO_PORT || 4848); // moves up when the port is taken (see server.listen)
+// API pass (security F2/F3): any local program can reach 127.0.0.1, so /api needs this secret. It lives only in memory and is new
+// at every start (the runtime folder is readable by other accounts, e.g. the Codex sandbox users); the browser gets it in the URL
+// fragment Studio opens and keeps it for later tabs.
+const API_TOKEN = crypto.randomBytes(32).toString('hex');
+// A worker only gets a pass for its own card's runtime start: it never opens the rest of the API.
+const cardToken = (cardId) => crypto.createHmac('sha256', API_TOKEN).update('runtime-start:' + cardId).digest('hex');
+const sameSecret = (a, b) => { if (typeof a !== 'string') return false; const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && crypto.timingSafeEqual(x, y); };
+// An outside claim only makes Studio stop writing, so it stays open for the documented curl use; releasing one needs the pass.
+const OPEN_ROUTES = new Set(['POST /api/workspace/claim']);
+const apiAllowed = (route, pass, b) => sameSecret(pass, API_TOKEN) || OPEN_ROUTES.has(route)
+  || (route === 'POST /api/runtime/start' && !!b?.cardId && sameSecret(pass, cardToken(String(b.cardId))));
 // Studio's Codex gets its own home so its sessions never show up in the user's own Codex history.
 const CODEX_HOME = process.env.STUDIO_CODEX_HOME ? path.resolve(process.env.STUDIO_CODEX_HOME) : path.join(RT, 'studio', 'codex-home');
 // Codex reads global rules from its home's AGENTS.md, so the user's own one is copied into Studio's home at each start.
@@ -249,11 +260,17 @@ async function startAion() {
   fs.mkdirSync(CODEX_HOME, { recursive: true });
   syncCodexRules();
   const logFile = fs.createWriteStream(path.join(RT, 'studio', 'aioncore.out.txt'));
-  const p = spawn(AION, ['--local', '--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)],
-    { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, CODEX_HOME } });
+  // No --local (security F2/F3): that mode turns AionCore's login off, so any local program could drive the agents through its port.
+  // The built-in user (the same system_default_user --local used, so old conversations stay) gets a new random password each start.
+  const pass = crypto.randomBytes(24).toString('hex');
+  await new Promise((res, rej) => {
+    const c = execFile(AION, ['--data-dir', data, 'user', 'set-password', '--password-stdin'], { windowsHide: true }, (e, out, err) => (e ? rej(new Error('AionCore 設定登入密碼失敗：' + (err || e.message))) : res()));
+    c.stdin.end(pass + '\n');
+  });
+  const args = ['--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)];
+  const p = spawn(AION, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, CODEX_HOME } });
   if (p.pid) {
     aionProcess = await getProcessInfo(p.pid);
-    const args = ['--local', '--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)];
     registerRuntime({
       job_id: 'studio_core',
       purpose: 'helper',
@@ -278,6 +295,16 @@ async function startAion() {
       if (m && /AIONCORE_READY/.test(buf)) { BASE = 'http://127.0.0.1:' + m[1]; res(); }
     });
   });
+  aionAuth = await aionLogin(pass);
+}
+// Bearer token for every call; writes also need the CSRF cookie echoed in a header.
+let aionAuth = {};
+async function aionLogin(password) {
+  const r = await fetch(BASE + '/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'admin', password }), signal: AbortSignal.timeout(API_TIMEOUT_MS) });
+  const j = await r.json().catch(() => ({}));
+  const csrf = r.headers.getSetCookie().map((c) => c.split(';')[0]).find((c) => c.startsWith('aionui-csrf-token='))?.slice('aionui-csrf-token='.length);
+  if (!r.ok || !j.token || !csrf) throw new Error('AionCore 登入失敗：' + r.status);
+  return { authorization: 'Bearer ' + j.token, cookie: 'aionui-csrf-token=' + csrf, 'x-csrf-token': csrf };
 }
 
 // Every AionCore call answers promptly (turns are polled, not awaited); the slowest seen in the spikes was ~8 s (create).
@@ -287,7 +314,7 @@ async function api(method, p, body) {
   const signal = AbortSignal.timeout(API_TIMEOUT_MS);
   // AionCore may still act on a request it never answered: the stop is unconfirmed, so the write lease stays.
   const timedOut = () => Object.assign(new Error(`AionCore ${method} ${p} 逾時：${API_TIMEOUT_MS / 1000} 秒沒有回應`), { stopUnconfirmed: true });
-  const r = await fetch(BASE + p, { method, headers: { 'content-type': 'application/json' }, body: body && JSON.stringify(body), signal })
+  const r = await fetch(BASE + p, { method, headers: { 'content-type': 'application/json', ...aionAuth }, body: body && JSON.stringify(body), signal })
     .catch((e) => { throw signal.aborted ? timedOut() : e; });
   const j = await r.json().catch(() => { if (signal.aborted) throw timedOut(); return {}; });
   if (!r.ok || j.success === false) throw new Error(`AionCore ${method} ${p} → ${r.status} ${JSON.stringify(j).slice(0, 300)}`);
@@ -317,7 +344,7 @@ async function createAgentConv(agent, ws, lead, cfg) {
 
 // AionCore pushes each agent's model / effort catalog as `acp_config_option` events on its WebSocket.
 function watchCatalogs() {
-  const ws = new WebSocket(BASE.replace('http', 'ws') + '/ws');
+  const ws = new WebSocket(BASE.replace('http', 'ws') + '/ws', { headers: { authorization: aionAuth.authorization } });
   ws.onmessage = (e) => {
     let d;
     try { d = JSON.parse(e.data).data; } catch { return; }
@@ -2446,7 +2473,7 @@ ${note}
 Continue the task. End your reply with a short summary (1-3 sentences).
 ${STATUS_RULES}` : `You are a WORKER in "Multi-Agent Studio". Your leader (${agentName(run.leader)}) assigned you this task.
 Work only inside this folder: ${t.workdir || run.project}
-${w.backendPort ? `If you must run this project's backend on port ${w.backendPort} for validation, let Studio own the process so it can verify and recover it: POST JSON to http://127.0.0.1:${PORT}/api/runtime/start with ws (project path), cardId (${t.id}), executable (absolute path), args (string array), cwd (inside this workspace), dataDir (an existing directory inside this workspace), port (${w.backendPort}), smokePath, and noCredentialsConfirmed:true only when restart needs no account credentials. For isolated smoke/test runs, set purpose to "smoke" or "test"; Studio allocates DATA_DIR and PORT, ignores dataDir and treats port as a preference. The command must honor those environment variables; use the returned runtime.port. Never register or stop an unknown process. A listener is not ready until Studio confirms process alive + reachable port + GET /health HTTP 200 + application ready.\n` : ''}${note ? `\nNOTE FROM STUDIO:\n${note}\n` : ''}${t.resumed ? '\nYou were interrupted while doing this task earlier. First check the current state of the project folder, then finish the task without redoing work that is already done.\n' : ''}
+${w.backendPort ? `If you must run this project's backend on port ${w.backendPort} for validation, let Studio own the process so it can verify and recover it: POST JSON to http://127.0.0.1:${PORT}/api/runtime/start with header x-studio-token: ${cardToken(t.id)} (valid only for this card's runtime start) and ws (project path), cardId (${t.id}), executable (absolute path), args (string array), cwd (inside this workspace), dataDir (an existing directory inside this workspace), port (${w.backendPort}), smokePath, and noCredentialsConfirmed:true only when restart needs no account credentials. For isolated smoke/test runs, set purpose to "smoke" or "test"; Studio allocates DATA_DIR and PORT, ignores dataDir and treats port as a preference. The command must honor those environment variables; use the returned runtime.port. Never register or stop an unknown process. A listener is not ready until Studio confirms process alive + reachable port + GET /health HTTP 200 + application ready.\n` : ''}${note ? `\nNOTE FROM STUDIO:\n${note}\n` : ''}${t.resumed ? '\nYou were interrupted while doing this task earlier. First check the current state of the project folder, then finish the task without redoing work that is already done.\n' : ''}
 Task: ${t.title}
 Instructions:
 ${t.instructions}
@@ -3811,10 +3838,15 @@ const server = http.createServer(async (req, res) => {
   const route = `${req.method} ${req.url}`;
   const record = req.method === 'POST' && !READ_POSTS.has(route);
   let b = {};
+  const pass = req.headers['x-studio-token'];
+  const noPass = () => send(401, { error: '沒有 Studio 通行碼：請從 Studio 視窗印出的網址開啟這一頁' });
+  // refuse before reading the body, except where the body names the card a worker pass is for; refusals are not logged (no event spam)
+  if (route !== 'POST /api/runtime/start' && !apiAllowed(route, pass)) return noPass();
   try {
     let raw = '';
     for await (const c of req) raw += c;
     b = raw ? JSON.parse(raw) : {};
+    if (!apiAllowed(route, pass, b)) return noPass();
     send(200, (await fn(b)) ?? { ok: true });
     if (record) event('api', { route, ...pickEventFields(b) });
   } catch (e) {
@@ -3850,7 +3882,7 @@ server.on('error', (e) => {
   server.listen(++PORT, '127.0.0.1');
 });
 server.on('listening', () => {
-  const url = `http://127.0.0.1:${PORT}`;
+  const url = `http://127.0.0.1:${PORT}/#t=${API_TOKEN}`; // the fragment never reaches a server or a log; the page keeps it
   console.log(`Multi-Agent Studio 已啟動：${url}  （關閉此視窗即停止）`);
   if (!process.env.STUDIO_NO_OPEN) spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore' });
 });
