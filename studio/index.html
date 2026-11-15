@@ -793,7 +793,13 @@ function chatHtml(activity) {
 }
 
 // Re-render only when the markup changed, so open drop-downs keep their scroll position.
-const setHtml = (el, html) => { if (el._html !== html) { el._html = html; el.innerHTML = html; } };
+// An opened 查看技術細節 is matched by its text and re-opened after a rebuild (a new chat message rebuilds the whole log).
+const setHtml = (el, html) => {
+  if (el._html === html) return;
+  const open = new Set([...(el.querySelectorAll?.('details.tech[open] pre') || [])].map((p) => p.textContent));
+  el._html = html; el.innerHTML = html;
+  if (open.size) for (const d of el.querySelectorAll('details.tech')) if (open.has(d.querySelector('pre')?.textContent)) d.open = true;
+};
 let doneOpen = false, stepsOpen = true; // stepsOpen: 每張工作卡的進度 stays as the user left it (open by default)
 const ICON = { DONE:'✅', WORKING:'⏳', WAITING:'🕒', PAUSED:'⏸️', INTERRUPTED:'⏸️', FAILED:'❌', WAITING_EXTERNAL:'🟡', WAITING_AGENT:'🤝', ASK_LEADER:'🙋', NEEDS_USER:'🔴' };
 const STEP_WORD = { DONE:'已完成', WORKING:'工作中', WAITING:'待做', PAUSED:'已暫停', INTERRUPTED:'已中斷', FAILED:'失敗', WAITING_EXTERNAL:'等待外部結果', WAITING_AGENT:'等待其他 AI', ASK_LEADER:'在問工頭', NEEDS_USER:'需要 Nana' };

@@ -34,6 +34,14 @@ async function run() {
   // Redraws keep what the user opened or closed: chat via setHtml, card progress via its remembered state.
   const renderProject = fn(html, 'renderProject');
   assert.match(renderProject, /setHtml\(box, chatHtml\(w\.activity\)\)/); assert.doesNotMatch(renderProject, /box\.innerHTML/);
+  // A rebuild (new chat message) re-opens the technical details the user had open, matched by text.
+  const setHtml = new Function(html.slice(html.indexOf('const setHtml ='), html.indexOf('let doneOpen')) + 'return setHtml;')();
+  const detail = (text, open) => ({ open, querySelector: () => ({ textContent: text }) });
+  let shown = [detail('A', true), detail('B', false)];
+  const chatBox = { _html: 'old', querySelectorAll: (q) => (q.includes('[open]') ? shown.filter((d) => d.open).map((d) => d.querySelector()) : shown),
+    set innerHTML(v) { shown = [detail('A', false), detail('B', false), detail('C', false)]; } };
+  setHtml(chatBox, 'new');
+  assert.deepEqual(shown.map((d) => d.open), [true, false, false], 'only the detail that was open is re-opened');
   assert.match(html, /id="stepsDrop" \$\{stepsOpen \? 'open' : ''\}/); assert.match(html, /stepsDrop'\) stepsOpen = e\.target\.open/);
 
   const responses = [], renders = [];
