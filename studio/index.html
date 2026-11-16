@@ -526,13 +526,34 @@ function wsStatus(w) {
   return w.tasks.length && w.tasks.every((t) => t.status === 'DONE') ? ['ok', '已完成', 'ok'] : ['bad', '有失敗', 'bad'];
 }
 
-async function post(url, body) {
+async function post(url, body, signal, current = () => true) {
   $('err') && ($('err').textContent = '');
-  const r = await fetch(url, { method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify(body || {}) });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) { if ($('err')) $('err').textContent = j.error || ('錯誤 ' + r.status); else alert(j.error); throw new Error(j.error); }
+  const r = await fetch(url, { method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify(body || {}), signal });
+  const j = await r.json().catch(error => { if (signal?.aborted || error.name === 'AbortError') throw error; return {}; });
+  if (!r.ok) { if (current()) { if ($('err')) $('err').textContent = j.error || ('錯誤 ' + r.status); else alert(j.error); } throw new Error(j.error || ('錯誤 ' + r.status)); }
   refresh();
   return j;
+}
+
+const projectStatePending = new Set();
+async function projectStateAction(b) {
+  const project = ws(), reading = b.hasAttribute('data-refresh-state');
+  const key = project + (reading ? ':refresh' : ':continue');
+  if (projectStatePending.has(key)) return;
+  projectStatePending.add(key);
+  const label = b.textContent, controller = new AbortController();
+  b.disabled = true; b.textContent = reading ? '讀取中…' : '核對狀態中…';
+  const timer = setTimeout(() => controller.abort(), 25000);
+  try {
+    await post(reading ? '/api/project-state/refresh' : '/api/continue', { ws: project }, controller.signal, () => ws() === project);
+  } catch (error) {
+    if (ws() === project && $('err')) $('err').textContent = error.name === 'AbortError'
+      ? '等待回覆逾時；伺服器可能仍在核對，未強制解除寫入權。請稍後再試。'
+      : error.message || '連線失敗，請稍後重試';
+  } finally {
+    clearTimeout(timer); projectStatePending.delete(key);
+    b.disabled = false; b.textContent = label;
+  }
 }
 
 const name = (id) => S.agents.find((a) => a.id === id)?.name || id;
@@ -1599,10 +1620,7 @@ document.addEventListener('click', (e) => {
       $('office')._html = ''; render();
     }).catch(() => {});
   }
-  if (b.hasAttribute('data-continue-state') || b.hasAttribute('data-refresh-state')) {
-    b.disabled = true; b.textContent = b.hasAttribute('data-refresh-state') ? '讀取中…' : '核對狀態中…';
-    return post(b.hasAttribute('data-refresh-state') ? '/api/project-state/refresh' : '/api/continue', { ws: ws() }).catch(() => {});
-  }
+  if (b.hasAttribute('data-continue-state') || b.hasAttribute('data-refresh-state')) return projectStateAction(b);
   if (b.hasAttribute('data-resume-job')) return post('/api/resume', { ws: ws() }).catch(() => {});
   if (b.dataset.continueCard) return post('/api/continue-card', { ws: ws(), taskId: b.dataset.continueCard }).catch(() => {});
   if (b.dataset.delegate) { b.disabled = true; return post('/api/card/delegate', { ws: ws(), taskId: b.dataset.for || '', agent: b.dataset.delegate }).catch(() => { b.disabled = false; }); }
