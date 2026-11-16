@@ -3449,6 +3449,15 @@ async function resumeJob(w, opts) {
     for (const got of reservations) if (!got.reused) retire(got.lease, 'resume failed');
     saveLeases(); throw e;
   }
+  // No leader operation is still alive after the drain above. A persisted ASK_LEADER
+  // (or a reply invalidated by Pause) has nobody left to answer it. Return it to
+  // the same worker with the question preserved, instead of leaving the job idle.
+  for (const t of w.tasks) if (t.status === 'ASK_LEADER') {
+    const question = t.wait?.what || '';
+    t.leaderAsks = Math.max(0, (t.leaderAsks || 0) - 1);
+    Object.assign(t, { status: 'WAITING', wait: null, resumed: true,
+      wakeNote: [t.wakeNote, `Your question to the leader was interrupted before an answer was delivered: "${question}". Check the current state and ask again if you still need the answer; do not assume approval.`].filter(Boolean).join('\n\n') });
+  }
   run.paused = false;
   run.active = true;
   for (const t of w.tasks) { if (t.status === 'PAUSED' || t.status === 'INTERRUPTED') t.status = 'WAITING'; if (t.status === 'WAITING') t.trust = true; } // you pressed 繼續: files changed while paused are expected
