@@ -43,7 +43,7 @@ jobs:
 
   office-preview:
     name: Office static visual preview (no models)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -53,7 +53,9 @@ jobs:
       - name: Generate actual office markup
         run: node scripts/office-preview.cjs
       - name: Install pinned browser renderer
-        run: npx --yes playwright@1.56.1 install --with-deps chromium
+        run: |
+          npx --yes playwright@1.56.1 install --with-deps chromium
+          sudo apt-get install -y fonts-noto-cjk
       - name: Render light, dark and narrow office previews
         run: |
           npx --yes playwright@1.56.1 screenshot --browser chromium --viewport-size '390,720' --color-scheme light --wait-for-timeout 300 file://$PWD/outputs/office-preview.html outputs/office-light.png
