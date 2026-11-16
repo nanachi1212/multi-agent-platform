@@ -14,6 +14,7 @@ const { region } = require('./lifecycle-harness.cjs');
     const logs = [], calls = { stop: 0, snapshots: 0, sleeps: 0 };
     let messages = o.messages || [], runtime = { state: 'processing', is_processing: true };
     const env = {
+      applyTurnModel: async () => {}, AGENTS: { codex: {}, claude: {} }, tierCfg: () => ({}),
       api: async (m, p, b) => (o.onApi?.(m, p, b), p.endsWith('/messages')) ? { items: messages } : p.endsWith('/usage') ? null : { runtime },
       clip: (s, n) => String(s).slice(0, n), toolText: (c) => c?.name || '', isAskAnswer: () => false,
       sendMessage: async () => ({ turn_id: 't1', msg_id: 'm0' }), active: new Map(), S: { agents: { codex: { working: 0 }, claude: { working: 0 } } },

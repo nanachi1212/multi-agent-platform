@@ -60,21 +60,22 @@
   .room-h .sub { margin:0; font-weight:400; }
   .room-toggle { padding:2px 10px; }
   .layout.room-off .room-h > :not(.room-toggle), .layout.room-off .scene { display:none; }
-    .scene { --wall:#efe8dc; --wall2:#e4dccd; --floor1:#e9dfcf; --floor2:#e2d6c3; --wood:#c9a57a; --wood2:#a9845a; --skin:#f1c9a5; --hair:#3b2f2a;
+    .scene { --wall:#c9d1ae; --wall2:#b5bd98; --floor1:#efe7db; --floor2:#e5d9c8; --wood:#d1ab81; --wood2:#9f7652; --skin:#f1c9a5; --hair:#3b2f2a;
     position:relative; border-radius:16px; overflow:hidden; border:1px solid var(--line); box-shadow:var(--shadow);
-    background:linear-gradient(var(--wall) 0 92px, var(--wall2) 92px 98px, transparent 98px),
-      repeating-linear-gradient(90deg, var(--floor1) 0 46px, var(--floor2) 46px 48px); }
+    background:linear-gradient(var(--wall) 0 112px, var(--wall2) 112px 118px, transparent 118px),
+      repeating-linear-gradient(90deg, var(--floor1) 0 46px, var(--floor2) 46px 47px); }
   @media (prefers-color-scheme: dark) { .scene { --wall:#2b2a30; --wall2:#232227; --floor1:#302c28; --floor2:#2a2723; --wood:#7d6247; --wood2:#5f4934; --skin:#d9b08c; --hair:#1b1715; } }
-  .wall { position:relative; height:98px; padding:12px 14px; display:flex; align-items:flex-start; gap:12px; }
-  .wall .sign { padding:4px 10px; border-radius:8px; background:var(--panel); border:1px solid var(--line); font-size:12px; font-weight:700; }
-  .wall .win { width:84px; height:52px; border:4px solid var(--panel); border-radius:6px; background:linear-gradient(#a9d3f2,#dff0fb); box-shadow:inset 0 0 0 1px var(--line); position:relative; }
+  .scene::before { content:""; position:absolute; inset:0; pointer-events:none; background:linear-gradient(125deg,transparent 30%,#fff7d42b 31% 37%,transparent 38% 45%,#fff7d41c 46% 53%,transparent 54%); }
+  .wall { position:relative; height:118px; padding:12px 14px; display:flex; align-items:flex-start; gap:12px; }
+  .wall .sign { position:absolute; left:14px; bottom:13px; max-width:calc(100% - 28px); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:4px 10px; border-radius:8px; background:var(--panel); border:1px solid var(--line); font-size:12px; font-weight:700; }
+  .wall .win { width:118px; height:61px; flex-shrink:0; border:4px solid var(--panel); border-radius:6px; background:radial-gradient(ellipse at 25% 30%,#fff9 0 12%,transparent 13%),linear-gradient(#9bc9d6,#e1f1e9); box-shadow:inset 0 0 0 1px var(--line); position:relative; }
   .wall .win::after { content:""; position:absolute; left:50%; top:0; bottom:0; border-left:3px solid var(--panel); }
   .wall .clock { width:30px; height:30px; border-radius:50%; background:var(--panel); border:2px solid var(--muted); position:relative; }
   .wall .clock::before, .wall .clock::after { content:""; position:absolute; left:50%; bottom:50%; width:2px; background:var(--text); transform-origin:bottom; }
   .wall .clock::before { height:9px; animation:spin 60s linear infinite; } .wall .clock::after { height:12px; animation:spin 6s linear infinite; }
   .wall .plant { margin-left:auto; font-size:28px; line-height:1; }
-  .desks { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:18px 12px; padding:14px 14px 70px; }
-  .desk { position:relative; height:150px; cursor:default; }
+  .desks { position:relative; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:22px 12px; padding:22px 14px 84px; }
+  .desk { position:relative; height:163px; cursor:default; }
   .desk.clickable { cursor:pointer; }
   .desk.clickable:hover .plate { outline:2px solid var(--c); }
   .desk .bubble { position:absolute; left:4px; right:4px; top:0; z-index:3; padding:3px 8px; border-radius:10px; background:var(--panel); border:1px solid var(--line); font-size:11px; line-height:1.35; text-align:center;
@@ -85,14 +86,14 @@
   .ask-bubble.wait { border-color:var(--pause); animation:askPulse 1.6s ease-in-out infinite; }
   @keyframes askPulse { 50% { box-shadow:0 0 0 5px var(--pause-soft); } }
   .desk .bubble::after { content:""; position:absolute; left:50%; bottom:-5px; width:8px; height:8px; background:var(--panel); border-right:1px solid var(--line); border-bottom:1px solid var(--line); transform:translateX(-50%) rotate(45deg); }
-  .desk .monitor { position:absolute; left:50%; top:28px; width:58px; height:38px; margin-left:-29px; border-radius:5px; background:#2d3036; border:3px solid #4a4e57; overflow:hidden; }
+  .desk .monitor { position:absolute; left:50%; top:32px; width:64px; height:43px; margin-left:-32px; border-radius:6px; background:#253941; border:3px solid #4d6067; overflow:hidden; box-shadow:0 3px 0 #263b43,0 5px 12px #263b4324; }
   .desk .monitor::after { content:""; position:absolute; left:50%; bottom:-11px; width:6px; height:8px; margin-left:-3px; background:#4a4e57; }
   .desk .monitor i { display:block; height:3px; margin:4px 5px 0; border-radius:2px; background:var(--c); opacity:.75; }
   .desk .monitor i:nth-child(2) { width:60%; } .desk .monitor i:nth-child(3) { width:80%; opacity:.5; } .desk .monitor i:nth-child(4) { width:40%; }
-  .desk .table { position:absolute; left:8px; right:8px; top:74px; height:12px; border-radius:4px; background:var(--wood); box-shadow:0 4px 0 var(--wood2); }
-  .desk .table::before, .desk .table::after { content:""; position:absolute; top:16px; width:4px; height:20px; background:var(--wood2); } .desk .table::before { left:8px; } .desk .table::after { right:8px; }
-  .desk .plate { position:absolute; left:50%; bottom:0; transform:translateX(-50%); padding:1px 8px; border-radius:999px; background:var(--c); color:#fff; font-size:11px; font-weight:700; white-space:nowrap; }
-  .guy { position:absolute; left:50%; top:66px; width:34px; height:44px; margin-left:-17px; z-index:2; } /* seen from behind, sitting in front of the desk */
+  .desk .table { position:absolute; left:4px; right:4px; top:82px; height:16px; border-radius:6px; background:linear-gradient(#e8c9a1,var(--wood)); border-top:2px solid #f7dfbb; box-shadow:0 4px 0 var(--wood2),0 10px 12px #49302112; }
+  .desk .table::before, .desk .table::after { content:""; position:absolute; top:18px; width:5px; height:26px; border-radius:0 0 2px 2px; background:var(--wood2); } .desk .table::before { left:8px; } .desk .table::after { right:8px; }
+  .desk .plate { position:absolute; left:50%; bottom:0; transform:translateX(-50%); padding:1px 8px; border-radius:999px; background:var(--panel); color:var(--text); border:1px solid var(--line); border-bottom:3px solid var(--c); font-size:11px; font-weight:700; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .guy { position:absolute; left:50%; top:76px; width:34px; height:44px; margin-left:-17px; z-index:2; } /* seen from behind, sitting in front of the desk */
   .guy .head { position:absolute; left:8px; top:0; width:18px; height:18px; border-radius:50%; background:var(--skin); box-shadow:inset 0 5px 0 var(--hair); }
   .guy .crown { position:absolute; left:9px; top:-13px; font-size:13px; }
   .guy .body { position:absolute; left:5px; top:16px; width:24px; height:20px; border-radius:9px 9px 4px 4px; background:var(--c); }
@@ -100,6 +101,38 @@
   .guy .arm.l { left:1px; transform:rotate(25deg); } .guy .arm.r { right:1px; transform:rotate(-25deg); }
   .guy .prop { position:absolute; font-size:14px; line-height:1; }
   .guy .z { position:absolute; left:24px; top:-10px; font-size:11px; font-weight:700; color:var(--muted); opacity:0; }
+  /* Small architectural details stay decorative; live states and task links remain above them. */
+  .desk::before { content:""; position:absolute; left:4%; right:4%; top:76px; height:60px; border:1px solid #fff5; border-radius:50%; background:#829d9820; }
+  .desk .chair { position:absolute; left:50%; top:106px; width:36px; height:27px; margin-left:-18px; border-radius:10px 10px 7px 7px; background:#647d7b; border:2px solid #8fa6a0; box-shadow:0 5px 0 #465e5c,0 9px 5px #33494318; z-index:2; pointer-events:none; }
+  .desk .chair::after { content:""; position:absolute; left:13px; top:29px; width:6px; height:9px; border-radius:2px; background:#465e5c; box-shadow:-12px 8px 0 -1px #465e5c,12px 8px 0 -1px #465e5c; }
+  .desk .cup { position:absolute; right:14px; top:72px; width:9px; height:11px; border-radius:1px 1px 3px 3px; border-top:2px solid #a17d65; background:#fff6e6; box-shadow:2px 1px 0 #cfbca4; }
+  .desk.work .monitor { box-shadow:0 3px 0 #263b43,0 0 16px color-mix(in srgb,var(--c) 25%,transparent); }
+  .desk.need .bubble { border-color:var(--bad); }
+  .desk.wait .bubble { border-color:var(--pause); }
+  .scene .empty { grid-column:1 / -1; text-align:center; padding:22px 0; }
+  .wall .win::before { content:""; position:absolute; left:-7px; right:-7px; bottom:-8px; height:5px; border-radius:2px; background:var(--wood); box-shadow:0 3px 5px #304d4520; }
+  .wall .curtain { position:absolute; top:-5px; bottom:-4px; width:17px; background:repeating-linear-gradient(90deg,#f7ecd2 0 4px,#e3d2b2 5px,#fff3da 8px); border-radius:2px 2px 7px 7px; box-shadow:1px 2px 3px #5a543025; z-index:1; }
+  .wall .curtain.left { left:-8px; transform:rotate(-3deg); }
+  .wall .curtain.right { right:-8px; transform:rotate(3deg); }
+  .wall .shelf { position:relative; display:flex; align-items:flex-end; gap:2px; height:32px; width:39px; border-bottom:5px solid var(--wood); margin-top:22px; flex-shrink:0; }
+  .wall .shelf i { width:7px; height:20px; border-radius:1px; background:#c88760; border-top:3px solid #fff4; }
+  .wall .shelf i:nth-child(2) { height:24px; background:#e3cca2; }
+  .wall .shelf i:nth-child(3) { height:18px; background:#668b8a; }
+  .wall .shelf .plant { position:absolute; right:-11px; top:-21px; font-size:24px; }
+  .wall .clock { margin-top:9px; flex-shrink:0; }
+  .wall .plant { align-self:center; filter:drop-shadow(0 3px 2px #304d4520); }
+  .lounge { padding:10px 15px; border-radius:50%; background:#90aaa82b; }
+  .sofa { position:relative; border:2px solid #a5bcb0; box-shadow:inset 0 9px 0 #b8cec0,0 4px 0 #768f80,0 7px 5px #304d4520; }
+  .sofa::after { content:""; position:absolute; left:39px; top:4px; bottom:0; border-left:1px solid #7f9b8a; }
+  @media (prefers-color-scheme: dark) {
+    .scene::before { opacity:.12; }
+    .wall .curtain { filter:brightness(.7); }
+    .scene { --wall:#293e43; --wall2:#1e3036; --floor1:#353638; --floor2:#2e3032; }
+    .wall .win { background:radial-gradient(circle at 75% 25%,#e2e8c6 0 8%,transparent 9%),linear-gradient(#273f63,#5d7b88); }
+    .desk .table { background:linear-gradient(#a68767,var(--wood)); border-top-color:#b79b7c; }
+    .desk .chair { background:#3c5359; border-color:#668087; }
+    .desk .chair, .desk .chair::after { box-shadow:none; }
+  }
   /* working: typing, head bob, scrolling screen */
   .desk.work .arm.l { animation:typeL .28s ease-in-out infinite alternate; } .desk.work .arm.r { animation:typeR .28s ease-in-out infinite alternate .14s; }
   .desk.work .head { animation:bob .6s ease-in-out infinite alternate; }
@@ -117,7 +150,7 @@
   .desk.phone .arm.l, .desk.phone .arm.r { transform:rotate(-70deg); } .desk.phone .arm.r { transform:rotate(70deg); }
   .desk.phone .prop { left:11px; top:22px; font-size:12px; filter:drop-shadow(0 0 4px #9fd3ff); animation:glow 1.6s ease-in-out infinite alternate; }
   .desk.phone .head { transform:translateY(3px); }
-  .desk.off .guy { opacity:0; } .desk.off .plate { background:var(--wait); }
+  .desk.off .guy { opacity:0; } .desk.off .plate { color:var(--muted); border-bottom-color:var(--wait); }
   .desk.off .monitor::before { content:"未連線"; position:absolute; inset:0; display:grid; place-items:center; color:#9aa0aa; font-size:10px; font-weight:700; }
   .lounge { position:absolute; left:14px; bottom:10px; display:flex; align-items:flex-end; gap:10px; font-size:22px; line-height:1; }
   .sofa { width:86px; height:26px; border-radius:10px 10px 6px 6px; background:#9db4a0; box-shadow:inset 0 8px 0 #b5c9b7; }
@@ -520,18 +553,16 @@ const effortLabel = (a, w) => !w ? '依專案設定' : tierOf(a, w)?.effort || (
 
 function cfgHtml(a, w) {
   if (!w) return '<div class="cfg-note">模型／思考強度在各專案頁分開設定。</div>';
+  if (a.external) return '<div class="cfg-note">外部 API 模型由供應商設定管理；目前後端不提供對話內模型切換。</div>';
   if (!a.models.length && !a.efforts.length) return `<div class="cfg-note">${a.status === 'checking' ? '讀取模型清單中…' : '這位 AI 員工使用預設模型（不支援切換）'}</div>`;
-  if (w.strategy !== 'custom') {
-    const t = w.tiers?.[a.id] || {}, tier = (x) => `${esc(modelName(a, x?.model))}${x?.effort ? ' · ' + esc(x.effort) : ''}`;
-    return `<div class="cfg-note">依模型策略「${esc((STRATEGY.find(([k]) => k === w.strategy) || [, ''])[1].split('：')[0])}」：成員普通卡 ${tier(t.normal)}；困難卡與工頭 ${tier(t.hard)}。想自己指定模型，把模型策略改成「🛠️ 自訂」。</div>`;
-  }
-  const cfg = w.agentCfg[a.id] || {}, busy = w.run?.active;
+  const tiers = w.tiers?.[a.id] || {};
+  const cfg = w.strategy === 'custom' ? w.agentCfg[a.id] || {} : { model: tiers.normal?.model, effort: tiers.normal?.effort, hardModel: tiers.hard?.model, hardEffort: tiers.hard?.effort };
   const models = (k) => `<select data-cfg="${a.id}" data-k="${k}"><option value="">${k === 'hardModel' ? '同平常' : '預設'}</option>${a.models.map((m) => `<option value="${esc(m.value)}" title="${esc(m.description)}" ${m.value === cfg[k] ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select>`;
   const efforts = (k) => `<select data-cfg="${a.id}" data-k="${k}" ${a.efforts.length ? '' : 'disabled'}><option value="">${k === 'hardEffort' ? '同平常' : '預設'}</option>${a.efforts.map((x) => `<option value="${esc(x)}" ${x === cfg[k] ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select>`;
-  return `<details class="cfg-box"><summary>這個專案的模型／思考強度${busy ? '（下一次開始工作生效）' : ''}</summary><div class="cfg">
+  return `<details class="cfg-box" open><summary>這個專案的模型／思考強度（下一步生效）</summary><div class="cfg">
     <label>平常的模型${models('model')}</label><label>平常的思考強度${efforts('effort')}</label>
     <label>困難卡／工頭的模型${models('hardModel')}</label><label>困難卡／工頭的思考強度${efforts('hardEffort')}</label>
-  </div><div class="cfg-note">工頭一律用「困難卡／工頭」那一組（它負責規劃和拍板）；成員平常用「平常」，被工頭標成「困難」的卡才用困難那一組。</div></details>`;
+  </div><div class="cfg-note">清單由 AI 自動回報；選擇後改用自訂策略。正在執行的一步不會中斷，下一步套用並保留對話。空白選項沿用現有對話設定，新對話用預設值。工頭一律用「困難卡／工頭」那一組（它負責規劃和拍板）；成員平常用「平常」，被工頭標成「困難」的卡才用困難那一組。</div></details>`;
 }
 
 // 5-hour / weekly plan limits: usage bar + thin bar for how far the window is toward its reset.
@@ -1283,11 +1314,11 @@ function roomHtml(w) {
       ${ask ? `<div class="ask-bubble ${ASK_PENDING.includes(ask.q.state) ? 'wait' : ''}" style="--c:${l.c}" data-detail="${ask.t.id}" data-ws="${esc(ask.ws)}" title="${esc(ask.q.state === 'answered' ? 'AI 回覆：' + ask.q.answer : '你問：' + ask.q.text)}">${ASK_PENDING.includes(ask.q.state) ? '💬 你問：' + esc(ask.q.text) : ask.q.state === 'answered' ? '💬 ' + esc(ask.q.answer) : ''}</div>` : ''}
       <div class="monitor"><i></i><i></i><i></i><i></i></div>
       <div class="guy">${leads.has(a.id) ? '<span class="crown">👑</span>' : ''}<b class="head"></b><b class="body"></b><b class="arm l"></b><b class="arm r"></b><span class="prop">${prop}</span><span class="z">z</span><span class="z">Z</span></div>
-      <div class="table"></div>
+      <div class="table" aria-hidden="true"></div><span class="cup" aria-hidden="true"></span><div class="chair" aria-hidden="true"></div>
       <div class="plate">${esc(a.name)}</div>
     </div>`;
   }).join('');
-  return `<div class="wall"><span class="sign">${esc(w ? w.name : '全部專案')}</span><span class="win"></span><span class="clock"></span><span class="plant">🪴</span></div>
+  return `<div class="wall"><span class="sign">${esc(w ? w.name : '全部專案')}</span><span class="win" aria-hidden="true"><i class="curtain left"></i><i class="curtain right"></i></span><span class="clock" aria-hidden="true"></span><span class="shelf" aria-hidden="true"><i></i><i></i><i></i><span class="plant">🪴</span></span></div>
     <div class="desks">${desks || '<div class="empty">還沒有 AI 員工。</div>'}</div>
     <div class="lounge"><span class="sofa"></span><span>🛋️</span><span>☕</span></div><span class="cat">🐈</span>`;
 }

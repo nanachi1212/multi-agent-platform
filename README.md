@@ -201,3 +201,11 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 ### License
 
 Licensed under the [GNU GPL v3.0](LICENSE). You may use, modify and distribute it; if you distribute a modified version, you must release its source under GPL-3.0 as well. AionCore is a separately downloaded third-party program with its own license and is not covered here.
+
+### 工作中切換模型
+
+各專案的員工卡會自動顯示後端回報的模型／思考強度下拉清單。選擇時會切到自訂策略，其他員工原本的有效策略值會保留。可分別設定普通卡與困難卡／工頭。
+
+切換在下一個步驟送出前，透過 AionCore 的 `config-options` 套用到原對話：不取消當下工具、不重建對話、不清掉歷史。若後端不支援選項或未確認設定，該步驟會報錯，不假稱切換成功。空白值沿用現有對話設定；新對話使用後端預設值。模型清單會隨後端事件及每步設定查詢更新。
+
+外部 API (`aionrs`) 員工目前仍由供應商設定管理模型，後端未提供此處的對話內模型切換，不顯示虛假的可切換選單。Windows 真實供應商驗收仍需在可用登入與額度下確認；離線回歸測試不會發送付費模型請求。
