@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const { region } = require('./lifecycle-harness.cjs');
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 
-function setup(stage = 'runtime', { stopConfirmed = true } = {}) {
+function setup(stage = 'runtime', { stopConfirmed = true, modelHelper, modelFailure } = {}) {
   const entered = deferred(), release = deferred(), prompts = [], applied = [], savedSteps = [], logs = [];
   let gated = false, snapshots = 0, reads = 0;
   let onStepEnd = () => {};
@@ -15,6 +15,7 @@ function setup(stage = 'runtime', { stopConfirmed = true } = {}) {
   const run = { id: 'original', active: true, paused: false, stopped: false, lifecycleEpoch: 0, leader: 'claude', convs: { codex: 'cid' } };
   const w = { run, tasks: [t], project: 'P' };
   const env = {
+      applyTurnModel: modelHelper || (async () => {}), AGENTS: { codex: {}, claude: {} },
     Halt, reviewAuthors: () => new Set(), agentName: x => x, nowIso: () => 'now', workKey: x => x.agent,
     log: (...args) => logs.push(args), missionNote: () => '', rulesNote: () => '', roleRules: () => '', accessRules: () => '', deliveryRules: () => '',
     STATUS_RULES: 'STATUS: DONE', CARD_STALL_MS: 900000, HARD_CAP_MS: 3600000, VERDICT_RE: {}, QUOTA_RE: /quota/, BILLING_RE: /billing/, MAX_QUOTA_WAITS: 3,
@@ -24,7 +25,7 @@ function setup(stage = 'runtime', { stopConfirmed = true } = {}) {
     snapTree: async () => ++snapshots === 1 ? 'before' : 'partial-after', keepStep: async (dir, card) => savedSteps.push({ dir, steps: [...card.steps] }),
     parseStatus: text => text.includes('STATUS: DONE') ? { kind: 'DONE', text, files: [] } : null,
     applyStatus: (w, card, status) => { applied.push(status); card.status = status.kind; }, reportFiles: async () => {}, wakeWaiters: () => {},
-    tierCfg: () => ({}), handToLeader: () => false, available: () => false,
+    tierCfg: (_w, _agent, hard) => modelHelper ? { model: hard ? 'strong' : 'new' } : {}, handToLeader: () => false, available: () => false,
     pause: () => { run.paused = true; run.active = false; }, saveRun: () => {}, notify: () => {}, label: () => 'test',
     usageOf: async () => { await gate('usage'); return null; }, usageDelta: () => null, chargeUsage: () => {}, refreshCodexLimits: () => {},
     codexRuntime: { prepare: async () => {}, stop: async () => stopConfirmed },
@@ -33,6 +34,12 @@ function setup(stage = 'runtime', { stopConfirmed = true } = {}) {
     sleep: async () => {}, stopTurn: async () => stopConfirmed, answerConfirmations: async () => {}, sendSteer: async () => {},
     isAskAnswer: () => false,
     api: async (method, url) => {
+      if (url.includes('/config-options')) {
+        await gate(method === 'GET' ? 'model-get' : 'model-put');
+        if (method === 'GET') return { config_options: [{ id: 'model', category: 'model', current_value: 'old', options: [{value:'old'}, {value:'new'}, {value:'strong'}] }] };
+        if (modelFailure === 'unconfirmed') throw Object.assign(new Error('config timeout'), { stopUnconfirmed: true });
+        return { confirmation: modelFailure === 'ack' ? 'command_ack' : 'observed' };
+      }
       if (!url.endsWith('/messages')) { await gate('runtime'); return { runtime: { state: 'idle', is_processing: false } }; }
       reads++; await gate('response');
       return { items: [{ id: 'sent' }, { type: 'text', position: 'left', content: { content: 'Stale completion\nSTATUS: DONE' } }] };
@@ -49,6 +56,26 @@ function setup(stage = 'runtime', { stopConfirmed = true } = {}) {
 }
 
 (async () => {
+  const { applyTurnModel } = await import('./live-models.mjs');
+  // Real helper + real turn + real runCard: cancellation during config I/O must not escalate the card.
+  for (const [stage, stop, modelFailure] of [
+    ['model-get', false, undefined], ['model-get', true, undefined],
+    ['model-put', false, 'ack'], ['model-put', false, 'unconfirmed']
+  ]) {
+    const x = setup(stage, { modelHelper: applyTurnModel, modelFailure });
+    const pending = x.api.runCard(x.w, x.t);
+    await x.entered.promise;
+    x.run[stop ? 'stopped' : 'paused'] = true; x.run.active = false;
+    x.release.resolve(); await pending;
+    assert.equal(x.prompts.length, 0, 'cancelled config startup never sends a model request');
+    assert.ok(!x.t.hard && !x.t.escalated, stage + ': cancellation must not escalate');
+    assert.equal(x.t.status, stop ? 'FAILED' : 'PAUSED');
+    if (modelFailure === 'unconfirmed') {
+      assert.equal(x.t.stopUnconfirmed, true, 'uncertain runtime safety remains fenced');
+      assert.match(x.t.result, /尚未確認停止/);
+    } else assert.equal(x.t.result, stop ? '已停止' : '已暫停');
+    assert.equal(x.applied.length, 0, 'no stale completion');
+  }
   for (const stage of ['runtime', 'response', 'conv', 'usage']) {
     const x = setup(stage), pending = x.api.runCard(x.w, x.t);
     await x.entered.promise;

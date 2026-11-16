@@ -1,6 +1,7 @@
 // Multi-Agent Studio MVP: local web UI + AionCore as the agent runtime.
 // Run: node studio/server.mjs   (or start-studio.cmd)
 import http from 'node:http';
+import { applyTurnModel, updateModelCatalog } from './live-models.mjs';
 import { createWorkspaceLeaseStore } from './workspace-lease.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -350,12 +351,7 @@ function watchCatalogs() {
     try { d = JSON.parse(e.data).data; } catch { return; }
     const agent = convAgent.get(d?.conversation_id);
     if (!agent || d.type !== 'acp_config_option') return;
-    const a = S.agents[agent];
-    for (const o of d.data?.config_options || []) {
-      const opts = (o.options || []).map((x) => ({ value: x.value, name: x.name || x.value, description: x.description || '' }));
-      if (o.category === 'model' && opts.length) a.models = opts;
-      if (o.category === 'thought_level' && opts.length) a.efforts = opts.map((x) => x.value);
-    }
+    updateModelCatalog(S.agents[agent], d.data?.config_options);
   };
   ws.onclose = () => setTimeout(watchCatalogs, 2000);
 }
@@ -367,6 +363,13 @@ function setAgentCfg(w, agent, model, effort, hardModel = '', hardEffort = '') {
   if (!a) throw new Error('未知的 Agent');
   for (const m of [model, hardModel]) if (m && !a.models.some((x) => x.value === m)) throw new Error(`${a.name} 沒有這個模型：${m}`);
   for (const e of [effort, hardEffort]) if (e && !a.efforts.includes(e)) throw new Error(`${a.name} 不支援這個思考強度：${e}`);
+  if (w.strategy !== 'custom') {
+    for (const id of Object.keys(AGENTS)) {
+      const normal = tierCfg(w, id, false), hard = tierCfg(w, id, true);
+      w.agentCfg[id] = { ...normal, hardModel: hard.model, hardEffort: hard.effort };
+    }
+    w.strategy = 'custom';
+  }
   w.agentCfg[agent] = { model: model || '', effort: effort || '', hardModel: hardModel || '', hardEffort: hardEffort || '' };
   S.agentCfg[agent] = { ...w.agentCfg[agent] };
   saveSettings();
@@ -542,6 +545,20 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
     catch (e) { throw Object.assign(e, { stopUnconfirmed: true }); }
   }
   if (!check && halted()) throw new Halt('執行已停止'); // usage / runtime preparation may have crossed Pause or Stop
+  if (!check && w && !AGENTS[agent].external) {
+    const key = Object.keys(run.convs || {}).find((k) => run.convs[k] === convId);
+    // `lead` also grants read-only worker permissions; model tier follows the stored conversation role.
+    const hard = /^(?:lead|work:hard)(?:[:@]|$)/.test(key?.slice(agent.length + 1) || '');
+    try {
+      await applyTurnModel(api, convId, tierCfg(w, agent, hard), S.agents[agent], () => !halted());
+    } catch (e) {
+      // Config I/O can reject after Pause/Stop. Preserve cancellation semantics, but never
+      // downgrade an unconfirmed stop (the caller must retain the card's safety fence).
+      if (!e.stopUnconfirmed && halted()) throw new Halt('切換模型期間工作已停止或變更');
+      throw e;
+    }
+    if (halted()) throw new Halt('切換模型期間工作已停止或變更');
+  }
   const sent = await sendMessage(convId, text);
   active.set(convId, sent.turn_id);
   convActivity.set(convId, { at: Date.now(), tool: '', confirm: false }); // a fresh turn starts with fresh activity
@@ -751,7 +768,9 @@ async function checkAgent(id) {
     // The check uses agent defaults so a bad saved model can't make the agent look unavailable.
     if (AGENTS[id].external) await extProvider(id);
     if (AGENTS[id].acp) await acpReady(id);
-    const reply = await turn(id, await createConv(id, ws, true), 'Reply with exactly: OK', { lead: true, check: true, timeout: 120e3 });
+    const cid = await createConv(id, ws, true);
+    await api('GET', `/api/conversations/${cid}/config-options`).then((r) => updateModelCatalog(a, r.config_options)).catch(() => {});
+    const reply = await turn(id, cid, 'Reply with exactly: OK', { lead: true, check: true, timeout: 120e3 });
     if (!/OK/i.test(reply)) throw new Error('沒有正常回覆：' + (reply || '(空白)'));
     if (a.checkTok === tok) a.status = 'available';
   } catch (e) {

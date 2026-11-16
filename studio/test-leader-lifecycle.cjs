@@ -13,6 +13,7 @@ function setup(stage = 'create') {
     run: { id: 'old', project: 'P', leader: 'claude', leaderGen: 0, convs: {}, phase: 'planning', active: true, paused: false, stopped: false, request: 'OLD REQUEST' } };
   const gate = async () => { entered.resolve(); await release.promise; };
   const env = {
+      applyTurnModel: async () => {}, AGENTS: { codex: {}, claude: {} },
     crypto, Halt, dirTag: () => '', tierCfg: () => ({}),
     createConv: async () => { const cid = 'conv' + (++calls); if (calls === 1 && stage === 'create') await gate(); return cid; },
     workersFor: () => ['codex'], available: () => true, agentName: x => x, isDir: () => true,
