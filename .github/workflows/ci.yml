@@ -40,3 +40,27 @@ jobs:
           name: w1-managed-spawn-evidence
           path: ${{ runner.temp }}/w1-evidence
           if-no-files-found: error
+
+  office-preview:
+    name: Office static visual preview (no models)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Generate actual office markup
+        run: node scripts/office-preview.cjs
+      - name: Install pinned browser renderer
+        run: npx --yes playwright@1.56.1 install --with-deps chromium
+      - name: Render light, dark and narrow office previews
+        run: |
+          npx --yes playwright@1.56.1 screenshot --browser chromium --viewport-size '390,720' --color-scheme light --wait-for-timeout 300 file://$PWD/outputs/office-preview.html outputs/office-light.png
+          npx --yes playwright@1.56.1 screenshot --browser chromium --viewport-size '390,720' --color-scheme dark --wait-for-timeout 300 file://$PWD/outputs/office-preview.html outputs/office-dark.png
+          npx --yes playwright@1.56.1 screenshot --browser chromium --viewport-size '320,720' --color-scheme light --wait-for-timeout 300 file://$PWD/outputs/office-preview.html outputs/office-narrow.png
+      - uses: actions/upload-artifact@v4
+        with:
+          name: office-visual-preview
+          path: outputs/office-*.png
+          if-no-files-found: error

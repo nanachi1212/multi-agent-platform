@@ -103,6 +103,10 @@
   .guy .z { position:absolute; left:24px; top:-10px; font-size:11px; font-weight:700; color:var(--muted); opacity:0; }
   /* Small architectural details stay decorative; live states and task links remain above them. */
   .desk::before { content:""; position:absolute; left:4%; right:4%; top:76px; height:60px; border:1px solid #fff5; border-radius:50%; background:#829d9820; }
+  .desk .keyboard { position:absolute; left:50%; top:79px; width:38px; height:9px; margin-left:-19px; border:2px solid #eee6d9; border-radius:2px; background:repeating-linear-gradient(90deg,#c6bfb3 0 3px,#f8f2e5 3px 4px); z-index:1; }
+  .desk .drawer { position:absolute; right:10px; top:101px; width:24px; height:24px; border:1px solid var(--wood2); border-radius:0 0 3px 3px; background:var(--wood); }
+  .desk .drawer::after { content:""; position:absolute; left:6px; right:6px; top:5px; height:2px; border-radius:2px; background:var(--wood2); }
+  .guy .head::after { content:""; position:absolute; left:0; top:2px; width:7px; height:10px; border-radius:6px 1px 5px 3px; background:var(--hair); }
   .desk .chair { position:absolute; left:50%; top:106px; width:36px; height:27px; margin-left:-18px; border-radius:10px 10px 7px 7px; background:#647d7b; border:2px solid #8fa6a0; box-shadow:0 5px 0 #465e5c,0 9px 5px #33494318; z-index:2; pointer-events:none; }
   .desk .chair::after { content:""; position:absolute; left:13px; top:29px; width:6px; height:9px; border-radius:2px; background:#465e5c; box-shadow:-12px 8px 0 -1px #465e5c,12px 8px 0 -1px #465e5c; }
   .desk .cup { position:absolute; right:14px; top:72px; width:9px; height:11px; border-radius:1px 1px 3px 3px; border-top:2px solid #a17d65; background:#fff6e6; box-shadow:2px 1px 0 #cfbca4; }
@@ -154,6 +158,7 @@
   .desk.off .monitor::before { content:"未連線"; position:absolute; inset:0; display:grid; place-items:center; color:#9aa0aa; font-size:10px; font-weight:700; }
   .lounge { position:absolute; left:14px; bottom:10px; display:flex; align-items:flex-end; gap:10px; font-size:22px; line-height:1; }
   .sofa { width:86px; height:26px; border-radius:10px 10px 6px 6px; background:#9db4a0; box-shadow:inset 0 8px 0 #b5c9b7; }
+  .sofa { border:2px solid #a5bcb0; box-shadow:inset 0 9px 0 #b8cec0,0 4px 0 #768f80,0 7px 5px #304d4520; }
   .cat { position:absolute; bottom:12px; font-size:18px; animation:stroll 38s linear infinite; }
   @keyframes typeL { from { transform:rotate(-55deg); } to { transform:rotate(-75deg); } }
   @keyframes typeR { from { transform:rotate(55deg); } to { transform:rotate(75deg); } }
@@ -1314,7 +1319,7 @@ function roomHtml(w) {
       ${ask ? `<div class="ask-bubble ${ASK_PENDING.includes(ask.q.state) ? 'wait' : ''}" style="--c:${l.c}" data-detail="${ask.t.id}" data-ws="${esc(ask.ws)}" title="${esc(ask.q.state === 'answered' ? 'AI 回覆：' + ask.q.answer : '你問：' + ask.q.text)}">${ASK_PENDING.includes(ask.q.state) ? '💬 你問：' + esc(ask.q.text) : ask.q.state === 'answered' ? '💬 ' + esc(ask.q.answer) : ''}</div>` : ''}
       <div class="monitor"><i></i><i></i><i></i><i></i></div>
       <div class="guy">${leads.has(a.id) ? '<span class="crown">👑</span>' : ''}<b class="head"></b><b class="body"></b><b class="arm l"></b><b class="arm r"></b><span class="prop">${prop}</span><span class="z">z</span><span class="z">Z</span></div>
-      <div class="table" aria-hidden="true"></div><span class="cup" aria-hidden="true"></span><div class="chair" aria-hidden="true"></div>
+      <div class="table" aria-hidden="true"></div><span class="cup" aria-hidden="true"></span><span class="keyboard" aria-hidden="true"></span><span class="drawer" aria-hidden="true"></span><div class="chair" aria-hidden="true"></div>
       <div class="plate">${esc(a.name)}</div>
     </div>`;
   }).join('');
