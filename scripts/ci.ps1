@@ -26,7 +26,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Studio runtime checks failed' }
     & node studio/lifecycle-check.cjs
     if ($LASTEXITCODE -ne 0) { throw 'Studio lifecycle checks failed' }
-    foreach ($file in @('studio/test-ui-safety.cjs', 'studio/test-runtime-identity.cjs', 'studio/test-audit-lifecycle.cjs', 'studio/test-progress-read.cjs', 'studio/test-lease-recovery.cjs', 'studio/test-ui-async.cjs', 'studio/test-state-recovery.cjs', 'studio/test-runtime-endpoint.cjs', 'studio/test-leader-lifecycle.cjs', 'studio/test-resume-orphan.cjs', 'studio/test-card-interrupt.cjs', 'studio/test-api-token.cjs', 'studio/test-workspace-lookup.cjs')) {
+    foreach ($file in @('studio/test-ui-safety.cjs', 'studio/test-runtime-identity.cjs', 'studio/test-audit-lifecycle.cjs', 'studio/test-stop-retry.cjs', 'studio/test-project-state-action.cjs', 'studio/test-progress-read.cjs', 'studio/test-lease-recovery.cjs', 'studio/test-ui-async.cjs', 'studio/test-state-recovery.cjs', 'studio/test-runtime-endpoint.cjs', 'studio/test-leader-lifecycle.cjs', 'studio/test-resume-orphan.cjs', 'studio/test-card-interrupt.cjs', 'studio/test-api-token.cjs', 'studio/test-workspace-lookup.cjs')) {
         & node --check $file
         if ($LASTEXITCODE -ne 0) { throw "Audit regression syntax failed: $file" }
         & node $file

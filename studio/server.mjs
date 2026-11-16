@@ -1168,7 +1168,7 @@ function deleteRoutine(w, id) {
 }
 
 // A job that ended can still be winding down (steps draining, runtimes stopping): no new job starts until that is done.
-const stillStopping = (w) => !!(w.leaderSteps?.size || w.executingSteps?.size || w.recoverySteps?.size || w.runtimeStarts?.size || w.tasks.some((t) => t.stopUnconfirmed || t.runtimeStopPending));
+const stillStopping = (w) => !!(w.stopDrain || w.leaderSteps?.size || w.executingSteps?.size || w.recoverySteps?.size || w.runtimeStarts?.size || w.tasks.some((t) => t.stopUnconfirmed || t.runtimeStopPending));
 
 // A routine's optional precheck (Orca's --precheck): one command run in the project folder before the routine starts.
 // Exit code 0 = go; anything else, or no answer within 30 s, = this slot is skipped and the team costs nothing.
@@ -1328,6 +1328,9 @@ async function start(w, request, cont = false, inherit = false) {
 async function startJob(w, request, cont, inherit) {
   await endLeftSetups(w, w.tasks); // a card that still tracks a leftover setup command must not be dropped by a new job
   if (settingUp(w)) throw new Error('上一件工作還有卡片的 worktree 在準備（設定指令還在跑），請等它完成或按 Stop');
+  // A failed STOP leaves conservative flags, but the old processes may have exited
+  // since then. Retry the full drain before replacing the job, never just clear flags.
+  if (w.run?.stopped && stillStopping(w)) await stopAndDrain(w);
   // no await from here on: the checks below hold when the job is made
   if (w.run?.active) throw new Error('這個專案的團隊正在工作中，請先等待、暫停或按 Stop');
   if (stillStopping(w)) throw new Error('Agent 還在停下中，不能啟動新工作');
@@ -1919,15 +1922,44 @@ async function drainExecution(w, cards = w.tasks) {
 }
 async function pauseAndDrain(w) { pause(w); await drainExecution(w); saveRun(w, 'paused'); }
 async function stopAndDrain(w) {
-  await endLeftSetups(w, w.tasks); // a leftover setup that cannot be ended keeps the job, its leases and the card's record
-  // Live setup commands are ended before the job is marked stopped: only a paused job is loaded again after a restart,
-  // so a command that cannot be confirmed gone keeps the job paused and its card blocked with the command's identity.
-  while (settingUp(w)) { if (w.run?.active) pause(w); await stopPreparing(w, '已停止'); }
-  const stuck = w.tasks.find((t) => t.preparing);
-  if (stuck) throw new Error(`「${stuck.title}」的 worktree 設定指令無法確認已停止（${stuck.worktree?.setupKillError || '原因不明'}），工作保持暫停、卡片保持阻擋；可稍後再按 Stop`);
-  stop(w); await drainExecution(w); releaseJobLeases(w, 'stopped');
-  for (const t of w.tasks) if (isWriter(t)) await releaseLock(w, t);
-  saveRun(w, 'stopped');
+  if (!w.run) return;
+  if (!w.stopDrain) {
+    const run = w.run, cards = w.tasks;
+    const current = () => {
+      if (w.run !== run || w.tasks !== cards) throw new Error('工作已變更，停止清理不會套用到新工作');
+    };
+    // Share the entire transition, including lock release and persistence. A concurrent
+    // Stop must not finish late and release/save the replacement job.
+    const pending = (async () => {
+      await endLeftSetups(w, cards);
+      current();
+      while (settingUp(w)) {
+        if (run.active) pause(w);
+        await stopPreparing(w, '已停止');
+        current();
+      }
+      const stuck = cards.find((t) => t.preparing);
+      if (stuck) throw new Error(`「${stuck.title}」的 worktree 設定指令無法確認已停止（${stuck.worktree?.setupKillError || '原因不明'}），工作保持暫停、卡片保持阻擋；可稍後再按 Stop`);
+      stop(w);
+      await drainExecution(w);
+      current();
+      releaseJobLeases(w, 'stopped');
+      for (const t of cards) if (isWriter(t)) { await releaseLock(w, t); current(); }
+      saveRun(w, 'stopped');
+    })().catch(error => {
+      if (w.run === run && w.tasks === cards) for (const t of cards) t.runtimeStopPending = true;
+      throw error;
+    }).finally(() => { if (w.stopDrain === pending) delete w.stopDrain; });
+    w.stopDrain = pending;
+  }
+  // Bound only the caller's wait, not cleanup. The shared promise remains an
+  // admission fence until verified cleanup, lock release and persistence finish.
+  let timer;
+  try {
+    await Promise.race([w.stopDrain, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('仍在核對 Agent 與工具程序停止狀態；背景清理持續中，尚未啟動新工作，請稍後再試。')), 20000);
+    })]);
+  } finally { clearTimeout(timer); }
 }
 
 // ----- external takeover: another AI session / the user takes the tree -----
