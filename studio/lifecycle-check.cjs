@@ -1418,6 +1418,32 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
     console.log('33 ASK_LEADER: answer, needs_user, unanswerable, hand-over after two: PASS');
   }
 
+  { // settings reject malformed numbers; a workspace stays visible until its stop/pause drain is actually done
+    ({ env, api } = makeEnv(() => 'STATUS: DONE'));
+    w = newW(); w.run.active = false; env.S.workspaces.push(w);
+    api.setTokenCap(w, '1200'); api.setAutoMax(w, '3'); api.setBackendPort(w, '3018');
+    assert.deepStrictEqual([w.tokenCap, w.autoMax, w.backendPort], [1200, 3, 3018]);
+    for (const bad of ['abc', NaN, Infinity, -1, 1.5]) {
+      assert.throws(() => api.setTokenCap(w, bad), /正整數/);
+      assert.throws(() => api.setAutoMax(w, bad), /正整數/);
+      assert.throws(() => api.setBackendPort(w, bad), /port/);
+    }
+    assert.deepStrictEqual([w.tokenCap, w.autoMax, w.backendPort], [1200, 3, 3018], 'invalid input cannot silently clear saved limits or port');
+    api.setTokenCap(w, ''); api.setAutoMax(w, ''); api.setBackendPort(w, '');
+    assert.deepStrictEqual([w.tokenCap, w.autoMax, w.backendPort], [0, 0, 0], 'blank input still clears optional settings');
+
+    w.stopDrain = Promise.resolve();
+    assert.throws(() => api.closeWorkspace(w), /清理完成/);
+    assert.ok(env.S.workspaces.includes(w), 'a draining workspace remains open for retry and status reporting');
+    delete w.stopDrain; w.leaderSteps = new Set([Promise.resolve()]);
+    assert.throws(() => api.closeWorkspace(w), /清理完成/);
+    w.leaderSteps.clear(); w.tasks.push({ runtimeStopPending: true });
+    assert.throws(() => api.closeWorkspace(w), /清理完成/);
+    w.tasks[0].runtimeStopPending = false; api.closeWorkspace(w);
+    assert.ok(!env.S.workspaces.includes(w), 'a fully drained inactive workspace can close');
+    console.log('36 numeric settings reject malformed values; workspace close waits for full drain: PASS');
+  }
+
   await require('./test-workspace-lease.cjs')({ makeEnv, mkTmp, region });
 
   // status-line parser

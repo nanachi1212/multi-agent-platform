@@ -48,4 +48,13 @@ assert.deepEqual(calls[2][1].headers, { 'content-type': 'application/json', 'x-s
 const later = { fetch: (u, o) => { calls.push([u, o]); } };
 new Function('location', 'localStorage', 'history', 'window', block)({ hash: '#p=x', pathname: '/' }, { getItem: (k) => store.get(k) ?? null }, { replaceState() { throw new Error('no'); } }, later);
 later.fetch('/api/state'); assert.equal(calls.at(-1)[1].headers['x-studio-token'], API_TOKEN, 'a later visit uses the kept pass');
-console.log('API pass: page pass, outside claim, card-scoped runtime start, browser keeps and sends the pass: PASS');
+
+// Request bodies are bounded even on the intentionally unauthenticated workspace-claim route.
+const bodyCode = src.slice(src.indexOf('const MAX_API_BODY_BYTES ='), src.indexOf('\nconst server = http.createServer'));
+const { Readable } = require('node:stream');
+const { readApiBody, MAX_API_BODY_BYTES } = new Function('Buffer', bodyCode + '\nreturn { readApiBody, MAX_API_BODY_BYTES };')(Buffer);
+(async () => {
+  assert.deepEqual(await readApiBody(Readable.from(['{"path":"P"}'])), { path: 'P' });
+  await assert.rejects(readApiBody(Readable.from([Buffer.alloc(MAX_API_BODY_BYTES + 1)])), error => error.statusCode === 413 && /too large/.test(error.message));
+  console.log('API pass and body limit: page pass, outside claim, card-scoped runtime start, browser token, 1 MiB cap: PASS');
+})().catch(error => { console.error(error); process.exitCode = 1; });

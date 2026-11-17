@@ -459,6 +459,14 @@ async function runRuntimeTests() {
     });
     assert.strictEqual(falseReady.status, 'BLOCKED', 'unrelated listener cannot satisfy readiness');
     assert.match(falseReady.reason, /Unknown PID/);
+    const ownershipQueryFailed = await readiness.checkBackendReadiness(runtime, {
+      isPidAlive: () => true, portReachable: async () => true,
+      verifyOwnership: async () => { throw new Error('CIM query unavailable'); },
+      getHealth: async () => ({ httpStatus: 200, body: { status: 'ok' } })
+    });
+    assert.strictEqual(ownershipQueryFailed.status, 'BLOCKED', 'one ownership query failure is a blocked runtime, not a failed readiness batch');
+    assert.strictEqual(ownershipQueryFailed.ownership_verified, false);
+    assert.match(ownershipQueryFailed.reason, /CIM query unavailable/);
     console.log('Case K: process + port + HTTP 200 + application ready; startup failure reason: PASS');
   }
 

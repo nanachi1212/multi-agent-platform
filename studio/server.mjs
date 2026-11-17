@@ -1099,8 +1099,8 @@ function setFinisher(w, agent) {
 // card waiting on that backend get the automatic health check / recovery.
 // 每張卡 token 上限: a card over it is not started again (its next step is refused); the Leader decides the retry.
 function setTokenCap(w, cap) {
-  cap = Number(cap) || 0;
-  if (cap < 0 || !Number.isInteger(cap)) throw new Error('token 上限必須是 0（不限）或正整數');
+  cap = Number(cap);
+  if (!Number.isFinite(cap) || cap < 0 || !Number.isInteger(cap)) throw new Error('token 上限必須是 0（不限）或正整數');
   w.tokenCap = cap;
   saveSettings();
 }
@@ -1108,7 +1108,8 @@ const cardTokens = (t) => (t.usage?.in || 0) + (t.usage?.out || 0);
 const overCap = (w, t) => !!w.tokenCap && cardTokens(t) >= w.tokenCap;
 
 function setBackendPort(w, port) {
-  port = Number(port) || 0;
+  port = Number(port);
+  if (!Number.isFinite(port)) throw new Error('port 必須是 1–65535 的整數（留空可清除）');
   if (port && !(Number.isInteger(port) && port > 0 && port < 65536)) throw new Error('port 必須是 1–65535 的整數');
   w.backendPort = port;
   saveSettings();
@@ -1126,8 +1127,8 @@ function setAfterDone(w, mode) {
 }
 
 function setAutoMax(w, max) {
-  max = Number(max) || 0;
-  if (max < 0 || !Number.isInteger(max)) throw new Error('連續上限必須是 0（不限）或正整數');
+  max = Number(max);
+  if (!Number.isFinite(max) || max < 0 || !Number.isInteger(max)) throw new Error('連續上限必須是 0（不限）或正整數');
   w.autoMax = max;
   saveSettings();
 }
@@ -3583,6 +3584,7 @@ function openWorkspace(p) {
 
 function closeWorkspace(w) {
   if (w.run?.active) throw new Error('這個專案的團隊還在工作，請先暫停或停止');
+  if (stillStopping(w)) throw new Error('這個專案仍在停止或暫停 Agent、工具程序與 runtime，請等清理完成再關閉');
   if ([...preparing.values()].some((e) => e.w === w) || w.tasks.some((t) => t.preparing)) throw new Error('這個專案有工作卡的 worktree 正在準備（設定指令還在跑），請等它完成或先按停止');
   S.workspaces = S.workspaces.filter((x) => x !== w); // a paused job stays in 歷史紀錄
   saveSettings();
@@ -3888,6 +3890,25 @@ const READ_POSTS = new Set(['POST /api/limits/refresh', 'POST /api/check', 'POST
 const EVENT_FIELDS = ['ws', 'path', 'taskId', 'agent', 'to', 'id', 'mode', 'strategy', 'max', 'cap', 'port', 'on', 'interrupt', 'time', 'days'];
 const pickEventFields = (b) => Object.fromEntries(EVENT_FIELDS.map((k) => [k, b?.[k]]).filter(([, v]) => v != null && (typeof v !== 'object' || Array.isArray(v))));
 
+const MAX_API_BODY_BYTES = 1 << 20;
+async function readApiBody(req) {
+  let size = 0, tooLarge = false;
+  const chunks = [];
+  for await (const chunk of req) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += bytes.length;
+    if (size > MAX_API_BODY_BYTES) { tooLarge = true; chunks.length = 0; }
+    else if (!tooLarge) chunks.push(bytes);
+  }
+  if (tooLarge) {
+    const error = new Error('request body too large');
+    error.statusCode = 413;
+    throw error;
+  }
+  const raw = chunks.length ? Buffer.concat(chunks, size).toString('utf8') : '';
+  return raw ? JSON.parse(raw) : {};
+}
+
 const server = http.createServer(async (req, res) => {
   const send = (code, body, type = 'application/json; charset=utf-8') => { res.writeHead(code, { 'content-type': type }); res.end(type.startsWith('application/json') ? JSON.stringify(body ?? {}) : body); };
   // Local-only: reject other hosts (DNS rebinding) and non-JSON POSTs (cross-site form posts).
@@ -3906,15 +3927,13 @@ const server = http.createServer(async (req, res) => {
   // refuse before reading the body, except where the body names the card a worker pass is for; refusals are not logged (no event spam)
   if (route !== 'POST /api/runtime/start' && !apiAllowed(route, pass)) return noPass();
   try {
-    let raw = '';
-    for await (const c of req) raw += c;
-    b = raw ? JSON.parse(raw) : {};
+    b = await readApiBody(req);
     if (!apiAllowed(route, pass, b)) return noPass();
     send(200, (await fn(b)) ?? { ok: true });
     if (record) event('api', { route, ...pickEventFields(b) });
   } catch (e) {
     if (record) event('api', { route, ...pickEventFields(b), error: e instanceof SyntaxError ? 'invalid JSON body' : e.message }); // a parser message can quote the raw body (secrets)
-    send(400, { error: e.message });
+    send(e.statusCode || 400, { error: e.message });
   }
 });
 

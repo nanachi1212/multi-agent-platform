@@ -37,7 +37,11 @@ export async function checkBackendReadiness(runtime, {
     try { health = await getHealth(runtime.port); }
     catch (error) { healthError = error?.message || String(error); }
   }
-  const ownership = alive && reachable ? await verifyOwnership(runtime) : { ok: false };
+  let ownership = { ok: false };
+  if (alive && reachable) {
+    try { ownership = await verifyOwnership(runtime); }
+    catch (error) { ownership = { ok: false, reason: `runtime ownership check failed: ${error?.message || String(error)}` }; }
+  }
   const applicationReady = health?.httpStatus === 200 && isApplicationReady(health.body);
   const ready = alive && reachable && ownership.ok && applicationReady;
   const detail = startupError(health?.body);
