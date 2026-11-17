@@ -18,7 +18,9 @@ Windows 優先的多 AI 協作平台。**Multi-Agent Studio** 是一個本機網
 2. 雙擊 `start-studio.cmd`，瀏覽器會打開 `http://127.0.0.1:4848`（連接埠被佔用時自動改用下一個）。關掉黑色視窗就會停止。
 3. 在左側「開啟專案」選一個資料夾，在「今天想讓『專案名』做什麼？」輸入需求，按「▶ 交給團隊」。
 
-第一次啟動會下載 AionCore v0.2.2（官方版本，SHA-256 驗證）到 `runtime/`。Studio 的 Codex 使用獨立資料夾（`runtime/studio/codex-home`），不會出現在你平常的 Codex 紀錄裡；第一次要在 Codex 卡片按「登入 Codex（Studio 專用）」。你的全域規則 `~/.codex/AGENTS.md` 每次啟動 Studio 時會複製進這個資料夾，改了規則重啟 Studio 就生效（Claude 本來就會讀 `~/.claude/CLAUDE.md`）。
+第一次啟動會下載 AionCore v0.2.2 到 `runtime/`，驗證官方 ZIP 與執行檔的 SHA-256；之後每次啟動也會驗證執行檔。損壞時先在暫存目錄驗證完整安裝，再替換執行檔，舊檔保留為 `aioncore.exe.unverified-*.bak`；下載／解壓縮／替換失敗會保留原檔並停止啟動。
+
+Studio 的 Codex 使用獨立資料夾（`runtime/studio/codex-home`），不會出現在你平常的 Codex 紀錄裡；第一次要在 Codex 卡片按「登入 Codex（Studio 專用）」。沒有規則檔時，Studio 會複製全域 `~/.codex/AGENTS.md` 並記錄來源與雜湊；之後重啟只更新未被修改的管理副本，來源刪除時也只移除該副本。既有未標記的規則檔（含舊版副本）、自訂內容、連結檔一律保留，需自行維護；`STUDIO_CODEX_HOME` 同樣適用。Claude 本來就會讀 `~/.claude/CLAUDE.md`。
 
 使用獨立 `STUDIO_RUNTIME` 測試時，預設也會建立未登入的 Codex home。可明確設定 `STUDIO_CODEX_HOME` 指向已登入的 **Studio 專用目錄**；登入、可用性檢查與 Agent 執行會使用同一目錄，不複製憑證。這會共用該 home 的 Codex 設定、登入與 session 紀錄；Studio 工作卡、租約及測試資料仍位於獨立 runtime。未設定時維持原本的隔離方式。
 
@@ -65,7 +67,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 **長期目標與定時工作**（專案頁「🎯 長期目標・⏰ 定時工作」）
 - 長期目標：每個專案一段話，工頭規劃、每張工作卡、最後的整體確認都會帶著它，讓 AI 知道「為什麼做」，但仍只做這次交辦的事。
 - 定時工作：設定「星期幾＋HH:MM」和一段需求，時間到就自動「交給團隊」，照這個專案的交付方式做，並發 Windows 通知。專案正在工作或暫停時不會插隊，等它空下來只跑一次（錯過好幾次也只跑一次）；開始失敗（例如工頭不可用）會通知你，不會每分鐘重試。修改或重新開啟一個定時工作時，從現在起算，不會補跑過去的時間。可加「前置檢查」：一個指令（在專案資料夾執行，30 秒內要結束），結束碼不是 0 就略過這次、不花額度，畫面顯示「上次略過」；檢查期間專案忙起來，這一格照樣等它空下來。
-- 事件紀錄：`runtime/studio/events.jsonl` 一行一筆，記錄所有專案的操作（每個 API 操作、工作開始／結束、定時工作與自動持續開發觸發）。只記 id 和設定值，不記需求內容、指示或 API key；每件工作的對話與工作卡仍在 history 裡（`job` 就是 history 檔名）。
+- 事件紀錄：`runtime/studio/events.jsonl` 一行一筆，記錄所有專案的操作（每個 API 操作、工作開始／結束、定時工作與自動持續開發觸發）。只記 id 和設定值，不記需求內容、指示或 API key；每件工作的對話與工作卡仍在 history 裡（`job` 就是 history 檔名）。事件檔每 5 MiB 輪替，保留 `.1` 到 `.5` 五份備份（`.1` 最新），超出時淘汰最舊事件備份；history 不受影響。
 
 **省額度**
 - 工頭不讀檔、不查 repo、不跑指令，只規劃與確認；調查和動手都交給成員。Claude Code 只在 Codex 和 Antigravity 做不了時才拿到工作卡。
@@ -116,7 +118,9 @@ A Windows-first multi-agent collaboration platform. **Multi-Agent Studio** is a 
 2. Double-click `start-studio.cmd`. The browser opens `http://127.0.0.1:4848` (the next free port is used if it is taken). Close the console window to stop.
 3. Open a project folder in the sidebar, type what you want under "今天想讓「<project>」做什麼？", and press "▶ 交給團隊".
 
-The first start downloads AionCore v0.2.2 (official release, SHA-256 checked) into `runtime/`. Studio runs Codex with its own home (`runtime/studio/codex-home`), so its sessions never appear in your normal Codex history; log in once with the "登入 Codex（Studio 專用）" button on the Codex card. Your global `~/.codex/AGENTS.md` is copied into that home at each Studio start, so an edited rule applies after a restart (Claude reads `~/.claude/CLAUDE.md` on its own).
+The first start downloads AionCore v0.2.2 into `runtime/` and verifies both the official ZIP and executable SHA-256. Each later start verifies the executable too. Repairs are extracted and verified in a staging directory before publication; the old executable is retained as `aioncore.exe.unverified-*.bak`. Download, extraction or replacement failures leave the old file intact and stop startup.
+
+Studio runs Codex with its own home (`runtime/studio/codex-home`), so its sessions never appear in your normal Codex history; log in once with the "登入 Codex（Studio 專用）" button. If no rules file exists, Studio copies global `~/.codex/AGENTS.md` and records its source and hash. Later starts update or remove only an unchanged managed copy. Unmarked existing files (including legacy copies), custom edits and links are preserved for manual maintenance, including in `STUDIO_CODEX_HOME`. Claude reads `~/.claude/CLAUDE.md` on its own.
 
 A separate `STUDIO_RUNTIME` also gets a fresh, unauthenticated Codex home by default. Set `STUDIO_CODEX_HOME` explicitly to an authenticated **Studio-specific directory** to reuse its login without copying credentials. Login, availability checks, and execution use that same home, including its Codex configuration and session history; Studio cards, leases, and fixture data remain in the separate runtime. Without this override, the existing isolation behavior is unchanged.
 
@@ -163,7 +167,7 @@ curl -X POST http://127.0.0.1:4848/api/workspace/release-claim -H "content-type:
 **Long-term goal and routines** (project page, "🎯 長期目標・⏰ 定時工作")
 - Long-term goal: one paragraph per project. The Leader's plan, every card brief and the final check carry it, so agents know why the work matters; they still do only what the request asks.
 - Routines: weekdays + HH:MM + a request. At that time Studio hands the request to the team with the project's delivery mode and sends a Windows notification. A project that is working or paused is never pushed aside: the routine runs once when the project is free (several missed slots run once). A routine that cannot start (e.g. the Leader is unavailable) notifies you and is not retried every minute. Editing or re-enabling a routine counts from now; past slots never run. An optional precheck (one command run in the project folder, 30 s limit) skips the slot at no cost when its exit code is not 0, shown as "上次略過"; if the project gets busy while it runs, the slot waits as usual.
-- Event log: `runtime/studio/events.jsonl`, one line per event across all projects: every API action, job start / end, routine and auto-continue starts. It keeps ids and settings only, never request text, notes or API keys; each job's chat and cards stay in its history file (`job` is the history file name).
+- Event log: `runtime/studio/events.jsonl`, one line per event across all projects: every API action, job start / end, routine and auto-continue starts. It keeps ids and settings only, never request text, notes or API keys; each job's chat and cards stay in its history file (`job` is the history file name). The log rotates at 5 MiB and retains five backups (`.1` newest through `.5`); the oldest event backup expires on rotation. Job history is unaffected.
 
 **Saving quota**
 - The Leader does not read files, search the repo or run commands; it only plans and checks, and sends investigation and work to workers. Claude Code gets a card only when Codex and Antigravity cannot do it.

@@ -13,6 +13,7 @@ import { checkBackendReadiness, recoverOwnedRuntime } from './runtime-readiness.
 import { createSmokeEnvironment, cleanupIsolatedDir } from './isolated-env.mjs';
 import { writeJson, claimRuntime } from './state-files.mjs';
 import { createCodexRuntimeGuard, processSnapshot, processTree } from './codex-runtime.mjs';
+import { syncRulesFile, ensureVerifiedExecutable, appendRotatingEvent, parseAcpArgs } from './local-maintenance.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 // STUDIO_RUNTIME = a separate runtime folder (settings, history, leases, events, AionCore data), so a test Studio can run
@@ -23,6 +24,7 @@ process.on('exit', () => { try { releaseInstance(); } catch (e) { console.error(
 const AION = path.join(ROOT, 'runtime', 'aioncore', 'aioncore.exe');
 const AION_URL = 'https://github.com/iOfficeAI/AionCore/releases/download/v0.2.2/aioncore-v0.2.2-x86_64-pc-windows-msvc.zip';
 const AION_ZIP_SHA256 = 'd1ed8d1da869230c18701747d07e8f068db5b8c9442e65261304aeb4c27eacf6';
+const AION_EXE_SHA256 = '67eb02774bab3855b759ec9756c2e540cd17b64b850407fa4b8bad07fd8a0892'; // executable inside the pinned, verified ZIP
 let PORT = Number(process.env.STUDIO_PORT || 4848); // moves up when the port is taken (see server.listen)
 // API pass (security F2/F3): any local program can reach 127.0.0.1, so /api needs this secret. It lives only in memory and is new
 // at every start (the runtime folder is readable by other accounts, e.g. the Codex sandbox users); the browser gets it in the URL
@@ -37,15 +39,12 @@ const apiAllowed = (route, pass, b) => sameSecret(pass, API_TOKEN) || OPEN_ROUTE
   || (route === 'POST /api/runtime/start' && !!b?.cardId && sameSecret(pass, cardToken(String(b.cardId))));
 // Studio's Codex gets its own home so its sessions never show up in the user's own Codex history.
 const CODEX_HOME = process.env.STUDIO_CODEX_HOME ? path.resolve(process.env.STUDIO_CODEX_HOME) : path.join(RT, 'studio', 'codex-home');
-// Codex reads global rules from its home's AGENTS.md, so the user's own one is copied into Studio's home at each start.
-// ponytail: a deleted global AGENTS.md leaves the last copy; delete it by hand if that ever matters.
+// Sync only unchanged Studio-managed copies; custom and unmarked rules remain user-owned.
 function syncCodexRules(env = process.env, home = CODEX_HOME) {
   const src = path.join(env.CODEX_HOME ? path.resolve(env.CODEX_HOME) : path.join(os.homedir(), '.codex'), 'AGENTS.md'), dst = path.join(home, 'AGENTS.md');
   try {
-    if (!fs.existsSync(src) || path.resolve(src).toLowerCase() === path.resolve(dst).toLowerCase()) return false;
-    fs.copyFileSync(src, dst);
-    return true;
-  } catch (e) { console.error('複製全域 AGENTS.md 到 Studio 的 Codex 失敗：' + e.message); return false; }
+    return syncRulesFile(src, dst);
+  } catch (e) { console.error('同步全域 AGENTS.md 到 Studio 的 Codex 失敗：' + e.message); return false; }
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -167,7 +166,7 @@ function saveRun(w, status) {
   else {
     const at = items.findIndex((x) => x.id + '.json' < run.id + '.json'); // same newest-first order as the file listing
     items.splice(at < 0 ? items.length : at, 0, copy);
-    if (items.length > 200) items.length = 200;
+    for (const dropped of items.splice(200)) histCache.rows.delete(dropped.id);
   }
   if (changed) histCache.rev = ++S.historyRev;
 }
@@ -218,12 +217,11 @@ function log(w, who, role, text, detail) {
 
 // Append-only record of who started or changed what, across all projects and jobs: API calls, job start / end,
 // routine and auto-continue starts. The chat and cards of a job stay in its history file (job = history file id).
-// ponytail: one file that only grows; rotate it by month if it gets large.
+// 5 MiB per file, plus five backups; old archives expire on rotation.
 const EVENTS = path.join(RT, 'studio', 'events.jsonl');
 function event(type, data = {}) {
   try {
-    fs.mkdirSync(path.dirname(EVENTS), { recursive: true });
-    fs.appendFileSync(EVENTS, JSON.stringify({ at: new Date().toISOString(), type, ...data }) + '\n');
+    appendRotatingEvent(EVENTS, { at: new Date().toISOString(), type, ...data });
   } catch (e) { console.error('事件紀錄寫入失敗：' + e.message); }
 }
 
@@ -231,15 +229,10 @@ function event(type, data = {}) {
 let BASE;
 
 async function ensureAion() {
-  if (fs.existsSync(AION)) return;
-  console.log('第一次啟動：下載 AionCore v0.2.2 ...');
-  const buf = Buffer.from(await (await fetch(AION_URL)).arrayBuffer());
-  if (crypto.createHash('sha256').update(buf).digest('hex') !== AION_ZIP_SHA256) throw new Error('AionCore 下載檔 SHA-256 不符，已中止');
-  const zip = path.join(RT, 'download', 'aioncore.zip');
-  fs.mkdirSync(path.dirname(zip), { recursive: true });
-  fs.mkdirSync(path.dirname(AION), { recursive: true });
-  fs.writeFileSync(zip, buf);
-  await new Promise((res, rej) => execFile('tar', ['-xf', zip, '-C', path.dirname(AION)], (e) => (e ? rej(e) : res())));
+  const result = await ensureVerifiedExecutable({ target: AION, url: AION_URL,
+    archiveHash: AION_ZIP_SHA256, executableHash: AION_EXE_SHA256,
+    cachedArchive: path.join(ROOT, 'runtime', 'download', 'aioncore-v0.2.2-x86_64-pc-windows-msvc.zip') });
+  if (result.installed) console.log('AionCore v0.2.2 已驗證並安裝' + (result.backup ? '；原檔備份：' + result.backup : ''));
 }
 
 let aionProcess, aionGone = '', aionClosing = false;
@@ -323,6 +316,12 @@ async function api(method, p, body) {
 }
 
 const convAgent = new Map(); // conversationId -> agent id (to route catalog events)
+// Keep live/restorable workspace conversations and a bounded tail of probes/retired conversations.
+function pruneConversations() {
+  const pinned = new Set([...active.keys(), ...S.workspaces.flatMap(w => Object.values(w.run?.convs || {}))]);
+  const retired = [...convAgent.keys()].filter(id => !pinned.has(id));
+  for (const id of retired.slice(0, Math.max(0, retired.length - 256))) convAgent.delete(id);
+}
 
 // cfg = the project's { model, effort } for this agent; none = agent defaults.
 async function createConv(agent, ws, lead, cfg) {
@@ -338,6 +337,7 @@ async function createAgentConv(agent, ws, lead, cfg) {
     try {
       const id = (await api('POST', '/api/conversations', body)).id;
       convAgent.set(id, agent);
+      pruneConversations();
       return id;
     } catch (e) { if (i >= 4) throw e; await sleep(1000); }
   }
@@ -350,7 +350,7 @@ function watchCatalogs() {
     let d;
     try { d = JSON.parse(e.data).data; } catch { return; }
     const agent = convAgent.get(d?.conversation_id);
-    if (!agent || d.type !== 'acp_config_option') return;
+    if (!agent || !S.agents[agent] || d.type !== 'acp_config_option') return;
     updateModelCatalog(S.agents[agent], d.data?.config_options);
   };
   ws.onclose = () => setTimeout(watchCatalogs, 2000);
@@ -704,9 +704,10 @@ async function addAcp(b) {
     if (c.added) throw new Error(c.name + ' 已經加入了');
     e = { id: 'acp_' + c.backend, name: c.name, backend: c.backend, yolo: c.yolo, agentId: '', command: '', args: [] };
   } else {
-    const name = String(b.name || '').trim(), command = String(b.command || '').trim();
-    // ponytail: arguments split on spaces, no quoting; enough for `opencode acp` / `npx -y pkg --acp`.
-    const args = String(b.args || '').trim().split(/\s+/).filter(Boolean);
+    const name = String(b.name || '').trim();
+    const rawCommand = String(b.command || '').trim();
+    const command = rawCommand.startsWith('"') && rawCommand.endsWith('"') ? rawCommand.slice(1, -1) : rawCommand;
+    const args = parseAcpArgs(b.args);
     if (!name) throw new Error('請填顯示名稱');
     if (!command) throw new Error('請填啟動指令（例如 opencode）');
     const agentId = (await api('POST', '/api/agents/custom', { name, command, args })).id;
@@ -3949,6 +3950,7 @@ for (const w of S.workspaces) {
 await startAion();
 watchCatalogs();
 setInterval(watchExternal, 60000); // GitHub PR / CI waits
+setInterval(pruneConversations, 60000);
 setInterval(retryCleanups, 60000); // worktree cleanups that failed for a reason that may pass
 setInterval(runRoutines, 30000); // routines: checked twice a minute so an HH:MM slot starts within that minute
 await refreshRuntimeReadiness();

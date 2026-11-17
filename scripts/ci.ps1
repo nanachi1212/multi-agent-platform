@@ -12,6 +12,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Studio state file checks failed' }
     & node studio/test-codex-provider.cjs
     if ($LASTEXITCODE -ne 0) { throw 'Studio Codex provider checks failed' }
+    & node --check studio/local-maintenance.mjs
+    if ($LASTEXITCODE -ne 0) { throw 'Studio local maintenance syntax failed' }
+    & node studio/test-local-maintenance.cjs
+    if ($LASTEXITCODE -ne 0) { throw 'Studio local maintenance checks failed' }
     & node --check studio/codex-runtime.mjs
     if ($LASTEXITCODE -ne 0) { throw 'Studio Codex runtime syntax check failed' }
     & node studio/test-codex-runtime.cjs

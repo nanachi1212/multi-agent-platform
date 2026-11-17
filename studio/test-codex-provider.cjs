@@ -9,11 +9,12 @@ const { region } = require('./lifecycle-harness.cjs');
   assert.equal(resolveHome({ CODEX_HOME: 'ambient-home' }), path.join(rt, 'studio', 'codex-home'));
   assert.equal(resolveHome({ STUDIO_CODEX_HOME: home }), home);
 
-  // the user's global AGENTS.md is copied into Studio's Codex home; nothing to copy, or the same file, is left alone
+  // The first copy is managed; future edits sync only while that copy is unchanged.
   const fs = require('node:fs'), os = require('node:os');
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-rules-')), user = path.join(tmp, 'user'), studio = path.join(tmp, 'studio');
   for (const d of [user, studio]) fs.mkdirSync(d);
-  const sync = new Function('process', 'path', 'RT', 'fs', 'os', homeCode.replace('return CODEX_HOME;', 'return syncCodexRules;'))({ env: {} }, path, rt, fs, os);
+  const { syncRulesFile } = await import('./local-maintenance.mjs');
+  const sync = new Function('process', 'path', 'RT', 'fs', 'os', 'syncRulesFile', homeCode.replace('return CODEX_HOME;', 'return syncCodexRules;'))({ env: {} }, path, rt, fs, os, syncRulesFile);
   try {
     assert.equal(sync({ CODEX_HOME: user }, studio), false, 'no global AGENTS.md: nothing copied');
     assert.ok(!fs.existsSync(path.join(studio, 'AGENTS.md')));

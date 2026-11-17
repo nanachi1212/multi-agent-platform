@@ -453,7 +453,7 @@
     <details id="acpCustom"><summary>清單裡沒有：用自訂指令</summary>
       <label>顯示名稱<input type="text" id="acpName" placeholder="例如：我的 OpenCode" autocomplete="off"></label>
       <label>啟動指令<input type="text" id="acpCmd" placeholder="例如：opencode" autocomplete="off"></label>
-      <label>參數（用空白分開）<input type="text" id="acpArgs" placeholder="例如：acp" autocomplete="off"></label>
+      <label>參數（空白分隔；含空白用雙引號，也可輸入 JSON 字串陣列）<input type="text" id="acpArgs" placeholder='例如：acp --config "C:\My Agent\config.json"' autocomplete="off"></label>
       <div class="hint">這個指令要能以 ACP（Agent Client Protocol）模式在標準輸入輸出上對話。</div>
     </details>
     <div class="hint" style="color:var(--bad)" id="acpErr"></div>
