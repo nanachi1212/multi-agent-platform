@@ -4,17 +4,26 @@ const assert = require('node:assert/strict');
   const opts = () => [ { id: 'model/id', category: 'model', current_value: 'old', options: [{ value: 'old' }, { value: 'new', name: 'New' }] }, { id: 'reasoning_effort', category: 'thought_level', current_value: 'low', options: [{ value: 'low' }, { value: 'high' }] } ];
   const a = {}; updateModelCatalog(a, opts()); assert.equal(a.models[1].name, 'New'); assert.deepEqual(a.efforts, ['low', 'high']);
   let calls = [];
-  const api = async (method, url, body) => { calls.push({ method, url, body }); return method === 'GET' ? { config_options: opts() } : { confirmation: 'observed' }; };
+  // Match the pinned backend contract: GET config-options is a 404, not a snapshot.
+  const api = async (method, url, body) => {
+    calls.push({ method, url, body });
+    if (method === 'POST' && url.endsWith('/runtime/ensure')) return { config_options: opts() };
+    if (method === 'PUT' && url.includes('/config-options/')) return { confirmation: 'observed' };
+    throw new Error('Route not found: ' + method + ' ' + url);
+  };
   await applyTurnModel(api, 'same-conversation', { model: 'new', effort: 'high' }, a);
   assert.equal(calls.length, 3); assert.equal(calls[1].url, '/api/conversations/same-conversation/config-options/model%2Fid');
+  assert.deepEqual(calls[0], { method: 'POST', url: '/api/conversations/same-conversation/runtime/ensure', body: {} });
   assert.equal(calls[2].url.endsWith('/reasoning_effort'), true);
   assert.ok(calls.every((c) => !/cancel|messages/.test(c.url)), 'only configuration, no restart or paid model message');
   calls = []; await applyTurnModel(api, 'same-conversation', { model: 'old' }, a); assert.equal(calls.length, 1);
   calls = []; await applyTurnModel(api, 'same-conversation', {}, a); assert.equal(calls.length, 0);
   await assert.rejects(applyTurnModel(api, 'same-conversation', { model: 'invented' }, a), /不支援/);
-  calls = []; await assert.rejects(applyTurnModel(api, 'same-conversation', { model: 'new' }, a, () => false), /已停止/); assert.equal(calls.length, 1);
-  await assert.rejects(applyTurnModel(async (m) => m === 'GET' ? { config_options: opts() } : { confirmation: 'command_ack' }, 'same', { model: 'new' }, a), /尚未確認/);
-  await applyTurnModel(async (m) => m === 'GET' ? { config_options: opts() } : { confirmation: 'pending_next_turn' }, 'same', { model: 'new' }, a);
+  calls = []; await assert.rejects(applyTurnModel(api, 'same-conversation', { model: 'new' }, a, () => false), /已停止/); assert.equal(calls.length, 0);
+  await assert.rejects(applyTurnModel(async (m) => m === 'POST' ? { config_options: opts() } : { confirmation: 'command_ack' }, 'same', { model: 'new' }, a), /尚未確認/);
+  await applyTurnModel(async (m) => m === 'POST' ? { config_options: opts() } : { confirmation: 'pending_next_turn' }, 'same', { model: 'new' }, a);
+  let allowed = true;
+  await assert.rejects(applyTurnModel(async (m) => { assert.equal(m, 'POST'); allowed = false; return { config_options: opts() }; }, 'same', { model: 'new' }, a, () => allowed), /已停止/);
   const fs = require('node:fs'), vm = require('node:vm');
   // The real turn must not send a model request after Stop crosses the settings await.
   const { region } = require('./lifecycle-harness.cjs');

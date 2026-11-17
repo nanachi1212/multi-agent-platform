@@ -770,7 +770,7 @@ async function checkAgent(id) {
     if (AGENTS[id].external) await extProvider(id);
     if (AGENTS[id].acp) await acpReady(id);
     const cid = await createConv(id, ws, true);
-    await api('GET', `/api/conversations/${cid}/config-options`).then((r) => updateModelCatalog(a, r.config_options)).catch(() => {});
+    await api('POST', `/api/conversations/${cid}/runtime/ensure`, {}).then((r) => updateModelCatalog(a, r.config_options)).catch(() => {});
     const reply = await turn(id, cid, 'Reply with exactly: OK', { lead: true, check: true, timeout: 120e3 });
     if (!/OK/i.test(reply)) throw new Error('沒有正常回覆：' + (reply || '(空白)'));
     if (a.checkTok === tok) a.status = 'available';

@@ -1,4 +1,5 @@
-// AionCore v0.2.2 config-options contract. Never restart a conversation or cancel a turn.
+// AionCore v0.2.2: runtime/ensure returns the config snapshot; the legacy GET
+// config-options route was removed. Never restart a conversation or cancel a turn.
 export function updateModelCatalog(agent, options = []) {
   if (!agent) return;
   for (const o of options) {
@@ -9,8 +10,9 @@ export function updateModelCatalog(agent, options = []) {
 }
 export async function applyTurnModel(api, cid, cfg, agent, allowed = () => true) {
   if (!cfg.model && !cfg.effort) return;
+  if (!allowed()) throw new Error('切換模型期間工作已停止或變更');
   const url = `/api/conversations/${encodeURIComponent(cid)}/config-options`;
-  let options = (await api('GET', url)).config_options || [];
+  let options = (await api('POST', `/api/conversations/${encodeURIComponent(cid)}/runtime/ensure`, {})).config_options || [];
   updateModelCatalog(agent, options);
   for (const [category, value] of [['model', cfg.model], ['thought_level', cfg.effort]]) {
     if (!value) continue; // Blank deliberately means keep the existing conversation's setting.
