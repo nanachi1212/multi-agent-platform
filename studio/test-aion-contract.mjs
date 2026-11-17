@@ -76,6 +76,32 @@ try {
   const readAudit = () => fs.readFileSync(audit, 'utf8').trim().split('\n').map(line => {
     const event = JSON.parse(line); fixturePids.add(event.pid); fixturePids.add(event.parentPid); return event;
   });
+  const waitFor = async (check, label) => {
+    const deadline = Date.now() + 10000;
+    do { if (await check()) return; await new Promise(resolve => setTimeout(resolve, 100)); } while (Date.now() < deadline);
+    assert.fail(label);
+  };
+  async function checkTurns(route, auditFile, pid) {
+    const events = () => fs.readFileSync(auditFile, 'utf8').trim().split('\n').map(JSON.parse).filter(x => x.pid === pid);
+    const idle = async () => { const { runtime } = await api('GET', route); return runtime.state === 'idle' && !runtime.is_processing; };
+    await api('POST', route + '/messages', { content: 'Reply with exactly: OK' });
+    await waitFor(idle, 'connection check finishes');
+    const messages = (await api('GET', route + '/messages')).items;
+    assert.ok(messages.some(x => x.position === 'left' && x.content?.content === 'OK'), 'agent actually answers the connection check');
+    // Pause/resume and Stop both use cancellation. Reuse the same session to catch a stuck turn after cancellation.
+    for (let round = 0; round < 2; round++) {
+      const prompts = events().filter(x => x.method === 'session/prompt').length;
+      const cancels = events().filter(x => x.method === 'session/cancel').length;
+      const sent = await api('POST', route + '/messages', { content: 'STUDIO_LIFECYCLE: wait for cancellation' });
+      await waitFor(() => events().filter(x => x.method === 'session/prompt').length === prompts + 1, 'work reaches the real agent');
+      assert.equal((await api('GET', route)).runtime.is_processing, true, 'work remains active until cancellation');
+      await api('POST', route + '/cancel', { turn_id: sent.turn_id });
+      await waitFor(idle, 'cancellation returns the conversation to idle');
+      assert.ok(events().filter(x => x.method === 'session/cancel').length > cancels, 'real ACP cancellation delivered');
+      assert.equal(isPidAlive(pid), true, 'cancel preserves the reusable ACP session');
+    }
+    assert.equal(events().filter(x => x.method === 'session/new').length, 1, 'resume does not replace the session');
+  }
   const sessionsBefore = readAudit().filter(x => x.method === 'session/new').length;
   assert.equal(sessionsBefore, 2, 'one registration probe plus one live conversation');
   const starts = readAudit().filter(x => x.method === 'initialize');
@@ -100,6 +126,7 @@ try {
   assert.equal(events.filter(x => x.method === 'session/new').length, sessionsBefore, 'configuration does not restart the session');
   assert.deepEqual(events.filter(x => x.method === 'session/set_config_option').map(x => x.configId), ['model', 'reasoning_effort']);
   assert.ok(events.every(x => ['initialize', 'session/new', 'session/set_config_option'].includes(x.method)), 'no model prompt, tools or authentication requests');
+  await checkTurns(route, audit, starts[1].pid);
   console.log(`AionCore ${AION_RELEASE.version} contract: executable path/name with spaces, literal argv, real auth/CSRF, custom ACP, runtime snapshot, removed GET, confirmed model/effort and session reuse: PASS`);
 
   for (const extension of ['cmd', 'bat']) {
@@ -138,9 +165,10 @@ try {
     assert.ok(target && /cmd\.exe$/i.test(shell?.executable) && launcher?.command?.includes('acp-launcher.cjs'), 'launcher, cmd.exe and agent stay in the owned backend tree');
     for (const row of [target, shell, launcher]) fixturePids.add(row.pid);
     assert.ok(batchEvents.every(event => ['initialize', 'session/new'].includes(event.method)), 'batch test invokes no models');
+    await checkTurns(`/api/conversations/${encodeURIComponent(live.id)}`, batchAudit, starts[1].pid);
     assert.equal(fs.existsSync(path.join(work, 'injected.txt')), false);
     assert.equal(fs.existsSync(path.join(work, 'injected2.txt')), false);
-    console.log(`AionCore ${extension} contract: real registration, live ACP launch, literal quotes/%/!, no injection and probe tree cleanup: PASS`);
+    console.log(`AionCore ${extension} contract: registration, literal quotes/%/!, connection reply, start/cancel/resume/stop, no injection and probe tree cleanup: PASS`);
   }
 } catch (error) {
   // No credentials or protocol bodies are printed. Backend startup output is diagnostic only.

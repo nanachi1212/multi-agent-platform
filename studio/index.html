@@ -508,6 +508,7 @@ const OPEN = ['WAITING', 'WORKING', 'PAUSED', 'INTERRUPTED', ...PARKED];
 const STATUS = { done:'完成', failed:'有失敗', stopped:'已停止', paused:'暫停中', running:'進行中', interrupted:'中斷（可繼續）' };
 let S = null, last = '', histKey = '', histOpenId = null, histOpenProject = '', shownView = null;
 const drafts = {}; // unsent request text per project
+const pausePending = new Set();
 
 // The page shows the overview (#) or one project (#p=<folder>).
 const curPath = () => { const m = location.hash.match(/^#p=(.+)$/); return m ? decodeURIComponent(m[1]) : ''; };
@@ -533,6 +534,14 @@ async function post(url, body, signal, current = () => true) {
   if (!r.ok) { if (current()) { if ($('err')) $('err').textContent = j.error || ('錯誤 ' + r.status); else alert(j.error); } throw new Error(j.error || ('錯誤 ' + r.status)); }
   refresh();
   return j;
+}
+
+async function pauseJob(project) {
+  if (pausePending.has(project)) return;
+  pausePending.add(project);
+  render();
+  try { await post('/api/pause', { ws: project }); }
+  finally { pausePending.delete(project); render(); }
 }
 
 const projectStatePending = new Set();
@@ -829,7 +838,7 @@ function boardHtml(tasks, agents, editable, workspace = null) {
         <span class="who"><i></i>${esc(agents.find((a) => a.id === t.agent)?.name || t.agent)}</span>
         ${askFlag(t)}
         ${blk ? `<div class="res" style="color:var(--bad);font-weight:700">🚫 ${esc(blk)}</div>` : ''}
-        ${t.result && t.status !== 'PAUSED' ? `<div class="res">${esc(t.result)}</div>` : ''}
+        ${t.result && !['PAUSED', 'WORKING'].includes(t.status) ? `<div class="res">${esc(t.result)}</div>` : ''}
         ${PARKED.includes(t.status) && !blk ? `<div class="res"><b>${esc(waitLine(t))}</b></div>` : ''}
         ${workState(t) ? `<div class="res"><b>${workState(t).ic} ${esc(workState(t).text)}</b></div>` : ''}
         ${editable && (ASKABLE.includes(t.status) || t.steps?.length) ? workButtons(t, curPath()) : ''}
@@ -894,7 +903,8 @@ function formatWorkspace(w, task = null) {
   const repo = w?.wsInfo?.repo || (wr?.repo) || (w?.project ? base(w.project) : '—');
   const branch = task?.worktree?.branch || w?.wsInfo?.branch || wr?.branch || '—';
   const worktree = task?.workdir || (task?.worktree?.path) || w?.wsInfo?.path || w?.project || '—';
-  const leaseStatus = w?.historical ? '—' : task ? (task.writes === false ? 'READ' : (wr && (wr.cardId === task.id || wr.card === task.title)) ? (wr.state || 'ACTIVE') : (wr ? wr.state : 'FREE')) : (wr?.state || (wr ? 'ACTIVE' : 'FREE'));
+  const hasReadLease = (L.readers || []).some((x) => !task || x.cardId === task.id);
+  const leaseStatus = w?.historical ? '—' : task ? (task.writes === false ? (hasReadLease ? 'READ' : 'FREE') : (wr && (wr.cardId === task.id || wr.card === task.title)) ? (wr.state || 'ACTIVE') : (wr ? wr.state : 'FREE')) : (wr?.state || (wr ? 'ACTIVE' : hasReadLease ? 'READ' : 'FREE'));
   const writerStr = wr ? `${wr.owner} / ${repo} / ${branch}` : '—';
   return {
     writer: wr?.owner || '—',
@@ -1038,7 +1048,7 @@ function doneDropHtml(w) {
   const n = w.tasks.filter((t) => t.status === 'DONE').length;
   const rows = w.tasks.length ? w.tasks.map((t) => `<div class="drow">
       <div><span title="${STEP_WORD[t.status] || t.status}">${ICON[t.status] || '•'}</span> <span class="t">${esc(t.title)}</span><span class="who" style="--c:${look(t.agent).c}"><i></i>${esc(name(t.agent))}</span></div>
-      <div class="res">${t.result ? esc(t.result) : t.status === 'WORKING' ? '正在做…' : '還沒開始'}</div></div>`).join('')
+      <div class="res">${t.status === 'WORKING' ? '正在做…' : t.result ? esc(t.result) : '還沒開始'}</div></div>`).join('')
     : '<div class="empty" style="padding:8px">這次還沒有工作卡。</div>';
   return `<details class="kpi kpi-drop" id="doneDrop" ${doneOpen ? 'open' : ''}><summary><div class="v">${n}/${w.tasks.length}</div><div class="l">這次完成的工作卡 ▾</div></summary><div class="drop">${rows}</div></details>`;
 }
@@ -1172,6 +1182,7 @@ function nowHtml(w, att) {
       <textarea id="answerText" placeholder="${ask.opts.length ? '或直接打字回覆…' : '在這裡回覆…'}"></textarea>
       <div class="row"><span class="spacer"></span><button class="btn primary" data-answer-send data-for="${ask.id}">送出回覆</button></div></div>`;
   else if (ts.some((t) => t.blocked && t.status === 'WAITING')) you = ts.filter((t) => t.blocked && t.status === 'WAITING').map((t) => blockedHtml(w, t)).join('');
+  else if (pausePending.has(w.project)) you = '正在確認成員與工具程序停止，完成後即可繼續。';
   else if (r.paused && r.extMod) you = '<button class="btn pz small" data-resume-confirm>確認接手並繼續</button> 這些修改不是 Studio 的 Agent 做的，Studio 什麼都沒有動。';
   else if (manual.length) you = manual.map((t) => `<div class="row" style="margin-bottom:6px">「${esc(t.wait.what)}」好了嗎？<button class="btn small pz" data-continue-card="${t.id}">好了，繼續</button></div>`).join('');
   else if (r.paused) you = '<button class="btn pz small" data-resume-job>▶ 繼續</button>';
@@ -1266,14 +1277,15 @@ function renderOverview() {
 
 function renderProject(w, force) {
   const r = w.run, running = !!r?.active, paused = !!r?.paused;
+  const pausing = pausePending.has(w.project);
   $('pvHead').style.setProperty('--c', look(w.leader).c);
   $('pvName').textContent = w.name;
   $('pvPath').textContent = $('pvPath').title = w.project;
   // Without a live job the pill shows the project state, not a bare 待命.
   $('runPill').textContent = running ? `團隊工作中 · 工頭 ${name(r.leader)}` : paused ? '已暫停 · 可稍後繼續' : w.pstate ? w.pstate.headline : (r?.stopped ? '已停止' : '待命');
   $('runPill').className = 'pill ' + (running ? 'on' : paused ? 'pz' : w.pstate ? { need:'bad', open:'on', wait:'on', done:'ok' }[w.pstate.level] || '' : '');
-  $('pauseResume').textContent = paused ? '繼續' : '暫停';
-  $('pauseResume').disabled = !running && !paused;
+  $('pauseResume').textContent = pausing ? '暫停中…' : paused ? '繼續' : '暫停';
+  $('pauseResume').disabled = pausing || (!running && !paused);
   $('stop').disabled = !running && !paused;
   $('closeWs').disabled = running;
 
@@ -1466,8 +1478,9 @@ $('setProject').onclick = () => openProject($('project').value).then(() => { $('
 $('stop').onclick = () => confirm('停止這件工作？\n\n• 成員馬上停下，未完成的工作卡標成失敗\n• 這件工作不能再按「繼續」，之後要用「▶ 接著處理」開新的一輪\n\n只是想晚點再做、保留進度，請按「暫停」。') && post('/api/stop', { ws: ws() });
 $('pauseResume').onclick = () => {
   const w = W();
+  if (pausePending.has(w?.project)) return;
   if (w?.run?.paused && w.run.extMod && !confirm('偵測到來源不明的修改：' + w.run.extMod.why + '\n\nStudio 什麼都沒有動。要確認接手並繼續嗎？')) return;
-  return post(w?.run?.paused ? '/api/resume' : '/api/pause', { ws: ws(), confirmExternal: !!w?.run?.extMod });
+  return w?.run?.paused ? post('/api/resume', { ws: ws(), confirmExternal: !!w.run.extMod }) : pauseJob(ws());
 };
 $('renameWs').onclick = () => { const n = prompt('這個專案的顯示名稱（留空 = 用資料夾名稱）', W()?.name || ''); if (n !== null) post('/api/workspace/rename', { ws: ws(), name: n }); };
 $('closeWs').onclick = () => post('/api/workspace/close', { ws: ws() }).then(() => go(''));

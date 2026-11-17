@@ -13,6 +13,7 @@ async function run() {
   };
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
   const s = {
+    pausePending: new Set(),
     S: { agents: [], workspaces: [], runtimes: [] }, curPath: () => '/A', esc,
     laneFolded: () => false, cardBlockedReason: () => '', formatWorkspace: () => ({ fullLine: 'A' }),
     runtimesOf: () => [], askFlag: () => '', look: () => ({ c: '#fff' }), workState: () => null,

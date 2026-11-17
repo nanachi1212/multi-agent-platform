@@ -10,12 +10,19 @@ const options = [
   { id: 'reasoning_effort', category: 'thought_level', name: 'Effort', type: 'select', currentValue: 'low',
     options: [{ value: 'low', name: 'Low' }, { value: 'high', name: 'High' }] },
 ];
-let sessionId;
-setTimeout(() => process.exit(3), 180000).unref(); // bounded fixture lifetime even if the runner dies
+let sessionId, pending;
+const send = message => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
+const chunk = text => send({ method: 'session/update', params: { sessionId,
+  update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } } } });
+setTimeout(() => process.exit(3), 1800000).unref(); // also allows bounded interactive Studio lifecycle checks
 readline.createInterface({ input: process.stdin }).on('close', () => process.exit(0)).on('line', line => {
   const request = JSON.parse(line);
   fs.appendFileSync(audit, JSON.stringify({ pid: process.pid, parentPid: process.ppid, method: request.method, configId: request.params?.configId,
     ...(request.method === 'initialize' ? { executable: process.execPath, args: process.argv.slice(3) } : {}) }) + '\n');
+  if (request.method === 'session/cancel' && request.params?.sessionId === sessionId && pending != null) {
+    send({ id: pending, result: { stopReason: 'cancelled' } });
+    pending = undefined;
+  }
   if (request.id == null) return;
   let result, error;
   if (request.method === 'initialize') result = { protocolVersion: 1, agentCapabilities: {}, authMethods: [], agentInfo: { name: 'studio-contract', version: '1' } };
@@ -28,6 +35,21 @@ readline.createInterface({ input: process.stdin }).on('close', () => process.exi
       option.currentValue = request.params.value;
       result = { configOptions: options };
     } else error = { code: -32602, message: 'Invalid fixture config option' };
+  } else if (request.method === 'session/prompt' && request.params.sessionId === sessionId) {
+    const prompt = request.params.prompt.filter(x => x.type === 'text').map(x => x.text).join('\n');
+    if (pending != null) error = { code: -32600, message: 'Fixture turn already running' };
+    else if (prompt.includes('Reply with exactly: OK')) { chunk('OK'); result = { stopReason: 'end_turn' }; }
+    else if (prompt.includes('STUDIO_LIFECYCLE') && prompt.includes('Workers you can assign:')) {
+      const agent = prompt.match(/Workers you can assign: ([^\s,]+)/)[1];
+      chunk(JSON.stringify({ message: '開始本機 ACP 生命週期測試。', subtasks: [{ title: 'ACP 暫停與停止測試',
+        agent, instructions: 'STUDIO_LIFECYCLE: wait for cancellation; do not modify any files.',
+        after: [], writes: false, role: 'build' }] }));
+      result = { stopReason: 'end_turn' };
+    } else if (prompt.includes('STUDIO_LIFECYCLE')) {
+      chunk('STUDIO_LIFECYCLE: 工作已開始，等待使用者暫停或停止。');
+      pending = request.id;
+      return;
+    } else error = { code: -32602, message: 'Unsupported fixture prompt' };
   } else error = { code: -32601, message: 'Unsupported fixture method: ' + request.method };
-  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, ...(error ? { error } : { result }) }) + '\n');
+  send({ id: request.id, ...(error ? { error } : { result }) });
 });

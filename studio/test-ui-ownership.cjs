@@ -14,6 +14,7 @@ module.exports = async function () {
   const sandbox = {
     console,
     S: { workspaces: [], agents: [], runtimes: [] },
+    pausePending: new Set(),
     STEP_WORD: { WAITING: '待做', WORKING: '工作中', DONE: '已完成', PAUSED: '已暫停', INTERRUPTED: '已中斷', FAILED: '失敗', WAITING_EXTERNAL: '等待外部結果', WAITING_AGENT: '等待其他 AI', NEEDS_USER: '需要 Nana' },
     PARKED: ['WAITING_EXTERNAL', 'WAITING_AGENT', 'NEEDS_USER'], stepsOpen: true,
     ICON: { DONE: '✅', WORKING: '⏳', WAITING: '🕒', PAUSED: '⏸️' },
@@ -46,7 +47,8 @@ module.exports = async function () {
     'attention',
     'askFlag',
     'boardHtml',
-    'projCardHtml'
+    'projCardHtml',
+    'doneDropHtml'
   ];
 
   vm.runInNewContext(html.match(/^const LANES = .*$/m)[0].replace('const ', 'globalThis.'), sandbox); // the page's own lanes, not a copy
@@ -116,6 +118,12 @@ module.exports = async function () {
   assert.ok(wsFmt.fullLine.includes('Readers: —'), 'fullLine includes readers');
   assert.ok(wsFmt.fullLine.includes('branch: feat/auto-watch-v1'), 'fullLine includes branch');
   assert.ok(wsFmt.fullLine.includes('lease: ACTIVE'), 'fullLine includes lease status');
+  const readOnly = { id: 'read-card', writes: false };
+  const reading = { lease: { readers: [{ cardId: readOnly.id, owner: 'ACP worker' }] } };
+  assert.equal(sandbox.formatWorkspace(reading, readOnly).leaseStatus, 'READ');
+  assert.equal(sandbox.formatWorkspace(reading).leaseStatus, 'READ', 'project reflects its active reader');
+  assert.equal(sandbox.formatWorkspace(reading, { ...readOnly, id: 'other-card' }).leaseStatus, 'FREE', 'another card owns the read lease');
+  assert.equal(sandbox.formatWorkspace({ lease: { readers: [] } }, readOnly).leaseStatus, 'FREE', 'Stop released the read lease');
 
   // Test boardHtml (Card rendering)
   sandbox.S.workspaces = [wsMock];
@@ -152,6 +160,12 @@ module.exports = async function () {
   assert.ok(boardResult.includes('🚫 Blocked：workspace currently owned by Claude'), 'Card must display specific blocked reason');
   assert.ok(boardResult.includes('Blocked</span>'), 'Blocked card must have Blocked tag');
 
+  const resumed = [{ id: 'resume-card', title: 'Resumed work', status: 'WORKING', result: '已暫停' }];
+  assert.ok(!sandbox.boardHtml(resumed, [], false).includes('已暫停'), 'running card does not display the previous pause result');
+  sandbox.doneOpen = true;
+  const resumedSummary = sandbox.doneDropHtml({ tasks: resumed });
+  assert.ok(resumedSummary.includes('正在做…') && !resumedSummary.includes('已暫停'), 'work summary prioritizes the current running state');
+
   // Test projCardHtml (Project rendering)
   const projResult = sandbox.projCardHtml(wsMock);
   assert.ok(projResult.includes('<b>Workspace</b>'), 'Project card must display Workspace');
@@ -164,6 +178,10 @@ module.exports = async function () {
     const nowResult = sandbox.nowHtml(wsMock, { ic: '🟢', cls: 'ok', text: '工作中' });
     assert.ok(nowResult.includes('<dt>Workspace</dt>'), 'nowHtml (Job) must display Workspace');
     assert.ok(nowResult.includes('<dt>Runtime</dt>'), 'nowHtml (Job) must display Runtime');
+    sandbox.pausePending.add(wsMock.project);
+    const pausing = sandbox.nowHtml({ ...wsMock, tasks: [], run: { ...wsMock.run, active: false, paused: true } }, { ic: '⏸️', cls: '', text: '暫停中' });
+    assert.ok(pausing.includes('正在確認成員與工具程序停止') && !pausing.includes('data-resume-job'), 'resume is unavailable while Pause is still draining');
+    sandbox.pausePending.clear();
   }
 
   // 2. Verify server.mjs /api/state response mapping
