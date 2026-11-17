@@ -19,6 +19,18 @@ jobs:
         shell: pwsh
         run: .\scripts\ci.ps1 -Mode Auto
 
+  aion-contract:
+    name: AionCore contract (no models)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verify the pinned backend and ACP contract
+        run: node studio/test-aion-contract.mjs
+
   w1-managed-spawn:
     name: W1 managed-spawn partial fix (no models)
     runs-on: windows-latest

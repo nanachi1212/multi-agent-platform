@@ -21,11 +21,11 @@ assert.ok(/http:\/\/127\.0\.0\.1:\$\{PORT\}\/#t=\$\{API_TOKEN\}/.test(src), 'Stu
 assert.ok(src.includes('x-studio-token: ${cardToken(t.id)}'), 'workers are told their card pass');
 
 // AionCore runs with its login on: no --local, a fresh password each start, and every call / the WebSocket carry the session
-const aionStart = src.slice(src.indexOf('async function startAion'), src.indexOf('async function api('));
+const aionStart = src.slice(src.indexOf('async function startAion'), src.indexOf('const convAgent'));
 assert.ok(!aionStart.includes("'--local'"), 'AionCore is not started in --local (no login) mode');
-assert.ok(/'user', 'set-password', '--password-stdin'/.test(aionStart) && /aionAuth = await aionLogin\(pass\)/.test(aionStart), 'Studio sets a new password and logs in');
-assert.ok(/headers: \{ 'content-type': 'application\/json', \.\.\.aionAuth \}/.test(src), 'every AionCore call carries the login and CSRF headers');
-assert.ok(src.includes("'/ws', { headers: { authorization: aionAuth.authorization } })"), 'the catalog WebSocket logs in too');
+assert.ok(/'user', 'set-password', '--password-stdin'/.test(aionStart) && /await aion.login\(pass\)/.test(aionStart), 'Studio sets a new password and logs in');
+assert.ok(src.includes('const api = aion.api;'), 'all calls use the directly tested authenticated client');
+assert.ok(src.includes("'/ws', { headers: { authorization: aion.authHeaders().authorization } })"), 'the catalog WebSocket logs in too');
 
 // the page keeps the pass from #t= and sends it with /api calls only
 const html = process.env.API_TOKEN_HTML ?? fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');

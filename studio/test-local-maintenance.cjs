@@ -113,10 +113,9 @@ const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
     console.log('Integration: custom ACP registration preserves argv; history row index stays bounded with cached records: PASS');
 
     if (process.argv[2]) { // optional local smoke with the real pinned release; never starts a model or reads credentials
-      const pinned = name => src.match(new RegExp('const ' + name + " = '([^']+)'"))[1];
+      const { AION_RELEASE } = await import('./aion-client.mjs');
       const official = path.join(root, 'official', 'aioncore.exe');
-      await ensureVerifiedExecutable({ target: official, url: pinned('AION_URL'), cachedArchive: path.resolve(process.argv[2]),
-        archiveHash: pinned('AION_ZIP_SHA256'), executableHash: pinned('AION_EXE_SHA256') }, noNetwork);
+      await ensureVerifiedExecutable({ target: official, ...AION_RELEASE, cachedArchive: path.resolve(process.argv[2]) }, noNetwork);
       const version = execFileSync(official, ['--version'], { windowsHide: true, encoding: 'utf8', timeout: 15000 });
       assert.match(version, /0\.2\.2/);
       console.log('Official AionCore: pinned ZIP/executable hashes, actual staging install and --version 0.2.2: PASS');

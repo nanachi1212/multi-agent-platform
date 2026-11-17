@@ -136,6 +136,7 @@ const path = require('node:path');
   console.log('isPidAlive: one conservative implementation: PASS');
 
   // AionCore ending by itself after ready is logged once and shown on the seats; Studio closing is not reported.
+  const { createAionClient } = await import('./aion-client.mjs');
   const aionSrc = server.slice(server.indexOf('let aionProcess, aionGone'), server.indexOf('const codexRuntime'));
   for (const closing of [false, true]) {
     const events = [], errors = [], agents = { codex: { status: 'available', note: '' } }, realError = console.error;
@@ -143,12 +144,18 @@ const path = require('node:path');
     try {
       const env = new Function('S', 'event', aionSrc + (closing ? 'aionClosing = true;' : '') + 'return { aionExited, gone: () => aionGone };')({ agents }, (t, d) => events.push(t));
       env.aionExited(3, null); env.aionExited(3, null);
+      let requests = 0;
+      const client = createAionClient({ baseUrl: () => 'http://fixture', unavailable: env.gone,
+        fetchImpl: async () => { requests++; return { ok: true, json: async () => ({ data: 'ok' }) }; } });
+      if (closing) assert.equal(await client.api('GET', '/probe'), 'ok');
+      else await assert.rejects(client.api('GET', '/probe'), /AionCore 已停止/);
+      assert.equal(requests, closing ? 1 : 0, 'actual client observes the server exit state');
       assert.equal(events.length, closing ? 0 : 1); assert.equal(errors.length, closing ? 0 : 1);
       assert.equal(agents.codex.status, closing ? 'available' : 'unavailable');
       if (!closing) { assert.match(agents.codex.note, /AionCore 已停止，請重新啟動 Studio/); assert.match(errors[0], /exit code 3/); }
     } finally { console.error = realError; }
   }
   assert.match(server, /p\.on\('exit', \(c, sig\) => \(BASE \? aionExited\(c, sig\)/, 'exit after ready goes to aionExited');
-  assert.match(server, /async function api\(method, p, body\) \{\r?\n  if \(aionGone\) throw new Error\(aionGone\);/);
+  assert.ok(server.includes('unavailable: () => aionGone'), 'server wires its exit state into the client');
   console.log('AionCore exit after ready is reported, Studio shutdown is not: PASS');
 })().catch(error => { console.error(error); process.exitCode = 1; });

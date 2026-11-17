@@ -2,6 +2,7 @@
 // Run: node studio/server.mjs   (or start-studio.cmd)
 import http from 'node:http';
 import { applyTurnModel, updateModelCatalog } from './live-models.mjs';
+import { AION_RELEASE, createAionClient } from './aion-client.mjs';
 import { createWorkspaceLeaseStore } from './workspace-lease.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -22,9 +23,6 @@ const RT = process.env.STUDIO_RUNTIME ? path.resolve(process.env.STUDIO_RUNTIME)
 const releaseInstance = await claimRuntime(RT); // before reading or writing shared state or launching any child
 process.on('exit', () => { try { releaseInstance(); } catch (e) { console.error('Studio runtime 解鎖失敗：' + e.message); } });
 const AION = path.join(ROOT, 'runtime', 'aioncore', 'aioncore.exe');
-const AION_URL = 'https://github.com/iOfficeAI/AionCore/releases/download/v0.2.2/aioncore-v0.2.2-x86_64-pc-windows-msvc.zip';
-const AION_ZIP_SHA256 = 'd1ed8d1da869230c18701747d07e8f068db5b8c9442e65261304aeb4c27eacf6';
-const AION_EXE_SHA256 = '67eb02774bab3855b759ec9756c2e540cd17b64b850407fa4b8bad07fd8a0892'; // executable inside the pinned, verified ZIP
 let PORT = Number(process.env.STUDIO_PORT || 4848); // moves up when the port is taken (see server.listen)
 // API pass (security F2/F3): any local program can reach 127.0.0.1, so /api needs this secret. It lives only in memory and is new
 // at every start (the runtime folder is readable by other accounts, e.g. the Codex sandbox users); the browser gets it in the URL
@@ -227,12 +225,13 @@ function event(type, data = {}) {
 
 // ---------- AionCore ----------
 let BASE;
+const aion = createAionClient({ baseUrl: () => BASE, unavailable: () => aionGone });
+const api = aion.api;
 
 async function ensureAion() {
-  const result = await ensureVerifiedExecutable({ target: AION, url: AION_URL,
-    archiveHash: AION_ZIP_SHA256, executableHash: AION_EXE_SHA256,
-    cachedArchive: path.join(ROOT, 'runtime', 'download', 'aioncore-v0.2.2-x86_64-pc-windows-msvc.zip') });
-  if (result.installed) console.log('AionCore v0.2.2 已驗證並安裝' + (result.backup ? '；原檔備份：' + result.backup : ''));
+  const result = await ensureVerifiedExecutable({ target: AION, ...AION_RELEASE,
+    cachedArchive: path.join(ROOT, 'runtime', 'download', AION_RELEASE.archive) });
+  if (result.installed) console.log(`AionCore v${AION_RELEASE.version} 已驗證並安裝` + (result.backup ? '；原檔備份：' + result.backup : ''));
 }
 
 let aionProcess, aionGone = '', aionClosing = false;
@@ -289,30 +288,7 @@ async function startAion() {
       if (m && /AIONCORE_READY/.test(buf)) { BASE = 'http://127.0.0.1:' + m[1]; res(); }
     });
   });
-  aionAuth = await aionLogin(pass);
-}
-// Bearer token for every call; writes also need the CSRF cookie echoed in a header.
-let aionAuth = {};
-async function aionLogin(password) {
-  const r = await fetch(BASE + '/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'admin', password }), signal: AbortSignal.timeout(API_TIMEOUT_MS) });
-  const j = await r.json().catch(() => ({}));
-  const csrf = r.headers.getSetCookie().map((c) => c.split(';')[0]).find((c) => c.startsWith('aionui-csrf-token='))?.slice('aionui-csrf-token='.length);
-  if (!r.ok || !j.token || !csrf) throw new Error('AionCore 登入失敗：' + r.status);
-  return { authorization: 'Bearer ' + j.token, cookie: 'aionui-csrf-token=' + csrf, 'x-csrf-token': csrf };
-}
-
-// Every AionCore call answers promptly (turns are polled, not awaited); the slowest seen in the spikes was ~8 s (create).
-const API_TIMEOUT_MS = 30e3;
-async function api(method, p, body) {
-  if (aionGone) throw new Error(aionGone);
-  const signal = AbortSignal.timeout(API_TIMEOUT_MS);
-  // AionCore may still act on a request it never answered: the stop is unconfirmed, so the write lease stays.
-  const timedOut = () => Object.assign(new Error(`AionCore ${method} ${p} 逾時：${API_TIMEOUT_MS / 1000} 秒沒有回應`), { stopUnconfirmed: true });
-  const r = await fetch(BASE + p, { method, headers: { 'content-type': 'application/json', ...aionAuth }, body: body && JSON.stringify(body), signal })
-    .catch((e) => { throw signal.aborted ? timedOut() : e; });
-  const j = await r.json().catch(() => { if (signal.aborted) throw timedOut(); return {}; });
-  if (!r.ok || j.success === false) throw new Error(`AionCore ${method} ${p} → ${r.status} ${JSON.stringify(j).slice(0, 300)}`);
-  return j.data;
+  await aion.login(pass);
 }
 
 const convAgent = new Map(); // conversationId -> agent id (to route catalog events)
@@ -345,7 +321,7 @@ async function createAgentConv(agent, ws, lead, cfg) {
 
 // AionCore pushes each agent's model / effort catalog as `acp_config_option` events on its WebSocket.
 function watchCatalogs() {
-  const ws = new WebSocket(BASE.replace('http', 'ws') + '/ws', { headers: { authorization: aionAuth.authorization } });
+  const ws = new WebSocket(BASE.replace('http', 'ws') + '/ws', { headers: { authorization: aion.authHeaders().authorization } });
   ws.onmessage = (e) => {
     let d;
     try { d = JSON.parse(e.data).data; } catch { return; }

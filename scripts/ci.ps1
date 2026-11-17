@@ -4,6 +4,12 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Push-Location -LiteralPath $repoRoot
 try {
+    foreach ($file in @('studio/aion-client.mjs', 'studio/test-aion-client.cjs', 'studio/test-aion-contract.mjs', 'studio/fixtures/contract-acp.cjs')) {
+        & node --check $file
+        if ($LASTEXITCODE -ne 0) { throw "AionCore contract syntax failed: $file" }
+    }
+    & node studio/test-aion-client.cjs
+    if ($LASTEXITCODE -ne 0) { throw 'AionCore client checks failed' }
     foreach ($file in @('studio/live-models.mjs', 'studio/server.mjs', 'studio/state-files.mjs', 'studio/test-state-files.cjs', 'studio/test-cleanup.cjs', 'studio/test-card-files.cjs', 'studio/test-turn-stall.cjs', 'studio/test-codex-provider.cjs', 'studio/workspace-lease.mjs', 'studio/lifecycle-harness.cjs', 'studio/test-workspace-lease.cjs', 'studio/runtime-registry.mjs', 'studio/isolated-env.mjs', 'studio/runtime-readiness.mjs', 'studio/test-runtime.cjs', 'studio/test-runtime-server.cjs', 'studio/test-ui-ownership.cjs', 'studio/lifecycle-check.cjs')) {
         & node --check $file
         if ($LASTEXITCODE -ne 0) { throw "Syntax check failed: $file" }
