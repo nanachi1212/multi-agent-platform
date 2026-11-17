@@ -17,7 +17,20 @@
 
 第二層在 GitHub 的 **AionCore contract (no models)** job 執行；不放進一般離線 CI 腳本，避免每次本機回歸都必須下載後端。下載、hash、平台或契約失敗都會讓 gate 失敗，不會略過後宣稱通過。
 
-執行檔快取在 `runtime/contract-aioncore/`，不替換正式 Studio 執行檔。測試 data／work／home 皆在專用暫存目錄，環境只繼承啟動所需系統變數；不繼承供應商 keys、使用者 Codex home 或規則檔。fixture 不呼叫模型、網路或工具；記錄所收方法並斷言沒有 prompt。結束核對程序身分、清理程序樹，再刪除測試目錄。測試包含 `Agent 中文 Tools/contract agent.exe` 與同名 `.cmd`／`.bat` wrapper，驗證新增探測及實際對話使用完整路徑、支援的參數原樣傳遞。批次檔另外核對 launcher → cmd.exe → Agent 的程序歸屬，以及探測後、後端關閉後皆無殘留。
+執行檔快取在 `runtime/contract-aioncore/`，不替換正式 Studio 執行檔。測試 data／work／home 皆在專用暫存目錄，環境只繼承啟動所需系統變數；不繼承供應商 keys、使用者 Codex home 或規則檔。fixture 不呼叫真實模型、網路或工具；以本機回覆驗證 `session/prompt`、`session/cancel`、取消後回到 idle，以及同一 session 再次接受工作。結束核對程序身分、清理程序樹，再刪除測試目錄。測試包含 `Agent 中文 Tools/contract agent.exe` 與同名 `.cmd`／`.bat` wrapper，驗證新增探測及實際對話使用完整路徑、支援的參數原樣傳遞。批次檔另外核對 launcher → cmd.exe → Agent 的程序歸屬，以及探測後、後端關閉後皆無殘留。
+
+## 真實 Agent 介面驗收（2026-11-17）
+
+在 Windows 的正式 Studio／固定版 AionCore 上，沿用既有 Claude 帳號與 Studio 專用 Codex 的 ChatGPT 登入；未重新登入或複製憑證。以 `STUDIO_RUNTIME` 隔離設定與工作紀錄，`STUDIO_CODEX_HOME` 指向原本已登入的 Studio 目錄，測試專案與正式專案分開。
+
+| 真實 Worker | 工頭 | 連線、開始工作 | 暫停 | 恢復 | 停止 |
+| --- | --- | --- | --- | --- | --- |
+| Codex | Claude Code | PASS | PASS | PASS | PASS |
+| Claude Code | Codex | PASS | PASS | PASS | PASS |
+
+所有操作由 Studio 介面觸發。Worker 實際執行每秒寫入 heartbeat、90 秒內自行結束的 Node 命令；核對 UI 與後端狀態、程序 PID／建立時間及 heartbeat，並非只看畫面文字。暫停後工具程序結束、heartbeat 不再增加、寫入租約為 `RESERVED`；恢復沿用同一工作與卡片，啟動新工具程序且 heartbeat 繼續增加；停止後工作卡記為「已停止」、無未確認停止旗標、工具程序消失且租約釋放。原專案未產生程式變更，四份既有自訂／全域規則檔的 SHA-256 前後一致。
+
+驗收須明確要求 Agent 等待前景命令完成：Codex 若取得執行中工具的 session ID，持續以 `write_stdin` 等待；Claude 使用前景 Bash，若取得背景 task 則持續查詢它。首次 Codex 嘗試提早回報 `WAITING_EXTERNAL`，因此不算「執行中暫停」通過；補明等待要求後重新驗收通過，未為此改動 Studio 排程或取消邏輯。這是特定日期、既有登入與受控本機命令的實測，不代表所有工具、供應商版本或模型行為都已驗證；W1／Store／MSIX pwsh 程序隔離仍不在範圍內。
 
 ## 驗證邊界與固定版本限制
 
