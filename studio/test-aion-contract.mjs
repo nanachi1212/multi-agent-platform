@@ -6,9 +6,10 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { AION_RELEASE, createAionClient } from './aion-client.mjs';
+import { acpBackendCommand, withAcpLauncherPath } from './acp-command.mjs';
 import { ensureVerifiedExecutable } from './local-maintenance.mjs';
 import { applyTurnModel } from './live-models.mjs';
-import { getProcessInfo, killProcessTree } from './runtime-registry.mjs';
+import { getProcessInfo, killProcessTree, isPidAlive } from './runtime-registry.mjs';
 
 assert.equal(process.platform, 'win32', 'This gate tests the pinned Windows release; unsupported platforms must not report PASS.');
 const root = path.resolve(import.meta.dirname, '..');
@@ -19,10 +20,11 @@ const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-aion-contract-'));
 const data = path.join(temp, 'data'), work = path.join(temp, 'work 中文 space'), home = path.join(temp, 'home');
 for (const dir of [data, work, home]) fs.mkdirSync(dir);
 // Do not inherit provider keys, Codex home, global rules or the user's app data.
-const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => /^(path|systemroot|windir|temp|tmp|comspec|pathext)$/i.test(key)));
+const env = withAcpLauncherPath(Object.fromEntries(Object.entries(process.env).filter(([key]) => /^(path|systemroot|windir|temp|tmp|comspec|pathext)$/i.test(key))));
 Object.assign(env, { USERPROFILE: home, HOME: home, APPDATA: path.join(home, 'AppData', 'Roaming'),
   LOCALAPPDATA: path.join(home, 'AppData', 'Local'), CODEX_HOME: path.join(home, '.codex') });
 let child, identity, base, output = '';
+const fixturePids = new Set();
 try {
   const password = crypto.randomBytes(24).toString('hex');
   await new Promise((resolve, reject) => {
@@ -50,10 +52,14 @@ try {
   await client.login(password);
   const { api } = client;
   const audit = path.join(temp, 'acp audit.jsonl');
-  // v0.2.2's probe splits command on whitespace and special-cases bare "node" as
-  // its managed runtime. "node.exe" uses PATH lookup (node_runtime/mod.rs).
-  const agent = await api('POST', '/api/agents/custom', { name: 'Studio contract fixture', command: 'node.exe',
-    args: [path.join(import.meta.dirname, 'fixtures', 'contract-acp.cjs'), audit] });
+  const agentExe = path.join(temp, 'Agent 中文 Tools', 'contract agent.exe');
+  fs.mkdirSync(path.dirname(agentExe));
+  fs.copyFileSync(process.execPath, agentExe);
+  const literalArgs = ['', 'a b', 'say "hi"', 'C:\\Agent Data\\', '& | > %PATH% $HOME'];
+  const agentArgs = [path.join(import.meta.dirname, 'fixtures', 'contract-acp.cjs'), audit, ...literalArgs];
+  await assert.rejects(api('POST', '/api/agents/custom', { name: 'Raw path regression', command: agentExe, args: agentArgs }), /cli_not_found/,
+    'pinned upstream truncates the unadapted executable path');
+  const agent = await api('POST', '/api/agents/custom', { name: 'Studio contract fixture', ...acpBackendCommand(agentExe, agentArgs) });
   assert.equal(typeof agent.id, 'string');
   const conversation = await api('POST', '/api/conversations', { type: 'acp', name: 'Contract test', extra: { agent_id: agent.id, workspace: work } });
   assert.equal(typeof conversation.id, 'string');
@@ -66,9 +72,20 @@ try {
   assert.equal(first.runtime.has_task, true);
   assert.equal(first.config_options.find(x => x.category === 'model').current_value, 'contract-small');
   assert.equal(first.config_options.find(x => x.category === 'thought_level').current_value, 'low');
-  const readAudit = () => fs.readFileSync(audit, 'utf8').trim().split('\n').map(JSON.parse);
+  const readAudit = () => fs.readFileSync(audit, 'utf8').trim().split('\n').map(line => {
+    const event = JSON.parse(line); fixturePids.add(event.pid); fixturePids.add(event.parentPid); return event;
+  });
   const sessionsBefore = readAudit().filter(x => x.method === 'session/new').length;
   assert.equal(sessionsBefore, 2, 'one registration probe plus one live conversation');
+  const starts = readAudit().filter(x => x.method === 'initialize');
+  assert.equal(starts.length, 2);
+  for (const start of starts) {
+    assert.equal(start.executable.toLowerCase(), agentExe.toLowerCase(), 'probe and live runtime launch the exact executable with spaces');
+    assert.deepEqual(start.args, literalArgs, 'argv survives without shell expansion, including empty arguments and quotes');
+  }
+  assert.equal(isPidAlive(starts[0].pid), false, 'registration probe leaves no target process');
+  assert.equal(isPidAlive(starts[0].parentPid), false, 'registration probe leaves no launcher process');
+  assert.equal(isPidAlive(starts[1].pid), true, 'live executable is running');
   await assert.rejects(api('GET', route + '/config-options'), /404/, 'removed route must not be mocked as successful');
   const catalog = {};
   await applyTurnModel(api, conversation.id, { model: 'contract-large', effort: 'high' }, catalog);
@@ -82,7 +99,7 @@ try {
   assert.equal(events.filter(x => x.method === 'session/new').length, sessionsBefore, 'configuration does not restart the session');
   assert.deepEqual(events.filter(x => x.method === 'session/set_config_option').map(x => x.configId), ['model', 'reasoning_effort']);
   assert.ok(events.every(x => ['initialize', 'session/new', 'session/set_config_option'].includes(x.method)), 'no model prompt, tools or authentication requests');
-  console.log(`AionCore ${AION_RELEASE.version} contract: real auth/CSRF, custom ACP, runtime snapshot, removed GET, confirmed model/effort and session reuse: PASS`);
+  console.log(`AionCore ${AION_RELEASE.version} contract: executable path/name with spaces, literal argv, real auth/CSRF, custom ACP, runtime snapshot, removed GET, confirmed model/effort and session reuse: PASS`);
 } catch (error) {
   // No credentials or protocol bodies are printed. Backend startup output is diagnostic only.
   console.error('Contract failure:', error.message);
@@ -92,6 +109,7 @@ try {
   if (child?.pid) {
     const cleaned = await killProcessTree(child.pid, undefined, identity);
     assert.equal(cleaned.ok, true, 'fixture process tree must be fully stopped');
+    for (const pid of fixturePids) assert.equal(isPidAlive(pid), false, 'fixture launcher/target must be stopped: ' + pid);
     console.log('AionCore contract fixture process cleanup: PASS');
   }
   fs.rmSync(temp, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });

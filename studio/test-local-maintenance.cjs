@@ -1,10 +1,11 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os'), crypto = require('node:crypto');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawnSync } = require('node:child_process');
 const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 
 (async () => {
   const { syncRulesFile, ensureVerifiedExecutable, appendRotatingEvent, parseAcpArgs } = await import('./local-maintenance.mjs');
+  const { acpBackendCommand, withAcpLauncherPath } = await import('./acp-command.mjs');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-maintenance-'));
   try {
     const source = path.join(root, 'user-rules.md'), target = path.join(root, 'home', 'AGENTS.md');
@@ -83,6 +84,28 @@ const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
     assert.deepEqual(JSON.parse(received), argv, 'actual child process receives exact argv including spaces and empty arguments');
     console.log('ACP arguments: quoted paths, backslashes, empty args, JSON arrays, malformed input and real child argv: PASS');
 
+    assert.deepEqual(acpBackendCommand('opencode', ['acp']), { command: 'opencode', args: ['acp'] }, 'simple commands retain existing backend handling');
+    for (const bad of ['node --acp', 'C:\\Agent Tools\\run.cmd', 'C:\\Agent Tools\\run.bat', '"agent.exe" --acp', 'a\0b']) {
+      assert.throws(() => acpBackendCommand(bad, []));
+    }
+    const originalEnv = { Path: 'original-path', KEEP: 'yes' }, launchEnv = withAcpLauncherPath(originalEnv);
+    assert.equal(launchEnv.Path, path.dirname(process.execPath) + path.delimiter + 'original-path');
+    assert.equal(launchEnv.KEEP, 'yes'); assert.equal(originalEnv.Path, 'original-path');
+    assert.equal(Object.keys(launchEnv).filter(key => key.toLowerCase() === 'path').length, 1);
+    const launcher = path.join(__dirname, 'acp-launcher.cjs');
+    const exactArgs = ['', 'a b', 'say "hi"', 'C:\\Agent Data\\', '& | > %PATH% $HOME'];
+    const childCode = `let input=''; process.stdin.on('data', chunk => input+=chunk).on('end', () => {
+      process.stdout.write(JSON.stringify({input,args:process.argv.slice(1),cwd:process.cwd(),env:process.env.ACP_TEST}));
+      process.stderr.write('fixture stderr'); process.exitCode=23;
+    });`;
+    const launched = spawnSync(process.execPath, [launcher, process.execPath, '-e', childCode, '--', ...exactArgs],
+      { input: 'ACP input\n', encoding: 'utf8', cwd: root, env: { ...process.env, ACP_TEST: 'inherited' }, windowsHide: true, timeout: 10000 });
+    assert.ifError(launched.error); assert.equal(launched.status, 23); assert.equal(launched.stderr, 'fixture stderr');
+    assert.deepEqual(JSON.parse(launched.stdout), { input: 'ACP input\n', args: exactArgs, cwd: root, env: 'inherited' });
+    const missing = spawnSync(process.execPath, [launcher, path.join(root, 'missing agent.exe')], { encoding: 'utf8', windowsHide: true, timeout: 10000 });
+    assert.ifError(missing.error); assert.equal(missing.status, 127); assert.equal(missing.stdout, ''); assert.match(missing.stderr, /ENOENT/);
+    console.log('ACP launcher: literal argv, stdio, cwd/env, exit status, missing executable and command validation: PASS');
+
     const src = fs.readFileSync(path.join(__dirname, 'server.mjs'), 'utf8').replace(/\r\n/g, '\n');
     const body = src.match(/function pruneConversations\(\) \{[\s\S]*?\n\}/)[0];
     const convAgent = new Map([['paused', 'codex'], ['working', 'claude']]);
@@ -97,11 +120,14 @@ const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 
     const registration = [], acpState = { acp: [], workspaces: [] };
     const addCode = src.slice(src.indexOf('async function addAcp('), src.indexOf('async function deleteAcp('));
-    const add = new Function('S', 'crypto', 'parseAcpArgs', 'api', 'registerAcp', 'saveSettings', 'checkAgent', addCode + '; return addAcp;')(
-      acpState, crypto, parseAcpArgs, async (method, route, body) => { registration.push(body); return { id: 'agent' }; }, () => {}, () => {}, () => {});
+    const add = new Function('S', 'crypto', 'parseAcpArgs', 'acpBackendCommand', 'api', 'registerAcp', 'saveSettings', 'checkAgent', addCode + '; return addAcp;')(
+      acpState, crypto, parseAcpArgs, acpBackendCommand, async (method, route, body) => { registration.push(body); return { id: 'agent' }; }, () => {}, () => {}, () => {});
     await add({ name: 'custom', command: '"C:\\My Agent\\agent.exe"', args: '--config "C:\\My Agent\\config.json" ""' });
-    assert.deepEqual(registration[0], { name: 'custom', command: 'C:\\My Agent\\agent.exe', args: ['--config', 'C:\\My Agent\\config.json', ''] });
+    assert.deepEqual(registration[0], { name: 'custom', command: 'node.exe', args: [path.join(__dirname, 'acp-launcher.cjs'), 'C:\\My Agent\\agent.exe', '--config', 'C:\\My Agent\\config.json', ''] });
+    assert.equal(acpState.acp[0].command, 'C:\\My Agent\\agent.exe', 'settings retain the user executable, not the launcher');
+    assert.deepEqual(acpState.acp[0].args, ['--config', 'C:\\My Agent\\config.json', '']);
     await assert.rejects(add({ name: 'invalid', command: 'agent.exe', args: '"unclosed' }), /雙引號/);
+    await assert.rejects(add({ name: 'invalid', command: 'node --acp', args: '' }), /完整路徑/);
     assert.equal(registration.length, 1, 'invalid argv is rejected before registering an external agent');
 
     const cacheCode = src.slice(src.indexOf('// ponytail: reads the newest 200'), src.indexOf('function historyItems()'));

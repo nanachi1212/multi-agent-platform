@@ -14,7 +14,8 @@ let sessionId;
 setTimeout(() => process.exit(3), 180000).unref(); // bounded fixture lifetime even if the runner dies
 readline.createInterface({ input: process.stdin }).on('close', () => process.exit(0)).on('line', line => {
   const request = JSON.parse(line);
-  fs.appendFileSync(audit, JSON.stringify({ pid: process.pid, method: request.method, configId: request.params?.configId }) + '\n');
+  fs.appendFileSync(audit, JSON.stringify({ pid: process.pid, parentPid: process.ppid, method: request.method, configId: request.params?.configId,
+    ...(request.method === 'initialize' ? { executable: process.execPath, args: process.argv.slice(3) } : {}) }) + '\n');
   if (request.id == null) return;
   let result, error;
   if (request.method === 'initialize') result = { protocolVersion: 1, agentCapabilities: {}, authMethods: [], agentInfo: { name: 'studio-contract', version: '1' } };

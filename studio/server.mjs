@@ -3,6 +3,7 @@
 import http from 'node:http';
 import { applyTurnModel, updateModelCatalog } from './live-models.mjs';
 import { AION_RELEASE, createAionClient } from './aion-client.mjs';
+import { acpBackendCommand, withAcpLauncherPath } from './acp-command.mjs';
 import { createWorkspaceLeaseStore } from './workspace-lease.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -261,7 +262,7 @@ async function startAion() {
     c.stdin.end(pass + '\n');
   });
   const args = ['--port', '0', '--data-dir', data, '--work-dir', work, '--managed-resources-mode', 'bundled', '--parent-pid', String(process.pid)];
-  const p = spawn(AION, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, CODEX_HOME } });
+  const p = spawn(AION, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], env: withAcpLauncherPath({ ...process.env, CODEX_HOME }) });
   if (p.pid) {
     aionProcess = await getProcessInfo(p.pid);
     registerRuntime({
@@ -686,7 +687,7 @@ async function addAcp(b) {
     const args = parseAcpArgs(b.args);
     if (!name) throw new Error('請填顯示名稱');
     if (!command) throw new Error('請填啟動指令（例如 opencode）');
-    const agentId = (await api('POST', '/api/agents/custom', { name, command, args })).id;
+    const agentId = (await api('POST', '/api/agents/custom', { name, ...acpBackendCommand(command, args) })).id;
     e = { id: 'acp_' + crypto.randomBytes(4).toString('hex'), name, backend: '', yolo: '', agentId, command, args };
   }
   S.acp.push(e);
