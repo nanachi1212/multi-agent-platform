@@ -23,7 +23,7 @@ for (const dir of [data, work, home]) fs.mkdirSync(dir);
 // Do not inherit provider keys, Codex home, global rules or the user's app data.
 const env = withAcpLauncherPath(Object.fromEntries(Object.entries(process.env).filter(([key]) => /^(path|systemroot|windir|temp|tmp|comspec|pathext)$/i.test(key))));
 Object.assign(env, { USERPROFILE: home, HOME: home, APPDATA: path.join(home, 'AppData', 'Roaming'),
-  LOCALAPPDATA: path.join(home, 'AppData', 'Local'), CODEX_HOME: path.join(home, '.codex') });
+  LOCALAPPDATA: path.join(home, 'AppData', 'Local'), CODEX_HOME: path.join(home, '.codex'), ACP_BATCH_VALUE: 'MUST_NOT_EXPAND' });
 let child, identity, base, output = '';
 const fixturePids = new Set();
 try {
@@ -105,9 +105,13 @@ try {
   for (const extension of ['cmd', 'bat']) {
     const batch = path.join(path.dirname(agentExe), 'contract agent.' + extension);
     // ASCII source; %~dp0 resolves the Unicode/spaced directory without code-page assumptions.
-    fs.writeFileSync(batch, '@echo off\r\nsetlocal EnableExtensions DisableDelayedExpansion\r\n"%~dp0contract agent.exe" %*\r\nexit /b %errorlevel%\r\n');
+    const direct = '@echo off\r\nsetlocal EnableExtensions DisableDelayedExpansion\r\n"%~dp0contract agent.exe" %*\r\nexit /b %errorlevel%\r\n';
+    const compound = '@echo off\r\nsetlocal EnableExtensions DisableDelayedExpansion\r\nset "dp0=%~dp0"\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%dp0%contract agent.exe" %*\r\n';
+    fs.writeFileSync(batch, extension === 'cmd' ? compound : direct);
     const batchAudit = path.join(temp, extension + ' audit.jsonl');
-    const expectedArgs = ['', 'a b', 'C:\\Agent Data\\', 'tail\\\\', '& echo BAD>injected.txt | < ^ ( )', '中文'];
+    const expectedArgs = ['', 'a b', 'C:\\Agent Data\\', 'tail\\\\', '& echo BAD>injected.txt | < ^ ( )', '中文',
+      'say "hi"', '%ACP_BATCH_VALUE%', '!ACP_BATCH_VALUE!', '100%', '{"name":"100% !literal!"}',
+      'x"&echo BAD>injected.txt&rem "', '"|echo BAD>injected2.txt&rem "', 'a' + '\\'.repeat(3) + '"b'];
     const batchArgs = [path.join(import.meta.dirname, 'fixtures', 'contract-acp.cjs'), batchAudit, ...expectedArgs];
     const custom = await api('POST', '/api/agents/custom', { name: 'Studio ' + extension + ' fixture', ...acpBackendCommand(batch, batchArgs) });
     const probeRows = await processSnapshot();
@@ -135,7 +139,8 @@ try {
     for (const row of [target, shell, launcher]) fixturePids.add(row.pid);
     assert.ok(batchEvents.every(event => ['initialize', 'session/new'].includes(event.method)), 'batch test invokes no models');
     assert.equal(fs.existsSync(path.join(work, 'injected.txt')), false);
-    console.log(`AionCore ${extension} contract: real registration, live ACP launch, exact argv and probe tree cleanup: PASS`);
+    assert.equal(fs.existsSync(path.join(work, 'injected2.txt')), false);
+    console.log(`AionCore ${extension} contract: real registration, live ACP launch, literal quotes/%/!, no injection and probe tree cleanup: PASS`);
   }
 } catch (error) {
   // No credentials or protocol bodies are printed. Backend startup output is diagnostic only.

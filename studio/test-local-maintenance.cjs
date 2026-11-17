@@ -106,20 +106,31 @@ const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
     assert.ifError(missing.error); assert.equal(missing.status, 127); assert.equal(missing.stdout, ''); assert.match(missing.stderr, /ENOENT/);
     console.log('ACP launcher: literal argv, stdio, cwd/env, exit status, missing executable and command validation: PASS');
 
-    const batchDir = path.join(root, 'Agent & (Tools)'); fs.mkdirSync(batchDir);
+    const batchDir = path.join(root, 'Agent & (Tools) %ACP_TEST% !ACP_TEST!'); fs.mkdirSync(batchDir);
     fs.writeFileSync(path.join(batchDir, 'echo.cjs'), childCode.replace('process.argv.slice(1)', 'process.argv.slice(2)'));
-    const batchArgs = ['', 'a b', 'C:\\Agent Data\\', 'tail\\\\', '--config=C:\\My Agent\\config.json', '& echo BAD>injected.txt | < ^ ( )', '中文\t參數'];
+    const batchArgs = ['', 'a b', 'C:\\Agent Data\\', 'tail\\\\', '--config=C:\\My Agent\\config.json', '& echo BAD>injected.txt | < ^ ( )', '中文\t參數',
+      'say "hi"', '%ACP_TEST%', '!ACP_TEST!', '%CD%', '%1', '%*', '%', '!', '100%', '{"name":"100% !literal!"}',
+      'x"&echo BAD>injected.txt&rem "', '"|echo BAD>injected2.txt &"', '^"&echo BAD>injected3.txt&rem "'];
+    for (let n = 0; n < 12; n++) batchArgs.push('a' + '\\'.repeat(n) + '"b', '\\'.repeat(n), 'a"' + '\\'.repeat(n), '"'.repeat(n));
+    const batchEnv = { ...process.env, ACP_TEST: 'inherited', ACP_TEST_NODE: process.execPath };
+    const pathKey = Object.keys(batchEnv).find(key => key.toLowerCase() === 'path');
+    batchEnv[pathKey] = batchDir + path.delimiter + batchEnv[pathKey];
     for (const extension of ['CMD', 'BAT']) {
       const batch = path.join(batchDir, 'agent wrapper.' + extension);
-      fs.writeFileSync(batch, '@echo off\r\nsetlocal EnableExtensions DisableDelayedExpansion\r\n"%ACP_TEST_NODE%" "%~dp0echo.cjs" %*\r\nexit /b %errorlevel%\r\n');
+      // Exercise both direct %* forwarding and the compound command used by npm shims.
+      const direct = '@echo off\r\nsetlocal EnableExtensions DisableDelayedExpansion\r\n"%ACP_TEST_NODE%" "%~dp0echo.cjs" %*\r\nexit /b %errorlevel%\r\n';
+      const compound = '@echo off\r\nsetlocal EnableExtensions DisableDelayedExpansion\r\nset "dp0=%~dp0"\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%ACP_TEST_NODE%" "%dp0%echo.cjs" %*\r\n';
+      fs.writeFileSync(batch, extension === 'CMD' ? compound : direct);
       const invocation = acpBackendCommand(batch, batchArgs);
       assert.equal(invocation.command, 'node.exe');
       const result = spawnSync(process.execPath, invocation.args, { input: 'ACP input\n', encoding: 'utf8', cwd: root,
-        env: { ...process.env, ACP_TEST: 'inherited', ACP_TEST_NODE: process.execPath }, windowsHide: true, timeout: 10000 });
+        env: batchEnv, windowsHide: true, timeout: 10000 });
       assert.ifError(result.error); assert.equal(result.status, 23, result.stderr); assert.equal(result.stderr, 'fixture stderr');
-      assert.deepEqual(JSON.parse(result.stdout), { input: 'ACP input\n', args: batchArgs, cwd: root, env: 'inherited' });
-      assert.equal(fs.existsSync(path.join(root, 'injected.txt')), false, 'shell syntax in an argument never runs');
-      const invalid = ['x"&echo BAD>injected.txt&rem "', '%PATH%', '!PATH!', 'line\nbreak', 'line\rbreak'];
+      const { cwd: batchCwd, ...received } = JSON.parse(result.stdout);
+      assert.equal(batchCwd.toLowerCase(), root.toLowerCase(), 'cmd.exe may canonicalize the Windows directory casing');
+      assert.deepEqual(received, { input: 'ACP input\n', args: batchArgs, env: 'inherited' });
+      for (const marker of ['injected.txt', 'injected2.txt', 'injected3.txt']) assert.equal(fs.existsSync(path.join(root, marker)), false, 'shell syntax in an argument never runs');
+      const invalid = ['line\nbreak', 'line\rbreak'];
       for (const argument of invalid) {
         assert.throws(() => acpBackendCommand(batch, [argument]), /批次檔/);
         const rejected = spawnSync(process.execPath, [launcher, batch, argument], { encoding: 'utf8', cwd: root, windowsHide: true, timeout: 10000 });
@@ -127,7 +138,13 @@ const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
       }
       assert.throws(() => acpBackendCommand(batch, ['x'.repeat(8001)]), /過長/);
     }
-    console.log('ACP batch launcher: .CMD/.BAT, spaced paths, literal metacharacters, stdio/exit, and unsafe-input rejection: PASS');
+    // A command found on PATH must use the same escaping even without spaces in its name.
+    fs.copyFileSync(path.join(batchDir, 'agent wrapper.BAT'), path.join(batchDir, 'agent.cmd'));
+    const fromPath = spawnSync(process.execPath, acpBackendCommand('agent.cmd', batchArgs).args,
+      { input: 'ACP input\n', encoding: 'utf8', cwd: root, env: batchEnv, windowsHide: true, timeout: 10000 });
+    assert.ifError(fromPath.error); assert.equal(fromPath.status, 23, fromPath.stderr);
+    assert.deepEqual(JSON.parse(fromPath.stdout).args, batchArgs);
+    console.log('ACP batch launcher: .CMD/.BAT and PATH shims, embedded quotes, literal %/!, slash runs, injection resistance, stdio/exit: PASS');
 
     const src = fs.readFileSync(path.join(__dirname, 'server.mjs'), 'utf8').replace(/\r\n/g, '\n');
     const body = src.match(/function pruneConversations\(\) \{[\s\S]*?\n\}/)[0];
@@ -151,11 +168,12 @@ const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
     assert.deepEqual(acpState.acp[0].args, ['--config', 'C:\\My Agent\\config.json', '']);
     for (const extension of ['cmd', 'bat']) {
       const command = 'C:\\My Agent\\agent.' + extension;
-      await add({ name: 'custom batch', command: '"' + command + '"', args: '--config "C:\\My Agent\\config.json" ""' });
-      assert.deepEqual(registration.at(-1), { name: 'custom batch', command: 'node.exe', args: [launcher, command, '--config', 'C:\\My Agent\\config.json', ''] });
+      const customArgs = ['--config', 'C:\\My Agent\\config.json', '', 'say "hi"', '%ACP_TEST%', '!ACP_TEST!'];
+      await add({ name: 'custom batch', command: '"' + command + '"', args: JSON.stringify(customArgs) });
+      assert.deepEqual(registration.at(-1), { name: 'custom batch', command: 'node.exe', args: [launcher, command, ...customArgs] });
       assert.equal(acpState.acp.at(-1).command, command);
-      assert.deepEqual(acpState.acp.at(-1).args, ['--config', 'C:\\My Agent\\config.json', '']);
-      await assert.rejects(add({ name: 'invalid batch', command, args: ['%PATH%'] }), /批次檔/);
+      assert.deepEqual(acpState.acp.at(-1).args, customArgs);
+      await assert.rejects(add({ name: 'invalid batch', command, args: ['line\nbreak'] }), /批次檔/);
     }
     await assert.rejects(add({ name: 'invalid', command: 'agent.exe', args: '"unclosed' }), /雙引號/);
     await assert.rejects(add({ name: 'invalid', command: 'node --acp', args: '' }), /完整路徑/);

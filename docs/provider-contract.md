@@ -25,11 +25,13 @@
 
 建置測試時實際發現 AionCore v0.2.2 的 custom-agent probe 先用空白切 `command`，因此 `C:\Program Files\...\node.exe` 會被截成 `C:\Program`；單純加引號也無法解決。Studio 對含空白的 `.exe` 完整路徑使用 Node launcher：後端接收 `node.exe`，原始執行檔與參數放在 argv，以 `spawn(..., { shell: false, stdio: 'inherit' })` 執行，不搬移使用者執行檔、不解讀 shell 符號。設定檔及 UI 仍保留使用者原始命令。AionCore 子程序的 PATH 前置 Studio 所用 Node 的目錄，讓新增探測及後續啟動都能找到 launcher runtime；不修改系統 PATH。
 
-含空白的 `.cmd`／`.bat` 完整路徑同樣使用 launcher，由它明確呼叫 `cmd.exe /d /s /v:off /c`，關閉 AutoRun 與預設延遲變數展開。路徑及每個參數分別加引號，尾端反斜線按原生 CLI 的 argv 規則處理，保留空參數與空白。驗證範圍是用 `%*` 轉交參數給原生 CLI 的 wrapper；腳本本身若自行拆參數或再次組合命令，其行為仍由腳本決定。
+明確以 `.cmd`／`.bat` 結尾的自訂命令都使用 launcher，包含含空白的完整路徑及 PATH 上的批次檔名稱。launcher 呼叫 `cmd.exe /d /s /v:off /c`，關閉 AutoRun 與預設延遲變數展開。參數先依 Windows 原生 CLI 規則保留空值、引號前與尾端的整段反斜線，再處理兩層 shell 跳脫，分別通過啟動解析與批次檔 `%*` 轉交。命令路徑只經一次跳脫，路徑中的 `%`／`!` 也保留原值。
 
-批次檔路徑／參數中的內嵌雙引號、`%`、`!`、NUL、換行，以及編碼後超過 8,000 字元的命令，會在新增前及 launcher 啟動前拒絕；不靜默修改或展開。一般參數欄用來包住含空白路徑的外層雙引號會先由 `parseAcpArgs` 解析，不受此限。需要內嵌特殊字元時，可改用 `.exe` 或直接以 `node.exe` 執行 Agent 腳本。這些限制只針對批次檔，`.exe` 仍不經 shell，沿用完整 argv 支援。`test-local-maintenance.cjs` 實跑兩種副檔名、stdin／stdout／stderr、cwd／env、退出碼、參數保留及注入輸入拒絕。
+批次檔參數支援內嵌雙引號、`%` 與 `!`；`%NAME%`／`!NAME!` 傳入字面值，不展開成環境變數。參數欄可用既有引號語法或 JSON 字串陣列輸入，設定仍儲存原始參數。NUL、CR／LF，以及編碼後超過 8,000 字元的命令仍會在新增前及 launcher 啟動前拒絕；Windows 檔案路徑本身仍不能包含雙引號。`.exe` 仍不經 shell，沿用原有 argv 支援。
 
-無空白命令沿用原有處理；含空白路徑可帶一組外層雙引號，參數仍須另填。不接受將 `node --acp` 整行誤填為執行檔。裸 `node` 仍採 AionCore 的 managed runtime 語意。上游日後修正解析時，可移除對應適配，但須先通過真實契約測試。
+驗證範圍是直接用 `%*` 轉交給原生 CLI 的 wrapper，以及 npm 的 `endLocal ... & ... %*` 形式。`test-local-maintenance.cjs` 實跑兩種副檔名、PATH 查找、stdin／stdout／stderr、cwd／env、退出碼、連續反斜線與引號組合，並確認注入字串原樣收到且沒有執行額外命令。真實 AionCore gate 對兩種 wrapper 都驗證新增、啟動、特殊參數及程序清理。腳本本身若自行拆參數、啟用延遲展開或再次用 `call`／shell 組合命令，其行為仍由腳本決定。
+
+其他無空白命令沿用原有處理；含空白路徑可帶一組外層雙引號，參數仍須另填。不接受將 `node --acp` 整行誤填為執行檔。裸 `node` 仍採 AionCore 的 managed runtime 語意。上游日後修正解析時，可移除對應適配，但須先通過真實契約測試。
 
 ## 契約來源與升級方式
 
@@ -38,6 +40,6 @@
 - [固定版本命令解析](https://github.com/iOfficeAI/AionCore/blob/47e66d0d151123e973b3fd1e77afcb5671b3f8c5/crates/aionui-runtime/src/node_runtime/mod.rs)
 - ACP v1：[初始化](https://agentclientprotocol.com/protocol/v1/initialization)、[session 建立](https://agentclientprotocol.com/protocol/v1/session-setup)、[config options](https://agentclientprotocol.com/protocol/v1/session-config-options)
 - Windows：[cmd 的引號、AutoRun 與變數展開規則](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/cmd)、[原生 CLI 的反斜線／引號解析](https://learn.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments)
-- 批次檔設計曾比對 MIT 授權的 [cross-spawn v7.0.6](https://github.com/moxystudio/node-cross-spawn/blob/v7.0.6/lib/parse.js)。實測 `%*` 二次解析的引號／反斜線組合後，採用較小且明確拒絕不支援輸入的範圍；沒有加入套件或複製其實作。
+- 兩層跳脫設計比對 ISC 授權的 [npm/promise-spawn 命令組裝](https://github.com/npm/promise-spawn/blob/3b123db4dabbd9ed80abb7ba477ec7a0acef3399/lib/index.js)與[參數編碼](https://github.com/npm/promise-spawn/blob/3b123db4dabbd9ed80abb7ba477ec7a0acef3399/lib/escape.js)。本地以整段反斜線比對實作原生 argv 編碼，避免只處理最後一個反斜線或使用可能反覆回溯的模式；沒有加入套件依賴。
 
 上游程式僅用於查證契約；fixture 依公開 wire protocol 實作，沒有複製上游 Rust 實作。升級時先更新 `AION_RELEASE` 的版本、URL 與已驗證雜湊，再跑單元及真實契約 gate；介面改動須同步檢查正式呼叫端，不能只改 mock 讓測試變綠。
