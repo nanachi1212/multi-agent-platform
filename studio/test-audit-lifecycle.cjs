@@ -55,6 +55,20 @@ function setup(overrides = {}) {
       assert.equal(X.env.S.leases.length, 0, 'no replacement lease published');
     }
 
+    // An automatic CI handoff must still match its triggering wait after drain/transcript.
+    // Explicit user handoffs while paused remain supported (covered above).
+    for (const when of ['drain', 'transcript']) {
+      const entered = deferred(), release = deferred(); let current = true;
+      const wait = async () => { entered.resolve(); await release.promise; };
+      const X = setup({ stopTurn: async () => { if (when === 'drain') await wait(); return true; },
+        api: async () => { if (when === 'transcript') await wait(); return { items: [] }; } });
+      const pending = X.api.handoffWriter(X.w, 'claude', X.t.id, 'CI finished', () => current);
+      await entered.promise; current = false; release.resolve();
+      await assert.rejects(pending, /工作或卡片已變更/);
+      assert.equal(X.t.agent, 'codex'); assert.equal(X.t.hold, false);
+      assert.equal(X.env.S.leases.length, 0, 'cancelled automatic handoff publishes no lease');
+    }
+
     // A failed drain also releases the transition guard so the user can retry.
     let canStop = false; const failure = setup({ stopTurn: async () => canStop });
     Object.assign(failure.w.run, { active: true, paused: false });

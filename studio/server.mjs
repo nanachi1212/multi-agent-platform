@@ -2081,7 +2081,7 @@ async function handoffExcerpt(cid, from) {
 }
 // Separate from t.hold: fallback deliberately holds a card before requesting a handoff.
 const ownershipTransitions = new WeakSet();
-async function handoffWriter(w, toAgent, taskId, extraNote = '') {
+async function handoffWriter(w, toAgent, taskId, extraNote = '', canProceed = () => true) {
   if (!AGENTS[toAgent]) throw new Error('未知的 Agent');
   if (!available(toAgent)) throw new Error(`${agentName(toAgent)} 目前不可用`);
   const run = w.run;
@@ -2110,7 +2110,7 @@ async function handoffWriter(w, toAgent, taskId, extraNote = '') {
     throw e;
   }
   const assertCurrent = () => {
-    if (w.run !== run || run.stopped || !w.tasks.includes(t) || t.agent !== from || (t.leaseGeneration || 0) !== generation || t.workdir !== workdir || t.preparing)
+    if (!canProceed() || w.run !== run || run.stopped || !w.tasks.includes(t) || t.agent !== from || (t.leaseGeneration || 0) !== generation || t.workdir !== workdir || t.preparing)
       throw new Error('等待期間工作或卡片已變更，取消交接');
   };
   assertCurrent();
@@ -3034,34 +3034,49 @@ const originRepo = (cwd) => new Promise((res) => execFile('git', ['-c', 'safe.di
   (e, out) => res(String(out || '').match(/github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\s*$/)?.[1] || '')));
 
 async function checkExternal(w, t) {
-  if (t.status !== 'WAITING_EXTERNAL' || !t.wait?.pr || t.wait.manual || checking.has(t.id)) return;
+  const run = w.run, wait = t.wait, epoch = run?.lifecycleEpoch || 0;
+  const agent = t.agent, generation = t.leaseGeneration || 0;
+  // A card can wait again after Resume or handoff. Its status alone cannot identify
+  // the request that produced this result. Carry this guard through auto-handoff too.
+  const current = () => w.run === run && run?.active && !run.paused && !run.stopped
+    && (run.lifecycleEpoch || 0) === epoch && w.tasks.includes(t) && t.status === 'WAITING_EXTERNAL'
+    && t.wait === wait && !wait?.manual && t.agent === agent && (t.leaseGeneration || 0) === generation;
+  if (!current() || t.hold || !wait?.pr || checking.has(t.id)) return;
   checking.add(t.id);
   try {
     // A bare "#23" belongs to the project's own origin (gh's default repo can point elsewhere).
-    const repo = /^\d+$/.test(String(t.wait.pr)) ? await originRepo(w.project) : '';
-    const j = await ghJson(['pr', 'view', String(t.wait.pr), ...(repo ? ['--repo', repo] : []), '--json', 'url,state,reviewDecision,statusCheckRollup'], w.project);
-    if (t.status !== 'WAITING_EXTERNAL') return;
+    const bare = /^\d+$/.test(String(wait.pr));
+    const repo = bare ? await originRepo(w.project) : '';
+    if (!current() || t.hold) return;
+    if (bare && !repo) throw new Error('找不到專案的 GitHub origin，請提供完整 PR 網址');
+    const j = await ghJson(['pr', 'view', String(wait.pr), ...(repo ? ['--repo', repo] : []), '--json', 'url,state,reviewDecision,statusCheckRollup'], w.project);
+    if (!current() || t.hold) return;
     const checks = j.statusCheckRollup || [];
     const pending = checks.filter((c) => (c.__typename === 'CheckRun' ? c.status !== 'COMPLETED' : ['PENDING', 'EXPECTED'].includes(c.state)));
-    t.wait.ci = checks.length ? `${checks.length - pending.length}/${checks.length} 個 CI 檢查完成` : '還沒看到 CI 檢查';
-    t.wait.checkedAt = new Date().toISOString();
-    if (!checks.length) t.wait.empty = (t.wait.empty || 0) + 1;
+    wait.ci = checks.length ? `${checks.length - pending.length}/${checks.length} 個 CI 檢查完成` : '還沒看到 CI 檢查';
+    wait.checkedAt = new Date().toISOString();
+    wait.errors = 0;
+    wait.empty = checks.length ? 0 : (wait.empty || 0) + 1;
     // A new PR can take a minute to register its checks: zero checks three times in a row means there are none.
-    if (j.state === 'OPEN' && (pending.length || (!checks.length && t.wait.empty < 3))) return;
+    if (j.state === 'OPEN' && (pending.length || (!checks.length && wait.empty < 3))) return;
     const summary = checks.map((c) => `${c.name || c.context || 'check'}: ${c.conclusion || c.state || c.status}`).join(', ') || 'no CI checks found';
     const note = `GitHub PR ${j.url}: state ${j.state}, review decision ${j.reviewDecision || 'none'}. CI: ${summary}.`;
     const fin = w.finisher;
     if (fin && fin !== t.agent && fin !== w.run?.leader && isWriter(t) && available(fin)) { // 收尾者 does the merge / cleanup instead of the strong model
       log(w, 'studio', 'system', `PR ${t.wait.pr} 的 CI 跑完了：依「收尾者」設定，「${t.title}」改由 ${agentName(fin)} 接手 merge 與收尾。`);
-      try { await handoffWriter(w, fin, t.id, `The result this card was waiting for has arrived:\n${note}`); return; }
-      catch (e) { log(w, 'studio', 'system', `收尾者 ${agentName(fin)} 接手失敗（${e.message}），交回 ${agentName(t.agent)}。`); }
+      try { await handoffWriter(w, fin, t.id, `The result this card was waiting for has arrived:\n${note}`, current); return; }
+      catch (e) {
+        if (!current() || t.hold) return;
+        log(w, 'studio', 'system', `收尾者 ${agentName(fin)} 接手失敗（${e.message}），交回 ${agentName(t.agent)}。`);
+      }
     }
     wake(w, t, note);
   } catch (e) {
-    if (t.status !== 'WAITING_EXTERNAL') return;
-    t.wait.errors = (t.wait.errors || 0) + 1; // gh hiccups (network, rate limit): try again next minute before asking the user
-    if (t.wait.errors < 3) { if (t.wait.errors === 1) log(w, 'studio', 'system', `查不到 PR ${t.wait.pr} 的狀態（${e.message}）：下一分鐘再試。`); return; }
-    Object.assign(t.wait, { manual: true, error: e.message });
+    if (!current() || t.hold) return;
+    wait.empty = 0;
+    wait.errors = (wait.errors || 0) + 1; // only consecutive gh failures count toward manual fallback
+    if (wait.errors < 3) { if (wait.errors === 1) log(w, 'studio', 'system', `查不到 PR ${wait.pr} 的狀態（${e.message}）：下一分鐘再試。`); return; }
+    Object.assign(wait, { manual: true, error: e.message });
     log(w, 'studio', 'system', `查不到 PR ${t.wait.pr} 的狀態（${e.message}）：結果好了請按「繼續」。`);
     notify(`${label(w)}：需要你按「繼續」`, `Studio 查不到 PR ${t.wait.pr} 的 CI 狀態`, 'ask', w.project);
   } finally { checking.delete(t.id); }
