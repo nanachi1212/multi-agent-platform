@@ -85,7 +85,7 @@ const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
     console.log('ACP arguments: quoted paths, backslashes, empty args, JSON arrays, malformed input and real child argv: PASS');
 
     assert.deepEqual(acpBackendCommand('opencode', ['acp']), { command: 'opencode', args: ['acp'] }, 'simple commands retain existing backend handling');
-    for (const bad of ['node --acp', 'C:\\Agent Tools\\run.cmd', 'C:\\Agent Tools\\run.bat', '"agent.exe" --acp', 'a\0b']) {
+    for (const bad of ['node --acp', 'C:\\Agent Tools\\run.ps1', '"agent.exe" --acp', 'a\0b']) {
       assert.throws(() => acpBackendCommand(bad, []));
     }
     const originalEnv = { Path: 'original-path', KEEP: 'yes' }, launchEnv = withAcpLauncherPath(originalEnv);
@@ -105,6 +105,29 @@ const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
     const missing = spawnSync(process.execPath, [launcher, path.join(root, 'missing agent.exe')], { encoding: 'utf8', windowsHide: true, timeout: 10000 });
     assert.ifError(missing.error); assert.equal(missing.status, 127); assert.equal(missing.stdout, ''); assert.match(missing.stderr, /ENOENT/);
     console.log('ACP launcher: literal argv, stdio, cwd/env, exit status, missing executable and command validation: PASS');
+
+    const batchDir = path.join(root, 'Agent & (Tools)'); fs.mkdirSync(batchDir);
+    fs.writeFileSync(path.join(batchDir, 'echo.cjs'), childCode.replace('process.argv.slice(1)', 'process.argv.slice(2)'));
+    const batchArgs = ['', 'a b', 'C:\\Agent Data\\', 'tail\\\\', '--config=C:\\My Agent\\config.json', '& echo BAD>injected.txt | < ^ ( )', '中文\t參數'];
+    for (const extension of ['CMD', 'BAT']) {
+      const batch = path.join(batchDir, 'agent wrapper.' + extension);
+      fs.writeFileSync(batch, '@echo off\r\nsetlocal EnableExtensions DisableDelayedExpansion\r\n"%ACP_TEST_NODE%" "%~dp0echo.cjs" %*\r\nexit /b %errorlevel%\r\n');
+      const invocation = acpBackendCommand(batch, batchArgs);
+      assert.equal(invocation.command, 'node.exe');
+      const result = spawnSync(process.execPath, invocation.args, { input: 'ACP input\n', encoding: 'utf8', cwd: root,
+        env: { ...process.env, ACP_TEST: 'inherited', ACP_TEST_NODE: process.execPath }, windowsHide: true, timeout: 10000 });
+      assert.ifError(result.error); assert.equal(result.status, 23, result.stderr); assert.equal(result.stderr, 'fixture stderr');
+      assert.deepEqual(JSON.parse(result.stdout), { input: 'ACP input\n', args: batchArgs, cwd: root, env: 'inherited' });
+      assert.equal(fs.existsSync(path.join(root, 'injected.txt')), false, 'shell syntax in an argument never runs');
+      const invalid = ['x"&echo BAD>injected.txt&rem "', '%PATH%', '!PATH!', 'line\nbreak', 'line\rbreak'];
+      for (const argument of invalid) {
+        assert.throws(() => acpBackendCommand(batch, [argument]), /批次檔/);
+        const rejected = spawnSync(process.execPath, [launcher, batch, argument], { encoding: 'utf8', cwd: root, windowsHide: true, timeout: 10000 });
+        assert.ifError(rejected.error); assert.equal(rejected.status, 127); assert.equal(rejected.stdout, ''); assert.match(rejected.stderr, /批次檔/);
+      }
+      assert.throws(() => acpBackendCommand(batch, ['x'.repeat(8001)]), /過長/);
+    }
+    console.log('ACP batch launcher: .CMD/.BAT, spaced paths, literal metacharacters, stdio/exit, and unsafe-input rejection: PASS');
 
     const src = fs.readFileSync(path.join(__dirname, 'server.mjs'), 'utf8').replace(/\r\n/g, '\n');
     const body = src.match(/function pruneConversations\(\) \{[\s\S]*?\n\}/)[0];
@@ -126,9 +149,17 @@ const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
     assert.deepEqual(registration[0], { name: 'custom', command: 'node.exe', args: [path.join(__dirname, 'acp-launcher.cjs'), 'C:\\My Agent\\agent.exe', '--config', 'C:\\My Agent\\config.json', ''] });
     assert.equal(acpState.acp[0].command, 'C:\\My Agent\\agent.exe', 'settings retain the user executable, not the launcher');
     assert.deepEqual(acpState.acp[0].args, ['--config', 'C:\\My Agent\\config.json', '']);
+    for (const extension of ['cmd', 'bat']) {
+      const command = 'C:\\My Agent\\agent.' + extension;
+      await add({ name: 'custom batch', command: '"' + command + '"', args: '--config "C:\\My Agent\\config.json" ""' });
+      assert.deepEqual(registration.at(-1), { name: 'custom batch', command: 'node.exe', args: [launcher, command, '--config', 'C:\\My Agent\\config.json', ''] });
+      assert.equal(acpState.acp.at(-1).command, command);
+      assert.deepEqual(acpState.acp.at(-1).args, ['--config', 'C:\\My Agent\\config.json', '']);
+      await assert.rejects(add({ name: 'invalid batch', command, args: ['%PATH%'] }), /批次檔/);
+    }
     await assert.rejects(add({ name: 'invalid', command: 'agent.exe', args: '"unclosed' }), /雙引號/);
     await assert.rejects(add({ name: 'invalid', command: 'node --acp', args: '' }), /完整路徑/);
-    assert.equal(registration.length, 1, 'invalid argv is rejected before registering an external agent');
+    assert.equal(registration.length, 3, 'invalid argv is rejected before registering an external agent');
 
     const cacheCode = src.slice(src.indexOf('// ponytail: reads the newest 200'), src.indexOf('function historyItems()'));
     const cache = new Function('S', 'writeJson', 'path', 'HISTORY', 'resumable', cacheCode + '; histCache.rev = S.historyRev; return { saveRun, histCache };')(

@@ -6,6 +6,7 @@
 - `studio/server.mjs`：後端啟動及退出、runtime 登記、供應商／工作區狀態、派工與生命週期。仍由 server 決定重試、取消與租約釋放。
 - `studio/live-models.mjs`：透過正式 client 讀取 runtime config snapshot，在同一對話設定模型與思考強度。
 - `studio/acp-command.mjs`／`studio/acp-launcher.cjs`：適配固定版本的自訂執行檔路徑限制，保留原始 argv 與 ACP stdio。
+- `studio/windows-batch.cjs`：僅為 `.cmd`／`.bat` 建立經驗證的 `cmd.exe` 呼叫，不處理其他命令。
 
 這次只抽離通訊與版本邊界，保留原來 30 秒 timeout 與 `stopUnconfirmed` 語意；沒有改寫派工狀態機、租約協定或使用者規則同步。
 
@@ -16,7 +17,7 @@
 
 第二層在 GitHub 的 **AionCore contract (no models)** job 執行；不放進一般離線 CI 腳本，避免每次本機回歸都必須下載後端。下載、hash、平台或契約失敗都會讓 gate 失敗，不會略過後宣稱通過。
 
-執行檔快取在 `runtime/contract-aioncore/`，不替換正式 Studio 執行檔。測試 data／work／home 皆在專用暫存目錄，環境只繼承啟動所需系統變數；不繼承供應商 keys、使用者 Codex home 或規則檔。fixture 不呼叫模型、網路或工具；記錄所收方法並斷言沒有 prompt。結束核對程序身分、清理程序樹，再刪除測試目錄。測試執行檔位於 `Agent 中文 Tools/contract agent.exe`，驗證新增探測及實際對話使用同一完整路徑，空參數、引號、尾端反斜線與 shell 符號都原樣傳遞，並確認探測及清理後沒有殘留 launcher／Agent。
+執行檔快取在 `runtime/contract-aioncore/`，不替換正式 Studio 執行檔。測試 data／work／home 皆在專用暫存目錄，環境只繼承啟動所需系統變數；不繼承供應商 keys、使用者 Codex home 或規則檔。fixture 不呼叫模型、網路或工具；記錄所收方法並斷言沒有 prompt。結束核對程序身分、清理程序樹，再刪除測試目錄。測試包含 `Agent 中文 Tools/contract agent.exe` 與同名 `.cmd`／`.bat` wrapper，驗證新增探測及實際對話使用完整路徑、支援的參數原樣傳遞。批次檔另外核對 launcher → cmd.exe → Agent 的程序歸屬，以及探測後、後端關閉後皆無殘留。
 
 ## 驗證邊界與固定版本限制
 
@@ -24,7 +25,11 @@
 
 建置測試時實際發現 AionCore v0.2.2 的 custom-agent probe 先用空白切 `command`，因此 `C:\Program Files\...\node.exe` 會被截成 `C:\Program`；單純加引號也無法解決。Studio 對含空白的 `.exe` 完整路徑使用 Node launcher：後端接收 `node.exe`，原始執行檔與參數放在 argv，以 `spawn(..., { shell: false, stdio: 'inherit' })` 執行，不搬移使用者執行檔、不解讀 shell 符號。設定檔及 UI 仍保留使用者原始命令。AionCore 子程序的 PATH 前置 Studio 所用 Node 的目錄，讓新增探測及後續啟動都能找到 launcher runtime；不修改系統 PATH。
 
-無空白命令沿用原有處理；含空白路徑可帶一組外層雙引號，參數仍須另填。`.cmd`／`.bat` 含空白路徑須使用 shell，這次不擴充，會顯示明確錯誤；也不接受將 `node --acp` 整行誤填為執行檔。裸 `node` 仍採 AionCore 的 managed runtime 語意。`test-local-maintenance.cjs` 另實跑 launcher 的 stdin／stdout／stderr、argv、cwd／env、退出碼及找不到執行檔測試。上游日後修正解析時，可移除此適配，但須先通過同一真實契約測試。
+含空白的 `.cmd`／`.bat` 完整路徑同樣使用 launcher，由它明確呼叫 `cmd.exe /d /s /v:off /c`，關閉 AutoRun 與預設延遲變數展開。路徑及每個參數分別加引號，尾端反斜線按原生 CLI 的 argv 規則處理，保留空參數與空白。驗證範圍是用 `%*` 轉交參數給原生 CLI 的 wrapper；腳本本身若自行拆參數或再次組合命令，其行為仍由腳本決定。
+
+批次檔路徑／參數中的內嵌雙引號、`%`、`!`、NUL、換行，以及編碼後超過 8,000 字元的命令，會在新增前及 launcher 啟動前拒絕；不靜默修改或展開。一般參數欄用來包住含空白路徑的外層雙引號會先由 `parseAcpArgs` 解析，不受此限。需要內嵌特殊字元時，可改用 `.exe` 或直接以 `node.exe` 執行 Agent 腳本。這些限制只針對批次檔，`.exe` 仍不經 shell，沿用完整 argv 支援。`test-local-maintenance.cjs` 實跑兩種副檔名、stdin／stdout／stderr、cwd／env、退出碼、參數保留及注入輸入拒絕。
+
+無空白命令沿用原有處理；含空白路徑可帶一組外層雙引號，參數仍須另填。不接受將 `node --acp` 整行誤填為執行檔。裸 `node` 仍採 AionCore 的 managed runtime 語意。上游日後修正解析時，可移除對應適配，但須先通過真實契約測試。
 
 ## 契約來源與升級方式
 
@@ -32,5 +37,7 @@
 - [固定版本 custom-agent probe](https://github.com/iOfficeAI/AionCore/blob/47e66d0d151123e973b3fd1e77afcb5671b3f8c5/crates/aionui-ai-agent/src/protocol/custom_agent_probe.rs)
 - [固定版本命令解析](https://github.com/iOfficeAI/AionCore/blob/47e66d0d151123e973b3fd1e77afcb5671b3f8c5/crates/aionui-runtime/src/node_runtime/mod.rs)
 - ACP v1：[初始化](https://agentclientprotocol.com/protocol/v1/initialization)、[session 建立](https://agentclientprotocol.com/protocol/v1/session-setup)、[config options](https://agentclientprotocol.com/protocol/v1/session-config-options)
+- Windows：[cmd 的引號、AutoRun 與變數展開規則](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/cmd)、[原生 CLI 的反斜線／引號解析](https://learn.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments)
+- 批次檔設計曾比對 MIT 授權的 [cross-spawn v7.0.6](https://github.com/moxystudio/node-cross-spawn/blob/v7.0.6/lib/parse.js)。實測 `%*` 二次解析的引號／反斜線組合後，採用較小且明確拒絕不支援輸入的範圍；沒有加入套件或複製其實作。
 
 上游程式僅用於查證契約；fixture 依公開 wire protocol 實作，沒有複製上游 Rust 實作。升級時先更新 `AION_RELEASE` 的版本、URL 與已驗證雜湊，再跑單元及真實契約 gate；介面改動須同步檢查正式呼叫端，不能只改 mock 讓測試變綠。

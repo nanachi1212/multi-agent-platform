@@ -10,6 +10,7 @@ import { acpBackendCommand, withAcpLauncherPath } from './acp-command.mjs';
 import { ensureVerifiedExecutable } from './local-maintenance.mjs';
 import { applyTurnModel } from './live-models.mjs';
 import { getProcessInfo, killProcessTree, isPidAlive } from './runtime-registry.mjs';
+import { processSnapshot, processTree } from './codex-runtime.mjs';
 
 assert.equal(process.platform, 'win32', 'This gate tests the pinned Windows release; unsupported platforms must not report PASS.');
 const root = path.resolve(import.meta.dirname, '..');
@@ -100,6 +101,42 @@ try {
   assert.deepEqual(events.filter(x => x.method === 'session/set_config_option').map(x => x.configId), ['model', 'reasoning_effort']);
   assert.ok(events.every(x => ['initialize', 'session/new', 'session/set_config_option'].includes(x.method)), 'no model prompt, tools or authentication requests');
   console.log(`AionCore ${AION_RELEASE.version} contract: executable path/name with spaces, literal argv, real auth/CSRF, custom ACP, runtime snapshot, removed GET, confirmed model/effort and session reuse: PASS`);
+
+  for (const extension of ['cmd', 'bat']) {
+    const batch = path.join(path.dirname(agentExe), 'contract agent.' + extension);
+    // ASCII source; %~dp0 resolves the Unicode/spaced directory without code-page assumptions.
+    fs.writeFileSync(batch, '@echo off\r\nsetlocal EnableExtensions DisableDelayedExpansion\r\n"%~dp0contract agent.exe" %*\r\nexit /b %errorlevel%\r\n');
+    const batchAudit = path.join(temp, extension + ' audit.jsonl');
+    const expectedArgs = ['', 'a b', 'C:\\Agent Data\\', 'tail\\\\', '& echo BAD>injected.txt | < ^ ( )', '中文'];
+    const batchArgs = [path.join(import.meta.dirname, 'fixtures', 'contract-acp.cjs'), batchAudit, ...expectedArgs];
+    const custom = await api('POST', '/api/agents/custom', { name: 'Studio ' + extension + ' fixture', ...acpBackendCommand(batch, batchArgs) });
+    const probeRows = await processSnapshot();
+    assert.ok(!probeRows.some(row => row.command?.toLowerCase().includes(batch.toLowerCase())), 'registration probe cleans launcher and cmd.exe: ' + extension);
+    const live = await api('POST', '/api/conversations', { type: 'acp', name: extension + ' contract', extra: { agent_id: custom.id, workspace: work } });
+    const runtime = await api('POST', `/api/conversations/${encodeURIComponent(live.id)}/runtime/ensure`, {});
+    assert.equal(runtime.runtime.has_task, true);
+    const batchEvents = fs.readFileSync(batchAudit, 'utf8').trim().split('\n').map(JSON.parse);
+    const starts = batchEvents.filter(event => event.method === 'initialize');
+    assert.equal(starts.length, 2, 'batch registration probe plus live launch');
+    for (const start of starts) {
+      fixturePids.add(start.pid); fixturePids.add(start.parentPid);
+      assert.equal(start.executable.toLowerCase(), agentExe.toLowerCase());
+      assert.deepEqual(start.args, expectedArgs, 'batch forwards exact argv to the ACP agent');
+    }
+    assert.equal(isPidAlive(starts[0].pid), false, 'probe target is stopped');
+    assert.equal(isPidAlive(starts[0].parentPid), false, 'probe cmd.exe is stopped');
+    const rows = await processSnapshot();
+    const ownedPids = new Set(processTree(rows, rows.find(row => row.pid === child.pid)).map(row => row.pid));
+    const owned = rows.filter(row => ownedPids.has(row.pid));
+    const target = owned.find(row => row.pid === starts[1].pid);
+    const shell = owned.find(row => row.pid === target?.parent);
+    const launcher = owned.find(row => row.pid === shell?.parent);
+    assert.ok(target && /cmd\.exe$/i.test(shell?.executable) && launcher?.command?.includes('acp-launcher.cjs'), 'launcher, cmd.exe and agent stay in the owned backend tree');
+    for (const row of [target, shell, launcher]) fixturePids.add(row.pid);
+    assert.ok(batchEvents.every(event => ['initialize', 'session/new'].includes(event.method)), 'batch test invokes no models');
+    assert.equal(fs.existsSync(path.join(work, 'injected.txt')), false);
+    console.log(`AionCore ${extension} contract: real registration, live ACP launch, exact argv and probe tree cleanup: PASS`);
+  }
 } catch (error) {
   // No credentials or protocol bodies are printed. Backend startup output is diagnostic only.
   console.error('Contract failure:', error.message);

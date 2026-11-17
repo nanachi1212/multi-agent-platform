@@ -4,7 +4,7 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Push-Location -LiteralPath $repoRoot
 try {
-    foreach ($file in @('studio/aion-client.mjs', 'studio/acp-command.mjs', 'studio/acp-launcher.cjs', 'studio/test-aion-client.cjs', 'studio/test-aion-contract.mjs', 'studio/fixtures/contract-acp.cjs')) {
+    foreach ($file in @('studio/aion-client.mjs', 'studio/acp-command.mjs', 'studio/acp-launcher.cjs', 'studio/windows-batch.cjs', 'studio/test-aion-client.cjs', 'studio/test-aion-contract.mjs', 'studio/fixtures/contract-acp.cjs')) {
         & node --check $file
         if ($LASTEXITCODE -ne 0) { throw "AionCore contract syntax failed: $file" }
     }
