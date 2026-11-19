@@ -89,16 +89,14 @@ const DELIVERY_IDS = ['auto', 'pr']; // delivery: auto = all the way to merge (d
 const AUTO_MAX_DEFAULT = 5; // auto-started jobs in a row before Studio stops and waits for the user (per project; 0 = no limit)
 const TOKEN_CAP_DEFAULT = 0; // tokens one card may spend before Studio stops it (0 = no cap); checked between steps, not inside one
 // S.leader is the default Leader for newly opened projects.
-const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [], leases: [], external: [], acp: [],
+const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [], closedWorkspaces: {}, leases: [], external: [], acp: [],
   limits: {}, notify: true, notices: [], noticeSeq: 0, runtimes: [] };
 // One workspace per project folder: its own Leader, board, team chat and run, so projects work side by side.
 // name = optional display name (tabs, cards, notifications); the folder name is used when empty.
 // agentCfg = this project's model / effort per agent; workers = agents allowed to work here.
 // New projects start from S.agentCfg (the last choices).
-const newWs = (project, leader = S.leader, name = '', agentCfg = S.agentCfg, workers = Object.keys(AGENTS)) => ({
-  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, autoMax: AUTO_MAX_DEFAULT, strategy: 'save', delivery: 'auto', finisher: '', fallback: '', backendPort: 0, worktreeSetup: '', tokenCap: TOKEN_CAP_DEFAULT, apiDailyTokenCap: 0, apiDailyUsage: null, mission: '', routines: [],
-  agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...agentCfg?.[id] }])),
-  workers: workers.filter((id) => AGENTS[id]),
+const newWs = (project, saved) => ({
+  ...workspaceSettings({ ...saved, project }), run: null, tasks: [], activity: [], autoRounds: 0,
 });
 // An agent may be gone (an external model that was deleted); old cards still name it.
 const agentName = (id) => AGENTS[id]?.name || id;
@@ -124,13 +122,14 @@ try {
   const saved = JSON.parse(fs.readFileSync(SETTINGS, 'utf8'));
   for (const e of saved.external || []) if (e?.id && e.providerId && e.model) { S.external.push({ id: String(e.id), name: String(e.name || e.model), platform: e.platform, baseUrl: String(e.baseUrl || ''), isFullUrl: !!e.isFullUrl, model: String(e.model), providerId: String(e.providerId) }); registerExternal(S.external.at(-1)); }
   for (const e of saved.acp || []) if (e?.id && (e.backend || e.agentId)) { S.acp.push({ id: String(e.id), name: String(e.name || e.id), backend: String(e.backend || ''), yolo: String(e.yolo || ''), agentId: String(e.agentId || ''), command: String(e.command || ''), args: (e.args || []).map(String) }); registerAcp(S.acp.at(-1)); }
-  S.closedApiBudgets = saved.closedApiBudgets || {};
+  // Older versions kept only API budgets for closed tabs, keyed by the same physical folder.
+  S.closedWorkspaces = { ...saved.closedApiBudgets, ...saved.closedWorkspaces };
   if (AGENTS[saved.leader]) S.leader = saved.leader;
   for (const id in S.agentCfg) Object.assign(S.agentCfg[id], saved.agentCfg?.[id]);
   // Older settings had one `project` and global models; it becomes the first open workspace with those models.
   S.workspaces = (saved.workspaces || (saved.project ? [{ project: saved.project }] : []))
     .filter((x) => isDir(x.project))
-    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', autoMax: x.autoMax == null ? AUTO_MAX_DEFAULT : Number(x.autoMax) || 0, strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto', finisher: AGENTS[x.finisher] ? x.finisher : '', fallback: AGENTS[x.fallback] ? x.fallback : '', backendPort: Number(x.backendPort) || 0, worktreeSetup: String(x.worktreeSetup || '').trim().slice(0, 500), tokenCap: x.tokenCap == null ? TOKEN_CAP_DEFAULT : Number(x.tokenCap) || 0, ...restoreApiBudget(x), mission: String(x.mission || ''), routines: (x.routines || []).filter(validRoutine) }));
+    .map((x) => newWs(x.project, x));
   S.recent = (saved.recent || []).filter(isDir);
   if (saved.notify === false) S.notify = false;
 } catch (e) {
@@ -141,8 +140,27 @@ try {
 }
 
 function saveSettings() {
-  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, worktreeSetup: w.worktreeSetup, tokenCap: w.tokenCap, apiDailyTokenCap: w.apiDailyTokenCap, apiDailyUsage: w.apiDailyUsage, mission: w.mission, routines: w.routines }));
-  writeJson(SETTINGS, { leader: S.leader, workspaces, closedApiBudgets: S.closedApiBudgets, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external, acp: S.acp });
+  const workspaces = S.workspaces.map(workspaceSettings);
+  writeJson(SETTINGS, { leader: S.leader, workspaces, closedWorkspaces: S.closedWorkspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external, acp: S.acp });
+}
+
+// Both open and closed projects use this same set of durable fields. Agent choices are resolved
+// against today's team on restore, since a model may have been removed while the tab was closed.
+function workspaceSettings(w) {
+  const cfg = w.agentCfg || S.agentCfg;
+  return {
+    project: w.project, name: String(w.name || ''), leader: AGENTS[w.leader] ? w.leader : S.leader,
+    agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...cfg[id] }])),
+    workers: (w.workers || Object.keys(AGENTS)).filter((id) => AGENTS[id]),
+    pstate: w.pstate || null, afterDone: AFTER_DONE.includes(w.afterDone) ? w.afterDone : 'stop',
+    autoMax: w.autoMax == null ? AUTO_MAX_DEFAULT : Number(w.autoMax) || 0,
+    strategy: STRATEGY_IDS.includes(w.strategy) ? w.strategy : 'save',
+    delivery: DELIVERY_IDS.includes(w.delivery) ? w.delivery : 'auto',
+    finisher: AGENTS[w.finisher] ? w.finisher : '', fallback: AGENTS[w.fallback] ? w.fallback : '',
+    backendPort: Number(w.backendPort) || 0, worktreeSetup: String(w.worktreeSetup || '').trim().slice(0, 500),
+    tokenCap: w.tokenCap == null ? TOKEN_CAP_DEFAULT : Number(w.tokenCap) || 0, ...restoreApiBudget(w),
+    mission: String(w.mission || ''), routines: (w.routines || []).filter(validRoutine),
+  };
 }
 
 // ponytail: reads the newest 200 history files once, then saveRun keeps the cache current in place; index them if history grows large.
@@ -205,6 +223,30 @@ function teamStats() {
 function readHistory(id) {
   if (!/^[\w-]+$/.test(id)) throw new Error('bad id');
   return JSON.parse(fs.readFileSync(path.join(HISTORY, id + '.json'), 'utf8'));
+}
+
+// Older versions could save a stopped job with a WORKING card after its admission check drained.
+// The lease store calls this under its startup lock, before publishing the release.
+function settleStoppedCard(lease) {
+  let record;
+  try { record = readHistory(lease.jobId); }
+  catch (error) {
+    console.error('無法核對已停止工作的歷史，保留寫入租約：' + error.message);
+    return false;
+  }
+  if (record?.status !== 'stopped' || record.id !== lease.jobId || !record.project || !lease.project || !same(record.project, lease.project)) return false;
+  const card = Array.isArray(record.tasks) && record.tasks.find(t => t?.id === lease.cardId);
+  if (!card || !card.id || !card.agent || card.agent !== lease.owner.agent || (card.leaseGeneration || 0) !== (lease.generation || 0)) return false;
+  if (card.stopUnconfirmed || card.runtimeStopPending || card.preparing || card.worktree?.setupProc || card.worktree?.setupLeft?.length) return false;
+  // Pause can reserve an executing writer before cancellation is confirmed. For a card that
+  // already ran, only resumeJob's post-drain reservation has an explicitly cleared reason.
+  if (lease.reason === 'runtime stop unconfirmed' || (card.firstStartedAt && lease.reason !== '')) return false;
+  if (card.status === 'WORKING') {
+    Object.assign(card, { status: 'FAILED', result: '已停止' });
+    writeJson(path.join(HISTORY, record.id + '.json'), record);
+  }
+  // If the lease write failed after history was saved, the next startup completes the release.
+  return card.status === 'FAILED' || card.status === 'DONE';
 }
 
 // Every event of a working run is also saved (status "running"), so closing the Studio mid-job loses nothing:
@@ -2055,6 +2097,13 @@ async function stopAndDrain(w) {
       stop(w);
       await drainExecution(w);
       current();
+      // An admission check may drain before runCard ever starts. Settle all unfinished
+      // cards now, while this job still owns the workspace and before releasing its leases.
+      if (run.stopped) {
+        for (const t of cards) {
+          if (!['DONE', 'FAILED'].includes(t.status)) Object.assign(t, { status: 'FAILED', result: '已停止' });
+        }
+      }
       releaseJobLeases(w, 'stopped');
       for (const t of cards) if (isWriter(t)) { await releaseLock(w, t); current(); }
       saveRun(w, 'stopped');
@@ -3729,8 +3778,8 @@ function openWorkspace(p) {
   let w = S.workspaces.find((x) => same(x.project, p));
   if (!w) {
     const key = treeKey(p);
-    w = Object.assign(newWs(p), restoreApiBudget(S.closedApiBudgets?.[key]));
-    if (S.closedApiBudgets) delete S.closedApiBudgets[key];
+    w = newWs(p, S.closedWorkspaces[key]);
+    delete S.closedWorkspaces[key];
     S.workspaces.push(w);
     refreshState(w);
   }
@@ -3743,9 +3792,7 @@ function closeWorkspace(w) {
   if (w.run?.active) throw new Error('這個專案的團隊還在工作，請先暫停或停止');
   if (stillStopping(w)) throw new Error('這個專案仍在停止或暫停 Agent、工具程序與 runtime，請等清理完成再關閉');
   if ([...preparing.values()].some((e) => e.w === w) || w.tasks.some((t) => t.preparing)) throw new Error('這個專案有工作卡的 worktree 正在準備（設定指令還在跑），請等它完成或先按停止');
-  if (w.apiDailyTokenCap || (w.apiDailyUsage && apiUsageToday(w.apiDailyUsage).tokens)) {
-    (S.closedApiBudgets ||= {})[treeKey(w.project)] = { apiDailyTokenCap: w.apiDailyTokenCap, apiDailyUsage: w.apiDailyUsage };
-  }
+  S.closedWorkspaces[treeKey(w.project)] = workspaceSettings(w);
   S.workspaces = S.workspaces.filter((x) => x !== w); // a paused job stays in 歷史紀錄
   saveSettings();
 }
@@ -3972,7 +4019,7 @@ const routes = {
       return { wsInfo: w.wsInfo, lease, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, worktreeSetup: w.worktreeSetup, tokenCap: w.tokenCap, apiDailyTokenCap: w.apiDailyTokenCap, apiDailyTokens: apiUsageToday(w.apiDailyUsage).tokens, mission: w.mission, routines: w.routines, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
         run: r && { usage: r.usage || null, extMod: r.extMod, claimedBy: r.claimedBy, id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
     });
-    const { leases, closedApiBudgets, ...state } = S; // the page shows each project's lease (above), never the raw list
+    const { leases, closedWorkspaces, ...state } = S; // only open projects and their lease summaries go to the page
     return { ...state, runtimes: S.runtimes, ...teamStats(), agents: Object.values(S.agents), workspaces };
   },
   // Project-scoped calls name their project in `ws` (its folder path).
@@ -4098,7 +4145,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-loadLeases(); // restore ownership before any worker can start
+loadLeases(settleStoppedCard); // restore ownership before any worker can start
 await cleanupStaleRuntimes({ rtDir: RT }).catch(() => {});
 
 // Show each open project's latest paused job again after a restart, ready to continue.

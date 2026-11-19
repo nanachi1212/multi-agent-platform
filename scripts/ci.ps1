@@ -16,6 +16,8 @@ try {
     }
     & node studio/test-state-files.cjs
     if ($LASTEXITCODE -ne 0) { throw 'Studio state file checks failed' }
+    & node studio/test-workspace-settings.cjs
+    if ($LASTEXITCODE -ne 0) { throw 'Studio workspace settings checks failed' }
     & node studio/test-codex-provider.cjs
     if ($LASTEXITCODE -ne 0) { throw 'Studio Codex provider checks failed' }
     & node --check studio/local-maintenance.mjs
@@ -36,7 +38,7 @@ try {
     # Keep that standalone entry point complete; do not run the same runtime suite twice.
     & node studio/lifecycle-check.cjs
     if ($LASTEXITCODE -ne 0) { throw 'Studio lifecycle checks failed' }
-    foreach ($file in @('studio/test-api-budget.cjs', 'studio/test-windows-toast.cjs', 'studio/test-verdict-binding.cjs', 'studio/test-office-scene.cjs', 'studio/test-notification-audio.cjs', 'studio/test-live-models.cjs', 'studio/test-ui-safety.cjs', 'studio/test-runtime-identity.cjs', 'studio/test-audit-lifecycle.cjs', 'studio/test-external-wait.cjs', 'studio/test-stop-retry.cjs', 'studio/test-project-state-action.cjs', 'studio/test-progress-read.cjs', 'studio/test-lease-recovery.cjs', 'studio/test-ui-async.cjs', 'studio/test-state-recovery.cjs', 'studio/test-runtime-endpoint.cjs', 'studio/test-leader-lifecycle.cjs', 'studio/test-resume-orphan.cjs', 'studio/test-card-interrupt.cjs', 'studio/test-api-token.cjs', 'studio/test-workspace-lookup.cjs')) {
+    foreach ($file in @('studio/test-api-budget.cjs', 'studio/test-windows-toast.cjs', 'studio/test-verdict-binding.cjs', 'studio/test-office-scene.cjs', 'studio/test-notification-audio.cjs', 'studio/test-live-models.cjs', 'studio/test-ui-safety.cjs', 'studio/test-runtime-identity.cjs', 'studio/test-audit-lifecycle.cjs', 'studio/test-external-wait.cjs', 'studio/test-stop-retry.cjs', 'studio/test-stopped-upgrade.cjs', 'studio/test-project-state-action.cjs', 'studio/test-progress-read.cjs', 'studio/test-lease-recovery.cjs', 'studio/test-ui-async.cjs', 'studio/test-state-recovery.cjs', 'studio/test-runtime-endpoint.cjs', 'studio/test-leader-lifecycle.cjs', 'studio/test-resume-orphan.cjs', 'studio/test-card-interrupt.cjs', 'studio/test-api-token.cjs', 'studio/test-workspace-lookup.cjs')) {
         & node --check $file
         if ($LASTEXITCODE -ne 0) { throw "Audit regression syntax failed: $file" }
         & node $file

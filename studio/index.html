@@ -509,6 +509,7 @@ const STATUS = { done:'完成', failed:'有失敗', stopped:'已停止', paused:
 let S = null, last = '', histKey = '', histOpenId = null, histOpenProject = '', shownView = null;
 const drafts = {}; // unsent request text per project
 const pausePending = new Set();
+const pendingRoutineAdds = new Set();
 
 // The page shows the overview (#) or one project (#p=<folder>).
 const curPath = () => { const m = location.hash.match(/^#p=(.+)$/); return m ? decodeURIComponent(m[1]) : ''; };
@@ -695,23 +696,27 @@ $('acpSave').onclick = async () => {
     $('acpDlg').close(); refresh();
   } finally { b.disabled = false; }
 };
-let extEditId = '';
+let extEditId = '', extDialogSeq = 0, extQuerySeq = 0;
+function resetExtModels() {
+  extQuerySeq++;
+  $('extModels').innerHTML = ''; $('extFetchNote').textContent = '';
+}
 function extOpen(id) {
   const e = id ? S.external.find((x) => x.id === id) : null;
+  extDialogSeq++;
   extEditId = e?.id || '';
   $('extTitle').textContent = e ? '編輯外部模型' : '新增外部模型';
   $('extName').value = e?.name || ''; $('extPlatform').value = e?.platform || 'openai'; $('extUrl').value = e?.baseUrl || '';
   $('extFull').checked = !!e?.isFullUrl; $('extKey').value = ''; $('extModel').value = e?.model || '';
   $('extKey').placeholder = e ? '（已儲存；留空 = 不變）' : 'sk-…';
-  $('extErr').textContent = ''; $('extFetchNote').textContent = ''; $('extModels').innerHTML = '';
+  $('extErr').textContent = ''; $('extSave').disabled = false;
+  resetExtModels();
   $('extDlg').showModal();
 }
-// Calls from the dialog show their errors inside the dialog.
 async function extCall(url, body) {
-  $('extErr').textContent = '';
   const r = await fetch(url, { method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify(body) });
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) { $('extErr').textContent = j.error || ('錯誤 ' + r.status); throw new Error(j.error); }
+  if (!r.ok) throw new Error(j.error || ('錯誤 ' + r.status));
   return j;
 }
 const extForm = () => ({ id:extEditId, name:$('extName').value, platform:$('extPlatform').value, baseUrl:$('extUrl').value, apiKey:$('extKey').value, model:$('extModel').value, isFullUrl:$('extFull').checked });
@@ -797,7 +802,19 @@ async function loadWork() {
   $('workAsk').hidden = !ASKABLE.includes(d.status);
   $('workBody').innerHTML = workHtml(d);
 }
-function openWork(ws, id) { workOpen = { ws, id }; workLogOpen = false; workDiff = null; diffSeq++; $('workBody').innerHTML = '<div class="empty">讀取中…</div>'; $('workDlg').showModal(); loadWork(); }
+function openWork(ws, id) {
+  const field = $('workQ');
+  if (workOpen) {
+    if (field.value) drafts[workOpen.draftKey] = field.value;
+    else delete drafts[workOpen.draftKey];
+  }
+  const draftKey = JSON.stringify([ws, id]);
+  workOpen = { ws, id, draftKey };
+  field.value = drafts[draftKey] || '';
+  workLogOpen = false; workDiff = null; diffSeq++;
+  $('workBody').innerHTML = '<div class="empty">讀取中…</div>';
+  $('workDlg').showModal(); loadWork();
+}
 async function askWork(text) {
   if (!workOpen) return;
   await post('/api/card/ask', { ws:workOpen.ws, taskId:workOpen.id, text }).catch(() => {});
@@ -1302,6 +1319,8 @@ function renderProject(w, force) {
     $('office').style.setProperty('--c', look(w.leader).c);
     setHtml($('office'), officeHtml(w));
   }
+  const addRoutineButton = $('office').querySelector('[data-rt-add]');
+  if (addRoutineButton) addRoutineButton.disabled = pendingRoutineAdds.has(w.project);
   if (force || !$('nowPanel').contains(document.activeElement)) { const att = attention(w); $('nowPanel').classList.toggle('need', !!att.need); setHtml($('nowPanel'), nowHtml(w, att)); }
   // The 工頭 card comes first so its model, limits and settings stay one click away.
   if (force || !$('seats').contains(document.activeElement)) setHtml($('seats'), [w.leader, ...S.agents.map((a) => a.id).filter((id) => id !== w.leader)].map((id) => seatHtml(S.agents.find((a) => a.id === id), w)).join(''));
@@ -1439,10 +1458,17 @@ async function refresh() {
 let seenNotice = null, lastRender = 0, audio = null;
 // Only a chime opens the audio device. A later click can unlock it if autoplay was blocked.
 document.addEventListener('click', () => {
-  if (audio?.state === 'suspended') audio.resume().catch(() => {});
+  if (S?.notify && audio?.state === 'suspended') audio.resume().catch(() => {});
 });
 
+function discardChimes() {
+  if (!audio) return;
+  audio.close().catch(() => {});
+  audio = null;
+}
+
 function handleNotices() {
+  if (!S.notify) discardChimes();
   if (seenNotice === null) { seenNotice = S.noticeSeq; return; } // don't replay old notices on page load
   for (const n of S.notices) if (n.id > seenNotice && S.notify) announce(n);
   seenNotice = S.noticeSeq;
@@ -1471,6 +1497,7 @@ function renderNotifyBtn() {
 
 $('notifyBtn').onclick = async () => {
   const on = !S.notify;
+  if (!on) discardChimes(); // before this click reaches the document's autoplay handler
   await post('/api/notify', { on });
   if (on) { chime(true); post('/api/notify/test'); } // shows a test toast right away
 };
@@ -1501,17 +1528,28 @@ $('workSend').onclick = () => { const q = $('workQ').value.trim(); if (!q) retur
 $('workQ').onkeydown = (e) => { if (e.key === 'Enter') $('workSend').click(); };
 setInterval(loadWork, 4000);
 $('extClose').onclick = () => $('extDlg').close();
+for (const id of ['extPlatform', 'extUrl', 'extKey', 'extFull']) $(id).oninput = resetExtModels;
 $('extFetch').onclick = async () => {
+  const query = ++extQuerySeq;
+  const current = () => query === extQuerySeq && $('extDlg').open;
   $('extFetchNote').textContent = '查詢中…';
   try {
     const m = await extCall('/api/external/models', extForm());
+    if (!current()) return;
     $('extModels').innerHTML = m.map((x) => `<option value="${esc(x)}">`).join('');
     $('extFetchNote').textContent = m.length ? `找到 ${m.length} 個模型：點「模型名稱」欄選擇` : '服務沒有回報模型清單，請自己輸入模型名稱';
-  } catch { $('extFetchNote').textContent = ''; }
+  } catch (e) { if (current()) $('extFetchNote').textContent = '查詢失敗：' + e.message; }
 };
 $('extSave').onclick = async () => {
-  const b = $('extSave'); b.disabled = true;
-  try { await extCall('/api/external/save', extForm()); $('extDlg').close(); refresh(); } catch { /* shown in the dialog */ } finally { b.disabled = false; }
+  const dialog = extDialogSeq, b = $('extSave');
+  const current = () => dialog === extDialogSeq && $('extDlg').open;
+  b.disabled = true; $('extErr').textContent = '';
+  try {
+    await extCall('/api/external/save', extForm());
+    if (current()) $('extDlg').close();
+    refresh();
+  } catch (e) { if (current()) $('extErr').textContent = e.message; }
+  finally { if (dialog === extDialogSeq) b.disabled = false; }
 };
 $('histResume').onclick = () => post('/api/resume', { id: histOpenId }).then(() => { closeHistory(); go(histOpenProject); });
 document.addEventListener('keydown', (e) => {
@@ -1598,9 +1636,20 @@ document.addEventListener('click', (e) => {
   const rtAdd = e.target.closest('[data-rt-add]');
   if (rtAdd) {
     const box = rtAdd.closest('.goal-b'), p = ws();
+    if (pendingRoutineAdds.has(p)) return;
     const days = [...box.querySelectorAll('input[data-rt-day]:checked')].map((x) => Number(x.dataset.rtDay));
-    return post('/api/routine/save', { ws: p, request: box.querySelector('input[data-rt-request]').value, precheck: box.querySelector('input[data-rt-precheck]').value, time: box.querySelector('input[data-rt-time]').value, days })
-      .then(() => { drafts['rt:' + p] = ''; drafts['rtp:' + p] = ''; $('office')._html = ''; rtAdd.blur(); render(); }).catch(() => {});
+    const request = box.querySelector('input[data-rt-request]').value, precheck = box.querySelector('input[data-rt-precheck]').value;
+    pendingRoutineAdds.add(p);
+    rtAdd.disabled = true;
+    return post('/api/routine/save', { ws: p, request, precheck, time: box.querySelector('input[data-rt-time]').value, days }, undefined, () => ws() === p)
+      .then(() => {
+        if (drafts['rt:' + p] === request) delete drafts['rt:' + p];
+        if (drafts['rtp:' + p] === precheck) delete drafts['rtp:' + p];
+        if (ws() === p) { $('office')._html = ''; rtAdd.blur(); }
+      }).catch(() => {}).finally(() => {
+        pendingRoutineAdds.delete(p);
+        if (ws() === p) render();
+      });
   }
   const rtDel = e.target.closest('[data-rt-del]');
   if (rtDel) { if (confirm('刪除這個定時工作？')) post('/api/routine/delete', { ws: ws(), id: rtDel.dataset.rtDel }).then(() => { $('office')._html = ''; rtDel.blur(); }).catch(() => {}); return; }
