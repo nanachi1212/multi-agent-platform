@@ -1486,11 +1486,11 @@ function pump(w) {
   const byId = (id) => w.tasks.find((x) => x.id === id);
   const order = [...w.tasks].sort((a, b) => (b.wakeNote ? 1 : 0) - (a.wakeNote ? 1 : 0));
   for (const t of order) {
-    if (t.status !== 'WAITING' || t.hold || t.preparing || w.executingSteps?.has(t.id)) continue;
+    if (t.status !== 'WAITING' || t.hold || w.executingSteps?.has(t.id)) continue;
     const entering = needsDependencyAdmission(w, t);
     const deps = (t.after || []).map(byId).filter((d) => d && (entering || !d.verdictStale));
     if (deps.some((d) => d.status === 'FAILED')) { runTask(w, t, true); continue; }
-    if (deps.some((d) => d.status !== 'DONE')) continue;
+    if (t.preparing || deps.some((d) => d.status !== 'DONE')) continue;
     if (!w.tasks.some((x) => x.status === 'WORKING' && x.agent === t.agent) && !(isWriter(t) && writerBusy(w, t))) runTask(w, t);
   }
   // Follow both dependency and agent waits; a runnable/external/user-held card can still make progress.
@@ -1951,6 +1951,11 @@ async function endWriteStep(w, t, ranAs = t.agent) {
 async function releaseRejectedReservations(w, t) {
   const reservations = () => cardLeases(w, t, t.agent).filter((l) => l.status === 'RESERVED' && sameCard(l, w, t));
   if (!reservations().length || t.stopUnconfirmed || t.runtimeStopPending) return;
+  if (t.preparing) {
+    // The card can fail admission while its worktree setup still owns a process.
+    await preparing.get(t.id)?.promise?.catch(() => {});
+    if (t.preparing) return;
+  }
   if (t.firstStartedAt) {
     try {
       await w.runtimeStarts?.get(t.id)?.catch(() => {});
