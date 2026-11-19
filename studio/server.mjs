@@ -89,16 +89,14 @@ const DELIVERY_IDS = ['auto', 'pr']; // delivery: auto = all the way to merge (d
 const AUTO_MAX_DEFAULT = 5; // auto-started jobs in a row before Studio stops and waits for the user (per project; 0 = no limit)
 const TOKEN_CAP_DEFAULT = 0; // tokens one card may spend before Studio stops it (0 = no cap); checked between steps, not inside one
 // S.leader is the default Leader for newly opened projects.
-const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [], leases: [], external: [], acp: [],
+const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}, workspaces: [], closedWorkspaces: {}, leases: [], external: [], acp: [],
   limits: {}, notify: true, notices: [], noticeSeq: 0, runtimes: [] };
 // One workspace per project folder: its own Leader, board, team chat and run, so projects work side by side.
 // name = optional display name (tabs, cards, notifications); the folder name is used when empty.
 // agentCfg = this project's model / effort per agent; workers = agents allowed to work here.
 // New projects start from S.agentCfg (the last choices).
-const newWs = (project, leader = S.leader, name = '', agentCfg = S.agentCfg, workers = Object.keys(AGENTS)) => ({
-  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, autoMax: AUTO_MAX_DEFAULT, strategy: 'save', delivery: 'auto', finisher: '', fallback: '', backendPort: 0, worktreeSetup: '', tokenCap: TOKEN_CAP_DEFAULT, apiDailyTokenCap: 0, apiDailyUsage: null, mission: '', routines: [],
-  agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...agentCfg?.[id] }])),
-  workers: workers.filter((id) => AGENTS[id]),
+const newWs = (project, saved) => ({
+  ...workspaceSettings({ ...saved, project }), run: null, tasks: [], activity: [], autoRounds: 0,
 });
 // An agent may be gone (an external model that was deleted); old cards still name it.
 const agentName = (id) => AGENTS[id]?.name || id;
@@ -124,13 +122,14 @@ try {
   const saved = JSON.parse(fs.readFileSync(SETTINGS, 'utf8'));
   for (const e of saved.external || []) if (e?.id && e.providerId && e.model) { S.external.push({ id: String(e.id), name: String(e.name || e.model), platform: e.platform, baseUrl: String(e.baseUrl || ''), isFullUrl: !!e.isFullUrl, model: String(e.model), providerId: String(e.providerId) }); registerExternal(S.external.at(-1)); }
   for (const e of saved.acp || []) if (e?.id && (e.backend || e.agentId)) { S.acp.push({ id: String(e.id), name: String(e.name || e.id), backend: String(e.backend || ''), yolo: String(e.yolo || ''), agentId: String(e.agentId || ''), command: String(e.command || ''), args: (e.args || []).map(String) }); registerAcp(S.acp.at(-1)); }
-  S.closedApiBudgets = saved.closedApiBudgets || {};
+  // Older versions kept only API budgets for closed tabs, keyed by the same physical folder.
+  S.closedWorkspaces = { ...saved.closedApiBudgets, ...saved.closedWorkspaces };
   if (AGENTS[saved.leader]) S.leader = saved.leader;
   for (const id in S.agentCfg) Object.assign(S.agentCfg[id], saved.agentCfg?.[id]);
   // Older settings had one `project` and global models; it becomes the first open workspace with those models.
   S.workspaces = (saved.workspaces || (saved.project ? [{ project: saved.project }] : []))
     .filter((x) => isDir(x.project))
-    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', autoMax: x.autoMax == null ? AUTO_MAX_DEFAULT : Number(x.autoMax) || 0, strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto', finisher: AGENTS[x.finisher] ? x.finisher : '', fallback: AGENTS[x.fallback] ? x.fallback : '', backendPort: Number(x.backendPort) || 0, worktreeSetup: String(x.worktreeSetup || '').trim().slice(0, 500), tokenCap: x.tokenCap == null ? TOKEN_CAP_DEFAULT : Number(x.tokenCap) || 0, ...restoreApiBudget(x), mission: String(x.mission || ''), routines: (x.routines || []).filter(validRoutine) }));
+    .map((x) => newWs(x.project, x));
   S.recent = (saved.recent || []).filter(isDir);
   if (saved.notify === false) S.notify = false;
 } catch (e) {
@@ -141,8 +140,27 @@ try {
 }
 
 function saveSettings() {
-  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, worktreeSetup: w.worktreeSetup, tokenCap: w.tokenCap, apiDailyTokenCap: w.apiDailyTokenCap, apiDailyUsage: w.apiDailyUsage, mission: w.mission, routines: w.routines }));
-  writeJson(SETTINGS, { leader: S.leader, workspaces, closedApiBudgets: S.closedApiBudgets, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external, acp: S.acp });
+  const workspaces = S.workspaces.map(workspaceSettings);
+  writeJson(SETTINGS, { leader: S.leader, workspaces, closedWorkspaces: S.closedWorkspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external, acp: S.acp });
+}
+
+// Both open and closed projects use this same set of durable fields. Agent choices are resolved
+// against today's team on restore, since a model may have been removed while the tab was closed.
+function workspaceSettings(w) {
+  const cfg = w.agentCfg || S.agentCfg;
+  return {
+    project: w.project, name: String(w.name || ''), leader: AGENTS[w.leader] ? w.leader : S.leader,
+    agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...cfg[id] }])),
+    workers: (w.workers || Object.keys(AGENTS)).filter((id) => AGENTS[id]),
+    pstate: w.pstate || null, afterDone: AFTER_DONE.includes(w.afterDone) ? w.afterDone : 'stop',
+    autoMax: w.autoMax == null ? AUTO_MAX_DEFAULT : Number(w.autoMax) || 0,
+    strategy: STRATEGY_IDS.includes(w.strategy) ? w.strategy : 'save',
+    delivery: DELIVERY_IDS.includes(w.delivery) ? w.delivery : 'auto',
+    finisher: AGENTS[w.finisher] ? w.finisher : '', fallback: AGENTS[w.fallback] ? w.fallback : '',
+    backendPort: Number(w.backendPort) || 0, worktreeSetup: String(w.worktreeSetup || '').trim().slice(0, 500),
+    tokenCap: w.tokenCap == null ? TOKEN_CAP_DEFAULT : Number(w.tokenCap) || 0, ...restoreApiBudget(w),
+    mission: String(w.mission || ''), routines: (w.routines || []).filter(validRoutine),
+  };
 }
 
 // ponytail: reads the newest 200 history files once, then saveRun keeps the cache current in place; index them if history grows large.
@@ -205,6 +223,30 @@ function teamStats() {
 function readHistory(id) {
   if (!/^[\w-]+$/.test(id)) throw new Error('bad id');
   return JSON.parse(fs.readFileSync(path.join(HISTORY, id + '.json'), 'utf8'));
+}
+
+// Older versions could save a stopped job with a WORKING card after its admission check drained.
+// The lease store calls this under its startup lock, before publishing the release.
+function settleStoppedCard(lease) {
+  let record;
+  try { record = readHistory(lease.jobId); }
+  catch (error) {
+    console.error('無法核對已停止工作的歷史，保留寫入租約：' + error.message);
+    return false;
+  }
+  if (record?.status !== 'stopped' || record.id !== lease.jobId || !record.project || !lease.project || !same(record.project, lease.project)) return false;
+  const card = Array.isArray(record.tasks) && record.tasks.find(t => t?.id === lease.cardId);
+  if (!card || !card.id || !card.agent || card.agent !== lease.owner.agent || (card.leaseGeneration || 0) !== (lease.generation || 0)) return false;
+  if (card.stopUnconfirmed || card.runtimeStopPending || card.preparing || card.worktree?.setupProc || card.worktree?.setupLeft?.length) return false;
+  // Pause can reserve an executing writer before cancellation is confirmed. For a card that
+  // already ran, only resumeJob's post-drain reservation has an explicitly cleared reason.
+  if (lease.reason === 'runtime stop unconfirmed' || (card.firstStartedAt && lease.reason !== '')) return false;
+  if (card.status === 'WORKING') {
+    Object.assign(card, { status: 'FAILED', result: '已停止' });
+    writeJson(path.join(HISTORY, record.id + '.json'), record);
+  }
+  // If the lease write failed after history was saved, the next startup completes the release.
+  return card.status === 'FAILED' || card.status === 'DONE';
 }
 
 // Every event of a working run is also saved (status "running"), so closing the Studio mid-job loses nothing:
@@ -1722,6 +1764,8 @@ async function verdictVersion(dir) {
   if (!tree) throw new Error('無法取得驗證工作的 Git 工作樹指紋');
   return { head, tree, dir: canonPath(root) };
 }
+const sameVerdictVersion = (a, b) => treeKey(a.dir) === treeKey(b.dir) && a.head === b.head && a.tree === b.tree;
+const versionLabel = (v) => `${v.dir} (${v.head} / ${v.tree})`;
 
 async function staleDependency(w, t) {
   for (const id of t.after || []) {
@@ -1730,7 +1774,7 @@ async function staleDependency(w, t) {
     const previous = dep.verifiedAt;
     const current = await verdictVersion(previous.dir);
     if (!current) { log(w, 'studio', 'system', `「${dep.title}」無法綁定版本，略過本次比對。`); continue; }
-    if (dep.verdictStale || current.head !== previous.head || current.tree !== previous.tree) {
+    if (dep.verdictStale || !sameVerdictVersion(current, previous)) {
       return { dep, reason: `驗證時是 ${previous.head} / ${previous.tree}，現在是 ${current.head} / ${current.tree}` };
     }
   }
@@ -2091,9 +2135,13 @@ async function stopAndDrain(w) {
       stop(w);
       await drainExecution(w);
       current();
-      // A step can exit before reaching a worker (e.g. Stop during its Git check).
-      // All work has now drained; persist a terminal state for every unfinished card.
-      for (const t of cards) if (!['DONE', 'FAILED'].includes(t.status)) Object.assign(t, { status: 'FAILED', result: '已停止' });
+      // An admission check may drain before runCard ever starts. Settle all unfinished
+      // cards now, while this job still owns the workspace and before releasing its leases.
+      if (run.stopped) {
+        for (const t of cards) {
+          if (!['DONE', 'FAILED'].includes(t.status)) Object.assign(t, { status: 'FAILED', result: '已停止' });
+        }
+      }
       releaseJobLeases(w, 'stopped');
       for (const t of cards) if (isWriter(t)) { await releaseLock(w, t); current(); }
       saveRun(w, 'stopped');
@@ -2671,7 +2719,6 @@ ${accessRules(t)}
 ${isWriter(t) && t.role !== 'check' ? deliveryRules(w.delivery, 'worker') : ''}
 When you end your turn, reply with a short summary of what you did (1-3 sentences).
 ${STATUS_RULES}`;
-    if (!(note && knowsTask)) t.briefed = workKey(t);
     const cid = await conv(w, t.agent, false, t.hard, t.workdir, roOf(t));
     // A step stopped by 立刻打斷 ends early (maybe with an error): park the card until the Leader has read the note.
     // hold also makes turn() throw Halt. Recover that interruption only while this execution still owns the card.
@@ -2700,7 +2747,25 @@ ${STATUS_RULES}`;
     };
     const dir = isWriter(t) ? (await workspaceOf(t.workdir || w.project)).path : '', before = dir ? await treeFiles(dir).catch(() => null) : null;
     if (dir) snap = { dir, at: nowIso(), before: await snapTree(dir) };
+    const verificationVersion = async () => {
+      const version = await verdictVersion(t.workdir || w.project);
+      if (!interrupted() && (w.run !== run || !run.active || (run.lifecycleEpoch || 0) !== epoch || t.status !== 'WORKING'
+        || t.agent !== startAgent || (t.leaseGeneration || 0) !== generation || t.hold)) throw new Halt('驗證已中斷');
+      return version;
+    };
+    if (VERDICT_RE[t.role] && !Object.hasOwn(t, 'verificationStart')) {
+      const start = await verificationVersion();
+      if (interrupted()) { park(); return; }
+      if (start && t.briefed) { // an unfinished card from before start versions were recorded
+        Object.assign(t, { verdictStale: true, verifiedAt: null });
+        return applyStatus(w, t, { kind: 'BLOCKED', text: '先前驗證的起始版本不明，請工頭追加重驗卡。',
+          detail: '舊紀錄缺少驗證開始時的版本，現在是 ' + versionLabel(start) });
+      }
+      t.verificationStart = start; // preserve what this reviewer could have read, including across waits and restarts
+      saveRun(w, 'running');
+    }
     const reported = new Set(), parsed = (r) => { const st = parseStatus(r); st?.files.forEach((f) => reported.add(f)); return st; };
+    if (!(note && knowsTask)) t.briefed = workKey(t);
     const reply = await step(prompt);
     if (t.interrupted) { park(); return; }
     let st = parsed(reply);
@@ -2727,11 +2792,19 @@ ${STATUS_RULES}`;
     }
     if (st.kind !== 'DONE' && overCap(w, t)) throw capErr(); // the step that just ended blew the budget and the card is not finished: stop it now, not at the next wake-up
     if (st.kind === 'DONE' && VERDICT_RE[t.role] && verdictOk(t, verdictOf(t, st.text))) {
-      const version = await verdictVersion(t.workdir || w.project);
+      const version = await verificationVersion();
       if (interrupted()) { park(); return; }
-      if (w.run !== run || !run.active || (run.lifecycleEpoch || 0) !== epoch || t.status !== 'WORKING' || t.agent !== startAgent || t.hold) throw new Halt('驗證已中斷');
-      t.verifiedAt = version;
-      if (!version) log(w, 'studio', 'system', `「${t.title}」無法綁定版本。`);
+      const start = t.verificationStart;
+      if (start && version && !sameVerdictVersion(start, version)) {
+        const detail = `驗證開始時是 ${versionLabel(start)}，現在是 ${versionLabel(version)}`;
+        t.verdictStale = true;
+        t.verifiedAt = null;
+        st = { ...st, kind: 'BLOCKED', text: '驗證期間程式碼已變更，結論已過期；請工頭追加重驗卡。', detail };
+      } else {
+        t.verifiedAt = start && version ? version : null;
+        t.verdictStale = false;
+        if (!t.verifiedAt) log(w, 'studio', 'system', `「${t.title}」無法綁定版本。`);
+      }
     }
     applyStatus(w, t, st, last);
     if (before) await reportFiles(w, t, dir, before, reported);
@@ -3745,8 +3818,8 @@ function openWorkspace(p) {
   let w = S.workspaces.find((x) => same(x.project, p));
   if (!w) {
     const key = treeKey(p);
-    w = Object.assign(newWs(p), restoreApiBudget(S.closedApiBudgets?.[key]));
-    if (S.closedApiBudgets) delete S.closedApiBudgets[key];
+    w = newWs(p, S.closedWorkspaces[key]);
+    delete S.closedWorkspaces[key];
     S.workspaces.push(w);
     refreshState(w);
   }
@@ -3759,9 +3832,7 @@ function closeWorkspace(w) {
   if (w.run?.active) throw new Error('這個專案的團隊還在工作，請先暫停或停止');
   if (stillStopping(w)) throw new Error('這個專案仍在停止或暫停 Agent、工具程序與 runtime，請等清理完成再關閉');
   if ([...preparing.values()].some((e) => e.w === w) || w.tasks.some((t) => t.preparing)) throw new Error('這個專案有工作卡的 worktree 正在準備（設定指令還在跑），請等它完成或先按停止');
-  if (w.apiDailyTokenCap || (w.apiDailyUsage && apiUsageToday(w.apiDailyUsage).tokens)) {
-    (S.closedApiBudgets ||= {})[treeKey(w.project)] = { apiDailyTokenCap: w.apiDailyTokenCap, apiDailyUsage: w.apiDailyUsage };
-  }
+  S.closedWorkspaces[treeKey(w.project)] = workspaceSettings(w);
   S.workspaces = S.workspaces.filter((x) => x !== w); // a paused job stays in 歷史紀錄
   saveSettings();
 }
@@ -3988,7 +4059,7 @@ const routes = {
       return { wsInfo: w.wsInfo, lease, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, worktreeSetup: w.worktreeSetup, tokenCap: w.tokenCap, apiDailyTokenCap: w.apiDailyTokenCap, apiDailyTokens: apiUsageToday(w.apiDailyUsage).tokens, mission: w.mission, routines: w.routines, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
         run: r && { usage: r.usage || null, extMod: r.extMod, claimedBy: r.claimedBy, id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
     });
-    const { leases, closedApiBudgets, ...state } = S; // the page shows each project's lease (above), never the raw list
+    const { leases, closedWorkspaces, ...state } = S; // only open projects and their lease summaries go to the page
     return { ...state, runtimes: S.runtimes, ...teamStats(), agents: Object.values(S.agents), workspaces };
   },
   // Project-scoped calls name their project in `ws` (its folder path).
@@ -4114,7 +4185,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-loadLeases(); // restore ownership before any worker can start
+loadLeases(settleStoppedCard); // restore ownership before any worker can start
 await cleanupStaleRuntimes({ rtDir: RT }).catch(() => {});
 
 // Show each open project's latest paused job again after a restart, ready to continue.

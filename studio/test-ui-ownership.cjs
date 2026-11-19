@@ -10,6 +10,25 @@ module.exports = async function () {
   // 1. Verify index.html UI helper functions and component rendering
   const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 
+  // Opening card B must never submit card A's unsent progress question to B.
+  const dialog = { showModal() {}, close() {} };
+  const fields = { workQ: { value: '' }, workDlg: dialog, workBody: {}, workSend: {}, workClose: {}, workAsk: {} };
+  const requests = [];
+  const work = vm.createContext({ $: id => fields[id], workOpen: null, drafts: {}, workLogOpen: false,
+    workDiff: null, diffSeq: 0, loadWork() {}, post: async (url, body) => requests.push([url, { ...body }]) });
+  vm.runInContext(html.slice(html.indexOf('function openWork('), html.indexOf('// Token usage')), work);
+  vm.runInContext(html.slice(html.indexOf("$('workClose').onclick"), html.indexOf("$('workQ').onkeydown")), work);
+  work.openWork('project-A', 'task');
+  fields.workQ.value = 'A 專案的版本細節？'; fields.workClose.onclick();
+  work.openWork('project-B', 'task');
+  assert.equal(fields.workQ.value, '');
+  fields.workSend.onclick(); assert.equal(requests.length, 0);
+  fields.workQ.value = 'B 的進度？'; fields.workSend.onclick();
+  assert.deepEqual(requests, [['/api/card/ask', { ws: 'project-B', taskId: 'task', text: 'B 的進度？' }]]);
+  work.openWork('project-A', 'other'); assert.equal(fields.workQ.value, '');
+  work.openWork('project-A', 'task'); assert.equal(fields.workQ.value, 'A 專案的版本細節？');
+  work.openWork('project-B', 'task'); assert.equal(fields.workQ.value, '', 'sent drafts stay cleared');
+
   // Extract relevant script block or eval in synthetic context
   const sandbox = {
     console,
@@ -191,11 +210,11 @@ module.exports = async function () {
   assert.ok(stateRoute.includes('workspaces'), 'GET /api/state route found');
   assert.ok(!serverCode.includes('workspace_summary') && !html.includes('workspace_summary'), 'workspace_summary is neither sent nor read');
   const publicState = vm.runInNewContext("({" + stateRoute + "})['GET /api/state']()", {
-    S: { workspaces: [], agents: {}, leases: [{ id: 'private' }], closedApiBudgets: { private: {} } }, teamStats: () => ({}),
+    S: { workspaces: [], agents: {}, leases: [{ id: 'private' }], closedWorkspaces: { private: {} } }, teamStats: () => ({}),
   });
   assert.ok(Array.isArray(publicState.workspaces), 'GET /api/state returns the workspace list');
   assert.ok(!Object.hasOwn(publicState, 'leases'), 'GET /api/state leaves out S.leases');
-  assert.ok(!Object.hasOwn(publicState, 'closedApiBudgets'), 'closed projects stay out of the public state');
+  assert.ok(!Object.hasOwn(publicState, 'closedWorkspaces'), 'closed projects stay out of the public state');
   assert.ok(serverCode.includes('blocked_reason'), 'server.mjs must compute blocked_reason for tasks');
 
   console.log('UI & API Workspace/Runtime/Blocked: PASS');
