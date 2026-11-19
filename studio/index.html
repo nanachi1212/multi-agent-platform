@@ -695,23 +695,27 @@ $('acpSave').onclick = async () => {
     $('acpDlg').close(); refresh();
   } finally { b.disabled = false; }
 };
-let extEditId = '';
+let extEditId = '', extDialogSeq = 0, extQuerySeq = 0;
+function resetExtModels() {
+  extQuerySeq++;
+  $('extModels').innerHTML = ''; $('extFetchNote').textContent = '';
+}
 function extOpen(id) {
   const e = id ? S.external.find((x) => x.id === id) : null;
+  extDialogSeq++;
   extEditId = e?.id || '';
   $('extTitle').textContent = e ? '編輯外部模型' : '新增外部模型';
   $('extName').value = e?.name || ''; $('extPlatform').value = e?.platform || 'openai'; $('extUrl').value = e?.baseUrl || '';
   $('extFull').checked = !!e?.isFullUrl; $('extKey').value = ''; $('extModel').value = e?.model || '';
   $('extKey').placeholder = e ? '（已儲存；留空 = 不變）' : 'sk-…';
-  $('extErr').textContent = ''; $('extFetchNote').textContent = ''; $('extModels').innerHTML = '';
+  $('extErr').textContent = ''; $('extSave').disabled = false;
+  resetExtModels();
   $('extDlg').showModal();
 }
-// Calls from the dialog show their errors inside the dialog.
 async function extCall(url, body) {
-  $('extErr').textContent = '';
   const r = await fetch(url, { method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify(body) });
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) { $('extErr').textContent = j.error || ('錯誤 ' + r.status); throw new Error(j.error); }
+  if (!r.ok) throw new Error(j.error || ('錯誤 ' + r.status));
   return j;
 }
 const extForm = () => ({ id:extEditId, name:$('extName').value, platform:$('extPlatform').value, baseUrl:$('extUrl').value, apiKey:$('extKey').value, model:$('extModel').value, isFullUrl:$('extFull').checked });
@@ -1513,17 +1517,28 @@ $('workSend').onclick = () => { const q = $('workQ').value.trim(); if (!q) retur
 $('workQ').onkeydown = (e) => { if (e.key === 'Enter') $('workSend').click(); };
 setInterval(loadWork, 4000);
 $('extClose').onclick = () => $('extDlg').close();
+for (const id of ['extPlatform', 'extUrl', 'extKey', 'extFull']) $(id).oninput = resetExtModels;
 $('extFetch').onclick = async () => {
+  const query = ++extQuerySeq;
+  const current = () => query === extQuerySeq && $('extDlg').open;
   $('extFetchNote').textContent = '查詢中…';
   try {
     const m = await extCall('/api/external/models', extForm());
+    if (!current()) return;
     $('extModels').innerHTML = m.map((x) => `<option value="${esc(x)}">`).join('');
     $('extFetchNote').textContent = m.length ? `找到 ${m.length} 個模型：點「模型名稱」欄選擇` : '服務沒有回報模型清單，請自己輸入模型名稱';
-  } catch { $('extFetchNote').textContent = ''; }
+  } catch (e) { if (current()) $('extFetchNote').textContent = '查詢失敗：' + e.message; }
 };
 $('extSave').onclick = async () => {
-  const b = $('extSave'); b.disabled = true;
-  try { await extCall('/api/external/save', extForm()); $('extDlg').close(); refresh(); } catch { /* shown in the dialog */ } finally { b.disabled = false; }
+  const dialog = extDialogSeq, b = $('extSave');
+  const current = () => dialog === extDialogSeq && $('extDlg').open;
+  b.disabled = true; $('extErr').textContent = '';
+  try {
+    await extCall('/api/external/save', extForm());
+    if (current()) $('extDlg').close();
+    refresh();
+  } catch (e) { if (current()) $('extErr').textContent = e.message; }
+  finally { if (dialog === extDialogSeq) b.disabled = false; }
 };
 $('histResume').onclick = () => post('/api/resume', { id: histOpenId }).then(() => { closeHistory(); go(histOpenProject); });
 document.addEventListener('keydown', (e) => {

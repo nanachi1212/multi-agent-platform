@@ -7,7 +7,59 @@ const path = require('node:path');
 const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 const src = fs.readFileSync(path.join(__dirname, 'server.mjs'), 'utf8');
 const fn = (source, name) => source.match(new RegExp(`(?:async )?function ${name}\\s*\\([\\s\\S]*?\\r?\\n\\}`))[0];
+async function testExternalModelDialog() {
+  const el = Object.fromEntries([...html.matchAll(/id="(ext\w+)"/g)].map(([, id]) => [id, { value: '', textContent: '', innerHTML: '' }]));
+  Object.assign(el.extDlg, { open: false, showModal() { this.open = true; }, close() { this.open = false; } });
+  const requests = [], refreshed = [];
+  const ctx = vm.createContext({
+    $: id => el[id], S: { external: ['A', 'B'].map(id => ({ id, name: id, baseUrl: 'https://' + id + '.test', model: id + '-manual' })) },
+    esc: value => value, refresh: () => refreshed.push(true),
+    fetch: (url, options) => new Promise(resolve => requests.push({ url, body: JSON.parse(options.body), resolve })),
+  });
+  vm.runInContext(html.slice(html.indexOf('let extEditId'), html.indexOf('function seatHtml')) +
+    html.slice(html.indexOf("$('extClose').onclick"), html.indexOf("$('histResume').onclick")), ctx);
+  const start = (button = 'extFetch') => {
+    const pending = el[button].onclick(), request = requests.at(-1);
+    return { id: request.body.id, async finish(data, ok = true) { request.resolve({ ok, status: ok ? 200 : 400, json: async () => data }); await pending; } };
+  };
+
+  ctx.extOpen('A'); const a = start(); el.extClose.onclick();
+  ctx.extOpen('B'); const b = start();
+  assert.deepEqual([a.id, b.id], ['A', 'B']);
+  await b.finish(['B-01']); await a.finish(['A-01']);
+  assert.equal(el.extModels.innerHTML, '<option value="B-01">', 'late A response must leave B’s model list intact');
+  assert.equal(el.extModel.value, 'B-manual');
+  const old = start(), latest = start();
+  await latest.finish(['B-02']); const note = el.extFetchNote.textContent;
+  await old.finish({ error: 'stale lookup error' }, false);
+  assert.equal(el.extModels.innerHTML, '<option value="B-02">');
+  assert.equal(el.extFetchNote.textContent, note); assert.equal(el.extErr.textContent, '');
+
+  for (const id of ['extPlatform', 'extUrl', 'extKey', 'extFull']) {
+    ctx.extOpen('B'); await start().finish(['old']);
+    const pending = start();
+    if (id === 'extFull') el[id].checked = !el[id].checked; else el[id].value = 'changed';
+    el[id].oninput();
+    assert.equal(el.extModels.innerHTML, '', id + ' discards the old suggestions immediately');
+    await pending.finish(['stale']);
+    assert.equal(el.extModels.innerHTML, ''); assert.equal(el.extFetchNote.textContent, '');
+  }
+  ctx.extOpen(''); const escaped = start(); el.extDlg.close(); // native Escape
+  await escaped.finish(['closed']); assert.equal(el.extModels.innerHTML, '');
+  ctx.extOpen(''); await start().finish({ error: 'current lookup error' }, false);
+  assert.ok((el.extFetchNote.textContent + el.extErr.textContent).includes('current lookup error'));
+
+  ctx.extOpen('A'); const saveA = start('extSave'); el.extClose.onclick(); ctx.extOpen('B');
+  assert.equal(el.extSave.disabled, false);
+  const saveB = start('extSave'); await saveA.finish({});
+  assert.ok(el.extDlg.open); assert.equal(el.extSave.disabled, true, 'A cannot close or enable B’s pending save');
+  assert.equal(refreshed.length, 1, 'a completed save still refreshes the overview');
+  await saveB.finish({ error: 'B save failed' }, false);
+  assert.ok(el.extDlg.open); assert.equal(el.extSave.disabled, false); assert.equal(el.extErr.textContent, 'B save failed');
+  console.log('External model dialog: reversed A/B replies, edited sources, stale errors and saves: PASS');
+}
 async function run() {
+  await testExternalModelDialog();
   const els = Object.fromEntries(['histTitle', 'histMeta', 'histBoard', 'histChat', 'histResume'].map(x => [x, {}]));
   let onCancel;
   els.histDlg = { opens: 0, showModal() { this.opens++; }, close() {}, addEventListener(type, handler) { assert.equal(type, 'cancel'); onCancel = handler; } };
