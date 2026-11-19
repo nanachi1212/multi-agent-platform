@@ -16,6 +16,8 @@ try {
     }
     & node studio/test-state-files.cjs
     if ($LASTEXITCODE -ne 0) { throw 'Studio state file checks failed' }
+    & node studio/test-workspace-settings.cjs
+    if ($LASTEXITCODE -ne 0) { throw 'Studio workspace settings checks failed' }
     & node studio/test-codex-provider.cjs
     if ($LASTEXITCODE -ne 0) { throw 'Studio Codex provider checks failed' }
     & node --check studio/local-maintenance.mjs
