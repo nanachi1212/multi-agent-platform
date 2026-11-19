@@ -2,7 +2,7 @@
 // Run: node studio/server.mjs   (or start-studio.cmd)
 import http from 'node:http';
 import { applyTurnModel, updateModelCatalog } from './live-models.mjs';
-import { AION_RELEASE, createAionClient } from './aion-client.mjs';
+import { AION_RELEASE, createAionClient, readAionrsUsage } from './aion-client.mjs';
 import { acpBackendCommand, withAcpLauncherPath } from './acp-command.mjs';
 import { createWorkspaceLeaseStore } from './workspace-lease.mjs';
 import fs from 'node:fs';
@@ -227,6 +227,7 @@ function event(type, data = {}) {
 
 // ---------- AionCore ----------
 let BASE;
+const aionDataDir = path.join(RT, 'studio', 'data');
 const aion = createAionClient({ baseUrl: () => BASE, unavailable: () => aionGone });
 const api = aion.api;
 
@@ -249,7 +250,7 @@ function aionExited(code, signal) {
 const codexRuntime = createCodexRuntimeGuard({ rtDir: RT, api, owner: () => aionProcess });
 async function startAion() {
   await ensureAion();
-  const data = path.join(RT, 'studio', 'data');
+  const data = aionDataDir;
   const work = path.join(RT, 'studio', 'work');
   for (const d of [data, work]) fs.mkdirSync(d, { recursive: true });
   fs.mkdirSync(CODEX_HOME, { recursive: true });
@@ -517,7 +518,7 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
   const halted = () => run && (w.run !== run || (run.lifecycleEpoch || 0) !== epoch || run.stopped || run.paused) || allowStart && !allowStart();
   if (!check && halted()) throw new Halt('執行已停止');
   if (!run) bill = null;
-  const usage0 = bill ? await usageOf(convId) : null;
+  const usage0 = bill ? await usageOf(convId, agent, true) : null;
   if (agent === 'codex') {
     try { await codexRuntime.prepare(convId); }
     catch (e) { throw Object.assign(e, { stopUnconfirmed: true }); }
@@ -543,7 +544,7 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
   active.set(convId, sent.turn_id);
   convActivity.set(convId, { at: Date.now(), tool: '', confirm: false }); // a fresh turn starts with fresh activity
   if (!check) S.agents[agent].working++;
-  let confirmedIdle = false;
+  let confirmedIdle = false, turnError;
   try {
     if (!check && halted()) throw new Halt('執行已停止');
     let mark = '', markAt = Date.now(), checkedAt = 0, tool = '', extended = 0, graceUntil = 0;
@@ -577,6 +578,7 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
       }
     }
   } catch (e) {
+    turnError = e;
     if (!confirmedIdle && !(await stopTurn(convId))) e.stopUnconfirmed = true;
     throw e;
   } finally {
@@ -586,7 +588,13 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
     if (left?.notes.length) left.fallback(left.notes); // the step ended first: the card hands them over after it
     if (!check) S.agents[agent].working--;
     if (agent === 'codex') refreshCodexLimits();
-    if (bill) chargeUsage(run, agent, bill === 'lead' ? null : bill, usageDelta(usage0, await usageOf(convId)), w);
+    if (bill) {
+      try { chargeUsage(run, agent, bill === 'lead' ? null : bill, usageDelta(usage0, await usageOf(convId, agent)), w); }
+      catch (e) {
+        if (!turnError) throw e;
+        log(w, 'studio', 'system', '這一步未能記錄用量：' + e.message);
+      }
+    }
     if (agent === 'codex' && !(await codexRuntime.stop(convId).catch(() => false))) throw Object.assign(new Error('Codex 工具程序尚未確認停止，保留寫入租約'), { stopUnconfirmed: true });
   }
   if (!check && halted()) throw new Halt('執行已停止');
@@ -799,10 +807,27 @@ function handoffNote(run) {
   return run.handoffFrom ? `\nYou are taking over as LEADER from ${agentName(run.handoffFrom)}. Continue the same job; do not ask the user to repeat the request.\n` : '';
 }
 
-// ---------- Token usage (AionCore keeps the LAST turn's usage per conversation) ----------
-const usageOf = (cid) => api('GET', `/api/conversations/${cid}/usage`).catch(() => null);
+// ---------- Token usage ----------
+async function usageOf(cid, agent, beforeSend = false) {
+  if (!AGENTS[agent]?.external) return api('GET', `/api/conversations/${cid}/usage`).catch(() => null);
+  let snapshot = await readAionrsUsage(aionDataDir, cid);
+  if (!snapshot) {
+    // Initializing a new runtime creates a real zero baseline. Windows may also
+    // briefly remove an existing state file while replacing it.
+    if (beforeSend) await api('POST', `/api/conversations/${cid}/runtime/ensure`, {});
+    else await sleep(30);
+    snapshot = await readAionrsUsage(aionDataDir, cid);
+  }
+  if (!snapshot) throw new Error('外部模型的對話用量無法確認');
+  return snapshot;
+}
 // The turn's tokens, or null when the backend did not report a new usage frame for it (unchanged snapshot).
 function usageDelta(before, after) {
+  if (after?.total) {
+    const a = after.total, b = before?.total;
+    if (!b || a.in < b.in || a.out < b.out || a.cache < b.cache) throw new Error('外部模型的累計用量已重設，無法確認本步用量');
+    return a.in === b.in && a.out === b.out ? null : { in: a.in - b.in, out: a.out - b.out, cache: a.cache - b.cache };
+  }
   const m = after?._meta;
   if (!m || JSON.stringify(before) === JSON.stringify(after)) return null;
   const n = (x) => Math.max(0, Number(x) || 0);

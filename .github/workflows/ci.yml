@@ -30,6 +30,8 @@ jobs:
           node-version: 22
       - name: Verify the pinned backend and ACP contract
         run: node studio/test-aion-contract.mjs
+      - name: Verify external budgeting with a local simulated provider
+        run: node studio/test-external-budget-contract.mjs
 
   w1-managed-spawn:
     name: W1 managed-spawn partial fix (no models)
