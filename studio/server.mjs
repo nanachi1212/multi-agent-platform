@@ -1442,7 +1442,7 @@ function pump(w) {
   if (onAgents.length && !w.tasks.some((t) => ['WORKING', 'WAITING', 'WAITING_EXTERNAL', 'ASK_LEADER', 'NEEDS_USER'].includes(t.status))) {
     for (const t of onAgents) wake(w, t, 'The agent you were waiting for has no open card. Continue with its recorded results, or report NEEDS_USER.');
   }
-  if (!run.summarizing && w.tasks.length && w.tasks.every((t) => t.status === 'DONE' || t.status === 'FAILED') && !w.tasks.some((t) => t.preparing)) summarize(w); // a setup still running (or unconfirmed) holds the wrap-up
+  if (!run.summarizing && !w.executingSteps?.size && w.tasks.length && w.tasks.every((t) => t.status === 'DONE' || t.status === 'FAILED') && !w.tasks.some((t) => t.preparing)) summarize(w); // a setup still running (or unconfirmed) holds the wrap-up
 }
 
 // ---------- Workspace lease: who may write which working tree ----------
@@ -1633,6 +1633,30 @@ async function privateGit(dir, fn) {
 }
 const writeTree = async (g) => (await g('add', '-A')).err ? '' : (await g('write-tree')).out?.trim() || '';
 const snapTree = async (dir) => (await privateGit(dir, writeTree)) || '';
+async function verdictVersion(dir) {
+  const info = await git(dir, 'rev-parse', '--show-toplevel', '--verify', 'HEAD');
+  if (info.err) return null;
+  const [root, head] = info.out.trim().split(/\r?\n/);
+  if (!head) return null;
+  const tree = await snapTree(root);
+  if (!tree) throw new Error('無法取得驗證工作的 Git 工作樹指紋');
+  return { head, tree, dir: canonPath(root) };
+}
+
+async function staleDependency(w, t) {
+  for (const id of t.after || []) {
+    const dep = w.tasks.find((x) => x.id === id);
+    if (!dep?.verifiedAt) continue;
+    const previous = dep.verifiedAt;
+    const current = await verdictVersion(previous.dir);
+    if (!current) { log(w, 'studio', 'system', `「${dep.title}」無法綁定版本，略過本次比對。`); continue; }
+    if (dep.verdictStale || current.head !== previous.head || current.tree !== previous.tree) {
+      return { dep, reason: `驗證時是 ${previous.head} / ${previous.tree}，現在是 ${current.head} / ${current.tree}` };
+    }
+  }
+  return null;
+}
+
 // t3code keeps its checkpoints under refs/t3/checkpoints; Studio keeps step n of a card as refs/studio/steps/<card>/<n>:
 // a commit of the after-tree whose parent is a commit of the before-tree. Refs live in the main repository (a removed
 // worktree keeps them) and are not pushed by a normal push. Refs older than STEP_KEEP_DAYS go when a new step is kept.
@@ -1847,14 +1871,26 @@ async function runTask(w, t) {
   w.stepsInFlight = (w.stepsInFlight || 0) + 1; // from now until the lease is settled, the watcher must not call our own edits "unknown"
   try {
     t.status = 'WORKING'; // reserve the slot at once: no second writer may start while the checks below run
-    if (!(await takeWriteSlot(w, t))) return;
-    if (!w.run?.active || t.status !== 'WORKING') { // paused or stopped while the check ran
-      if (t.status === 'WORKING') Object.assign(t, w.run?.stopped ? { status: 'FAILED', result: '已停止' } : { status: 'PAUSED', result: '已暫停', resumed: true });
-      await endWriteStep(w, t, ranAs);
-      return;
+    const run = w.run, epoch = run.lifecycleEpoch;
+    const stale = t.after?.length ? await staleDependency(w, t) : null;
+    if (w.run !== run || !run.active || epoch !== run.lifecycleEpoch || t.status !== 'WORKING' || t.hold) return;
+    if (stale) {
+      const { dep, reason } = stale;
+      Object.assign(dep, { status: 'FAILED', verdictStale: true, detail: '結論已過期：' + reason });
+      Object.assign(t, { status: 'FAILED', result: `「${dep.title}」結論已過期，這張卡沒有開始；請工頭追加重驗卡。` });
+      log(w, 'studio', 'system', t.result + ' ' + reason, reason);
+      wakeWaiters(w, t);
+    } else {
+      if (!(await takeWriteSlot(w, t))) return;
+      try {
+        if (!w.run?.active || t.status !== 'WORKING') {
+          if (t.status === 'WORKING') Object.assign(t, w.run?.stopped ? { status: 'FAILED', result: '已停止' } : { status: 'PAUSED', result: '已暫停', resumed: true });
+          return;
+        }
+        await runCard(w, t);
+      } finally { await endWriteStep(w, t, ranAs); }
+      if (t.status === 'DONE' && t.worktree) await cleanupWorktree(w, t);
     }
-    try { await runCard(w, t); } finally { await endWriteStep(w, t, ranAs); }
-    if (t.status === 'DONE' && t.worktree) await cleanupWorktree(w, t);
   } catch (e) {
     Object.assign(t, { status: w.run?.stopped ? 'FAILED' : 'PAUSED', result: w.run?.stopped ? '已停止' : e.message, resumed: true });
     if (w.run?.active) pause(w);
@@ -2571,6 +2607,13 @@ ${STATUS_RULES}`;
       st = parsed(last) || { kind: 'BLOCKED', detail: '沒有有效的 STATUS，無法確認工作已完成', options: [], text: last.trim() };
     }
     if (st.kind !== 'DONE' && overCap(w, t)) throw capErr(); // the step that just ended blew the budget and the card is not finished: stop it now, not at the next wake-up
+    if (st.kind === 'DONE' && VERDICT_RE[t.role] && verdictOk(t, verdictOf(t, st.text))) {
+      const version = await verdictVersion(t.workdir || w.project);
+      if (interrupted()) { park(); return; }
+      if (w.run !== run || !run.active || (run.lifecycleEpoch || 0) !== epoch || t.status !== 'WORKING' || t.agent !== startAgent || t.hold) throw new Halt('驗證已中斷');
+      t.verifiedAt = version;
+      if (!version) log(w, 'studio', 'system', `「${t.title}」無法綁定版本。`);
+    }
     applyStatus(w, t, st, last);
     if (before) await reportFiles(w, t, dir, before, reported);
     if (t.status === 'DONE' && overCap(w, t)) { // finished, but the last step went over: the work stays, the user hears about it
@@ -2632,7 +2675,7 @@ ${STATUS_RULES}`;
     wakeWaiters(w, t);
   } finally { // also a step that was paused, stopped, timed out or failed: its partial edits are worth a look
     const after = snap?.before && await snapTree(snap.dir);
-    if (after && after !== snap.before) { (t.steps ||= []).push({ at: snap.at, before: snap.before, after }); await keepStep(snap.dir, t).catch(() => {}); } // only steps that changed files
+    if (after && after !== snap.before) { (t.steps ||= []).push({ at: snap.at, finishedAt: nowIso(), before: snap.before, after }); await keepStep(snap.dir, t).catch(() => {}); } // only steps that changed files
   }
 }
 
@@ -3226,6 +3269,13 @@ async function continueProject(w) {
 // ---------- The Leader checks the whole request ----------
 const MAX_ROUNDS = 3; // extra card rounds before the Leader must ask the user
 
+function verdictCoverage(w, t) {
+  if (!t.verifiedAt || !w.tasks.some((writer) => writer !== t && isWriter(writer) && writer.status === 'DONE'
+    && writer.doneAt >= t.doneAt && treeKey(writer.workdir || w.project) === treeKey(t.workdir || w.project)
+    && writer.steps?.some((s) => (s.finishedAt || s.at) >= t.doneAt && s.before !== s.after && s.after !== t.verifiedAt.tree))) return '';
+  return ' [驗證後有修改，結論未覆蓋最新版本；請工頭安排重驗]';
+}
+
 async function summarize(w, userAnswer = '') { return leaderStep(w, (run, epoch) => summarizeStep(w, run, epoch, userAnswer)); }
 async function summarizeStep(w, run, epoch, userAnswer = '') {
   run.summarizing = true;
@@ -3233,7 +3283,7 @@ async function summarizeStep(w, run, epoch, userAnswer = '') {
   run.ask = null;
   const gen = run.leaderGen, lead = run.leader;
   const workers = workersFor(w, lead);
-  const results = w.tasks.map((t) => `- [${t.status}] ${t.title} (${agentName(t.agent)}): ${clip(t.result, 500)}${t.status === 'FAILED' && t.detail ? ` [technical reason: ${clip(t.detail, 200)}]` : ''}`).join('\n');
+  const results = w.tasks.map((t) => `- [${t.status}] ${t.title} (${agentName(t.agent)}): ${clip(t.result, 500)}${t.status === 'FAILED' && t.detail ? ` [technical reason: ${clip(t.detail, 200)}]` : ''}${verdictCoverage(w, t)}`).join('\n');
   try {
     const reply = await turn(lead, await conv(w, lead, true), `You are the LEADER. Every current card has ended.${handoffNote(run)}
 Original user request:
