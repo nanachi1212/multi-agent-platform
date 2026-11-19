@@ -19,6 +19,52 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
     git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'base');
     git(repo, 'worktree', 'add', '-qb', 'review', wt);
     git(wt, 'commit', '--allow-empty', '-qm', 'different head');
+    async function stopDuringVerdictCheck() {
+      const w = newW();
+      w.project = w.run.project = repo;
+      Object.assign(w.run, { phase: 'working', active: false, paused: true });
+      let headRead, releaseHead, observeStop;
+      const stopAccepted = new Promise(resolve => { observeStop = resolve; });
+      const { api, env } = makeEnv(() => 'ok\nSTATUS: DONE', {
+        execFile(cmd, args, opts, callback) {
+          if (cmd !== 'git' || !args.includes('--show-toplevel') || !args.includes('--verify')) {
+            return execFile(cmd, args, opts, callback);
+          }
+          headRead = new Promise(resolve => {
+            execFile(cmd, args, opts, (...result) => {
+              releaseHead = () => callback(...result);
+              resolve();
+            });
+          });
+        },
+        event(type, data) { if (type === 'job.end' && data.status === 'stopped') observeStop(); },
+      });
+      runtimes.push(env.RT);
+      env.S.workspaces.push(w);
+      const check = { id: 'verify', title: 'verify', role: 'check', agent: 'codex', status: 'DONE', result: 'PASS',
+        verifiedAt: { dir: repo, head: git(repo, 'rev-parse', 'HEAD'), tree: await api.snapTree(repo) } };
+      const writer = { id: 'deliver', title: 'deliver', role: 'build', agent: 'codex', status: 'WAITING', writes: true, after: [check.id] };
+      const waiting = { id: 'next', title: 'next', role: 'review', agent: 'claude', status: 'WAITING', writes: false, after: [writer.id] };
+      w.tasks.push(check, writer, waiting);
+      const diskLeases = () => JSON.parse(fs.readFileSync(path.join(env.RT, 'studio', 'leases.json'), 'utf8'));
+      await api.resume(w);
+      assert.ok(headRead, 'resume entered the prerequisite version check');
+      await headRead;
+      assert.equal(writer.firstStartedAt, undefined, 'the writer has not started during version verification');
+      const stop = api.stopAndDrain(w);
+      try {
+        await Promise.race([stopAccepted, stop.then(() => assert.fail('Stop returned while Git was held'))]);
+        assert.ok(diskLeases().some(l => l.cardId === writer.id && l.status === 'RESERVED'), 'retain the writer lease while draining');
+      } finally {
+        releaseHead();
+        await stop;
+      }
+      assert.equal(w.run.result, 'stopped');
+      assert.equal(env.prompts.length, 0, 'no worker or leader was dispatched after Stop');
+      assert.deepEqual([check.status, check.result], ['DONE', 'PASS']);
+      assert.deepEqual(w.tasks.slice(1).map(t => t.status), ['FAILED', 'FAILED']);
+      assert.equal(diskLeases().filter(l => l.status !== 'RELEASED').length, 0);
+    }
     async function scenario(dir, role, change) {
       const w = newW(); w.project = w.run.project = dir === plain ? plain : repo;
       w.run.startedAt = new Date().toISOString();
@@ -60,6 +106,7 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
       const summary = env.prompts.find(p => p.text.includes('Every current card has ended'));
       assert.equal(summary.text.includes('驗證後有修改，結論未覆蓋最新版本'), change === 'tree');
     }
+    await stopDuringVerdictCheck();
     await scenario(repo, 'check');
     await scenario(wt, 'review', 'other');
     await scenario(wt, 'review', 'head');
@@ -68,5 +115,5 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
   } finally {
     for (const dir of [...runtimes, temp]) await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 10 });
   }
-  console.log('verdict binding: unchanged, dirty tree, HEAD-only change, non-Git, linked worktree and summary PASS');
+  console.log('verdict binding: Stop during validation, unchanged, dirty tree, HEAD-only change, non-Git, linked worktree and summary PASS');
 })().catch(err => { console.error(err); process.exitCode = 1; });
