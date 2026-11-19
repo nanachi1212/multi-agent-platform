@@ -1486,11 +1486,12 @@ function pump(w) {
   const byId = (id) => w.tasks.find((x) => x.id === id);
   const order = [...w.tasks].sort((a, b) => (b.wakeNote ? 1 : 0) - (a.wakeNote ? 1 : 0));
   for (const t of order) {
-    if (t.status !== 'WAITING') continue;
-    const deps = (t.after || []).map(byId).filter(Boolean);
-    if (deps.some((d) => d.status === 'FAILED')) { Object.assign(t, { status: 'FAILED', result: '前一張工作卡失敗，這張沒有開始；交給工頭決定下一步。' }); continue; }
+    if (t.status !== 'WAITING' || t.hold || t.preparing || w.executingSteps?.has(t.id)) continue;
+    const entering = needsDependencyAdmission(w, t);
+    const deps = (t.after || []).map(byId).filter((d) => d && (entering || !d.verdictStale));
+    if (deps.some((d) => d.status === 'FAILED')) { runTask(w, t, true); continue; }
     if (deps.some((d) => d.status !== 'DONE')) continue;
-    if (!t.hold && !t.preparing && !w.executingSteps?.has(t.id) && !w.tasks.some((x) => x.status === 'WORKING' && x.agent === t.agent) && !(isWriter(t) && writerBusy(w, t))) runTask(w, t);
+    if (!w.tasks.some((x) => x.status === 'WORKING' && x.agent === t.agent) && !(isWriter(t) && writerBusy(w, t))) runTask(w, t);
   }
   // Follow both dependency and agent waits; a runnable/external/user-held card can still make progress.
   const onAgents = w.tasks.filter((t) => t.status === 'WAITING_AGENT');
@@ -1516,6 +1517,11 @@ function pump(w) {
     for (const t of onAgents) wake(w, t, 'The agent you were waiting for has no open card. Continue with its recorded results, or report NEEDS_USER.');
   }
   if (!run.summarizing && !w.executingSteps?.size && w.tasks.length && w.tasks.every((t) => t.status === 'DONE' || t.status === 'FAILED') && !w.tasks.some((t) => t.preparing)) summarize(w); // a setup still running (or unconfirmed) holds the wrap-up
+}
+
+// Old histories already record firstStartedAt. A previously started card in its original folder was admitted there.
+function needsDependencyAdmission(w, t) {
+  return !t.firstStartedAt || (t.admittedWorkdir && t.admittedWorkdir !== treeKey(t.workdir || w.project));
 }
 
 // ---------- Workspace lease: who may write which working tree ----------
@@ -1929,16 +1935,39 @@ async function endWriteStep(w, t, ranAs = t.agent) {
     if (!t.workdir) w.run.treeStamp = stamp;
     w.run.leftAt = nowIso();
   }
+  // A card moved while waiting can still have its original checkout reserved as well as this worktree.
+  const priorDirs = t.worktree ? new Set(cardLeases(w, t, ranAs).filter(l => l.mode === 'write' && l.key !== treeKey(t.workdir)).map(l => l.path)) : [];
   if (t.agent !== ranAs) releaseCardLeases(w, t, 'handed off', ranAs); // the card moved on while this step was ending: not our lease any more
   else if (w.run?.stopped) releaseCardLeases(w, t, 'stopped', ranAs);
   else if (w.run?.paused) reserveCardLeases(w, t, 'paused', ranAs);
   else if (holdsWriteLock(t)) reserveCardLeases(w, t, 'waiting', ranAs);
   else releaseCardLeases(w, t, 'card finished', ranAs);
   if (!w.tasks.some((x) => holdsWriteLock(x) && sameTree(x, t))) await releaseLock(w, t);
+  for (const dir of priorDirs) await releaseLock(w, { workdir: dir }); // releaseLock keeps any tree with a live lease
 }
 
-async function runTask(w, t) {
-  if (apiBudgetSpent(w, t.agent)) return waitForApiBudget(w, t);
+// A handoff or takeover question can reserve a write lease before the first worker turn.
+// Drop only this card's current reservations. A moving card may still have one in its old tree.
+async function releaseRejectedReservations(w, t) {
+  const reservations = () => cardLeases(w, t, t.agent).filter((l) => l.status === 'RESERVED' && sameCard(l, w, t));
+  if (!reservations().length || t.stopUnconfirmed || t.runtimeStopPending) return;
+  if (t.firstStartedAt) {
+    try {
+      await w.runtimeStarts?.get(t.id)?.catch(() => {});
+      await cleanupCardRuntimes(w, [t], w.run.id, {}); // no worker turn is active, including in a shared conversation
+    } catch { t.runtimeStopPending = true; return; }
+  }
+  const dirs = withLeaseTransaction(() => {
+    const held = reservations();
+    for (const l of held) retire(l, 'prerequisite failed before admission');
+    saveLeases();
+    return [...new Set(held.map(l => l.path))];
+  });
+  for (const dir of dirs) await releaseLock(w, { workdir: dir });
+}
+
+async function runTask(w, t, failedDependency = false) {
+  if (!failedDependency && apiBudgetSpent(w, t.agent)) return waitForApiBudget(w, t);
   if (t.ask?.apiBudget) t.ask = null;
   const ranAs = t.agent;
   let settleStep;
@@ -1948,13 +1977,17 @@ async function runTask(w, t) {
   try {
     t.status = 'WORKING'; // reserve the slot at once: no second writer may start while the checks below run
     const run = w.run, epoch = run.lifecycleEpoch;
-    const stale = t.after?.length ? await staleDependency(w, t) : null;
+    const stale = !failedDependency && t.after?.length && needsDependencyAdmission(w, t) ? await staleDependency(w, t) : null;
     if (w.run !== run || !run.active || epoch !== run.lifecycleEpoch || t.status !== 'WORKING' || t.hold) return;
-    if (stale) {
-      const { dep, reason } = stale;
-      Object.assign(dep, { status: 'FAILED', verdictStale: true, detail: '結論已過期：' + reason });
-      Object.assign(t, { status: 'FAILED', result: `「${dep.title}」結論已過期，這張卡沒有開始；請工頭追加重驗卡。` });
-      log(w, 'studio', 'system', t.result + ' ' + reason, reason);
+    if (failedDependency || stale) {
+      Object.assign(t, { status: 'FAILED', result: '前一張工作卡失敗，這張沒有開始；交給工頭決定下一步。' });
+      if (stale) {
+        const { dep, reason } = stale;
+        Object.assign(dep, { status: 'FAILED', verdictStale: true, detail: '結論已過期：' + reason });
+        t.result = `「${dep.title}」結論已過期，這張卡沒有開始；請工頭追加重驗卡。`;
+        log(w, 'studio', 'system', t.result + ' ' + reason, reason);
+      }
+      await releaseRejectedReservations(w, t);
       wakeWaiters(w, t);
     } else {
       if (!(await takeWriteSlot(w, t))) return;
@@ -2393,6 +2426,7 @@ async function makeWorktree(w, t, e) {
   if (r.err) throw new Error('建立 worktree 失敗：' + r.err);
   e.keys.add(treeKey(dir)); // now it exists: its real path (a link in RT) is a key too
   const inc = await includeIgnored(info.path, dir).catch((e) => ({ entries: [], text: '讀取 .worktreeinclude 失敗，什麼都沒補：' + e.message }));
+  if (t.after?.length && t.firstStartedAt) t.admittedWorkdir ||= treeKey(t.workdir || w.project);
   Object.assign(t, { workdir: dir, worktree: { path: dir, branch, base, repoPath: info.path, included: inc.entries }, blocked: null, blockReason: '', blockLogged: '' });
   log(w, 'studio', 'system', `「${t.title}」改在獨立 worktree 做（branch ${branch}）：不會碰到主資料夾的寫入者。${inc.text ? ' .worktreeinclude：' + inc.text + '。' : ''}`);
   if (w.worktreeSetup && !e.stopped) {
@@ -2606,6 +2640,7 @@ async function runCard(w, t) {
   t.status = 'WORKING';
   t.workingSince = nowIso(); // this work spell (shown as 已執行)
   t.firstStartedAt ||= t.workingSince;
+  if (t.after?.length) t.admittedWorkdir = treeKey(t.workdir || w.project);
   t.wakeNote = '';
   log(w, t.agent, 'worker', (note ? '收到等待的結果，繼續：' : t.resumed ? '繼續工作：' : '開始工作：') + t.title);
   let snap = null; // { dir, at, before }: a writing step's tree before it; the after-tree is taken however the step ends
