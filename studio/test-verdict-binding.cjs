@@ -11,6 +11,7 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
   fs.mkdirSync(repo); fs.mkdirSync(plain);
   const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', windowsHide: true }).trim();
   const file = dir => path.join(dir, 'source.txt');
+  const runtimes = [];
   try {
     git(repo, 'init', '-qb', 'main');
     git(repo, 'config', 'user.name', 'Test'); git(repo, 'config', 'user.email', 'test@example.invalid');
@@ -22,11 +23,12 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
       const w = newW(); w.project = w.run.project = dir === plain ? plain : repo;
       w.run.startedAt = new Date().toISOString();
       const { api, env } = makeEnv((_agent, prompt) => {
-        if (prompt.includes('Every current card has ended')) return '{"done":true,"report":"ok"}';
+        if (prompt.includes('Every current card has ended')) return '{"needs_user":"Review coverage?"}';
         if (prompt.includes('Task: verify')) return (role === 'review' ? 'GO WITH CHANGES' : 'PASS') + '\nSTATUS: DONE';
         if (prompt.includes('Task: edit')) fs.writeFileSync(file(dir), 'after verification');
         return 'ok\nSTATUS: DONE';
       }, { execFile });
+      runtimes.push(env.RT);
       env.S.workspaces.push(w);
       const card = (id, writes, extra) => {
         const t = { id, title: id, agent: 'codex', writes, status: 'WAITING', after: [], ...extra };
@@ -63,6 +65,8 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
     await scenario(wt, 'review', 'head');
     await scenario(repo, 'check', 'tree');
     await scenario(plain, 'review');
-    console.log('verdict binding: unchanged, dirty tree, HEAD-only change, non-Git, linked worktree and summary PASS');
-  } finally { fs.rmSync(temp, { recursive: true, force: true, maxRetries: 10 }); }
+  } finally {
+    for (const dir of [...runtimes, temp]) await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 10 });
+  }
+  console.log('verdict binding: unchanged, dirty tree, HEAD-only change, non-Git, linked worktree and summary PASS');
 })().catch(err => { console.error(err); process.exitCode = 1; });
