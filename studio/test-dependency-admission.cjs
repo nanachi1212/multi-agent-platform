@@ -87,6 +87,45 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
     assert.equal(pending.status, 'FAILED');
     assert.ok(!pending.firstStartedAt);
     assert.ok(!e.S.leases.some(l => l.cardId === 'p' && l.status !== 'RELEASED'));
+
+    // Stop while the real Git preflight still holds its answer. The result is stale
+    // by the time Git replies, but the stopped card must never dispatch or invalidate its prerequisite.
+    const job = newW(); job.project = job.run.project = repo;
+    const checked = Promise.withResolvers(), resumeGit = Promise.withResolvers(), stopped = Promise.withResolvers();
+    const snapshots = [];
+    const delayedGit = (cmd, args, opts, callback) => execFile(cmd, args, opts, async (...result) => {
+      if (args.includes('--show-toplevel') && args.includes('--verify')) {
+        checked.resolve(); await resumeGit.promise;
+      }
+      callback(...result);
+    });
+    const halted = makeEnv(() => assert.fail('a stopped admission sent work'), { execFile: delayedGit,
+      saveRun(w, status) {
+        if (status === 'stopped') { snapshots.push(w.tasks.at(-1).status); stopped.resolve(); }
+      } });
+    runtimes.push(halted.env.RT); halted.env.S.workspaces.push(job);
+    const source = { id: 'checked', title: 'check', role: 'check', agent: 'codex', writes: true, status: 'DONE', verdictStale: false,
+      verifiedAt: { dir: repo, head: git(repo, 'rev-parse', 'HEAD'), tree: await halted.api.snapTree(repo) } };
+    fs.writeFileSync(file(repo), 'changed after the last PASS');
+    const target = { id: 'last', title: 'deliver', agent: 'codex', writes: true, after: [source.id], status: 'WAITING' };
+    job.tasks.push(source, target);
+    const admission = halted.api.runTask(job, target);
+    const timeout = AbortSignal.timeout(10000);
+    const deadline = new Promise((_, reject) => timeout.addEventListener('abort', () => reject(new Error('stop preflight timed out')), { once: true }));
+    let stopping;
+    try {
+      await Promise.race([checked.promise, deadline]);
+      stopping = halted.api.stopAndDrain(job);
+      await Promise.race([stopped.promise, deadline]);
+    } finally { resumeGit.resolve(); await Promise.all([admission, stopping]); }
+    assert.equal(job.run.result, 'stopped');
+    assert.equal(target.status, 'FAILED', 'stopped preflight must not leave the card WORKING');
+    assert.equal(target.result, '已停止');
+    assert.equal(snapshots.at(-1), 'FAILED');
+    assert.equal(target.firstStartedAt, undefined);
+    assert.equal(source.status, 'DONE'); assert.equal(source.verdictStale, false);
+    assert.equal(halted.env.prompts.length, 0); assert.equal(job.executingSteps.size, 0);
+    assert.ok(!halted.env.S.leases.some(l => l.status !== 'RELEASED'));
   } finally {
     for (const dir of [...runtimes, temp]) await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 10 });
   }

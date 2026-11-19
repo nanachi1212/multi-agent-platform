@@ -2091,6 +2091,9 @@ async function stopAndDrain(w) {
       stop(w);
       await drainExecution(w);
       current();
+      // A step can exit before reaching a worker (e.g. Stop during its Git check).
+      // All work has now drained; persist a terminal state for every unfinished card.
+      for (const t of cards) if (!['DONE', 'FAILED'].includes(t.status)) Object.assign(t, { status: 'FAILED', result: '已停止' });
       releaseJobLeases(w, 'stopped');
       for (const t of cards) if (isWriter(t)) { await releaseLock(w, t); current(); }
       saveRun(w, 'stopped');
