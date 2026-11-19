@@ -509,6 +509,7 @@ const STATUS = { done:'完成', failed:'有失敗', stopped:'已停止', paused:
 let S = null, last = '', histKey = '', histOpenId = null, histOpenProject = '', shownView = null;
 const drafts = {}; // unsent request text per project
 const pausePending = new Set();
+const pendingRoutineAdds = new Set();
 
 // The page shows the overview (#) or one project (#p=<folder>).
 const curPath = () => { const m = location.hash.match(/^#p=(.+)$/); return m ? decodeURIComponent(m[1]) : ''; };
@@ -1318,6 +1319,8 @@ function renderProject(w, force) {
     $('office').style.setProperty('--c', look(w.leader).c);
     setHtml($('office'), officeHtml(w));
   }
+  const addRoutineButton = $('office').querySelector('[data-rt-add]');
+  if (addRoutineButton) addRoutineButton.disabled = pendingRoutineAdds.has(w.project);
   if (force || !$('nowPanel').contains(document.activeElement)) { const att = attention(w); $('nowPanel').classList.toggle('need', !!att.need); setHtml($('nowPanel'), nowHtml(w, att)); }
   // The 工頭 card comes first so its model, limits and settings stay one click away.
   if (force || !$('seats').contains(document.activeElement)) setHtml($('seats'), [w.leader, ...S.agents.map((a) => a.id).filter((id) => id !== w.leader)].map((id) => seatHtml(S.agents.find((a) => a.id === id), w)).join(''));
@@ -1625,9 +1628,20 @@ document.addEventListener('click', (e) => {
   const rtAdd = e.target.closest('[data-rt-add]');
   if (rtAdd) {
     const box = rtAdd.closest('.goal-b'), p = ws();
+    if (pendingRoutineAdds.has(p)) return;
     const days = [...box.querySelectorAll('input[data-rt-day]:checked')].map((x) => Number(x.dataset.rtDay));
-    return post('/api/routine/save', { ws: p, request: box.querySelector('input[data-rt-request]').value, precheck: box.querySelector('input[data-rt-precheck]').value, time: box.querySelector('input[data-rt-time]').value, days })
-      .then(() => { drafts['rt:' + p] = ''; drafts['rtp:' + p] = ''; $('office')._html = ''; rtAdd.blur(); render(); }).catch(() => {});
+    const request = box.querySelector('input[data-rt-request]').value, precheck = box.querySelector('input[data-rt-precheck]').value;
+    pendingRoutineAdds.add(p);
+    rtAdd.disabled = true;
+    return post('/api/routine/save', { ws: p, request, precheck, time: box.querySelector('input[data-rt-time]').value, days }, undefined, () => ws() === p)
+      .then(() => {
+        if (drafts['rt:' + p] === request) delete drafts['rt:' + p];
+        if (drafts['rtp:' + p] === precheck) delete drafts['rtp:' + p];
+        if (ws() === p) { $('office')._html = ''; rtAdd.blur(); }
+      }).catch(() => {}).finally(() => {
+        pendingRoutineAdds.delete(p);
+        if (ws() === p) render();
+      });
   }
   const rtDel = e.target.closest('[data-rt-del]');
   if (rtDel) { if (confirm('刪除這個定時工作？')) post('/api/routine/delete', { ws: ws(), id: rtDel.dataset.rtDel }).then(() => { $('office')._html = ''; rtDel.blur(); }).catch(() => {}); return; }

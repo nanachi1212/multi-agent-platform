@@ -87,6 +87,37 @@ async function run() {
   const renderProject = fn(html, 'renderProject');
   assert.match(renderProject, /setHtml\(box, chatHtml\(w\.activity\)\)/); assert.doesNotMatch(renderProject, /box\.innerHTML/);
   // A rebuild (new chat message) re-opens the technical details the user had open, matched by text.
+  // Two clicks before the save response must create just one enabled routine.
+  const projects = { A: { routines: [] }, B: { routines: [] } }, replies = [];
+  const form = { request: '每天整理報表', precheck: '', time: '09:30' };
+  const box = { querySelector: s => ({ value: form[s.match(/data-rt-(\w+)/)[1]] }),
+    querySelectorAll: () => [{ dataset: { rtDay: '1' } }] };
+  const button = () => ({ closest: () => box, blur() {} });
+  const ui = { current: 'A', ws: () => ui.current, pendingRoutineAdds: new Set(), drafts: { 'rt:A': form.request },
+    $: () => ({}), render() {}, crypto, saveSettings() {},
+    post: (path, body) => {
+      assert.equal(path, '/api/routine/save');
+      return new Promise((resolve, reject) => replies.push({ save() { ui.saveRoutine(projects[body.ws], body); resolve(); }, reject }));
+    } };
+  vm.createContext(ui);
+  vm.runInContext([fn(src, 'validRoutine'), fn(src, 'saveRoutine')].join('\n'), ui);
+  vm.runInContext('function click(e) {' + html.match(/const rtAdd = [\s\S]*?(?=  const rtDel = )/)[0] + '}', ui);
+  const add = () => ui.click({ target: { closest: () => button() } });
+  const firstSave = add();
+  add(); // even a replacement button from a redraw must refer to the same pending request
+  assert.equal(replies.length, 1, 'only one create reaches the server during a double click');
+  ui.current = 'B'; const otherSave = add();
+  assert.equal(replies.length, 2, 'projects have independent forms');
+  ui.drafts['rt:A'] = '明天的工作';
+  replies[0].save(); await firstSave; replies[1].save(); await otherSave;
+  assert.equal(ui.drafts['rt:A'], '明天的工作');
+  assert.deepEqual(Object.values(projects).map(w => w.routines.length), [1, 1]);
+  const saved = projects.A.routines[0];
+  assert.ok(saved.on && saved.id); assert.equal(saved.request, form.request); assert.equal(saved.time, '09:30');
+  ui.current = 'A'; const failedSave = add(); replies[2].reject(new Error('temporary failure')); await failedSave;
+  const retrySave = add(); replies[3].save(); await retrySave;
+  assert.equal(projects.A.routines.length, 2, 'a later intentional submit or retry remains possible');
+
   const setHtml = new Function(html.slice(html.indexOf('const setHtml ='), html.indexOf('let doneOpen')) + 'return setHtml;')();
   const detail = (text, open) => ({ open, querySelector: () => ({ textContent: text }) });
   let shown = [detail('A', true), detail('B', false)];
