@@ -96,7 +96,7 @@ const S = { leader: 'codex', recent: [], historyRev: 0, agentCfg: {}, agents: {}
 // agentCfg = this project's model / effort per agent; workers = agents allowed to work here.
 // New projects start from S.agentCfg (the last choices).
 const newWs = (project, leader = S.leader, name = '', agentCfg = S.agentCfg, workers = Object.keys(AGENTS)) => ({
-  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, autoMax: AUTO_MAX_DEFAULT, strategy: 'save', delivery: 'auto', finisher: '', fallback: '', backendPort: 0, worktreeSetup: '', tokenCap: TOKEN_CAP_DEFAULT, mission: '', routines: [],
+  project, leader, name, run: null, tasks: [], activity: [], pstate: null, afterDone: 'stop', autoRounds: 0, autoMax: AUTO_MAX_DEFAULT, strategy: 'save', delivery: 'auto', finisher: '', fallback: '', backendPort: 0, worktreeSetup: '', tokenCap: TOKEN_CAP_DEFAULT, apiDailyTokenCap: 0, apiDailyUsage: null, mission: '', routines: [],
   agentCfg: Object.fromEntries(Object.keys(AGENTS).map((id) => [id, { model: '', effort: '', ...agentCfg?.[id] }])),
   workers: workers.filter((id) => AGENTS[id]),
 });
@@ -124,12 +124,13 @@ try {
   const saved = JSON.parse(fs.readFileSync(SETTINGS, 'utf8'));
   for (const e of saved.external || []) if (e?.id && e.providerId && e.model) { S.external.push({ id: String(e.id), name: String(e.name || e.model), platform: e.platform, baseUrl: String(e.baseUrl || ''), isFullUrl: !!e.isFullUrl, model: String(e.model), providerId: String(e.providerId) }); registerExternal(S.external.at(-1)); }
   for (const e of saved.acp || []) if (e?.id && (e.backend || e.agentId)) { S.acp.push({ id: String(e.id), name: String(e.name || e.id), backend: String(e.backend || ''), yolo: String(e.yolo || ''), agentId: String(e.agentId || ''), command: String(e.command || ''), args: (e.args || []).map(String) }); registerAcp(S.acp.at(-1)); }
+  S.closedApiBudgets = saved.closedApiBudgets || {};
   if (AGENTS[saved.leader]) S.leader = saved.leader;
   for (const id in S.agentCfg) Object.assign(S.agentCfg[id], saved.agentCfg?.[id]);
   // Older settings had one `project` and global models; it becomes the first open workspace with those models.
   S.workspaces = (saved.workspaces || (saved.project ? [{ project: saved.project }] : []))
     .filter((x) => isDir(x.project))
-    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', autoMax: x.autoMax == null ? AUTO_MAX_DEFAULT : Number(x.autoMax) || 0, strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto', finisher: AGENTS[x.finisher] ? x.finisher : '', fallback: AGENTS[x.fallback] ? x.fallback : '', backendPort: Number(x.backendPort) || 0, worktreeSetup: String(x.worktreeSetup || '').trim().slice(0, 500), tokenCap: x.tokenCap == null ? TOKEN_CAP_DEFAULT : Number(x.tokenCap) || 0, mission: String(x.mission || ''), routines: (x.routines || []).filter(validRoutine) }));
+    .map((x) => Object.assign(newWs(x.project, AGENTS[x.leader] ? x.leader : S.leader, String(x.name || ''), x.agentCfg || S.agentCfg, x.workers || Object.keys(AGENTS)), { pstate: x.pstate || null, afterDone: AFTER_DONE.includes(x.afterDone) ? x.afterDone : 'stop', autoMax: x.autoMax == null ? AUTO_MAX_DEFAULT : Number(x.autoMax) || 0, strategy: STRATEGY_IDS.includes(x.strategy) ? x.strategy : 'save', delivery: DELIVERY_IDS.includes(x.delivery) ? x.delivery : 'auto', finisher: AGENTS[x.finisher] ? x.finisher : '', fallback: AGENTS[x.fallback] ? x.fallback : '', backendPort: Number(x.backendPort) || 0, worktreeSetup: String(x.worktreeSetup || '').trim().slice(0, 500), tokenCap: x.tokenCap == null ? TOKEN_CAP_DEFAULT : Number(x.tokenCap) || 0, ...restoreApiBudget(x), mission: String(x.mission || ''), routines: (x.routines || []).filter(validRoutine) }));
   S.recent = (saved.recent || []).filter(isDir);
   if (saved.notify === false) S.notify = false;
 } catch (e) {
@@ -140,8 +141,8 @@ try {
 }
 
 function saveSettings() {
-  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, worktreeSetup: w.worktreeSetup, tokenCap: w.tokenCap, mission: w.mission, routines: w.routines }));
-  writeJson(SETTINGS, { leader: S.leader, workspaces, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external, acp: S.acp });
+  const workspaces = S.workspaces.map((w) => ({ project: w.project, leader: w.leader, name: w.name, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, worktreeSetup: w.worktreeSetup, tokenCap: w.tokenCap, apiDailyTokenCap: w.apiDailyTokenCap, apiDailyUsage: w.apiDailyUsage, mission: w.mission, routines: w.routines }));
+  writeJson(SETTINGS, { leader: S.leader, workspaces, closedApiBudgets: S.closedApiBudgets, recent: S.recent, agentCfg: S.agentCfg, notify: S.notify, external: S.external, acp: S.acp });
 }
 
 // ponytail: reads the newest 200 history files once, then saveRun keeps the cache current in place; index them if history grows large.
@@ -536,6 +537,8 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
     }
     if (halted()) throw new Halt('切換模型期間工作已停止或變更');
   }
+  // Another card may spend the last tokens during conversation setup or between follow-up turns.
+  if (bill && bill !== 'lead' && w?.apiDailyTokenCap && apiBudgetSpent(w, agent)) throw Object.assign(new Error('今日 API 預算已用完'), { apiBudget: true });
   const sent = await sendMessage(convId, text);
   active.set(convId, sent.turn_id);
   convActivity.set(convId, { at: Date.now(), tool: '', confirm: false }); // a fresh turn starts with fresh activity
@@ -583,7 +586,7 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
     if (left?.notes.length) left.fallback(left.notes); // the step ended first: the card hands them over after it
     if (!check) S.agents[agent].working--;
     if (agent === 'codex') refreshCodexLimits();
-    if (bill) chargeUsage(run, agent, bill === 'lead' ? null : bill, usageDelta(usage0, await usageOf(convId)));
+    if (bill) chargeUsage(run, agent, bill === 'lead' ? null : bill, usageDelta(usage0, await usageOf(convId)), w);
     if (agent === 'codex' && !(await codexRuntime.stop(convId).catch(() => false))) throw Object.assign(new Error('Codex 工具程序尚未確認停止，保留寫入租約'), { stopUnconfirmed: true });
   }
   if (!check && halted()) throw new Halt('執行已停止');
@@ -807,13 +810,16 @@ function usageDelta(before, after) {
   return d.in + d.out ? d : null;
 }
 // Adds a turn to the job (Leader / workers / per agent) and, for a worker turn, to its card.
-function chargeUsage(run, agent, t, d) {
+function chargeUsage(run, agent, t, d, w) {
   if (!run || !d) return;
   const add = (o) => { o.in += d.in; o.out += d.out; o.cache += d.cache; o.turns++; return o; };
   const z = () => ({ in: 0, out: 0, cache: 0, turns: 0 });
   const u = (run.usage ||= { lead: z(), work: z(), agents: {} });
   add(t ? u.work : u.lead); add(u.agents[agent] ||= z());
-  if (t) add(t.usage ||= z());
+  if (t) {
+    add(t.usage ||= z());
+    if (AGENTS[agent]?.external) recordApiUsage(w, d.in + d.out);
+  }
 }
 
 // ---------- Automatic fallback when a worker's quota is gone ----------
@@ -1076,14 +1082,54 @@ function setFinisher(w, agent) {
 // The project's own backend port ('' / 0 = none): only then do workers hear about Studio-managed runtimes and does a
 // card waiting on that backend get the automatic health check / recovery.
 // 每張卡 token 上限: a card over it is not started again (its next step is refused); the Leader decides the retry.
-function setTokenCap(w, cap) {
+function tokenLimit(cap) {
   cap = Number(cap);
-  if (!Number.isFinite(cap) || cap < 0 || !Number.isInteger(cap)) throw new Error('token 上限必須是 0（不限）或正整數');
-  w.tokenCap = cap;
+  if (!Number.isInteger(cap) || cap < 0) throw new Error('token 上限必須是 0（不限）或正整數');
+  return cap;
+}
+function setTokenCap(w, cap) {
+  w.tokenCap = tokenLimit(cap);
   saveSettings();
 }
 const cardTokens = (t) => (t.usage?.in || 0) + (t.usage?.out || 0);
 const overCap = (w, t) => !!w.tokenCap && cardTokens(t) >= w.tokenCap;
+
+function restoreApiBudget(saved) {
+  const cap = saved?.apiDailyTokenCap, usage = saved?.apiDailyUsage;
+  return {
+    apiDailyTokenCap: Number.isInteger(cap) && cap > 0 ? cap : 0,
+    apiDailyUsage: Number.isSafeInteger(usage?.tokens) && usage.tokens >= 0
+      ? { date: usage.date, tokens: usage.tokens, warned: usage.warned === true } : null,
+  };
+}
+function apiUsageToday(usage, now = new Date()) {
+  const date = now.toLocaleDateString('en-CA');
+  return usage?.date === date ? usage : { date, tokens: 0, warned: false };
+}
+function recordApiUsage(w, tokens) {
+  const usage = w.apiDailyUsage = apiUsageToday(w.apiDailyUsage);
+  usage.tokens += tokens;
+  const cap = w.apiDailyTokenCap;
+  const warn = cap > 0 && !usage.warned && usage.tokens >= Math.ceil(cap * 0.8);
+  if (warn) usage.warned = true;
+  saveSettings();
+  if (warn) {
+    event('api.budget.warning', { tokens: usage.tokens, cap });
+    notify(`${label(w)}：今日 API 用量達 80%`, `外部模型工作卡已用 ${usage.tokens} / ${cap} tokens。`, 'ask', w.project);
+  }
+}
+function setApiDailyTokenCap(w, cap) {
+  w.apiDailyTokenCap = tokenLimit(cap);
+  recordApiUsage(w, 0); // A lower cap may already be past the warning threshold.
+}
+function apiBudgetSpent(w, agent) {
+  return w.apiDailyTokenCap > 0 && AGENTS[agent]?.external && apiUsageToday(w.apiDailyUsage).tokens >= w.apiDailyTokenCap;
+}
+function waitForApiBudget(w, t) {
+  const question = '今日 API 預算已用完。可調高上限、改派成員，或等明天再繼續。';
+  Object.assign(t, { status: 'NEEDS_USER', ask: { apiBudget: true, question, options: ['重新檢查預算'] } });
+  log(w, 'studio', 'system', `「${t.title}」${question}`);
+}
 
 function setBackendPort(w, port) {
   port = Number(port);
@@ -1458,7 +1504,8 @@ const RECENT_EDIT_MS = 90e3, LOCK_BEAT_MS = 30e3;
 const LEASE_BEAT_MS = 20e3, LEASE_RESERVED_TTL_MS = 12 * 3600e3;
 const isWriter = (t) => t.writes !== false;
 const sameTree = (a, b) => (a.workdir || '') === (b.workdir || '');
-const holdsWriteLock = (t) => isWriter(t) && ['WORKING', 'WAITING_EXTERNAL', 'ASK_LEADER', 'NEEDS_USER'].includes(t.status);
+const budgetBeforeStart = (t) => t.ask?.apiBudget && !t.firstStartedAt;
+const holdsWriteLock = (t) => isWriter(t) && !budgetBeforeStart(t) && ['WORKING', 'WAITING_EXTERNAL', 'ASK_LEADER', 'NEEDS_USER'].includes(t.status);
 const writerBusy = (w, t) => w.tasks.some((x) => x !== t && sameTree(x, t) && holdsWriteLock(x));
 const nowIso = () => new Date().toISOString();
 
@@ -1864,6 +1911,8 @@ async function endWriteStep(w, t, ranAs = t.agent) {
 }
 
 async function runTask(w, t) {
+  if (apiBudgetSpent(w, t.agent)) return waitForApiBudget(w, t);
+  if (t.ask?.apiBudget) t.ask = null;
   const ranAs = t.agent;
   let settleStep;
   w.executingSteps ||= new Map();
@@ -2629,6 +2678,7 @@ ${STATUS_RULES}`;
     }
     if (e instanceof Halt && run.paused) { if (t.agent === startAgent) Object.assign(t, { status: 'PAUSED', result: '已暫停', resumed: true, wakeNote: note }); return; } // handed off meanwhile: the card is the new agent's now
     if (e instanceof Halt && run.stopped) { t.status = 'FAILED'; t.result = '已停止'; return; }
+    if (e.apiBudget) return waitForApiBudget(w, t);
     if (e.cap) { // the card's own budget is gone: stop it here, the Leader decides whether and how to retry
       Object.assign(t, { status: 'FAILED', result: `沒有完成：超過這張卡的 token 上限（${e.message}）。Studio 停止這張卡，交給工頭決定要不要換方法重試。`, detail: e.message });
       log(w, t.agent, 'worker', t.result + '：' + t.title, e.message);
@@ -3366,6 +3416,10 @@ function answer(w, taskId, text) {
     const t = w.tasks.find((x) => x.id === taskId);
     if (t?.status !== 'NEEDS_USER') throw new Error('這張工作卡沒有在等你回覆');
     log(w, 'user', 'user', `回覆「${t.title}」：${text}`);
+    if (t.ask?.apiBudget) {
+      Object.assign(t, { status: 'WAITING', ask: null });
+      return pump(w);
+    }
     if (t.takeover) { // "may Studio write over what was changed meanwhile?"
       Object.assign(t, { takeover: false, ask: null });
       // only the option 「先不要（暫停）」 or a reply that starts with 暫停 pauses; 「不要暫停，繼續」 does not
@@ -3494,7 +3548,7 @@ async function resumeJob(w, opts) {
   try {
     const trees = new Map();
     for (const t of w.tasks) {
-      if (!isWriter(t) || ['DONE', 'FAILED'].includes(t.status)) continue;
+      if (!isWriter(t) || ['DONE', 'FAILED'].includes(t.status) || budgetBeforeStart(t)) continue;
       const info = await workspaceOf(t.workdir || w.project);
       if (!trees.has(info.key)) trees.set(info.key, { info, cards: [] });
       trees.get(info.key).cards.push(t);
@@ -3619,7 +3673,13 @@ function openWorkspace(p) {
   p = path.resolve(String(p).trim());
   if (!isDir(p)) throw new Error('資料夾不存在：' + p);
   let w = S.workspaces.find((x) => same(x.project, p));
-  if (!w) { S.workspaces.push((w = newWs(p))); refreshState(w); }
+  if (!w) {
+    const key = treeKey(p);
+    w = Object.assign(newWs(p), restoreApiBudget(S.closedApiBudgets?.[key]));
+    if (S.closedApiBudgets) delete S.closedApiBudgets[key];
+    S.workspaces.push(w);
+    refreshState(w);
+  }
   S.recent = [w.project, ...S.recent.filter((x) => !same(x, w.project))].slice(0, 8);
   saveSettings();
   return { project: w.project };
@@ -3629,6 +3689,9 @@ function closeWorkspace(w) {
   if (w.run?.active) throw new Error('這個專案的團隊還在工作，請先暫停或停止');
   if (stillStopping(w)) throw new Error('這個專案仍在停止或暫停 Agent、工具程序與 runtime，請等清理完成再關閉');
   if ([...preparing.values()].some((e) => e.w === w) || w.tasks.some((t) => t.preparing)) throw new Error('這個專案有工作卡的 worktree 正在準備（設定指令還在跑），請等它完成或先按停止');
+  if (w.apiDailyTokenCap || (w.apiDailyUsage && apiUsageToday(w.apiDailyUsage).tokens)) {
+    (S.closedApiBudgets ||= {})[treeKey(w.project)] = { apiDailyTokenCap: w.apiDailyTokenCap, apiDailyUsage: w.apiDailyUsage };
+  }
   S.workspaces = S.workspaces.filter((x) => x !== w); // a paused job stays in 歷史紀錄
   saveSettings();
 }
@@ -3852,10 +3915,10 @@ const routes = {
         const blocked_reason = why ? 'Blocked：' + String(why).trim().replace(/^Blocked\s*[:：]?\s*/i, '') : null;
         return { ...t, blocked_reason, ...(t.status === 'WORKING' ? { activity: convActivity.get(convOf(w, t)) || null } : {}) };
       });
-      return { wsInfo: w.wsInfo, lease, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, worktreeSetup: w.worktreeSetup, tokenCap: w.tokenCap, mission: w.mission, routines: w.routines, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
+      return { wsInfo: w.wsInfo, lease, project: w.project, name: label(w), leader: w.leader, agentCfg: w.agentCfg, workers: w.workers, pstate: w.pstate, afterDone: w.afterDone, autoRounds: w.autoRounds, autoMax: w.autoMax, strategy: w.strategy, delivery: w.delivery, finisher: w.finisher, fallback: w.fallback, backendPort: w.backendPort, worktreeSetup: w.worktreeSetup, tokenCap: w.tokenCap, apiDailyTokenCap: w.apiDailyTokenCap, apiDailyTokens: apiUsageToday(w.apiDailyUsage).tokens, mission: w.mission, routines: w.routines, tiers: tiersOf(w), tasks, activity: w.activity, progress: readProjectProgress(w),
         run: r && { usage: r.usage || null, extMod: r.extMod, claimedBy: r.claimedBy, id: r.id, active: r.active, stopped: r.stopped, paused: r.paused, phase: r.phase, leader: r.leader, request: r.request, startedAt: r.startedAt, result: r.result, ask: r.ask, continues: r.continues, summarizing: r.summarizing, notes: (r.notes || []).length, noting: !!r.noting } };
     });
-    const { leases, ...state } = S; // the page shows each project's lease (above), never the raw list
+    const { leases, closedApiBudgets, ...state } = S; // the page shows each project's lease (above), never the raw list
     return { ...state, runtimes: S.runtimes, ...teamStats(), agents: Object.values(S.agents), workspaces };
   },
   // Project-scoped calls name their project in `ws` (its folder path).
@@ -3902,6 +3965,7 @@ const routes = {
   'POST /api/fallback': (b) => setFallback(wsOf(b.ws), b.agent),
   'POST /api/backend-port': (b) => setBackendPort(wsOf(b.ws), b.port),
   'POST /api/worktree-setup': (b) => setWorktreeSetup(wsOf(b.ws), b.command),
+  'POST /api/daily-api-budget': (b) => setApiDailyTokenCap(wsOf(b.ws), b.cap),
   'POST /api/token-cap': (b) => setTokenCap(wsOf(b.ws), b.cap),
   'POST /api/mission': (b) => setMission(wsOf(b.ws), b.text),
   'POST /api/routine/save': (b) => saveRoutine(wsOf(b.ws), b),
