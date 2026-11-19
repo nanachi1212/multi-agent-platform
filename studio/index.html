@@ -797,7 +797,19 @@ async function loadWork() {
   $('workAsk').hidden = !ASKABLE.includes(d.status);
   $('workBody').innerHTML = workHtml(d);
 }
-function openWork(ws, id) { workOpen = { ws, id }; workLogOpen = false; workDiff = null; diffSeq++; $('workBody').innerHTML = '<div class="empty">讀取中…</div>'; $('workDlg').showModal(); loadWork(); }
+function openWork(ws, id) {
+  const field = $('workQ');
+  if (workOpen) {
+    if (field.value) drafts[workOpen.draftKey] = field.value;
+    else delete drafts[workOpen.draftKey];
+  }
+  const draftKey = JSON.stringify([ws, id]);
+  workOpen = { ws, id, draftKey };
+  field.value = drafts[draftKey] || '';
+  workLogOpen = false; workDiff = null; diffSeq++;
+  $('workBody').innerHTML = '<div class="empty">讀取中…</div>';
+  $('workDlg').showModal(); loadWork();
+}
 async function askWork(text) {
   if (!workOpen) return;
   await post('/api/card/ask', { ws:workOpen.ws, taskId:workOpen.id, text }).catch(() => {});
