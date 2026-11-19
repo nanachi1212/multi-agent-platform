@@ -19,6 +19,8 @@
 
 執行檔快取在 `runtime/contract-aioncore/`，不替換正式 Studio 執行檔。測試 data／work／home 皆在專用暫存目錄，環境只繼承啟動所需系統變數；不繼承供應商 keys、使用者 Codex home 或規則檔。fixture 不呼叫真實模型、網路或工具；以本機回覆驗證 `session/prompt`、`session/cancel`、取消後回到 idle，以及同一 session 再次接受工作。結束核對程序身分、清理程序樹，再刪除測試目錄。測試包含 `Agent 中文 Tools/contract agent.exe` 與同名 `.cmd`／`.bat` wrapper，驗證新增探測及實際對話使用完整路徑、支援的參數原樣傳遞。批次檔另外核對 launcher → cmd.exe → Agent 的程序歸屬，以及探測後、後端關閉後皆無殘留。
 
+外部 API 工作卡使用固定版 AionCore 的 aionrs。此引擎在每個對話的 `aionrs-sessions/sessions/<id>/state.json` 保存 `total_usage`。Studio 在第一次送件前確認對話已初始化，步驟結束後以累計差額入帳。輸入 tokens 已包含快取命中，用量表另外顯示快取，預算只加輸入及輸出。Windows 契約測試 `node studio/test-external-budget-contract.mjs` 啟動隔離 Studio、固定版後端及 localhost 模擬供應商，驗證實際派工與預算。
+
 ## 真實 Agent 介面驗收（2026-11-17）
 
 在 Windows 的正式 Studio／固定版 AionCore 上，沿用既有 Claude 帳號與 Studio 專用 Codex 的 ChatGPT 登入；未重新登入或複製憑證。以 `STUDIO_RUNTIME` 隔離設定與工作紀錄，`STUDIO_CODEX_HOME` 指向原本已登入的 Studio 目錄，測試專案與正式專案分開。

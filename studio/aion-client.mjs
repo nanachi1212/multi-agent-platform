@@ -1,3 +1,6 @@
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+
 // The release used by Studio and the real-backend contract gate must be identical.
 export const AION_RELEASE = Object.freeze({
   version: '0.2.2',
@@ -7,8 +10,25 @@ export const AION_RELEASE = Object.freeze({
   executableHash: '67eb02774bab3855b759ec9756c2e540cd17b64b850407fa4b8bad07fd8a0892',
 });
 
-// Only transport/authentication live here. Runtime ownership, retries, cancellation
-// and lifecycle decisions remain with the caller. Importing this module starts nothing.
+// The pinned aionrs backend persists cumulative usage here before it reports idle.
+// Its conversation /usage endpoint is for ACP and has no aionrs usage frames.
+export async function readAionrsUsage(dataDir, cid) {
+  if (typeof cid !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(cid)) throw new Error('外部模型對話 ID 無效');
+  const file = path.join(dataDir, 'aionrs-sessions', 'sessions', cid, 'state.json');
+  let data;
+  try { data = await readFile(file, 'utf8'); }
+  catch (e) { if (e.code === 'ENOENT') return null; throw new Error('無法讀取外部模型的對話用量'); }
+  let state;
+  try { state = JSON.parse(data); } catch { /* Parser errors may contain message text. */ }
+  const u = state?.total_usage;
+  if (state?.id !== cid || !u || ![u.input_tokens, u.output_tokens, u.cache_read_tokens].every(n => Number.isSafeInteger(n) && n >= 0)) {
+    throw new Error('外部模型的對話用量格式異常');
+  }
+  return { total: { in: u.input_tokens, out: u.output_tokens, cache: u.cache_read_tokens } };
+}
+
+// Runtime ownership, retries, cancellation and lifecycle decisions remain with the caller.
+// Importing this module starts nothing.
 export function createAionClient({ baseUrl, unavailable = () => '', timeoutMs = 30e3, fetchImpl = globalThis.fetch }) {
   let auth = {};
   async function login(password) {

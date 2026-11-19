@@ -5,6 +5,7 @@ const { region, mkTmp, makeEnv, newW } = require('./lifecycle-harness.cjs');
 
 (async () => {
   const { writeJson } = await import('./state-files.mjs');
+  const { readAionrsUsage } = await import('./aion-client.mjs');
   const rt = mkTmp('studio-api-budget-'), settings = path.join(rt, 'studio', 'settings.json');
   const EVENT = [], notices = [], agents = { codex: {}, claude: {}, ext: { external: true } };
   let now = new Date(2026, 10, 18, 23, 59, 58);
@@ -49,6 +50,19 @@ const { region, mkTmp, makeEnv, newW } = require('./lifecycle-harness.cjs');
     // The real dispatch/turn path: the first response crosses the daily cap; asking for a missing STATUS needs another turn.
     let sends = 0, reads = 0, turn;
     harness = makeEnv(() => 'OK\nSTATUS: DONE', { AGENTS: agents, turn: (...args) => turn(...args) });
+    const id = 'a1b2c3d4', file = path.join(rt, 'aionrs-sessions', 'sessions', id, 'state.json');
+    const snapshot = (input_tokens, output_tokens, cache_read_tokens) => {
+      writeJson(file, { id, total_usage: { input_tokens, output_tokens, cache_read_tokens } });
+      return readAionrsUsage(rt, id);
+    };
+    assert.equal(await readAionrsUsage(rt, id), null);
+    await assert.rejects(readAionrsUsage(rt, '..'), /ID/);
+    const first = await snapshot(79, 31, 4), second = await snapshot(158, 62, 8);
+    assert.deepEqual(harness.api.usageDelta(first, second), { in: 79, out: 31, cache: 4 });
+    assert.equal(harness.api.usageDelta(second, second), null);
+    assert.throws(() => harness.api.usageDelta(second, first), /重設/);
+    writeJson(file, { id: 'different', total_usage: {} });
+    await assert.rejects(readAionrsUsage(rt, id), /用量格式/);
     const job = newW(); job.apiDailyTokenCap = 100;
     const worker = { id: 'one', title: 'one', agent: 'ext', writes: false, status: 'WAITING', after: [] };
     job.tasks.push(worker);
