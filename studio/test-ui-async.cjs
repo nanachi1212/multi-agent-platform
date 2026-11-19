@@ -75,7 +75,7 @@ async function run() {
     let release;
     const routine = { id: 'routine', on: true, request: 'scheduled edit', precheck: 'slow check', time: '09:00', lastAt: '' };
     const w = { project: '/test/project', leader: 'codex', tasks: [], routines: [routine] }, plans = [];
-    const env = { S: { workspaces: [w] }, crypto, CONTINUE_RE: /^continue/, launchingWs: new Set(), preparing: new Map(), treeKey: x => x,
+    const env = { S: { workspaces: [w], closedWorkspaces: {} }, workspaceSettings: (w) => ({ project: w.project }), crypto, CONTINUE_RE: /^continue/, launchingWs: new Set(), preparing: new Map(), treeKey: x => x,
       routineDue: () => true, stillStopping: () => false, precheck: () => new Promise(resolve => { release = resolve; }),
       saveSettings() {}, event() {}, log() {}, notify() {}, label: () => 'test', clip: x => x, endLeftSetups: async () => {},
       settingUp: () => false, isDir: () => true, available: () => true, workersFor: () => ['claude'], latestJob: () => null,
