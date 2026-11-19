@@ -225,6 +225,30 @@ function readHistory(id) {
   return JSON.parse(fs.readFileSync(path.join(HISTORY, id + '.json'), 'utf8'));
 }
 
+// Older versions could save a stopped job with a WORKING card after its admission check drained.
+// The lease store calls this under its startup lock, before publishing the release.
+function settleStoppedCard(lease) {
+  let record;
+  try { record = readHistory(lease.jobId); }
+  catch (error) {
+    console.error('無法核對已停止工作的歷史，保留寫入租約：' + error.message);
+    return false;
+  }
+  if (record?.status !== 'stopped' || record.id !== lease.jobId || !record.project || !lease.project || !same(record.project, lease.project)) return false;
+  const card = Array.isArray(record.tasks) && record.tasks.find(t => t?.id === lease.cardId);
+  if (!card || !card.id || !card.agent || card.agent !== lease.owner.agent || (card.leaseGeneration || 0) !== (lease.generation || 0)) return false;
+  if (card.stopUnconfirmed || card.runtimeStopPending || card.preparing || card.worktree?.setupProc || card.worktree?.setupLeft?.length) return false;
+  // Pause can reserve an executing writer before cancellation is confirmed. For a card that
+  // already ran, only resumeJob's post-drain reservation has an explicitly cleared reason.
+  if (lease.reason === 'runtime stop unconfirmed' || (card.firstStartedAt && lease.reason !== '')) return false;
+  if (card.status === 'WORKING') {
+    Object.assign(card, { status: 'FAILED', result: '已停止' });
+    writeJson(path.join(HISTORY, record.id + '.json'), record);
+  }
+  // If the lease write failed after history was saved, the next startup completes the release.
+  return card.status === 'FAILED' || card.status === 'DONE';
+}
+
 // Every event of a working run is also saved (status "running"), so closing the Studio mid-job loses nothing:
 // after a restart the job shows as interrupted and can be continued like a paused one.
 // detail = technical text (raw replies, parser errors); the page shows it only behind 查看技術細節.
@@ -1513,11 +1537,12 @@ function pump(w) {
   const byId = (id) => w.tasks.find((x) => x.id === id);
   const order = [...w.tasks].sort((a, b) => (b.wakeNote ? 1 : 0) - (a.wakeNote ? 1 : 0));
   for (const t of order) {
-    if (t.status !== 'WAITING') continue;
-    const deps = (t.after || []).map(byId).filter(Boolean);
-    if (deps.some((d) => d.status === 'FAILED')) { Object.assign(t, { status: 'FAILED', result: '前一張工作卡失敗，這張沒有開始；交給工頭決定下一步。' }); continue; }
-    if (deps.some((d) => d.status !== 'DONE')) continue;
-    if (!t.hold && !t.preparing && !w.executingSteps?.has(t.id) && !w.tasks.some((x) => x.status === 'WORKING' && x.agent === t.agent) && !(isWriter(t) && writerBusy(w, t))) runTask(w, t);
+    if (t.status !== 'WAITING' || t.hold || w.executingSteps?.has(t.id)) continue;
+    const entering = needsDependencyAdmission(w, t);
+    const deps = (t.after || []).map(byId).filter((d) => d && (entering || !d.verdictStale));
+    if (deps.some((d) => d.status === 'FAILED')) { runTask(w, t, true); continue; }
+    if (t.preparing || deps.some((d) => d.status !== 'DONE')) continue;
+    if (!w.tasks.some((x) => x.status === 'WORKING' && x.agent === t.agent) && !(isWriter(t) && writerBusy(w, t))) runTask(w, t);
   }
   // Follow both dependency and agent waits; a runnable/external/user-held card can still make progress.
   const onAgents = w.tasks.filter((t) => t.status === 'WAITING_AGENT');
@@ -1543,6 +1568,11 @@ function pump(w) {
     for (const t of onAgents) wake(w, t, 'The agent you were waiting for has no open card. Continue with its recorded results, or report NEEDS_USER.');
   }
   if (!run.summarizing && !w.executingSteps?.size && w.tasks.length && w.tasks.every((t) => t.status === 'DONE' || t.status === 'FAILED') && !w.tasks.some((t) => t.preparing)) summarize(w); // a setup still running (or unconfirmed) holds the wrap-up
+}
+
+// Old histories already record firstStartedAt. A previously started card in its original folder was admitted there.
+function needsDependencyAdmission(w, t) {
+  return !t.firstStartedAt || (t.admittedWorkdir && t.admittedWorkdir !== treeKey(t.workdir || w.project));
 }
 
 // ---------- Workspace lease: who may write which working tree ----------
@@ -1743,6 +1773,8 @@ async function verdictVersion(dir) {
   if (!tree) throw new Error('無法取得驗證工作的 Git 工作樹指紋');
   return { head, tree, dir: canonPath(root) };
 }
+const sameVerdictVersion = (a, b) => treeKey(a.dir) === treeKey(b.dir) && a.head === b.head && a.tree === b.tree;
+const versionLabel = (v) => `${v.dir} (${v.head} / ${v.tree})`;
 
 async function staleDependency(w, t) {
   for (const id of t.after || []) {
@@ -1751,7 +1783,7 @@ async function staleDependency(w, t) {
     const previous = dep.verifiedAt;
     const current = await verdictVersion(previous.dir);
     if (!current) { log(w, 'studio', 'system', `「${dep.title}」無法綁定版本，略過本次比對。`); continue; }
-    if (dep.verdictStale || current.head !== previous.head || current.tree !== previous.tree) {
+    if (dep.verdictStale || !sameVerdictVersion(current, previous)) {
       return { dep, reason: `驗證時是 ${previous.head} / ${previous.tree}，現在是 ${current.head} / ${current.tree}` };
     }
   }
@@ -1956,16 +1988,44 @@ async function endWriteStep(w, t, ranAs = t.agent) {
     if (!t.workdir) w.run.treeStamp = stamp;
     w.run.leftAt = nowIso();
   }
+  // A card moved while waiting can still have its original checkout reserved as well as this worktree.
+  const priorDirs = t.worktree ? new Set(cardLeases(w, t, ranAs).filter(l => l.mode === 'write' && l.key !== treeKey(t.workdir)).map(l => l.path)) : [];
   if (t.agent !== ranAs) releaseCardLeases(w, t, 'handed off', ranAs); // the card moved on while this step was ending: not our lease any more
   else if (w.run?.stopped) releaseCardLeases(w, t, 'stopped', ranAs);
   else if (w.run?.paused) reserveCardLeases(w, t, 'paused', ranAs);
   else if (holdsWriteLock(t)) reserveCardLeases(w, t, 'waiting', ranAs);
   else releaseCardLeases(w, t, 'card finished', ranAs);
   if (!w.tasks.some((x) => holdsWriteLock(x) && sameTree(x, t))) await releaseLock(w, t);
+  for (const dir of priorDirs) await releaseLock(w, { workdir: dir }); // releaseLock keeps any tree with a live lease
 }
 
-async function runTask(w, t) {
-  if (apiBudgetSpent(w, t.agent)) return waitForApiBudget(w, t);
+// A handoff or takeover question can reserve a write lease before the first worker turn.
+// Drop only this card's current reservations. A moving card may still have one in its old tree.
+async function releaseRejectedReservations(w, t) {
+  const reservations = () => cardLeases(w, t, t.agent).filter((l) => l.status === 'RESERVED' && sameCard(l, w, t));
+  if (!reservations().length || t.stopUnconfirmed || t.runtimeStopPending) return;
+  if (t.preparing) {
+    // The card can fail admission while its worktree setup still owns a process.
+    await preparing.get(t.id)?.promise?.catch(() => {});
+    if (t.preparing) return;
+  }
+  if (t.firstStartedAt) {
+    try {
+      await w.runtimeStarts?.get(t.id)?.catch(() => {});
+      await cleanupCardRuntimes(w, [t], w.run.id, {}); // no worker turn is active, including in a shared conversation
+    } catch { t.runtimeStopPending = true; return; }
+  }
+  const dirs = withLeaseTransaction(() => {
+    const held = reservations();
+    for (const l of held) retire(l, 'prerequisite failed before admission');
+    saveLeases();
+    return [...new Set(held.map(l => l.path))];
+  });
+  for (const dir of dirs) await releaseLock(w, { workdir: dir });
+}
+
+async function runTask(w, t, failedDependency = false) {
+  if (!failedDependency && apiBudgetSpent(w, t.agent)) return waitForApiBudget(w, t);
   if (t.ask?.apiBudget) t.ask = null;
   const ranAs = t.agent;
   let settleStep;
@@ -1975,13 +2035,17 @@ async function runTask(w, t) {
   try {
     t.status = 'WORKING'; // reserve the slot at once: no second writer may start while the checks below run
     const run = w.run, epoch = run.lifecycleEpoch;
-    const stale = t.after?.length ? await staleDependency(w, t) : null;
+    const stale = !failedDependency && t.after?.length && needsDependencyAdmission(w, t) ? await staleDependency(w, t) : null;
     if (w.run !== run || !run.active || epoch !== run.lifecycleEpoch || t.status !== 'WORKING' || t.hold) return;
-    if (stale) {
-      const { dep, reason } = stale;
-      Object.assign(dep, { status: 'FAILED', verdictStale: true, detail: '結論已過期：' + reason });
-      Object.assign(t, { status: 'FAILED', result: `「${dep.title}」結論已過期，這張卡沒有開始；請工頭追加重驗卡。` });
-      log(w, 'studio', 'system', t.result + ' ' + reason, reason);
+    if (failedDependency || stale) {
+      Object.assign(t, { status: 'FAILED', result: '前一張工作卡失敗，這張沒有開始；交給工頭決定下一步。' });
+      if (stale) {
+        const { dep, reason } = stale;
+        Object.assign(dep, { status: 'FAILED', verdictStale: true, detail: '結論已過期：' + reason });
+        t.result = `「${dep.title}」結論已過期，這張卡沒有開始；請工頭追加重驗卡。`;
+        log(w, 'studio', 'system', t.result + ' ' + reason, reason);
+      }
+      await releaseRejectedReservations(w, t);
       wakeWaiters(w, t);
     } else {
       if (!(await takeWriteSlot(w, t))) return;
@@ -2080,6 +2144,13 @@ async function stopAndDrain(w) {
       stop(w);
       await drainExecution(w);
       current();
+      // An admission check may drain before runCard ever starts. Settle all unfinished
+      // cards now, while this job still owns the workspace and before releasing its leases.
+      if (run.stopped) {
+        for (const t of cards) {
+          if (!['DONE', 'FAILED'].includes(t.status)) Object.assign(t, { status: 'FAILED', result: '已停止' });
+        }
+      }
       releaseJobLeases(w, 'stopped');
       for (const t of cards) if (isWriter(t)) { await releaseLock(w, t); current(); }
       saveRun(w, 'stopped');
@@ -2420,6 +2491,7 @@ async function makeWorktree(w, t, e) {
   if (r.err) throw new Error('建立 worktree 失敗：' + r.err);
   e.keys.add(treeKey(dir)); // now it exists: its real path (a link in RT) is a key too
   const inc = await includeIgnored(info.path, dir).catch((e) => ({ entries: [], text: '讀取 .worktreeinclude 失敗，什麼都沒補：' + e.message }));
+  if (t.after?.length && t.firstStartedAt) t.admittedWorkdir ||= treeKey(t.workdir || w.project);
   Object.assign(t, { workdir: dir, worktree: { path: dir, branch, base, repoPath: info.path, included: inc.entries }, blocked: null, blockReason: '', blockLogged: '' });
   log(w, 'studio', 'system', `「${t.title}」改在獨立 worktree 做（branch ${branch}）：不會碰到主資料夾的寫入者。${inc.text ? ' .worktreeinclude：' + inc.text + '。' : ''}`);
   if (w.worktreeSetup && !e.stopped) {
@@ -2633,6 +2705,7 @@ async function runCard(w, t) {
   t.status = 'WORKING';
   t.workingSince = nowIso(); // this work spell (shown as 已執行)
   t.firstStartedAt ||= t.workingSince;
+  if (t.after?.length) t.admittedWorkdir = treeKey(t.workdir || w.project);
   t.wakeNote = '';
   log(w, t.agent, 'worker', (note ? '收到等待的結果，繼續：' : t.resumed ? '繼續工作：' : '開始工作：') + t.title);
   let snap = null; // { dir, at, before }: a writing step's tree before it; the after-tree is taken however the step ends
@@ -2655,7 +2728,6 @@ ${accessRules(t)}
 ${isWriter(t) && t.role !== 'check' ? deliveryRules(w.delivery, 'worker') : ''}
 When you end your turn, reply with a short summary of what you did (1-3 sentences).
 ${STATUS_RULES}`;
-    if (!(note && knowsTask)) t.briefed = workKey(t);
     const cid = await conv(w, t.agent, false, t.hard, t.workdir, roOf(t));
     // A step stopped by 立刻打斷 ends early (maybe with an error): park the card until the Leader has read the note.
     // hold also makes turn() throw Halt. Recover that interruption only while this execution still owns the card.
@@ -2684,7 +2756,25 @@ ${STATUS_RULES}`;
     };
     const dir = isWriter(t) ? (await workspaceOf(t.workdir || w.project)).path : '', before = dir ? await treeFiles(dir).catch(() => null) : null;
     if (dir) snap = { dir, at: nowIso(), before: await snapTree(dir) };
+    const verificationVersion = async () => {
+      const version = await verdictVersion(t.workdir || w.project);
+      if (!interrupted() && (w.run !== run || !run.active || (run.lifecycleEpoch || 0) !== epoch || t.status !== 'WORKING'
+        || t.agent !== startAgent || (t.leaseGeneration || 0) !== generation || t.hold)) throw new Halt('驗證已中斷');
+      return version;
+    };
+    if (VERDICT_RE[t.role] && !Object.hasOwn(t, 'verificationStart')) {
+      const start = await verificationVersion();
+      if (interrupted()) { park(); return; }
+      if (start && t.briefed) { // an unfinished card from before start versions were recorded
+        Object.assign(t, { verdictStale: true, verifiedAt: null });
+        return applyStatus(w, t, { kind: 'BLOCKED', text: '先前驗證的起始版本不明，請工頭追加重驗卡。',
+          detail: '舊紀錄缺少驗證開始時的版本，現在是 ' + versionLabel(start) });
+      }
+      t.verificationStart = start; // preserve what this reviewer could have read, including across waits and restarts
+      saveRun(w, 'running');
+    }
     const reported = new Set(), parsed = (r) => { const st = parseStatus(r); st?.files.forEach((f) => reported.add(f)); return st; };
+    if (!(note && knowsTask)) t.briefed = workKey(t);
     const reply = await step(prompt);
     if (t.interrupted) { park(); return; }
     let st = parsed(reply);
@@ -2711,11 +2801,19 @@ ${STATUS_RULES}`;
     }
     if (st.kind !== 'DONE' && overCap(w, t)) throw capErr(); // the step that just ended blew the budget and the card is not finished: stop it now, not at the next wake-up
     if (st.kind === 'DONE' && VERDICT_RE[t.role] && verdictOk(t, verdictOf(t, st.text))) {
-      const version = await verdictVersion(t.workdir || w.project);
+      const version = await verificationVersion();
       if (interrupted()) { park(); return; }
-      if (w.run !== run || !run.active || (run.lifecycleEpoch || 0) !== epoch || t.status !== 'WORKING' || t.agent !== startAgent || t.hold) throw new Halt('驗證已中斷');
-      t.verifiedAt = version;
-      if (!version) log(w, 'studio', 'system', `「${t.title}」無法綁定版本。`);
+      const start = t.verificationStart;
+      if (start && version && !sameVerdictVersion(start, version)) {
+        const detail = `驗證開始時是 ${versionLabel(start)}，現在是 ${versionLabel(version)}`;
+        t.verdictStale = true;
+        t.verifiedAt = null;
+        st = { ...st, kind: 'BLOCKED', text: '驗證期間程式碼已變更，結論已過期；請工頭追加重驗卡。', detail };
+      } else {
+        t.verifiedAt = start && version ? version : null;
+        t.verdictStale = false;
+        if (!t.verifiedAt) log(w, 'studio', 'system', `「${t.title}」無法綁定版本。`);
+      }
     }
     applyStatus(w, t, st, last);
     if (before) await reportFiles(w, t, dir, before, reported);
@@ -4096,7 +4194,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-loadLeases(); // restore ownership before any worker can start
+loadLeases(settleStoppedCard); // restore ownership before any worker can start
 await cleanupStaleRuntimes({ rtDir: RT }).catch(() => {});
 
 // Show each open project's latest paused job again after a restart, ready to continue.
