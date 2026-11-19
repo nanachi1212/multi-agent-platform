@@ -1758,6 +1758,8 @@ async function verdictVersion(dir) {
   if (!tree) throw new Error('無法取得驗證工作的 Git 工作樹指紋');
   return { head, tree, dir: canonPath(root) };
 }
+const sameVerdictVersion = (a, b) => treeKey(a.dir) === treeKey(b.dir) && a.head === b.head && a.tree === b.tree;
+const versionLabel = (v) => `${v.dir} (${v.head} / ${v.tree})`;
 
 async function staleDependency(w, t) {
   for (const id of t.after || []) {
@@ -1766,7 +1768,7 @@ async function staleDependency(w, t) {
     const previous = dep.verifiedAt;
     const current = await verdictVersion(previous.dir);
     if (!current) { log(w, 'studio', 'system', `「${dep.title}」無法綁定版本，略過本次比對。`); continue; }
-    if (dep.verdictStale || current.head !== previous.head || current.tree !== previous.tree) {
+    if (dep.verdictStale || !sameVerdictVersion(current, previous)) {
       return { dep, reason: `驗證時是 ${previous.head} / ${previous.tree}，現在是 ${current.head} / ${current.tree}` };
     }
   }
@@ -2677,7 +2679,6 @@ ${accessRules(t)}
 ${isWriter(t) && t.role !== 'check' ? deliveryRules(w.delivery, 'worker') : ''}
 When you end your turn, reply with a short summary of what you did (1-3 sentences).
 ${STATUS_RULES}`;
-    if (!(note && knowsTask)) t.briefed = workKey(t);
     const cid = await conv(w, t.agent, false, t.hard, t.workdir, roOf(t));
     // A step stopped by 立刻打斷 ends early (maybe with an error): park the card until the Leader has read the note.
     // hold also makes turn() throw Halt. Recover that interruption only while this execution still owns the card.
@@ -2706,7 +2707,25 @@ ${STATUS_RULES}`;
     };
     const dir = isWriter(t) ? (await workspaceOf(t.workdir || w.project)).path : '', before = dir ? await treeFiles(dir).catch(() => null) : null;
     if (dir) snap = { dir, at: nowIso(), before: await snapTree(dir) };
+    const verificationVersion = async () => {
+      const version = await verdictVersion(t.workdir || w.project);
+      if (!interrupted() && (w.run !== run || !run.active || (run.lifecycleEpoch || 0) !== epoch || t.status !== 'WORKING'
+        || t.agent !== startAgent || (t.leaseGeneration || 0) !== generation || t.hold)) throw new Halt('驗證已中斷');
+      return version;
+    };
+    if (VERDICT_RE[t.role] && !Object.hasOwn(t, 'verificationStart')) {
+      const start = await verificationVersion();
+      if (interrupted()) { park(); return; }
+      if (start && t.briefed) { // an unfinished card from before start versions were recorded
+        Object.assign(t, { verdictStale: true, verifiedAt: null });
+        return applyStatus(w, t, { kind: 'BLOCKED', text: '先前驗證的起始版本不明，請工頭追加重驗卡。',
+          detail: '舊紀錄缺少驗證開始時的版本，現在是 ' + versionLabel(start) });
+      }
+      t.verificationStart = start; // preserve what this reviewer could have read, including across waits and restarts
+      saveRun(w, 'running');
+    }
     const reported = new Set(), parsed = (r) => { const st = parseStatus(r); st?.files.forEach((f) => reported.add(f)); return st; };
+    if (!(note && knowsTask)) t.briefed = workKey(t);
     const reply = await step(prompt);
     if (t.interrupted) { park(); return; }
     let st = parsed(reply);
@@ -2733,11 +2752,19 @@ ${STATUS_RULES}`;
     }
     if (st.kind !== 'DONE' && overCap(w, t)) throw capErr(); // the step that just ended blew the budget and the card is not finished: stop it now, not at the next wake-up
     if (st.kind === 'DONE' && VERDICT_RE[t.role] && verdictOk(t, verdictOf(t, st.text))) {
-      const version = await verdictVersion(t.workdir || w.project);
+      const version = await verificationVersion();
       if (interrupted()) { park(); return; }
-      if (w.run !== run || !run.active || (run.lifecycleEpoch || 0) !== epoch || t.status !== 'WORKING' || t.agent !== startAgent || t.hold) throw new Halt('驗證已中斷');
-      t.verifiedAt = version;
-      if (!version) log(w, 'studio', 'system', `「${t.title}」無法綁定版本。`);
+      const start = t.verificationStart;
+      if (start && version && !sameVerdictVersion(start, version)) {
+        const detail = `驗證開始時是 ${versionLabel(start)}，現在是 ${versionLabel(version)}`;
+        t.verdictStale = true;
+        t.verifiedAt = null;
+        st = { ...st, kind: 'BLOCKED', text: '驗證期間程式碼已變更，結論已過期；請工頭追加重驗卡。', detail };
+      } else {
+        t.verifiedAt = start && version ? version : null;
+        t.verdictStale = false;
+        if (!t.verifiedAt) log(w, 'studio', 'system', `「${t.title}」無法綁定版本。`);
+      }
     }
     applyStatus(w, t, st, last);
     if (before) await reportFiles(w, t, dir, before, reported);
