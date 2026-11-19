@@ -10,6 +10,25 @@ module.exports = async function () {
   // 1. Verify index.html UI helper functions and component rendering
   const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 
+  // Opening card B must never submit card A's unsent progress question to B.
+  const dialog = { showModal() {}, close() {} };
+  const fields = { workQ: { value: '' }, workDlg: dialog, workBody: {}, workSend: {}, workClose: {}, workAsk: {} };
+  const requests = [];
+  const work = vm.createContext({ $: id => fields[id], workOpen: null, drafts: {}, workLogOpen: false,
+    workDiff: null, diffSeq: 0, loadWork() {}, post: async (url, body) => requests.push([url, { ...body }]) });
+  vm.runInContext(html.slice(html.indexOf('function openWork('), html.indexOf('// Token usage')), work);
+  vm.runInContext(html.slice(html.indexOf("$('workClose').onclick"), html.indexOf("$('workQ').onkeydown")), work);
+  work.openWork('project-A', 'task');
+  fields.workQ.value = 'A 專案的版本細節？'; fields.workClose.onclick();
+  work.openWork('project-B', 'task');
+  assert.equal(fields.workQ.value, '');
+  fields.workSend.onclick(); assert.equal(requests.length, 0);
+  fields.workQ.value = 'B 的進度？'; fields.workSend.onclick();
+  assert.deepEqual(requests, [['/api/card/ask', { ws: 'project-B', taskId: 'task', text: 'B 的進度？' }]]);
+  work.openWork('project-A', 'other'); assert.equal(fields.workQ.value, '');
+  work.openWork('project-A', 'task'); assert.equal(fields.workQ.value, 'A 專案的版本細節？');
+  work.openWork('project-B', 'task'); assert.equal(fields.workQ.value, '', 'sent drafts stay cleared');
+
   // Extract relevant script block or eval in synthetic context
   const sandbox = {
     console,
