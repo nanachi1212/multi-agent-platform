@@ -135,9 +135,14 @@ export function createWorkspaceLeaseStore({ fs, path, crypto, S, RT, INSTANCE, A
       finally { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); }
     });
   }
-  function loadLeases() {
+  function loadLeases(settleStoppedCard) {
     withLeaseTransaction(() => {
-      for (const l of S.leases) if (l.mode === 'read' && l.instance !== INSTANCE && !pidAlive(l.pid) && l.status !== 'RELEASED') retire(l, 'Studio restarted');
+      for (const l of S.leases) {
+        if (l.instance === INSTANCE || l.status === 'RELEASED') continue;
+        if (l.mode === 'read' && !pidAlive(l.pid)) retire(l, 'Studio restarted');
+        if (l.mode === 'write' && l.status === 'RESERVED' && l.jobStopped === true && l.owner?.kind === 'studio'
+            && Number.isInteger(l.pid) && l.pid > 0 && !pidAlive(l.pid) && settleStoppedCard?.(l)) retire(l, 'stopped');
+      }
       saveLeases();
     });
   }

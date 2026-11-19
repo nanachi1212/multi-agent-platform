@@ -225,6 +225,30 @@ function readHistory(id) {
   return JSON.parse(fs.readFileSync(path.join(HISTORY, id + '.json'), 'utf8'));
 }
 
+// Older versions could save a stopped job with a WORKING card after its admission check drained.
+// The lease store calls this under its startup lock, before publishing the release.
+function settleStoppedCard(lease) {
+  let record;
+  try { record = readHistory(lease.jobId); }
+  catch (error) {
+    console.error('無法核對已停止工作的歷史，保留寫入租約：' + error.message);
+    return false;
+  }
+  if (record?.status !== 'stopped' || record.id !== lease.jobId || !record.project || !lease.project || !same(record.project, lease.project)) return false;
+  const card = Array.isArray(record.tasks) && record.tasks.find(t => t?.id === lease.cardId);
+  if (!card || !card.id || !card.agent || card.agent !== lease.owner.agent || (card.leaseGeneration || 0) !== (lease.generation || 0)) return false;
+  if (card.stopUnconfirmed || card.runtimeStopPending || card.preparing || card.worktree?.setupProc || card.worktree?.setupLeft?.length) return false;
+  // Pause can reserve an executing writer before cancellation is confirmed. For a card that
+  // already ran, only resumeJob's post-drain reservation has an explicitly cleared reason.
+  if (lease.reason === 'runtime stop unconfirmed' || (card.firstStartedAt && lease.reason !== '')) return false;
+  if (card.status === 'WORKING') {
+    Object.assign(card, { status: 'FAILED', result: '已停止' });
+    writeJson(path.join(HISTORY, record.id + '.json'), record);
+  }
+  // If the lease write failed after history was saved, the next startup completes the release.
+  return card.status === 'FAILED' || card.status === 'DONE';
+}
+
 // Every event of a working run is also saved (status "running"), so closing the Studio mid-job loses nothing:
 // after a restart the job shows as interrupted and can be continued like a paused one.
 // detail = technical text (raw replies, parser errors); the page shows it only behind 查看技術細節.
@@ -4094,7 +4118,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-loadLeases(); // restore ownership before any worker can start
+loadLeases(settleStoppedCard); // restore ownership before any worker can start
 await cleanupStaleRuntimes({ rtDir: RT }).catch(() => {});
 
 // Show each open project's latest paused job again after a restart, ready to continue.

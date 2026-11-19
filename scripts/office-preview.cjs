@@ -17,5 +17,5 @@ const css = source.match(/<style>([\s\S]*?)<\/style>/)[1];
 const output = path.resolve(process.argv[2] || 'outputs/office-preview.html');
 fs.mkdirSync(path.dirname(output), {recursive:true});
 fs.writeFileSync(output, `<!doctype html><html lang="zh-Hant"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AI 辦公室實作預覽</title><style>${css}
-body{margin:0}main{padding:18px;width:min(100%,390px)}.scene{margin-top:12px}.scene *,.scene *::before,.scene *::after{animation:none!important}</style><main><div class="room-h">AI 辦公室 <span class="sub">2 位工作中</span></div><div class="scene">${scene}</div></main></html>`);
+body{margin:0;font-family:"Microsoft JhengHei UI","Microsoft JhengHei",sans-serif}main{padding:18px;width:min(100%,390px)}.scene{margin-top:12px}.scene *,.scene *::before,.scene *::after{animation:none!important}</style><main><div class="room-h">AI 辦公室 <span class="sub">2 位工作中</span></div><div class="scene">${scene}</div></main></html>`);
 console.log(output);

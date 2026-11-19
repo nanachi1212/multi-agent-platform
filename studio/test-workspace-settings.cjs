@@ -41,7 +41,7 @@ async function start(file, runtime) {
   };
 }
 
-(async () => {
+async function testWorkspaceSettings() {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'studio-tab-settings-')));
   let app;
   try {
@@ -116,4 +116,7 @@ async function start(file, runtime) {
   } finally {
     try { await app?.stop(); } finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
   }
-})().catch(e => { console.error(e); process.exitCode = 1; });
+}
+
+module.exports = { stageStudio, start };
+if (require.main === module) testWorkspaceSettings().catch(e => { console.error(e); process.exitCode = 1; });
