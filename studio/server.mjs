@@ -2071,6 +2071,13 @@ async function stopAndDrain(w) {
       stop(w);
       await drainExecution(w);
       current();
+      // An admission check may drain before runCard ever starts. Settle all unfinished
+      // cards now, while this job still owns the workspace and before releasing its leases.
+      if (run.stopped) {
+        for (const t of cards) {
+          if (!['DONE', 'FAILED'].includes(t.status)) Object.assign(t, { status: 'FAILED', result: '已停止' });
+        }
+      }
       releaseJobLeases(w, 'stopped');
       for (const t of cards) if (isWriter(t)) { await releaseLock(w, t); current(); }
       saveRun(w, 'stopped');
