@@ -1307,12 +1307,14 @@ function notify(title, body, kind, project) {
 
 // Clicking the toast opens that project's tab in the browser.
 function windowsToast(title, body, url) {
-  const ps = `[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+  const ps = `$ErrorActionPreference = 'Stop'
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
 $x = New-Object Windows.Data.Xml.Dom.XmlDocument
 $x.LoadXml('<toast activationType="protocol"><visual><binding template="ToastGeneric"><text/><text/><text placement="attribution">Multi-Agent Studio</text></binding></visual></toast>')
 $x.DocumentElement.SetAttribute('launch', $env:STUDIO_URL)
-$t = $x.GetElementsByTagName('text'); [void]$t[0].AppendChild($x.CreateTextNode($env:STUDIO_TITLE)); [void]$t[1].AppendChild($x.CreateTextNode($env:STUDIO_BODY))
+$x.SelectSingleNode('/toast/visual/binding/text[1]').InnerText = $env:STUDIO_TITLE
+$x.SelectSingleNode('/toast/visual/binding/text[2]').InnerText = $env:STUDIO_BODY
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))`;
   // Text goes through env vars, never into the script itself.
   execFile('powershell.exe', ['-NoProfile', '-Command', ps], { windowsHide: true, env: { ...process.env, STUDIO_TITLE: title, STUDIO_BODY: body, STUDIO_URL: url } },
