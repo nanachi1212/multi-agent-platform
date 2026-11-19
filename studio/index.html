@@ -1437,7 +1437,10 @@ async function refresh() {
 
 // ---------- Notifications: the server sends the Windows toast; open pages add a sound ----------
 let seenNotice = null, lastRender = 0, audio = null;
-document.addEventListener('pointerdown', () => { audio ??= new AudioContext(); }); // browsers only allow sound after a click
+// Only a chime opens the audio device. A later click can unlock it if autoplay was blocked.
+document.addEventListener('click', () => {
+  if (audio?.state === 'suspended') audio.resume().catch(() => {});
+});
 
 function handleNotices() {
   if (seenNotice === null) { seenNotice = S.noticeSeq; return; } // don't replay old notices on page load
