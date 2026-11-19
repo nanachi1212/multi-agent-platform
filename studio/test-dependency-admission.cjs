@@ -24,7 +24,10 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
       let turns = 0, summary = '';
       const { api, env } = makeEnv((_agent, prompt) => {
         if (prompt.includes('Every current card has ended')) { summary = prompt; return '{"needs_user":"Finished"}'; }
-        if (prompt.includes('Task: check')) return 'PASS\nSTATUS: DONE';
+        if (prompt.includes('Task: check')) {
+          assert.equal(fs.readFileSync(file(repo), 'utf8'), 'A');
+          return 'PASS\nSTATUS: DONE';
+        }
         if (++turns === 1) {
           if (edit) fs.writeFileSync(file(repo), 'B');
           return 'Waiting for input.\nSTATUS: NEEDS_USER: Continue?';
@@ -36,14 +39,22 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
       const writer = { id: edit ? 'writer' : 'clean-writer', title: 'edit', role: 'build', agent: 'antigravity', writes: true, after: ['check'], status: 'WAITING' };
       w.tasks.push(check, writer);
       const live = () => env.S.leases.filter(l => l.cardId === writer.id && l.mode === 'write' && l.status !== 'RELEASED');
+      const diskWriters = () => JSON.parse(fs.readFileSync(path.join(env.RT, 'studio', 'leases.json'), 'utf8'))
+        .filter(l => l.mode === 'write' && l.status !== 'RELEASED');
+      const originalLock = path.join(repo, '.git', 'studio-writer.lock');
       await api.runTask(w, check); assert.equal(check.status, 'DONE', check.result);
       await api.runTask(w, writer); assert.equal(writer.status, 'NEEDS_USER', writer.result);
+      assert.equal(turns, 1);
+      assert.equal(fs.readFileSync(file(repo), 'utf8'), edit ? 'B' : 'A');
       assert.deepEqual(live().map(l => l.status), ['RESERVED']);
+      assert.deepEqual(diskWriters().map(l => [l.cardId, l.status]), [[writer.id, 'RESERVED']]);
+      assert.ok(fs.existsSync(originalLock));
       if (oldHistory) delete writer.admittedWorkdir;
       if (sibling) { // A later sibling has never started and must still reject the old PASS.
         const next = { id: 'sibling', title: 'delivery', agent: 'codex', writes: false, after: ['check'], status: 'WAITING' };
         w.tasks.push(next); await api.runTask(w, next);
         assert.equal(next.status, 'FAILED'); assert.equal(check.verdictStale, true);
+        assert.equal(env.prompts.filter(p => p.text.includes('Task: delivery')).length, 0);
         assert.equal(live().length, 1, 'rejecting the sibling must preserve the parked writer lease');
       }
       if (move) await api.useWorktree(w, writer.id);
@@ -54,6 +65,8 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
       assert.equal(writer.status, rejected ? 'FAILED' : 'DONE', writer.result);
       assert.equal(turns, rejected ? 1 : 2);
       assert.deepEqual(live(), []);
+      assert.deepEqual(diskWriters(), []);
+      assert.ok(!fs.existsSync(originalLock));
       assert.equal(w.lockTimers?.size || 0, 0);
       if (move) assert.ok(Object.values(w.lockPaths).filter(Boolean).every(p => !fs.existsSync(p)));
       assert.equal(check.status, rejected || sibling ? 'FAILED' : 'DONE');
