@@ -112,7 +112,17 @@ function setup(stage = 'create', overrides = {}) {
     x.w.run.active = false; x.api.runRoutines(due); await tick();
     assert.equal(x.w.run.request, r.request);
   }
-  console.log('Routines: simultaneous due slots, precheck, manual start and repeated polls: PASS');
+  {
+    const r = routine('A'), saved = [];
+    const x = setup('create', { saveSettings: () => saved.push(r.lastAt) });
+    Object.assign(x.w, { run: null, routines: [r] }); x.env.S.workspaces = [x.w];
+    x.api.runRoutines(due);
+    await x.entered.promise; await tick(); // creating the leader conversation is still blocked
+    assert.equal(x.w.run.phase, 'planning');
+    assert.deepEqual(saved, [due.toISOString()], 'persist the consumed slot as soon as the job is accepted');
+    x.release.resolve(); await tick();
+  }
+  console.log('Routines: simultaneous due slots, precheck, manual start, repeated polls and persistence before planning completes: PASS');
   for (const stage of ['create', 'response']) for (const next of ['start', 'resume']) {
     const x = setup(stage), old = x.w.run;
     const pending = x.api.planPhase(x.w); await x.entered.promise;
