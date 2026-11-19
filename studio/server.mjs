@@ -1263,39 +1263,48 @@ const stillStopping = (w) => !!(w.stopDrain || w.leaderSteps?.size || w.executin
 const precheck = (w, r) => new Promise((res) => execFile('cmd.exe', ['/d', '/s', '/c', `"${r.precheck}"`], { cwd: w.project, windowsHide: true, windowsVerbatimArguments: true, timeout: 30000, maxBuffer: 1 << 20 },
   (e, out, err) => { const said = String(err || out || '').trim().slice(0, 200); res(e ? (e.killed ? '前置檢查超過 30 秒沒有結束' : typeof e.code === 'number' ? `前置檢查結束碼 ${e.code}` : `前置檢查無法執行（${e.code || e.message}）`) + (said ? '：' + said : '') : ''); }));
 
+const pendingRoutines = new WeakSet(); // only in flight: never persist a reservation as a consumed slot
+const routineBusy = (w) => launchingWs.has(w) || w.run?.active || w.run?.paused || stillStopping(w);
 function runRoutines(now = new Date()) {
-  for (const w of S.workspaces) for (const r of w.routines) {
-    if (!routineDue(r, now) || w.run?.active || w.run?.paused || stillStopping(w)) continue; // busy or still winding down: the slot waits until the project is free
-    const was = r.lastAt;
-    r.lastAt = now.toISOString();
-    const go = () => {
-      const prev = w.run;
-      w.autoRounds = 0; // a fresh chain, like a job the user starts
-      const started = start(w, r.request);
-      event('routine.start', { project: w.project, routine: r.id, job: w.run !== prev ? w.run?.id : null });
-      return started.then(() => {
-        r.lastResult = '';
-        log(w, 'studio', 'system', `⏰ 這件工作由定時工作（${r.time}）自動開始。`);
-        notify(`${label(w)}：定時工作開始`, clip(r.request, 100), 'done', w.project);
-      }, (e) => {
-        r.lastResult = e.message;
-        event('routine.error', { project: w.project, routine: r.id, error: e.message });
-        notify(`${label(w)}：定時工作沒有開始`, e.message, 'ask', w.project);
-      }).finally(saveSettings);
-    };
-    if (!r.precheck) { go(); continue; }
-    precheck(w, r).then((why) => {
-      if (!S.workspaces.includes(w) || !w.routines.includes(r) || !r.on) return; // closed, deleted or switched off while the check ran
-      if (why) { // the slot is used up (lastAt is set): a skipped routine is not re-checked every 30 s
-        r.lastResult = '略過：' + why;
-        log(w, 'studio', 'system', `⏰ 定時工作（${r.time}）這次略過：${why}。`);
-        event('routine.skip', { project: w.project, routine: r.id, reason: why.split('：')[0] });
-        return saveSettings();
-      }
-      if (w.run?.active || w.run?.paused || stillStopping(w)) { r.lastAt = was; return; } // got busy while the check ran: the slot waits, as without a precheck
-      return go();
-    });
+  for (const w of S.workspaces) {
+    if (pendingRoutines.has(w) || routineBusy(w)) continue;
+    // If one job spans the next scheduled time, let a still-waiting routine have its turn first.
+    const [r] = w.routines.filter((r) => routineDue(r, now))
+      .sort((a, b) => (Date.parse(a.lastAt) || 0) - (Date.parse(b.lastAt) || 0));
+    if (!r) continue;
+    pendingRoutines.add(w);
+    runRoutine(w, r, now).finally(() => pendingRoutines.delete(w));
   }
+}
+async function runRoutine(w, r, now) {
+  if (r.precheck) {
+    const since = r.since;
+    const why = await precheck(w, r);
+    if (!S.workspaces.includes(w) || !w.routines.includes(r) || !r.on || r.since !== since || routineBusy(w)) return;
+    if (why) {
+      r.lastAt = now.toISOString();
+      r.lastResult = '略過：' + why;
+      log(w, 'studio', 'system', `⏰ 定時工作（${r.time}）這次略過：${why}。`);
+      event('routine.skip', { project: w.project, routine: r.id, reason: why.split('：')[0] });
+      return saveSettings();
+    }
+  }
+  w.autoRounds = 0; // a fresh chain, like a job the user starts
+  try {
+    await start(w, r.request);
+  } catch (e) {
+    r.lastAt = now.toISOString(); // a genuine startup failure is reported once for this slot
+    r.lastResult = e.message;
+    event('routine.error', { project: w.project, routine: r.id, error: e.message });
+    notify(`${label(w)}：定時工作沒有開始`, e.message, 'ask', w.project);
+    return saveSettings();
+  }
+  r.lastAt = now.toISOString();
+  r.lastResult = '';
+  event('routine.start', { project: w.project, routine: r.id, job: w.run?.id || null });
+  log(w, 'studio', 'system', `⏰ 這件工作由定時工作（${r.time}）自動開始。`);
+  notify(`${label(w)}：定時工作開始`, clip(r.request, 100), 'done', w.project);
+  saveSettings();
 }
 
 // ---------- Plan limits (5-hour / weekly) ----------
