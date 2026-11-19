@@ -164,7 +164,8 @@ async function run() {
       settingUp: () => false, isDir: () => true, available: () => true, workersFor: () => ['claude'], latestJob: () => null,
       projectContext: () => '', agentName: x => x, planPhase: x => plans.push(x), knownRefs: () => [] };
     vm.createContext(env);
-    vm.runInContext(['launching', 'start', 'startJob', 'runRoutines', 'closeWorkspace'].map(name => fn(src, name)).join('\n'), env);
+    const scheduler = src.slice(src.indexOf('const pendingRoutines ='), src.indexOf('// ---------- Plan limits'));
+    vm.runInContext(scheduler + ['launching', 'start', 'startJob', 'closeWorkspace'].map(name => fn(src, name)).join('\n'), env);
     env.runRoutines(); if (closed) env.closeWorkspace(w); release(''); await new Promise(resolve => setImmediate(resolve));
     assert.equal(plans.length, closed ? 0 : 1, 'closed workspace cannot start a pending routine; open workspace still can');
     assert.equal(!!w.run?.active, !closed);

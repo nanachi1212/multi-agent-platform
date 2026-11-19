@@ -6,7 +6,7 @@ const src = fs.readFileSync(require('node:path').join(__dirname, 'server.mjs'), 
 const region = (a, b) => { const i = src.indexOf(a), j = src.indexOf(b, i); assert(i >= 0 && j > i, a); return src.slice(i, j); };
 const deferred = () => { let resolve; const promise = new Promise(r => resolve = r); return { promise, resolve }; };
 const tick = () => new Promise(r => setImmediate(r));
-function setup(stage = 'create') {
+function setup(stage = 'create', overrides = {}) {
   const entered = deferred(), release = deferred(), prompts = [], messages = new Map(); let calls = 0;
   class Halt extends Error {}
   const w = { project: 'P', leader: 'claude', workers: ['codex'], tasks: [], activity: [],
@@ -18,7 +18,8 @@ function setup(stage = 'create') {
     createConv: async () => { const cid = 'conv' + (++calls); if (calls === 1 && stage === 'create') await gate(); return cid; },
     workersFor: () => ['codex'], available: () => true, agentName: x => x, isDir: () => true,
     endLeftSetups: async () => {}, settingUp: () => false,
-    latestJob: () => null, projectContext: () => '', knownRefs: () => [], event: () => {}, log: () => {},
+    latestJob: () => null, projectContext: () => '', knownRefs: () => [], events: [], event: (type, data) => env.events.push({ type, ...data }), log: () => {},
+    saveSettings: () => {}, label: () => 'project', notify: () => {},
     missionNote: () => '', planPrompt: r => r.request, parsePlan: JSON.parse, FIX_JSON: 'fix',
     addCards: (w, cards) => w.tasks.push(...cards), pump: () => {}, processNotes: () => {},
     finish: () => { throw Error('unexpected finish'); },
@@ -36,22 +37,98 @@ function setup(stage = 'create') {
     chargeUsage: () => {}, usageDelta: () => {}, isAskAnswer: () => false,
     leaseBlocker: async () => null, saveLeases: () => {}, watchExternal: () => {},
     clip: x => String(x || ''), handoffNote: () => '', memoryNote: () => '', deliveryRules: () => '',
-    SUBTASK_SHAPE: '', SUBTASK_RULES: '', parseJson: JSON.parse
+    SUBTASK_SHAPE: '', SUBTASK_RULES: '', parseJson: JSON.parse, ...overrides
   };
   const code = region('async function conv(w,', "// This run's conversations")
     + region('async function turn(agent,', '// ---------- External provider')
     + region('const CONTINUE_RE =', '// Start every WAITING')
     + region('function pump(w)', '// ---------- Workspace lease:')
     + region('const MAX_ROUNDS =', 'function askUser(w,')
-    + src.match(/^const stillStopping = .*$/m)[0] + '\n'
+    + region('function routineSlot(', '// ---------- Plan limits')
     + region('async function drainExecution(w,', 'async function stopAndDrain(w)')
     + region('function pause(w)', '// Can be continued')
     + region('const launchingWs =', 'async function reassign(w,')
-    + 'return { start, planPhase, pause, pauseAndDrain, resume, turn, pump };';
+    + 'return { start, planPhase, pause, pauseAndDrain, resume, turn, pump, runRoutines };';
   const api = new Function(...Object.keys(env), code)(...Object.values(env));
   return { w, env, api, entered, release, prompts };
 }
 (async () => {
+  const due = new Date(2026, 10, 19, 9, 30, 10);
+  const routine = (id) => ({ id, request: 'schedule ' + id, on: true, time: '09:30', days: [due.getDay()],
+    since: new Date(2026, 10, 18).toISOString(), lastAt: '', lastResult: '' });
+  for (const withCheck of [false, true]) {
+    let finishCheck, checks = 0;
+    const x = setup('routine', { execFile: (_cmd, _args, _opts, cb) => { checks++; finishCheck = () => cb(null, '', ''); } });
+    const [a, b] = [routine('A'), routine('B')];
+    if (withCheck) a.precheck = 'before A';
+    Object.assign(x.w, { run: null, routines: [a, b] });
+    x.env.S.workspaces = [x.w];
+    x.api.runRoutines(due); x.api.runRoutines(due);
+    if (withCheck) {
+      await tick(); // another poll arrives while the first precheck is still outstanding
+      x.api.runRoutines(due); await tick();
+      assert.equal(checks, 1);
+      assert.deepEqual(x.prompts, [], 'neither planner receives work before A clears its precheck');
+      assert.deepEqual([a.lastAt, b.lastAt], ['', ''], 'pending prechecks and later routines keep their slots');
+      finishCheck();
+    }
+    await tick();
+    const firstId = x.w.run.id;
+    assert.equal(x.w.run.request, a.request);
+    assert.deepEqual([a.lastAt, b.lastAt, b.lastResult], [due.toISOString(), '', ''], 'a launch in progress cannot consume B');
+    x.api.runRoutines(due); await tick();
+    assert.equal(b.lastAt, '', 'B waits while A is active');
+    x.w.run.active = false;
+    const next = new Date(+due + 60000);
+    x.api.runRoutines(next); x.api.runRoutines(next); await tick();
+    assert.equal(x.w.run.request, b.request);
+    assert.equal(b.lastAt, next.toISOString());
+    x.w.run.active = false;
+    x.api.runRoutines(next); await tick();
+    assert.notEqual(x.w.run.id, firstId);
+    assert.deepEqual(x.prompts, [{ prompt: a.request, job: firstId }, { prompt: b.request, job: x.w.run.id }]);
+    assert.equal(checks, withCheck ? 1 : 0);
+    assert.deepEqual(x.env.events.filter(e => e.type === 'routine.start').map(e => [e.routine, e.job]), [['A', firstId], ['B', x.w.run.id]]);
+    assert.equal(x.env.events.filter(e => e.type === 'routine.error').length, 0);
+  }
+  {
+    const x = setup('routine');
+    const daily = ['A', 'B'].map(id => ({ ...routine(id), days: [0, 1, 2, 3, 4, 5, 6] }));
+    Object.assign(x.w, { run: null, routines: daily }); x.env.S.workspaces = [x.w];
+    x.api.runRoutines(due); await tick();
+    assert.equal(x.w.run.request, 'schedule A');
+    x.w.run.active = false;
+    const tomorrow = new Date(+due + 24 * 60 * 60000);
+    x.api.runRoutines(tomorrow); await tick();
+    assert.equal(x.w.run.request, 'schedule B', 'an older pending routine must not starve when A spans another slot');
+    x.w.run.active = false; x.api.runRoutines(tomorrow); await tick();
+    assert.equal(x.w.run.request, 'schedule A');
+    x.w.run.active = false; x.api.runRoutines(tomorrow); await tick();
+    assert.deepEqual(x.env.events.filter(e => e.type === 'routine.start').map(e => e.routine), ['A', 'B', 'A']);
+  }
+  {
+    const launching = deferred();
+    const x = setup('routine', { endLeftSetups: () => launching.promise });
+    const r = routine('A');
+    Object.assign(x.w, { run: null, routines: [r] }); x.env.S.workspaces = [x.w];
+    const manual = x.api.start(x.w, 'manual job');
+    x.api.runRoutines(due); await tick();
+    assert.deepEqual([r.lastAt, r.lastResult], ['', ''], 'manual launch has the project before it publishes w.run');
+    launching.resolve(); await manual; await tick();
+    x.w.run.active = false; x.api.runRoutines(due); await tick();
+    assert.equal(x.w.run.request, r.request);
+  }
+  {
+    const r = routine('A'), saved = [];
+    const x = setup('create', { saveSettings: () => saved.push(r.lastAt) });
+    Object.assign(x.w, { run: null, routines: [r] }); x.env.S.workspaces = [x.w];
+    x.api.runRoutines(due);
+    await x.entered.promise; await tick(); // creating the leader conversation is still blocked
+    assert.equal(x.w.run.phase, 'planning');
+    assert.deepEqual(saved, [due.toISOString()], 'persist the consumed slot as soon as the job is accepted');
+    x.release.resolve(); await tick();
+  }
+  console.log('Routines: simultaneous due slots, precheck, manual start, repeated polls and persistence before planning completes: PASS');
   for (const stage of ['create', 'response']) for (const next of ['start', 'resume']) {
     const x = setup(stage), old = x.w.run;
     const pending = x.api.planPhase(x.w); await x.entered.promise;
