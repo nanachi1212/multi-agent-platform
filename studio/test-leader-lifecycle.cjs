@@ -65,7 +65,10 @@ function setup(stage = 'create', overrides = {}) {
     x.env.S.workspaces = [x.w];
     x.api.runRoutines(due); x.api.runRoutines(due);
     if (withCheck) {
+      await tick(); // another poll arrives while the first precheck is still outstanding
+      x.api.runRoutines(due); await tick();
       assert.equal(checks, 1);
+      assert.deepEqual(x.prompts, [], 'neither planner receives work before A clears its precheck');
       assert.deepEqual([a.lastAt, b.lastAt], ['', ''], 'pending prechecks and later routines keep their slots');
       finishCheck();
     }
@@ -82,6 +85,9 @@ function setup(stage = 'create', overrides = {}) {
     assert.equal(b.lastAt, next.toISOString());
     x.w.run.active = false;
     x.api.runRoutines(next); await tick();
+    assert.notEqual(x.w.run.id, firstId);
+    assert.deepEqual(x.prompts, [{ prompt: a.request, job: firstId }, { prompt: b.request, job: x.w.run.id }]);
+    assert.equal(checks, withCheck ? 1 : 0);
     assert.deepEqual(x.env.events.filter(e => e.type === 'routine.start').map(e => [e.routine, e.job]), [['A', firstId], ['B', x.w.run.id]]);
     assert.equal(x.env.events.filter(e => e.type === 'routine.error').length, 0);
   }
