@@ -1439,10 +1439,17 @@ async function refresh() {
 let seenNotice = null, lastRender = 0, audio = null;
 // Only a chime opens the audio device. A later click can unlock it if autoplay was blocked.
 document.addEventListener('click', () => {
-  if (audio?.state === 'suspended') audio.resume().catch(() => {});
+  if (S?.notify && audio?.state === 'suspended') audio.resume().catch(() => {});
 });
 
+function discardChimes() {
+  if (!audio) return;
+  audio.close().catch(() => {});
+  audio = null;
+}
+
 function handleNotices() {
+  if (!S.notify) discardChimes();
   if (seenNotice === null) { seenNotice = S.noticeSeq; return; } // don't replay old notices on page load
   for (const n of S.notices) if (n.id > seenNotice && S.notify) announce(n);
   seenNotice = S.noticeSeq;
@@ -1471,6 +1478,7 @@ function renderNotifyBtn() {
 
 $('notifyBtn').onclick = async () => {
   const on = !S.notify;
+  if (!on) discardChimes(); // before this click reaches the document's autoplay handler
   await post('/api/notify', { on });
   if (on) { chime(true); post('/api/notify/test'); } // shows a test toast right away
 };
