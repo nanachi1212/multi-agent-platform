@@ -190,7 +190,12 @@ module.exports = async function () {
   const stateRoute = serverCode.match(/'GET \/api\/state': \(\) => \{[\s\S]*?\n  \},/)?.[0] || '';
   assert.ok(stateRoute.includes('workspaces'), 'GET /api/state route found');
   assert.ok(!serverCode.includes('workspace_summary') && !html.includes('workspace_summary'), 'workspace_summary is neither sent nor read');
-  assert.ok(/const \{ leases, \.\.\.state \} = S;/.test(stateRoute) && stateRoute.includes('...state,') && !stateRoute.includes('...S,'), 'GET /api/state leaves out S.leases');
+  const publicState = vm.runInNewContext("({" + stateRoute + "})['GET /api/state']()", {
+    S: { workspaces: [], agents: {}, leases: [{ id: 'private' }], closedApiBudgets: { private: {} } }, teamStats: () => ({}),
+  });
+  assert.ok(Array.isArray(publicState.workspaces), 'GET /api/state returns the workspace list');
+  assert.ok(!Object.hasOwn(publicState, 'leases'), 'GET /api/state leaves out S.leases');
+  assert.ok(!Object.hasOwn(publicState, 'closedApiBudgets'), 'closed projects stay out of the public state');
   assert.ok(serverCode.includes('blocked_reason'), 'server.mjs must compute blocked_reason for tasks');
 
   console.log('UI & API Workspace/Runtime/Blocked: PASS');
