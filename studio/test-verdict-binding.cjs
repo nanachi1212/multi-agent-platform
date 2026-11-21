@@ -343,6 +343,40 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
       assert.equal(check.verifiedAt.tree, await api.snapTree(dir), 'bound to the tree that includes the output from both runs');
     }
 
+    // 立刻打斷 gives the folder back, but the output the check left before it is still its own; a tracked edit is not.
+    for (const tracked of [false, true]) {
+      const dir = freshRepo();
+      const w = newW(); w.project = w.run.project = dir;
+      w.run.startedAt = new Date().toISOString();
+      let calls = 0;
+      const check = { id: 'verify', title: 'verify', instructions: 'run tests', role: 'check', agent: 'codex', writes: true, status: 'WAITING', after: [], trust: true };
+      const { api, env } = makeEnv((_agent, prompt) => {
+        if (prompt.includes('Every current card has ended')) return '{"needs_user":"ok?"}';
+        if (++calls === 1) {
+          fs.mkdirSync(path.join(dir, 'coverage'));
+          fs.writeFileSync(path.join(dir, 'coverage', 'report.txt'), 'lines 100%');
+          if (tracked) fs.writeFileSync(path.join(dir, 'source.txt'), 'changed by the check');
+          Object.assign(check, { interrupted: true, hold: true }); // the user interrupts this step
+          return 'cut short';
+        }
+        return 'PASS\nall tests passed\nSTATUS: DONE';
+      }, { execFile });
+      runtimes.push(env.RT); env.S.workspaces.push(w);
+      w.tasks.push(check);
+      await api.runTask(w, check);
+      assert.equal(check.status, 'WAITING', check.result);
+      assert.match(check.wakeNote, /half done/);
+      check.hold = false; // the leader has passed the instruction on
+      for (let i = 0; i < 400 && calls < 2; i++) {
+        if (check.status === 'WAITING' && !w.executingSteps.has('verify')) await api.runTask(w, check);
+        else await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      await until(() => !w.executingSteps.size && !w.leaderSteps?.size, 'the interrupted check to settle');
+      assert.equal(calls, 2, 'the check ran again');
+      assert.equal(check.status === 'DONE', !tracked, check.result);
+      assert.equal(check.verdictStale, tracked);
+    }
+
     // A writer that edits after the PASS and then fails still changed the tree; one that changed nothing does not.
     for (const edits of [true, false]) {
       const dir = freshRepo();

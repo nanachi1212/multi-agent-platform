@@ -40,6 +40,21 @@ dist/
 coverage/
 *.tsbuildinfo
 
+# Test and check output (reports, results, traces, caches)
+test-results/
+playwright-report/
+.nyc_output/
+.pytest_cache/
+__pycache__/
+htmlcov/
+.coverage
+.coverage.*
+lcov.info
+junit*.xml
+*.lcov
+*.tap
+*.trx
+
 # IDE and operating system
 .vscode/
 .idea/

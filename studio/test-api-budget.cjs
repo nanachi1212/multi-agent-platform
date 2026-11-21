@@ -158,6 +158,32 @@ const { region, mkTmp, makeEnv, newW } = require('./lifecycle-harness.cjs');
     await settled(nw, 'g');
     assert.equal(g.status, 'DONE');
     assert.equal(noted.env.prompts.slice(sent).filter(p => p.text.includes('use the v2 API instead')).length, 1, 'the member hears the instruction exactly once');
+
+    // A card woken with an update still owes its member that update when the budget refuses its first turn.
+    let turns = 0;
+    const woken = makeEnv((agent, prompt) => {
+      if (prompt.includes('Every current card has ended')) return '{"needs_user":"ok?"}';
+      if (++turns === 1) {
+        kw.apiDailyUsage.tokens = kw.apiDailyTokenCap; // another card spent the rest while this one was starting
+        throw Object.assign(new Error('今日 API 預算已用完'), { apiBudget: true }); // what turn() throws before sending
+      }
+      return 'finished\nSTATUS: DONE';
+    }, { execFile });
+    extra.push(woken.env.RT);
+    woken.env.AGENTS.ext = { name: 'Ext API', external: true };
+    const kw = newW(); kw.project = kw.run.project = repoAt('woken');
+    Object.assign(kw.run, { phase: 'working', startedAt: new Date().toISOString() });
+    kw.workers.push('ext'); spent(kw, 10); woken.env.S.workspaces.push(kw);
+    const k = { id: 'k', title: 'k', instructions: 'k', role: 'build', agent: 'ext', writes: true, status: 'WAITING', after: [], trust: true, wakeNote: 'The user answered: deploy to staging' };
+    kw.tasks.push(k);
+    await woken.api.runTask(kw, k);
+    assert.equal(k.status, 'NEEDS_USER'); assert.ok(k.ask?.apiBudget);
+    const refusedAt = woken.env.prompts.length;
+    kw.apiDailyTokenCap = 1000;
+    woken.api.answer(kw, 'k', '重新檢查預算');
+    await settled(kw, 'k');
+    assert.equal(k.status, 'DONE');
+    assert.equal(woken.env.prompts.slice(refusedAt).filter(p => p.text.includes('deploy to staging')).length, 1, 'the update reaches the member once the budget allows the turn');
   } finally {
     for (const dir of extra) await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 10 }).catch(() => {});
     if (harness) await fs.promises.rm(harness.env.RT, { recursive: true, force: true });
