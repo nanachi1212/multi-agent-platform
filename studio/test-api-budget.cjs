@@ -20,6 +20,7 @@ const { region, mkTmp, makeEnv, newW } = require('./lifecycle-harness.cjs');
     + region('function openWorkspace(p)', 'function removeRecent(p)')
     + 'return { S, setApiDailyTokenCap, chargeUsage, apiBudgetSpent, closeWorkspace, openWorkspace };')(...Object.values(env));
   let harness;
+  const extra = [];
   try {
     writeJson(settings, { project: rt }); // legacy settings, before workspaces or API budgets
     let app = load(), w = app.S.workspaces[0];
@@ -94,9 +95,73 @@ const { region, mkTmp, makeEnv, newW } = require('./lifecycle-harness.cjs');
     harness.api.answer(job, next.id, '重新檢查預算');
     await job.executingSteps.get(next.id).done;
     assert.equal(next.status, 'DONE', 'raising the cap admits the parked card on user retry');
+
+    // A handoff reserves the folder for an external member whose budget is spent; the card never started.
+    const { execFile, execFileSync } = require('node:child_process');
+    const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', windowsHide: true });
+    const repoAt = (name) => {
+      const repo = path.join(rt, name); fs.mkdirSync(repo);
+      git(repo, 'init', '-qb', 'main'); git(repo, 'config', 'user.name', 'Test'); git(repo, 'config', 'user.email', 'test@example.invalid');
+      fs.writeFileSync(path.join(repo, 'source.txt'), 'base'); git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'base');
+      return repo;
+    };
+    const today = () => new Date().toLocaleDateString('en-CA');
+    const spent = (w, tokens) => Object.assign(w, { apiDailyTokenCap: 100, apiDailyUsage: { date: today(), tokens, warned: true } });
+    const settled = async (w, id) => { await new Promise(r => setTimeout(r, 50)); while (w.executingSteps?.has(id)) await w.executingSteps.get(id).done; };
+    const handed = makeEnv(() => 'ok\nSTATUS: DONE', { execFile });
+    extra.push(handed.env.RT);
+    handed.env.AGENTS.ext = { name: 'Ext API', external: true };
+    const hw = newW(); hw.project = hw.run.project = repoAt('handoff');
+    Object.assign(hw.run, { phase: 'working', startedAt: new Date().toISOString() });
+    hw.workers.push('ext'); spent(hw, 100); handed.env.S.workspaces.push(hw);
+    const a = { id: 'a', title: 'a', instructions: 'a', role: 'build', agent: 'codex', writes: true, status: 'WAITING', after: [], trust: true };
+    hw.tasks.push(a);
+    await handed.api.handoffWriter(hw, 'ext', 'a');
+    await settled(hw, 'a');
+    assert.equal(a.agent, 'ext'); assert.equal(a.status, 'NEEDS_USER'); assert.ok(a.ask?.apiBudget);
+    assert.equal(a.firstStartedAt, undefined);
+    assert.ok(!handed.env.S.leases.some(l => l.cardId === 'a' && ['ACTIVE', 'RESERVED'].includes(l.status)), 'a card waiting for budget gives back its reservation');
+    const b = { id: 'b', title: 'b', instructions: 'b', role: 'build', agent: 'claude', writes: true, status: 'WAITING', after: [], trust: true };
+    hw.tasks.push(b); handed.api.pump(hw);
+    await settled(hw, 'b');
+    assert.equal(b.status, 'DONE', 'another writer in the same folder is not stuck behind the budget');
+    hw.apiDailyTokenCap = 1000;
+    handed.api.answer(hw, 'a', '重新檢查預算');
+    await settled(hw, 'a');
+    assert.equal(a.status, 'DONE', 'after the cap is raised the card takes a fresh lease and finishes');
+    assert.equal(handed.env.prompts.filter(p => p.agent === 'ext' && p.text.includes('Task: a')).length, 1);
+
+    // A user instruction queued for the next step survives a follow-up turn the budget refuses.
+    let calls = 0, refused = false, g;
+    const noted = makeEnv((agent, prompt) => {
+      if (prompt.includes('Every current card has ended')) return '{"needs_user":"ok?"}';
+      if (++calls === 1) { g.notes = ['use the v2 API instead']; return 'first step\nSTATUS: DONE'; }
+      if (prompt.includes('New instruction from the user') && !refused) {
+        refused = true; nw.apiDailyUsage.tokens = nw.apiDailyTokenCap; // the first step used the rest of today's budget
+        throw Object.assign(new Error('今日 API 預算已用完'), { apiBudget: true }); // what turn() throws before sending
+      }
+      return 'finished\nSTATUS: DONE';
+    }, { execFile });
+    extra.push(noted.env.RT);
+    noted.env.AGENTS.ext = { name: 'Ext API', external: true };
+    const nw = newW(); nw.project = nw.run.project = repoAt('notes');
+    Object.assign(nw.run, { phase: 'working', startedAt: new Date().toISOString() });
+    nw.workers.push('ext'); spent(nw, 10); noted.env.S.workspaces.push(nw);
+    g = { id: 'g', title: 'g', instructions: 'g', role: 'build', agent: 'ext', writes: true, status: 'WAITING', after: [], trust: true };
+    nw.tasks.push(g);
+    await noted.api.runTask(nw, g);
+    assert.ok(refused); assert.equal(g.status, 'NEEDS_USER'); assert.ok(g.ask?.apiBudget);
+    assert.deepEqual(g.notes, ['use the v2 API instead'], 'the refused turn never ran: the instruction is still queued');
+    const sent = noted.env.prompts.length;
+    nw.apiDailyTokenCap = 1000;
+    noted.api.answer(nw, 'g', '重新檢查預算');
+    await settled(nw, 'g');
+    assert.equal(g.status, 'DONE');
+    assert.equal(noted.env.prompts.slice(sent).filter(p => p.text.includes('use the v2 API instead')).length, 1, 'the member hears the instruction exactly once');
   } finally {
+    for (const dir of extra) await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 10 }).catch(() => {});
     if (harness) await fs.promises.rm(harness.env.RT, { recursive: true, force: true });
     await fs.promises.rm(rt, { recursive: true, force: true });
   }
-  console.log('API budget: subscriptions, handoff usage, daily warning, restart, close/reopen, midnight, admission and in-flight overage PASS');
+  console.log('API budget: subscriptions, handoff usage, daily warning, restart, close/reopen, midnight, admission, in-flight overage, handoff reservation released while over budget and queued instruction kept on a refused turn PASS');
 })().catch(e => { console.error(e); process.exitCode = 1; });

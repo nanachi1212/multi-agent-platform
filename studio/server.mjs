@@ -1769,9 +1769,11 @@ async function verdictVersion(dir) {
   if (info.err) return null;
   const [root, head] = info.out.trim().split(/\r?\n/);
   if (!head) return null;
-  const tree = await snapTree(root);
-  if (!tree) throw new Error('無法取得驗證工作的 Git 工作樹指紋');
-  return { head, tree, dir: canonPath(root) };
+  // The private index copy holds tracked and staged paths only: `add -u` fingerprints them, then `add -A` the whole tree.
+  const [tracked, tree] = (await privateGit(root, async (g) => [
+    (await g('add', '-u')).err ? '' : (await g('write-tree')).out?.trim() || '', await writeTree(g)])) || [];
+  if (!tracked || !tree) throw new Error('無法取得驗證工作的 Git 工作樹指紋');
+  return { head, tree, tracked, dir: canonPath(root) };
 }
 const sameVerdictVersion = (a, b) => treeKey(a.dir) === treeKey(b.dir) && a.head === b.head && a.tree === b.tree;
 const versionLabel = (v) => `${v.dir} (${v.head} / ${v.tree})`;
@@ -2025,7 +2027,12 @@ async function releaseRejectedReservations(w, t) {
 }
 
 async function runTask(w, t, failedDependency = false) {
-  if (!failedDependency && apiBudgetSpent(w, t.agent)) return waitForApiBudget(w, t);
+  if (!failedDependency && apiBudgetSpent(w, t.agent)) {
+    waitForApiBudget(w, t);
+    // A handoff may have reserved the folder for this member before any turn ran; nobody waits behind a card that waits for budget.
+    if (!t.firstStartedAt) { await releaseRejectedReservations(w, t); pump(w); }
+    return;
+  }
   if (t.ask?.apiBudget) t.ask = null;
   const ranAs = t.agent;
   let settleStep;
@@ -2800,9 +2807,10 @@ ${STATUS_RULES}`;
     }
     let last = reply;
     while (t.notes?.length) {
-      const note = t.notes.splice(0).join('\n');
+      const pending = t.notes.splice(0), note = pending.join('\n');
       log(w, 'studio', 'system', `把你的指示交給 ${agentName(t.agent)}，接著調整「${t.title}」。`);
-      last = await step(`New instruction from the user (via the leader) for your task "${t.title}":\n${note}\n\nApply it to this task now. End your reply with a short summary (1-3 sentences).\n${STATUS_RULES}`);
+      try { last = await step(`New instruction from the user (via the leader) for your task "${t.title}":\n${note}\n\nApply it to this task now. End your reply with a short summary (1-3 sentences).\n${STATUS_RULES}`); }
+      catch (e) { if (e.apiBudget) t.notes.unshift(...pending); throw e; } // the turn never ran: the instruction is still owed
       if (t.interrupted) { park(); return; }
       st = parsed(last) || { kind: 'BLOCKED', detail: '沒有有效的 STATUS，無法確認工作已完成', options: [], text: last.trim() };
     }
@@ -2811,7 +2819,11 @@ ${STATUS_RULES}`;
       const version = await verificationVersion();
       if (interrupted()) { park(); return; }
       const start = t.verificationStart;
-      if (start && version && !sameVerdictVersion(start, version)) {
+      // A writing check is the only Studio writer in its folder, so untracked paths that changed are its own output;
+      // tracked files and HEAD still count. Reviews read alongside writers, so everything counts for them.
+      const ownOutput = isWriter(t) && start?.tracked && version?.tracked && treeKey(start.dir) === treeKey(version.dir)
+        && start.head === version.head && start.tracked === version.tracked;
+      if (start && version && !ownOutput && !sameVerdictVersion(start, version)) {
         const detail = `驗證開始時是 ${versionLabel(start)}，現在是 ${versionLabel(version)}`;
         t.verdictStale = true;
         t.verifiedAt = null;
@@ -3479,8 +3491,9 @@ async function continueProject(w) {
 const MAX_ROUNDS = 3; // extra card rounds before the Leader must ask the user
 
 function verdictCoverage(w, t) {
-  if (!t.verifiedAt || !w.tasks.some((writer) => writer !== t && isWriter(writer) && writer.status === 'DONE'
-    && writer.doneAt >= t.doneAt && treeKey(writer.workdir || w.project) === treeKey(t.workdir || w.project)
+  // Any writer counts, finished or not: one that edited after the verdict and then failed still changed the tree.
+  if (!t.verifiedAt || !w.tasks.some((writer) => writer !== t && isWriter(writer)
+    && treeKey(writer.workdir || w.project) === treeKey(t.workdir || w.project)
     && writer.steps?.some((s) => (s.finishedAt || s.at) >= t.doneAt && s.before !== s.after && s.after !== t.verifiedAt.tree))) return '';
   return ' [驗證後有修改，結論未覆蓋最新版本；請工頭安排重驗]';
 }

@@ -215,6 +215,97 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
     await overlappingReview(wt, wt);
     await overlappingReview(wt, repo);
 
+    // A check card's own test run leaves or rewrites untracked files .gitignore does not cover: its own output, not a code change.
+    // A changed tracked file still makes its verdict stale; a review keeps the full comparison.
+    let fresh = 0;
+    const freshRepo = () => {
+      const dir = path.join(temp, 'own-' + ++fresh);
+      fs.mkdirSync(dir);
+      git(dir, 'init', '-qb', 'main');
+      git(dir, 'config', 'user.name', 'Test'); git(dir, 'config', 'user.email', 'test@example.invalid');
+      fs.writeFileSync(file(dir), 'base');
+      fs.writeFileSync(path.join(dir, 'scratch.txt'), 'untracked before the check'); // never committed
+      git(dir, 'add', 'source.txt'); git(dir, 'commit', '-qm', 'base');
+      return dir;
+    };
+    async function verdictOwnOutput(role, during, dir = freshRepo()) {
+      const w = newW(); w.project = w.run.project = dir;
+      w.run.startedAt = new Date().toISOString();
+      const { api, env } = makeEnv((_agent, prompt) => {
+        if (prompt.includes('Task: verify')) {
+          during(dir);
+          return (role === 'review' ? 'GO' : 'PASS') + '\nall tests passed\nSTATUS: DONE';
+        }
+        return 'ok\nSTATUS: DONE';
+      }, { execFile });
+      runtimes.push(env.RT); env.S.workspaces.push(w);
+      const check = { id: 'verify', title: 'verify', role, agent: 'codex', writes: role === 'check', status: 'WAITING', after: [], workdir: dir };
+      w.tasks.push(check);
+      await api.runTask(w, check);
+      return { w, api, env, check, dir };
+    }
+    {
+      const { w, api, env, check, dir } = await verdictOwnOutput('check', (d) => {
+        fs.mkdirSync(path.join(d, 'coverage'));
+        fs.writeFileSync(path.join(d, 'coverage', 'report.txt'), 'lines 100%');
+      });
+      assert.equal(check.status, 'DONE', check.result);
+      assert.equal(check.verdictStale, false);
+      assert.equal(check.verifiedAt.tree, await api.snapTree(dir), 'bound to the tree that includes its own output');
+      const next = { id: 'deliver', title: 'deliver', role: 'build', agent: 'codex', writes: true, trust: true, status: 'WAITING', after: ['verify'], workdir: dir };
+      w.tasks.push(next);
+      await api.runTask(w, next);
+      assert.equal(next.status, 'DONE', next.result);
+      assert.ok(env.prompts.some(p => p.text.includes('Task: deliver')), 'the dependent writer was dispatched');
+      // A re-check in the same repo rewrites the first run's output (and untracked scratch files): still its own output.
+      const again = await verdictOwnOutput('check', (d) => {
+        fs.writeFileSync(path.join(d, 'coverage', 'report.txt'), 'lines 97%');
+        fs.writeFileSync(path.join(d, 'scratch.txt'), 'rewritten by the second run');
+      }, dir);
+      assert.equal(again.check.status, 'DONE', again.check.result);
+      assert.equal(again.check.verdictStale, false);
+      assert.equal(again.check.verifiedAt.tree, await again.api.snapTree(dir));
+    }
+    {
+      const { check } = await verdictOwnOutput('check', (d) => fs.writeFileSync(file(d), 'changed by the check'));
+      assert.notEqual(check.status, 'DONE', check.result);
+      assert.equal(check.verdictStale, true);
+      assert.match(check.result, /驗證期間程式碼已變更/);
+    }
+    {
+      const { check } = await verdictOwnOutput('review', (d) => fs.writeFileSync(path.join(d, 'new-file.txt'), 'appeared during the review'));
+      assert.notEqual(check.status, 'DONE', check.result);
+      assert.equal(check.verdictStale, true);
+      assert.match(check.result, /驗證期間程式碼已變更/);
+    }
+
+    // A writer that edits after the PASS and then fails still changed the tree; one that changed nothing does not.
+    for (const edits of [true, false]) {
+      const dir = freshRepo();
+      const w = newW(); w.project = w.run.project = dir;
+      w.run.startedAt = new Date().toISOString();
+      const { api, env } = makeEnv((_agent, prompt) => {
+        if (prompt.includes('Every current card has ended')) return '{"needs_user":"Review coverage?"}';
+        if (prompt.includes('Task: verify')) return 'PASS\nSTATUS: DONE';
+        if (prompt.includes('Task: edit')) {
+          if (edits) fs.writeFileSync(file(dir), 'edited after the PASS');
+          return 'half way\nSTATUS: BLOCKED: the tool crashed';
+        }
+        return 'ok\nSTATUS: DONE';
+      }, { execFile });
+      runtimes.push(env.RT); env.S.workspaces.push(w);
+      const check = { id: 'verify', title: 'verify', role: 'check', agent: 'codex', writes: true, status: 'WAITING', after: [], trust: true };
+      const writer = { id: 'edit', title: 'edit', role: 'build', agent: 'claude', writes: true, status: 'WAITING', after: [], trust: true, ledByLeader: true };
+      w.tasks.push(check); await api.runTask(w, check);
+      assert.equal(check.status, 'DONE', check.result);
+      w.tasks.push(writer); await api.runTask(w, writer);
+      assert.notEqual(writer.status, 'DONE', writer.result);
+      await api.summarize(w);
+      const summary = env.prompts.find(p => p.text.includes('Every current card has ended'));
+      const line = summary.text.split('\n').find(l => l.includes('] verify ('));
+      assert.equal(line.includes('驗證後有修改'), edits, line);
+    }
+
     const w = newW(); w.project = w.run.project = repo;
     let parkedOnce = false;
     const { api, env } = makeEnv((_agent, prompt) => prompt.includes('Task: parked review') && !parkedOnce
@@ -273,5 +364,5 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
   } finally {
     for (const dir of [...runtimes, temp]) await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 10 });
   }
-  console.log('verdict binding: Stop and interruption during validation, unchanged, dirty tree, HEAD-only change, non-Git, linked worktree, rerun after reassignment and summary PASS');
+  console.log('verdict binding: Stop and interruption during validation, unchanged, dirty tree, HEAD-only change, non-Git, linked worktree, rerun after reassignment, a check\'s own untracked output (new and on re-run) vs a changed tracked file, review sees any change, and summary (incl. a failed writer after the PASS) PASS');
 })().catch(err => { console.error(err); process.exitCode = 1; });
