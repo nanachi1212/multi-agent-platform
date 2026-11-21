@@ -34,9 +34,11 @@ function setup(stage = 'runtime', { stopConfirmed = true, modelHelper, modelFail
     sleep: async () => {}, stopTurn: async () => stopConfirmed, answerConfirmations: async () => {}, sendSteer: async () => {},
     isAskAnswer: () => false,
     api: async (method, url) => {
-      if (url.includes('/config-options')) {
-        await gate(method === 'GET' ? 'model-get' : 'model-put');
-        if (method === 'GET') return { config_options: [{ id: 'model', category: 'model', current_value: 'old', options: [{value:'old'}, {value:'new'}, {value:'strong'}] }] };
+      // AionCore returns the config snapshot from runtime/ensure (the GET config-options route is gone).
+      const snapshot = url.endsWith('/runtime/ensure');
+      if (snapshot || url.includes('/config-options')) {
+        await gate(snapshot ? 'model-get' : 'model-put');
+        if (snapshot) return { config_options: [{ id: 'model', category: 'model', current_value: 'old', options: [{value:'old'}, {value:'new'}, {value:'strong'}] }] };
         if (modelFailure === 'unconfirmed') throw Object.assign(new Error('config timeout'), { stopUnconfirmed: true });
         return { confirmation: modelFailure === 'ack' ? 'command_ack' : 'observed' };
       }
@@ -55,6 +57,9 @@ function setup(stage = 'runtime', { stopConfirmed = true, modelHelper, modelFail
     onStepEnd: fn => { onStepEnd = fn; } };
 }
 
+// An await that never settles lets Node exit 0 without the PASS line; that must fail CI.
+let finished = false;
+process.on('exit', () => { if (!finished && !process.exitCode) { console.error('Card interrupt: ended before the PASS line (an await never settled)'); process.exitCode = 1; } });
 (async () => {
   const { applyTurnModel } = await import('./live-models.mjs');
   // Real helper + real turn + real runCard: cancellation during config I/O must not escalate the card.
@@ -88,7 +93,7 @@ function setup(stage = 'runtime', { stopConfirmed = true, modelHelper, modelFail
     assert.equal(x.applied.length, 0, 'stale DONE must not publish');
     assert.equal(x.prompts.length, ['conv', 'usage'].includes(stage) ? 0 : 1);
     assert.equal(x.savedSteps.length, 1, 'partial edits remain in step history');
-    assert.deepEqual(x.t.steps[0], { at: 'now', before: 'before', after: 'partial-after' });
+    assert.deepEqual(x.t.steps[0], { at: 'now', finishedAt: 'now', before: 'before', after: 'partial-after' });
     x.t.hold = false; // Leader has finished processing the instruction.
     await x.api.runCard(x.w, x.t);
     assert.equal(x.t.status, 'DONE'); assert.equal(x.applied.length, 1);
@@ -134,5 +139,6 @@ function setup(stage = 'runtime', { stopConfirmed = true, modelHelper, modelFail
     assert.equal(x.t.status, 'PAUSED', 'unconfirmed stop must retain its safety state');
     assert.equal(x.t.stopUnconfirmed, true); assert.equal(x.run.paused, true); assert.equal(x.applied.length, 0);
   }
+  finished = true;
   console.log('Card interrupt: real turn/runCard/instruct gated startup, idle, response, partial edits, resume, lifecycle/owner guards, unconfirmed stop: PASS');
 })().catch(e => { console.error(e); process.exitCode = 1; });

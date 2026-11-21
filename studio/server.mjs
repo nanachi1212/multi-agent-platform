@@ -1769,11 +1769,15 @@ async function verdictVersion(dir) {
   if (info.err) return null;
   const [root, head] = info.out.trim().split(/\r?\n/);
   if (!head) return null;
-  const tree = await snapTree(root);
-  if (!tree) throw new Error('無法取得驗證工作的 Git 工作樹指紋');
-  return { head, tree, dir: canonPath(root) };
+  // The private index copy holds tracked and staged paths only: `add -u` fingerprints them, then `add -A` the whole tree.
+  const [tracked, tree] = (await privateGit(root, async (g) => [
+    (await g('add', '-u')).err ? '' : (await g('write-tree')).out?.trim() || '', await writeTree(g)])) || [];
+  if (!tracked || !tree) throw new Error('無法取得驗證工作的 Git 工作樹指紋');
+  return { head, tree, tracked, dir: canonPath(root) };
 }
 const sameVerdictVersion = (a, b) => treeKey(a.dir) === treeKey(b.dir) && a.head === b.head && a.tree === b.tree;
+// Same folder, HEAD and tracked files: at most untracked paths differ.
+const sameTrackedVersion = (a, b) => !!a?.tracked && !!b?.tracked && treeKey(a.dir) === treeKey(b.dir) && a.head === b.head && a.tracked === b.tracked;
 const versionLabel = (v) => `${v.dir} (${v.head} / ${v.tree})`;
 
 async function staleDependency(w, t) {
@@ -2025,7 +2029,12 @@ async function releaseRejectedReservations(w, t) {
 }
 
 async function runTask(w, t, failedDependency = false) {
-  if (!failedDependency && apiBudgetSpent(w, t.agent)) return waitForApiBudget(w, t);
+  if (!failedDependency && apiBudgetSpent(w, t.agent)) {
+    waitForApiBudget(w, t);
+    // A handoff may have reserved the folder for this member before any turn ran; nobody waits behind a card that waits for budget.
+    if (!t.firstStartedAt) { await releaseRejectedReservations(w, t); pump(w); }
+    return;
+  }
   if (t.ask?.apiBudget) t.ask = null;
   const ranAs = t.agent;
   let settleStep;
@@ -2036,7 +2045,12 @@ async function runTask(w, t, failedDependency = false) {
     t.status = 'WORKING'; // reserve the slot at once: no second writer may start while the checks below run
     const run = w.run, epoch = run.lifecycleEpoch;
     const stale = !failedDependency && t.after?.length && needsDependencyAdmission(w, t) ? await staleDependency(w, t) : null;
-    if (w.run !== run || !run.active || epoch !== run.lifecycleEpoch || t.status !== 'WORKING' || t.hold) return;
+    if (w.run !== run || !run.active || epoch !== run.lifecycleEpoch || t.status !== 'WORKING' || t.hold) {
+      // No worker turn has started, so nothing else settles a card this check leaves WORKING. Stop ends it;
+      // 立刻打斷 puts it back in line (no step ran, nothing is half done) until the Leader clears the hold.
+      if (w.run === run && t.status === 'WORKING') Object.assign(t, run.stopped ? { status: 'FAILED', result: '已停止' } : { status: 'WAITING', interrupted: false });
+      return;
+    }
     if (failedDependency || stale) {
       Object.assign(t, { status: 'FAILED', result: '前一張工作卡失敗，這張沒有開始；交給工頭決定下一步。' });
       if (stale) {
@@ -2762,16 +2776,22 @@ ${STATUS_RULES}`;
         || t.agent !== startAgent || (t.leaseGeneration || 0) !== generation || t.hold)) throw new Halt('驗證已中斷');
       return version;
     };
-    if (VERDICT_RE[t.role] && !Object.hasOwn(t, 'verificationStart')) {
+    // The start version is what one reviewer's reading began from. A conversation that gets the full brief
+    // (first run, handoff, new tier, reset, a failed card given out again) reads afresh, so it starts anew.
+    let heldFrom = null; // the version when this run of a writing check took the folder; the folder is free again whenever the card waits
+    if (VERDICT_RE[t.role] && (!knowsTask || !Object.hasOwn(t, 'verificationStart'))) {
       const start = await verificationVersion();
       if (interrupted()) { park(); return; }
-      if (start && t.briefed) { // an unfinished card from before start versions were recorded
+      if (start && knowsTask) { // an unfinished card from before start versions were recorded
         Object.assign(t, { verdictStale: true, verifiedAt: null });
         return applyStatus(w, t, { kind: 'BLOCKED', text: '先前驗證的起始版本不明，請工頭追加重驗卡。',
           detail: '舊紀錄缺少驗證開始時的版本，現在是 ' + versionLabel(start) });
       }
-      t.verificationStart = start; // preserve what this reviewer could have read, including across waits and restarts
+      t.verificationStart = heldFrom = start; // preserve what this reviewer could have read, including across waits and restarts
       saveRun(w, 'running');
+    } else if (VERDICT_RE[t.role] && isWriter(t)) {
+      heldFrom = await verificationVersion();
+      if (interrupted()) { Object.assign(t, { status: 'WAITING', interrupted: false, wakeNote: note }); return; } // no step ran: the update is still owed, nothing is half done
     }
     const reported = new Set(), parsed = (r) => { const st = parseStatus(r); st?.files.forEach((f) => reported.add(f)); return st; };
     if (!(note && knowsTask)) t.briefed = workKey(t);
@@ -2793,9 +2813,10 @@ ${STATUS_RULES}`;
     }
     let last = reply;
     while (t.notes?.length) {
-      const note = t.notes.splice(0).join('\n');
+      const pending = t.notes.splice(0), note = pending.join('\n');
       log(w, 'studio', 'system', `把你的指示交給 ${agentName(t.agent)}，接著調整「${t.title}」。`);
-      last = await step(`New instruction from the user (via the leader) for your task "${t.title}":\n${note}\n\nApply it to this task now. End your reply with a short summary (1-3 sentences).\n${STATUS_RULES}`);
+      try { last = await step(`New instruction from the user (via the leader) for your task "${t.title}":\n${note}\n\nApply it to this task now. End your reply with a short summary (1-3 sentences).\n${STATUS_RULES}`); }
+      catch (e) { if (e.apiBudget) t.notes.unshift(...pending); throw e; } // the turn never ran: the instruction is still owed
       if (t.interrupted) { park(); return; }
       st = parsed(last) || { kind: 'BLOCKED', detail: '沒有有效的 STATUS，無法確認工作已完成', options: [], text: last.trim() };
     }
@@ -2804,7 +2825,11 @@ ${STATUS_RULES}`;
       const version = await verificationVersion();
       if (interrupted()) { park(); return; }
       const start = t.verificationStart;
-      if (start && version && !sameVerdictVersion(start, version)) {
+      // While this run holds the folder a writing check is its only Studio writer, so untracked paths that changed since
+      // it took the folder are its own output; tracked files and HEAD still count, and so does any change from before
+      // (another writer may have had the folder while the card waited). Reviews read alongside writers: everything counts.
+      const ownOutput = isWriter(t) && start && heldFrom && sameVerdictVersion(start, heldFrom) && sameTrackedVersion(heldFrom, version);
+      if (start && version && !ownOutput && !sameVerdictVersion(start, version)) {
         const detail = `驗證開始時是 ${versionLabel(start)}，現在是 ${versionLabel(version)}`;
         t.verdictStale = true;
         t.verifiedAt = null;
@@ -2814,6 +2839,11 @@ ${STATUS_RULES}`;
         t.verdictStale = false;
         if (!t.verifiedAt) log(w, 'studio', 'system', `「${t.title}」無法綁定版本。`);
       }
+    } else if (st.kind !== 'DONE' && isWriter(t) && heldFrom && t.verificationStart && sameVerdictVersion(t.verificationStart, heldFrom)) {
+      // The card goes on later: the untracked output this run left so far is its own, so its reading continues from here.
+      const sofar = await verificationVersion();
+      if (interrupted()) { park(); return; }
+      if (sameTrackedVersion(heldFrom, sofar)) t.verificationStart = sofar;
     }
     applyStatus(w, t, st, last);
     if (before) await reportFiles(w, t, dir, before, reported);
@@ -3472,8 +3502,9 @@ async function continueProject(w) {
 const MAX_ROUNDS = 3; // extra card rounds before the Leader must ask the user
 
 function verdictCoverage(w, t) {
-  if (!t.verifiedAt || !w.tasks.some((writer) => writer !== t && isWriter(writer) && writer.status === 'DONE'
-    && writer.doneAt >= t.doneAt && treeKey(writer.workdir || w.project) === treeKey(t.workdir || w.project)
+  // Any writer counts, finished or not: one that edited after the verdict and then failed still changed the tree.
+  if (!t.verifiedAt || !w.tasks.some((writer) => writer !== t && isWriter(writer)
+    && treeKey(writer.workdir || w.project) === treeKey(t.workdir || w.project)
     && writer.steps?.some((s) => (s.finishedAt || s.at) >= t.doneAt && s.before !== s.after && s.after !== t.verifiedAt.tree))) return '';
   return ' [驗證後有修改，結論未覆蓋最新版本；請工頭安排重驗]';
 }
@@ -3745,6 +3776,7 @@ async function reassign(w, taskId, agent) {
   if (isWriter(t)) return handoffWriter(w, agent, taskId);
   if (!available(agent)) throw new Error('Agent 目前不可用');
   if (reviewAuthors(w, t).has(agent)) throw new Error(`${agentName(agent)} 寫了這張卡要審的東西，審查不能交給它`);
+  if (t.status === 'FAILED') t.briefed = ''; // an ended card given out again starts over, also when the same member gets it
   t.agent = agent; t.status = w.run.paused ? 'PAUSED' : 'WAITING';
   saveRun(w, w.run.paused ? 'paused' : 'running');
   if (w.run.active) pump(w);
