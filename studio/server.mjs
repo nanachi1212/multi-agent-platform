@@ -2036,7 +2036,12 @@ async function runTask(w, t, failedDependency = false) {
     t.status = 'WORKING'; // reserve the slot at once: no second writer may start while the checks below run
     const run = w.run, epoch = run.lifecycleEpoch;
     const stale = !failedDependency && t.after?.length && needsDependencyAdmission(w, t) ? await staleDependency(w, t) : null;
-    if (w.run !== run || !run.active || epoch !== run.lifecycleEpoch || t.status !== 'WORKING' || t.hold) return;
+    if (w.run !== run || !run.active || epoch !== run.lifecycleEpoch || t.status !== 'WORKING' || t.hold) {
+      // No worker turn has started, so nothing else settles a card this check leaves WORKING. Stop ends it;
+      // 立刻打斷 puts it back in line (no step ran, nothing is half done) until the Leader clears the hold.
+      if (w.run === run && t.status === 'WORKING') Object.assign(t, run.stopped ? { status: 'FAILED', result: '已停止' } : { status: 'WAITING', interrupted: false });
+      return;
+    }
     if (failedDependency || stale) {
       Object.assign(t, { status: 'FAILED', result: '前一張工作卡失敗，這張沒有開始；交給工頭決定下一步。' });
       if (stale) {
@@ -2762,10 +2767,12 @@ ${STATUS_RULES}`;
         || t.agent !== startAgent || (t.leaseGeneration || 0) !== generation || t.hold)) throw new Halt('驗證已中斷');
       return version;
     };
-    if (VERDICT_RE[t.role] && !Object.hasOwn(t, 'verificationStart')) {
+    // The start version is what one reviewer's reading began from. A conversation that gets the full brief
+    // (first run, handoff, new tier, reset, a failed card given out again) reads afresh, so it starts anew.
+    if (VERDICT_RE[t.role] && (!knowsTask || !Object.hasOwn(t, 'verificationStart'))) {
       const start = await verificationVersion();
       if (interrupted()) { park(); return; }
-      if (start && t.briefed) { // an unfinished card from before start versions were recorded
+      if (start && knowsTask) { // an unfinished card from before start versions were recorded
         Object.assign(t, { verdictStale: true, verifiedAt: null });
         return applyStatus(w, t, { kind: 'BLOCKED', text: '先前驗證的起始版本不明，請工頭追加重驗卡。',
           detail: '舊紀錄缺少驗證開始時的版本，現在是 ' + versionLabel(start) });
@@ -3745,6 +3752,7 @@ async function reassign(w, taskId, agent) {
   if (isWriter(t)) return handoffWriter(w, agent, taskId);
   if (!available(agent)) throw new Error('Agent 目前不可用');
   if (reviewAuthors(w, t).has(agent)) throw new Error(`${agentName(agent)} 寫了這張卡要審的東西，審查不能交給它`);
+  if (t.status === 'FAILED') t.briefed = ''; // an ended card given out again starts over, also when the same member gets it
   t.agent = agent; t.status = w.run.paused ? 'PAUSED' : 'WAITING';
   saveRun(w, w.run.paused ? 'paused' : 'running');
   if (w.run.active) pump(w);

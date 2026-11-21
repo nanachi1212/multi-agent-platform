@@ -11,6 +11,10 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
   fs.mkdirSync(repo); fs.mkdirSync(plain);
   const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', windowsHide: true }).trim();
   const file = dir => path.join(dir, 'source.txt');
+  const until = async (ok, what) => {
+    for (let i = 0; i < 400 && !ok(); i++) await new Promise(resolve => setTimeout(resolve, 25));
+    assert.ok(ok(), what);
+  };
   const runtimes = [];
   try {
     git(repo, 'init', '-qb', 'main');
@@ -66,6 +70,50 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
       assert.deepEqual(w.tasks.slice(1).map(t => t.status), ['FAILED', 'FAILED']);
       assert.equal(diskLeases().filter(l => l.status !== 'RELEASED').length, 0);
     }
+    // 立刻打斷 arrives while the prerequisite version is being read: no worker turn exists to park the card.
+    async function interruptDuringVerdictCheck() {
+      const w = newW();
+      w.project = w.run.project = repo;
+      Object.assign(w.run, { phase: 'working', startedAt: new Date().toISOString() });
+      let headRead, releaseHead, releaseLeader, held = false;
+      const leaderRead = new Promise(resolve => { releaseLeader = resolve; });
+      const { api, env } = makeEnv(async (_agent, prompt) => {
+        if (prompt.includes('the user sent new instructions')) { await leaderRead; return '{"message":"ok","tell":[],"cancel":[],"add":[]}'; }
+        if (prompt.includes('Every current card has ended')) return '{"needs_user":"Done?"}';
+        return 'ok\nSTATUS: DONE';
+      }, {
+        execFile(cmd, args, opts, callback) {
+          if (held || cmd !== 'git' || !args.includes('--show-toplevel') || !args.includes('--verify')) return execFile(cmd, args, opts, callback);
+          held = true;
+          headRead = new Promise(resolve => {
+            execFile(cmd, args, opts, (...result) => { releaseHead = () => callback(...result); resolve(); });
+          });
+        },
+      });
+      runtimes.push(env.RT);
+      env.S.workspaces.push(w);
+      const check = { id: 'verify', title: 'verify', role: 'check', agent: 'codex', status: 'DONE', result: 'PASS',
+        verifiedAt: { dir: repo, head: git(repo, 'rev-parse', 'HEAD'), tree: await api.snapTree(repo) } };
+      const writer = { id: 'deliver', title: 'deliver', instructions: 'deliver', role: 'build', agent: 'codex', status: 'WAITING', writes: true, trust: true, after: [check.id] };
+      w.tasks.push(check, writer);
+      const briefs = () => env.prompts.filter(p => p.text.includes('Task: deliver'));
+      api.pump(w);
+      assert.ok(headRead, 'the card entered the prerequisite version check');
+      await headRead;
+      api.instruct(w, 'also update the docs', true);
+      assert.deepEqual([writer.status, writer.hold, writer.interrupted], ['WORKING', true, true]);
+      const admission = w.executingSteps.get(writer.id).done;
+      releaseHead();
+      await admission;
+      assert.deepEqual([writer.status, writer.hold, writer.interrupted], ['WAITING', true, false], 'the interrupted check returns the card to the queue');
+      assert.equal(briefs().length, 0, 'held until the Leader has read the instruction');
+      releaseLeader();
+      await until(() => writer.status === 'DONE', 'the card runs once the Leader clears the hold');
+      // Let the step give back its lease and the Leader finish the wrap-up before the next case uses this repository.
+      await until(() => !w.executingSteps.size && !w.leaderSteps?.size && env.prompts.some(p => p.text.includes('Every current card has ended')), 'the job settles');
+      assert.equal(briefs().length, 1, 'dispatched exactly once');
+      assert.ok(!briefs()[0].text.includes('stopped your previous step'), 'no step ran, so nothing is reported as half done');
+    }
     async function scenario(dir, role, change) {
       const w = newW(); w.project = w.run.project = dir === plain ? plain : repo;
       w.run.startedAt = new Date().toISOString();
@@ -111,6 +159,7 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
       assert.equal(summary.text.includes('驗證後有修改，結論未覆蓋最新版本'), change === 'tree');
     }
     await stopDuringVerdictCheck();
+    await interruptDuringVerdictCheck();
     await scenario(repo, 'check');
     await scenario(wt, 'review', 'other');
     await scenario(wt, 'review', 'head');
@@ -167,8 +216,9 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
     await overlappingReview(wt, repo);
 
     const w = newW(); w.project = w.run.project = repo;
-    const { api, env } = makeEnv((_agent, prompt) => prompt.includes('Task: parked review')
-      ? 'Read the file.\nSTATUS: NEEDS_USER: Continue?' : 'GO\nSTATUS: DONE', { execFile });
+    let parkedOnce = false;
+    const { api, env } = makeEnv((_agent, prompt) => prompt.includes('Task: parked review') && !parkedOnce
+      ? (parkedOnce = true, 'Read the file.\nSTATUS: NEEDS_USER: Continue?') : 'GO\nSTATUS: DONE', { execFile });
     runtimes.push(env.RT); env.S.workspaces.push(w);
     const parked = { id: 'parked', title: 'parked review', role: 'review', agent: 'codex', writes: false, after: [], status: 'WAITING' };
     w.tasks.push(parked);
@@ -179,6 +229,29 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
     await api.runTask(w, parked);
     assert.equal(parked.status, 'FAILED', parked.result);
     assert.equal(parked.verdictStale, true);
+    // Given to another member, the stale card is read afresh; nothing changes during that reading, so it binds.
+    await api.reassign(w, parked.id, 'antigravity');
+    await api.runTask(w, parked);
+    assert.equal(parked.status, 'DONE', parked.result);
+    assert.equal(parked.verdictStale, false);
+    assert.equal(parked.verifiedAt.tree, await api.snapTree(repo));
+
+    // An ordinary NO-GO, a fix, then the same member looks again: the second reading starts at the fixed tree.
+    {
+      const w = newW(); w.project = w.run.project = repo;
+      const verdicts = ['NO-GO\nsource.txt is wrong', 'GO'];
+      const { api, env } = makeEnv(() => verdicts.shift() + '\nSTATUS: DONE', { execFile });
+      runtimes.push(env.RT); env.S.workspaces.push(w);
+      const again = { id: 'again', title: 'second look', role: 'review', agent: 'codex', writes: false, after: [], status: 'WAITING' };
+      w.tasks.push(again);
+      await api.runTask(w, again);
+      assert.equal(again.status, 'FAILED', again.result);
+      fs.writeFileSync(file(repo), 'fixed after the NO-GO');
+      await api.reassign(w, again.id, 'codex');
+      await api.runTask(w, again);
+      assert.equal(again.status, 'DONE', again.result);
+      assert.equal(again.verifiedAt.tree, await api.snapTree(repo));
+    }
 
     for (const dir of [repo, plain]) {
       const w = newW(); w.project = w.run.project = dir;
@@ -200,5 +273,5 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
   } finally {
     for (const dir of [...runtimes, temp]) await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 10 });
   }
-  console.log('verdict binding: Stop during validation, unchanged, dirty tree, HEAD-only change, non-Git, linked worktree and summary PASS');
+  console.log('verdict binding: Stop and interruption during validation, unchanged, dirty tree, HEAD-only change, non-Git, linked worktree, rerun after reassignment and summary PASS');
 })().catch(err => { console.error(err); process.exitCode = 1; });
