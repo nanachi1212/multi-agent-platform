@@ -115,14 +115,14 @@ const { region, mkTmp, makeEnv, newW } = require('./lifecycle-harness.cjs');
     Object.assign(hw.run, { phase: 'working', startedAt: new Date().toISOString() });
     hw.workers.push('ext'); spent(hw, 100); handed.env.S.workspaces.push(hw);
     const a = { id: 'a', title: 'a', instructions: 'a', role: 'build', agent: 'codex', writes: true, status: 'WAITING', after: [], trust: true };
-    hw.tasks.push(a);
+    const b = { id: 'b', title: 'b', instructions: 'b', role: 'build', agent: 'claude', writes: true, status: 'WAITING', after: [], trust: true };
+    hw.tasks.push(a, b); // b is queued for the same folder: Studio's own dispatch must start it once the reservation is given back
     await handed.api.handoffWriter(hw, 'ext', 'a');
     await settled(hw, 'a');
     assert.equal(a.agent, 'ext'); assert.equal(a.status, 'NEEDS_USER'); assert.ok(a.ask?.apiBudget);
     assert.equal(a.firstStartedAt, undefined);
     assert.ok(!handed.env.S.leases.some(l => l.cardId === 'a' && ['ACTIVE', 'RESERVED'].includes(l.status)), 'a card waiting for budget gives back its reservation');
-    const b = { id: 'b', title: 'b', instructions: 'b', role: 'build', agent: 'claude', writes: true, status: 'WAITING', after: [], trust: true };
-    hw.tasks.push(b); handed.api.pump(hw);
+    for (let i = 0; i < 200 && b.status !== 'DONE'; i++) await new Promise(r => setTimeout(r, 25));
     await settled(hw, 'b');
     assert.equal(b.status, 'DONE', 'another writer in the same folder is not stuck behind the budget');
     hw.apiDailyTokenCap = 1000;

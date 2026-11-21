@@ -1776,6 +1776,8 @@ async function verdictVersion(dir) {
   return { head, tree, tracked, dir: canonPath(root) };
 }
 const sameVerdictVersion = (a, b) => treeKey(a.dir) === treeKey(b.dir) && a.head === b.head && a.tree === b.tree;
+// Same folder, HEAD and tracked files: at most untracked paths differ.
+const sameTrackedVersion = (a, b) => !!a?.tracked && !!b?.tracked && treeKey(a.dir) === treeKey(b.dir) && a.head === b.head && a.tracked === b.tracked;
 const versionLabel = (v) => `${v.dir} (${v.head} / ${v.tree})`;
 
 async function staleDependency(w, t) {
@@ -2776,6 +2778,7 @@ ${STATUS_RULES}`;
     };
     // The start version is what one reviewer's reading began from. A conversation that gets the full brief
     // (first run, handoff, new tier, reset, a failed card given out again) reads afresh, so it starts anew.
+    let heldFrom = null; // the version when this run of a writing check took the folder; the folder is free again whenever the card waits
     if (VERDICT_RE[t.role] && (!knowsTask || !Object.hasOwn(t, 'verificationStart'))) {
       const start = await verificationVersion();
       if (interrupted()) { park(); return; }
@@ -2784,8 +2787,11 @@ ${STATUS_RULES}`;
         return applyStatus(w, t, { kind: 'BLOCKED', text: '先前驗證的起始版本不明，請工頭追加重驗卡。',
           detail: '舊紀錄缺少驗證開始時的版本，現在是 ' + versionLabel(start) });
       }
-      t.verificationStart = start; // preserve what this reviewer could have read, including across waits and restarts
+      t.verificationStart = heldFrom = start; // preserve what this reviewer could have read, including across waits and restarts
       saveRun(w, 'running');
+    } else if (VERDICT_RE[t.role] && isWriter(t)) {
+      heldFrom = await verificationVersion();
+      if (interrupted()) { Object.assign(t, { status: 'WAITING', interrupted: false, wakeNote: note }); return; } // no step ran: the update is still owed, nothing is half done
     }
     const reported = new Set(), parsed = (r) => { const st = parseStatus(r); st?.files.forEach((f) => reported.add(f)); return st; };
     if (!(note && knowsTask)) t.briefed = workKey(t);
@@ -2819,10 +2825,10 @@ ${STATUS_RULES}`;
       const version = await verificationVersion();
       if (interrupted()) { park(); return; }
       const start = t.verificationStart;
-      // A writing check is the only Studio writer in its folder, so untracked paths that changed are its own output;
-      // tracked files and HEAD still count. Reviews read alongside writers, so everything counts for them.
-      const ownOutput = isWriter(t) && start?.tracked && version?.tracked && treeKey(start.dir) === treeKey(version.dir)
-        && start.head === version.head && start.tracked === version.tracked;
+      // While this run holds the folder a writing check is its only Studio writer, so untracked paths that changed since
+      // it took the folder are its own output; tracked files and HEAD still count, and so does any change from before
+      // (another writer may have had the folder while the card waited). Reviews read alongside writers: everything counts.
+      const ownOutput = isWriter(t) && start && heldFrom && sameVerdictVersion(start, heldFrom) && sameTrackedVersion(heldFrom, version);
       if (start && version && !ownOutput && !sameVerdictVersion(start, version)) {
         const detail = `驗證開始時是 ${versionLabel(start)}，現在是 ${versionLabel(version)}`;
         t.verdictStale = true;
@@ -2833,6 +2839,11 @@ ${STATUS_RULES}`;
         t.verdictStale = false;
         if (!t.verifiedAt) log(w, 'studio', 'system', `「${t.title}」無法綁定版本。`);
       }
+    } else if (st.kind !== 'DONE' && isWriter(t) && heldFrom && t.verificationStart && sameVerdictVersion(t.verificationStart, heldFrom)) {
+      // The card goes on later: the untracked output this run left so far is its own, so its reading continues from here.
+      const sofar = await verificationVersion();
+      if (interrupted()) { park(); return; }
+      if (sameTrackedVersion(heldFrom, sofar)) t.verificationStart = sofar;
     }
     applyStatus(w, t, st, last);
     if (before) await reportFiles(w, t, dir, before, reported);

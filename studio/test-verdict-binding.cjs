@@ -279,6 +279,70 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
       assert.match(check.result, /驗證期間程式碼已變更/);
     }
 
+    // A check that waits for another member gives the folder back: untracked files a writer adds meanwhile are not its output.
+    {
+      const dir = freshRepo();
+      const w = newW(); w.project = w.run.project = dir;
+      w.run.startedAt = new Date().toISOString();
+      let checkCalls = 0;
+      const { api, env } = makeEnv((agent, prompt) => {
+        if (prompt.includes('Every current card has ended')) return '{"needs_user":"ok?"}';
+        if (agent === 'codex') return ++checkCalls === 1 ? 'waiting\nSTATUS: WAITING_AGENT: claude: the build output' : 'PASS\nall tests passed\nSTATUS: DONE';
+        if (prompt.includes('Task: build')) { fs.writeFileSync(path.join(dir, 'feature.js'), 'new untested module'); return 'built\nSTATUS: DONE'; }
+        return 'ok\nSTATUS: DONE';
+      }, { execFile });
+      runtimes.push(env.RT); env.S.workspaces.push(w);
+      const check = { id: 'verify', title: 'verify', instructions: 'run tests', role: 'check', agent: 'codex', writes: true, status: 'WAITING', after: [], trust: true };
+      const build = { id: 'build', title: 'build', instructions: 'b', role: 'build', agent: 'claude', writes: true, status: 'WAITING', after: [], trust: true };
+      w.tasks.push(check, build);
+      await api.runTask(w, check);
+      assert.equal(check.status, 'WAITING_AGENT', check.result);
+      assert.ok(!env.S.leases.some(l => l.cardId === 'verify' && ['ACTIVE', 'RESERVED'].includes(l.status)), 'a check waiting for a member does not keep the folder');
+      await api.runTask(w, build);
+      assert.equal(build.status, 'DONE', build.result);
+      for (let i = 0; i < 400 && checkCalls < 2; i++) {
+        if (check.status === 'WAITING' && !w.executingSteps.has('verify')) await api.runTask(w, check);
+        else await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      await until(() => !w.executingSteps.size && !w.leaderSteps?.size, 'the woken check to settle');
+      assert.equal(checkCalls, 2, 'the check was woken after the build');
+      assert.notEqual(check.status, 'DONE', check.result);
+      assert.equal(check.verdictStale, true);
+      assert.match(check.result, /驗證期間程式碼已變更/);
+    }
+
+    // A check that asks the user keeps the folder: the output it left before the question is still its own when it passes.
+    {
+      const dir = freshRepo();
+      const w = newW(); w.project = w.run.project = dir;
+      w.run.startedAt = new Date().toISOString();
+      let calls = 0;
+      const { api, env } = makeEnv((_agent, prompt) => {
+        if (prompt.includes('Every current card has ended')) return '{"needs_user":"ok?"}';
+        if (++calls === 1) {
+          fs.mkdirSync(path.join(dir, 'coverage'));
+          fs.writeFileSync(path.join(dir, 'coverage', 'report.txt'), 'lines 100%');
+          return 'ran tests\nSTATUS: NEEDS_USER: also run e2e?\nOPTIONS: yes | no';
+        }
+        fs.writeFileSync(path.join(dir, 'coverage', 'report.txt'), 'lines 99%');
+        return 'PASS\nall tests passed\nSTATUS: DONE';
+      }, { execFile });
+      runtimes.push(env.RT); env.S.workspaces.push(w);
+      const check = { id: 'verify', title: 'verify', instructions: 'run tests', role: 'check', agent: 'codex', writes: true, status: 'WAITING', after: [], trust: true };
+      w.tasks.push(check);
+      await api.runTask(w, check);
+      assert.equal(check.status, 'NEEDS_USER', check.result);
+      api.answer(w, 'verify', 'no');
+      for (let i = 0; i < 400 && calls < 2; i++) {
+        if (check.status === 'WAITING' && !w.executingSteps.has('verify')) await api.runTask(w, check);
+        else await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      await until(() => !w.executingSteps.size && !w.leaderSteps?.size, 'the answered check to settle');
+      assert.equal(check.status, 'DONE', check.result);
+      assert.equal(check.verdictStale, false);
+      assert.equal(check.verifiedAt.tree, await api.snapTree(dir), 'bound to the tree that includes the output from both runs');
+    }
+
     // A writer that edits after the PASS and then fails still changed the tree; one that changed nothing does not.
     for (const edits of [true, false]) {
       const dir = freshRepo();
