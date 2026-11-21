@@ -87,18 +87,36 @@ process.on('exit', () => { if (!finished && !process.exitCode) { console.error('
     x.api.instruct(x.w, 'Use blue instead', true);
     x.t.notes.push('Use blue instead'); // Leader may deliver the card-specific note before it stops.
     x.release.resolve(); await pending;
+    const sent = !['conv', 'usage'].includes(stage); // these two gates close before the first message goes out
     assert.equal(x.t.status, 'WAITING', `${stage}: immediate interrupt must park, not fail`);
-    assert.equal(x.t.resumed, true); assert.equal(x.t.interrupted, false); assert.equal(x.t.hold, true);
-    assert.match(x.t.wakeNote, /last step may be half done/); assert.match(x.t.wakeNote, /Use blue instead/);
+    assert.equal(x.t.resumed, sent ? true : undefined); assert.equal(x.t.interrupted, false); assert.equal(x.t.hold, true);
+    assert.equal(/last step may be half done/.test(x.t.wakeNote), sent, `${stage}: only a step that reached the agent can be half done`);
+    assert.match(x.t.wakeNote, /Use blue instead/);
     assert.equal(x.applied.length, 0, 'stale DONE must not publish');
-    assert.equal(x.prompts.length, ['conv', 'usage'].includes(stage) ? 0 : 1);
+    assert.equal(x.prompts.length, sent ? 1 : 0);
     assert.equal(x.savedSteps.length, 1, 'partial edits remain in step history');
     assert.deepEqual(x.t.steps[0], { at: 'now', finishedAt: 'now', before: 'before', after: 'partial-after' });
     x.t.hold = false; // Leader has finished processing the instruction.
     await x.api.runCard(x.w, x.t);
     assert.equal(x.t.status, 'DONE'); assert.equal(x.applied.length, 1);
     assert.match(x.prompts.at(-1), /Use blue instead/);
+    assert.equal(/Task: Preserve partial edits/.test(x.prompts.at(-1)), !sent, `${stage}: an agent that never got the brief gets it now`);
     assert.equal(x.env.cardStep.size, 0); assert.equal(x.env.active.size, 0); assert.equal(x.env.S.agents.codex.working, 0);
+  }
+  // A woken card stopped before its first message goes out still owes its agent the update it was woken with.
+  for (const stage of ['conv', 'usage']) {
+    const x = setup(stage);
+    Object.assign(x.t, { briefed: 'codex', wakeNote: 'The user answered: deploy to staging' });
+    const pending = x.api.runCard(x.w, x.t);
+    await x.entered.promise;
+    x.api.instruct(x.w, 'Use blue instead', true);
+    x.release.resolve(); await pending;
+    assert.equal(x.t.status, 'WAITING'); assert.equal(x.prompts.length, 0);
+    assert.match(x.t.wakeNote, /deploy to staging/, `${stage}: the update is still owed`);
+    x.t.hold = false;
+    await x.api.runCard(x.w, x.t);
+    assert.equal(x.t.status, 'DONE'); assert.equal(x.prompts.length, 1);
+    assert.match(x.prompts[0], /Update from Multi-Agent Studio/); assert.match(x.prompts[0], /deploy to staging/);
   }
   // An interruption marker is not permission to recover a stale lifecycle/owner.
   const invalidations = {

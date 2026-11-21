@@ -558,14 +558,15 @@ async function sendSteer(w, agent, convId) {
 async function turn(agent, convId, text, { w, lead = false, check = false, allowStart, ask = false, timeout = 25 * 60e3, progressEvery = 30000, bill = lead && !check ? 'lead' : null } = {}) {
   const run = w?.run, epoch = run?.lifecycleEpoch || 0;
   const halted = () => run && (w.run !== run || (run.lifecycleEpoch || 0) !== epoch || run.stopped || run.paused) || allowStart && !allowStart();
-  if (!check && halted()) throw new Halt('執行已停止');
+  const unsent = (why) => Object.assign(new Halt(why), { unsent: true }); // halted before the message went out: the agent never saw it
+  if (!check && halted()) throw unsent('執行已停止');
   if (!run) bill = null;
   const usage0 = bill ? await usageOf(convId, agent, true) : null;
   if (agent === 'codex') {
     try { await codexRuntime.prepare(convId); }
     catch (e) { throw Object.assign(e, { stopUnconfirmed: true }); }
   }
-  if (!check && halted()) throw new Halt('執行已停止'); // usage / runtime preparation may have crossed Pause or Stop
+  if (!check && halted()) throw unsent('執行已停止'); // usage / runtime preparation may have crossed Pause or Stop
   if (!check && w && !AGENTS[agent].external) {
     const key = Object.keys(run.convs || {}).find((k) => run.convs[k] === convId);
     // `lead` also grants read-only worker permissions; model tier follows the stored conversation role.
@@ -575,10 +576,10 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
     } catch (e) {
       // Config I/O can reject after Pause/Stop. Preserve cancellation semantics, but never
       // downgrade an unconfirmed stop (the caller must retain the card's safety fence).
-      if (!e.stopUnconfirmed && halted()) throw new Halt('切換模型期間工作已停止或變更');
+      if (!e.stopUnconfirmed && halted()) throw unsent('切換模型期間工作已停止或變更');
       throw e;
     }
-    if (halted()) throw new Halt('切換模型期間工作已停止或變更');
+    if (halted()) throw unsent('切換模型期間工作已停止或變更');
   }
   // Another card may spend the last tokens during conversation setup or between follow-up turns.
   if (bill && bill !== 'lead' && w?.apiDailyTokenCap && apiBudgetSpent(w, agent)) throw Object.assign(new Error('今日 API 預算已用完'), { apiBudget: true });
@@ -1059,7 +1060,7 @@ function wake(w, t, note, why = '') {
     return log(w, 'studio', 'system', `「${t.title}」又收到一則消息，開始時會一起交給 ${agentName(t.agent)}。`);
   }
   if (!PARKED.includes(t.status)) return;
-  Object.assign(t, { status: 'WAITING', wakeNote: note, wait: null, ask: null });
+  Object.assign(t, { status: 'WAITING', wakeNote: [t.wakeNote, note].filter(Boolean).join('\n\n'), wait: null, ask: null }); // a card stopped by the budget before its turn still owes an earlier note
   log(w, 'studio', 'system', why || `「${t.title}」等待的結果到了，交回 ${agentName(t.agent)} 繼續。`);
   pump(w);
 }
@@ -2714,7 +2715,7 @@ async function runCard(w, t) {
     log(w, 'studio', 'system', `「${t.title}」${t.result}`);
     return wakeWaiters(w, t);
   }
-  const note = t.wakeNote;
+  const note = t.wakeNote, briefed = t.briefed;
   const startAgent = t.agent, generation = t.leaseGeneration || 0;
   t.status = 'WORKING';
   t.workingSince = nowIso(); // this work spell (shown as 已執行)
@@ -2723,6 +2724,8 @@ async function runCard(w, t) {
   t.wakeNote = '';
   log(w, t.agent, 'worker', (note ? '收到等待的結果，繼續：' : t.resumed ? '繼續工作：' : '開始工作：') + t.title);
   let snap = null; // { dir, at, before }: a writing step's tree before it; the after-tree is taken however the step ends
+  let heldFrom = null; // the version when this run of a writing check took the folder; the folder is free again whenever the card waits
+  let started = false, unsent = false; // started: a message of this run reached the agent; unsent: the last step ended before its message went out
   try {
     const deps = (t.after || []).map((id) => w.tasks.find((x) => x.id === id)).filter(Boolean);
     const knowsTask = t.briefed === workKey(t); // this agent's conversation has had the full card brief (a handoff or a new tier starts over)
@@ -2751,21 +2754,22 @@ ${STATUS_RULES}`;
     const capErr = () => Object.assign(new Error(`這張卡已用 ${cardTokens(t)} tokens，超過上限 ${w.tokenCap}`), { cap: true });
     const step = async (text) => {
       if (overCap(w, t)) throw capErr(); // no further step for a card over its budget
-      cardStep.add(cid);
+      cardStep.add(cid); unsent = false;
       try {
         if (askBusy.has(cid)) { // a progress question is being answered: Stop / Pause / 打斷 / handoff meanwhile cancelled that turn, not this step
           await askBusy.get(cid);
-          if (interrupted()) return '';
-          if (run.stopped || run.paused) throw new Halt(run.stopped ? '已停止' : '已暫停');
+          if (interrupted()) { unsent = true; return ''; }
+          if (run.stopped || run.paused) throw Object.assign(new Halt(run.stopped ? '已停止' : '已暫停'), { unsent: true });
         }
         return await turn(t.agent, cid, text, { w, lead: !isWriter(t), bill: t, timeout: CARD_STALL_MS, allowStart: () => t.agent === startAgent && !t.hold && !t.preparing && run.active });
-      } catch (e) { if (!e.stopUnconfirmed && interrupted()) return ''; throw e; } finally { cardStep.delete(cid); t.stepEndAt = Date.now(); }
+      } catch (e) { unsent = !!(e.unsent || e.apiBudget); if (!e.stopUnconfirmed && interrupted()) return ''; throw e; } finally { started ||= !unsent; cardStep.delete(cid); t.stepEndAt = Date.now(); }
     };
     const park = () => {
       if (!interrupted()) throw new Halt('執行已停止'); // ownership can change after a successful step resolves, too
-      Object.assign(t, { status: 'WAITING', interrupted: false, resumed: true,
-        wakeNote: 'The user stopped your previous step midway to give you a new instruction. First check the current state of the files (your last step may be half done), then continue the task.'
-          + (t.notes?.length ? '\nNew instruction from the user (via the leader): ' + t.notes.splice(0).join('\n') : '') }); // the note may arrive before the stop
+      const added = t.notes?.length ? 'New instruction from the user (via the leader): ' + t.notes.splice(0).join('\n') : ''; // the note may arrive before the stop
+      Object.assign(t, { status: 'WAITING', interrupted: false }, started
+        ? { resumed: true, wakeNote: 'The user stopped your previous step midway to give you a new instruction. First check the current state of the files (your last step may be half done), then continue the task.' + (added && '\n' + added) }
+        : { briefed, wakeNote: [note, added].filter(Boolean).join('\n\n') }); // nothing went out in this run: the brief and the update it was woken with are still owed, nothing is half done
       log(w, t.agent, 'worker', '已停下，等工頭轉達你的新指示：' + t.title);
     };
     const dir = isWriter(t) ? (await workspaceOf(t.workdir || w.project)).path : '', before = dir ? await treeFiles(dir).catch(() => null) : null;
@@ -2778,7 +2782,6 @@ ${STATUS_RULES}`;
     };
     // The start version is what one reviewer's reading began from. A conversation that gets the full brief
     // (first run, handoff, new tier, reset, a failed card given out again) reads afresh, so it starts anew.
-    let heldFrom = null; // the version when this run of a writing check took the folder; the folder is free again whenever the card waits
     if (VERDICT_RE[t.role] && (!knowsTask || !Object.hasOwn(t, 'verificationStart'))) {
       const start = await verificationVersion();
       if (interrupted()) { park(); return; }
@@ -2791,7 +2794,7 @@ ${STATUS_RULES}`;
       saveRun(w, 'running');
     } else if (VERDICT_RE[t.role] && isWriter(t)) {
       heldFrom = await verificationVersion();
-      if (interrupted()) { Object.assign(t, { status: 'WAITING', interrupted: false, wakeNote: note }); return; } // no step ran: the update is still owed, nothing is half done
+      if (interrupted()) { park(); return; }
     }
     const reported = new Set(), parsed = (r) => { const st = parseStatus(r); st?.files.forEach((f) => reported.add(f)); return st; };
     if (!(note && knowsTask)) t.briefed = workKey(t);
@@ -2817,7 +2820,7 @@ ${STATUS_RULES}`;
       log(w, 'studio', 'system', `把你的指示交給 ${agentName(t.agent)}，接著調整「${t.title}」。`);
       try { last = await step(`New instruction from the user (via the leader) for your task "${t.title}":\n${note}\n\nApply it to this task now. End your reply with a short summary (1-3 sentences).\n${STATUS_RULES}`); }
       catch (e) { if (e.apiBudget) t.notes.unshift(...pending); throw e; } // the turn never ran: the instruction is still owed
-      if (t.interrupted) { park(); return; }
+      if (t.interrupted) { if (unsent) t.notes.unshift(...pending); park(); return; }
       st = parsed(last) || { kind: 'BLOCKED', detail: '沒有有效的 STATUS，無法確認工作已完成', options: [], text: last.trim() };
     }
     if (st.kind !== 'DONE' && overCap(w, t)) throw capErr(); // the step that just ended blew the budget and the card is not finished: stop it now, not at the next wake-up
@@ -2839,11 +2842,6 @@ ${STATUS_RULES}`;
         t.verdictStale = false;
         if (!t.verifiedAt) log(w, 'studio', 'system', `「${t.title}」無法綁定版本。`);
       }
-    } else if (st.kind !== 'DONE' && isWriter(t) && heldFrom && t.verificationStart && sameVerdictVersion(t.verificationStart, heldFrom)) {
-      // The card goes on later: the untracked output this run left so far is its own, so its reading continues from here.
-      const sofar = await verificationVersion();
-      if (interrupted()) { park(); return; }
-      if (sameTrackedVersion(heldFrom, sofar)) t.verificationStart = sofar;
     }
     applyStatus(w, t, st, last);
     if (before) await reportFiles(w, t, dir, before, reported);
@@ -2858,9 +2856,9 @@ ${STATUS_RULES}`;
       if (run.active) pause(w);
       saveRun(w, run.stopped ? 'stopped' : 'paused'); return;
     }
-    if (e instanceof Halt && run.paused) { if (t.agent === startAgent) Object.assign(t, { status: 'PAUSED', result: '已暫停', resumed: true, wakeNote: note }); return; } // handed off meanwhile: the card is the new agent's now
+    if (e instanceof Halt && run.paused) { if (t.agent === startAgent) Object.assign(t, { status: 'PAUSED', result: '已暫停', resumed: true, wakeNote: note }, started ? {} : { briefed }); return; } // handed off meanwhile: the card is the new agent's now
     if (e instanceof Halt && run.stopped) { t.status = 'FAILED'; t.result = '已停止'; return; }
-    if (e.apiBudget) return waitForApiBudget(w, t);
+    if (e.apiBudget) { if (!started) Object.assign(t, { briefed, wakeNote: note }); return waitForApiBudget(w, t); } // refused before anything went out: the brief and the update are still owed
     if (e.cap) { // the card's own budget is gone: stop it here, the Leader decides whether and how to retry
       Object.assign(t, { status: 'FAILED', result: `沒有完成：超過這張卡的 token 上限（${e.message}）。Studio 停止這張卡，交給工頭決定要不要換方法重試。`, detail: e.message });
       log(w, t.agent, 'worker', t.result + '：' + t.title, e.message);
@@ -2908,6 +2906,16 @@ ${STATUS_RULES}`;
   } finally { // also a step that was paused, stopped, timed out or failed: its partial edits are worth a look
     const after = snap?.before && await snapTree(snap.dir);
     if (after && after !== snap.before) { (t.steps ||= []).push({ at: snap.at, finishedAt: nowIso(), before: snap.before, after }); await keepStep(snap.dir, t).catch(() => {}); } // only steps that changed files
+    // A writing check that goes on later (it waits, was paused or interrupted) still holds the folder here: the untracked
+    // output this run left is its own, so its reading continues from this point. A tracked change keeps the old start.
+    if (heldFrom && isWriter(t) && t.status !== 'DONE' && t.agent === startAgent && (t.leaseGeneration || 0) === generation
+      && t.verificationStart && sameVerdictVersion(t.verificationStart, heldFrom)) {
+      const sofar = await verdictVersion(t.workdir || w.project).catch(() => null);
+      if (sofar && sameTrackedVersion(heldFrom, sofar)) {
+        t.verificationStart = sofar;
+        if (w.run === run && (run.active || run.paused)) saveRun(w, run.paused ? 'paused' : 'running'); // a restart must not fall back to the older start
+      }
+    }
   }
 }
 
