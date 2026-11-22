@@ -1717,10 +1717,10 @@ async function acquireLock(w, t) {
   timer.unref?.(); w.lockTimers.set(key, timer);
 }
 async function releaseLock(w, t) {
-  const dir = (await workspaceOf(t?.workdir || w.project)).path, key = treeKey(dir);
+  const dir = (await workspaceOf(t?.workdir || w.project)).path, key = treeKey(dir), f = await lockFile(w, dir);
+  // Checked after the last await: a writer that took the folder meanwhile holds a lease, and the lock file and heartbeat are its own.
   if (S.leases.some((l) => l.key === key && l.mode === 'write' && l.status !== 'RELEASED' && l.instance === INSTANCE)) return;
   clearInterval(w.lockTimers?.get(key)); w.lockTimers?.delete(key);
-  const f = await lockFile(w, dir);
   if (!f) return;
   try { if (JSON.parse(fs.readFileSync(f, 'utf8')).instance === INSTANCE) fs.unlinkSync(f); } catch { /* no lock of ours */ }
 }
