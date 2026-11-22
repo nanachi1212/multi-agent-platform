@@ -2003,6 +2003,9 @@ async function takeWriteSlot(w, t) {
     saveLeases();
     Object.assign(t, { status: 'WAITING', blockReason: why.text, blocked: null });
     if (t.blockLogged !== why.text) { t.blockLogged = why.text; log(w, 'studio', 'system', `「${t.title}」先不動：${why.text}。等對方做完，Studio 每 30 秒再看一次。`); }
+    // A release that skipped while this lease was live left its lock file and heartbeat. Not awaited: the card must leave its
+    // step now so the next pump can start it; releaseLock checks the leases after its last await, so a later writer keeps its lock.
+    if (!got.reused) releaseLock(w, t).catch(() => {});
     retryLater(w);
     return false;
   }
