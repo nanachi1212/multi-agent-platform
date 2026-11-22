@@ -1536,7 +1536,11 @@ function pump(w) {
   const run = w.run;
   if (!run?.active || run.paused || run.phase !== 'working') return;
   const byId = (id) => w.tasks.find((x) => x.id === id);
-  const order = [...w.tasks].sort((a, b) => (b.wakeNote ? 1 : 0) - (a.wakeNote ? 1 : 0));
+  // A woken card goes first, and before it a writer that already holds its folder's reservation: a writer started ahead
+  // of the holder marks itself WORKING (so the holder may not start), then loses the folder to the reservation, on every retry.
+  const holds = (t) => isWriter(t) && cardLeases(w, t, t.agent).some((l) => l.status === 'RESERVED' && l.mode === 'write' && sameCard(l, w, t));
+  const rank = (t) => (holds(t) ? 2 : 0) + (t.wakeNote ? 1 : 0);
+  const order = [...w.tasks].sort((a, b) => rank(b) - rank(a));
   for (const t of order) {
     if (t.status !== 'WAITING' || t.hold || w.executingSteps?.has(t.id)) continue;
     const entering = needsDependencyAdmission(w, t);
@@ -1779,6 +1783,37 @@ async function verdictVersion(dir) {
 const sameVerdictVersion = (a, b) => treeKey(a.dir) === treeKey(b.dir) && a.head === b.head && a.tree === b.tree;
 // Same folder, HEAD and tracked files: at most untracked paths differ.
 const sameTrackedVersion = (a, b) => !!a?.tracked && !!b?.tracked && treeKey(a.dir) === treeKey(b.dir) && a.head === b.head && a.tracked === b.tracked;
+// Paths that differ between two snapshot trees of one repository (the snapshots wrote their objects into it).
+async function treeChanges(dir, a, b) {
+  if (a === b) return [];
+  const r = await git(dir, 'diff-tree', '-r', '-z', '--name-only', '--no-renames', a, b);
+  if (r.err) throw new Error('無法比對驗證工作的 Git 工作樹');
+  return r.out.split('\0').filter(Boolean);
+}
+// The untracked paths a writing check changed between two versions are its output, except a file another writer of this
+// job (not a check) listed in FILES: editing that is editing code nobody has committed yet. Unlisted files (a report a build
+// card's own test run left) stay output, or a re-check could never pass. A failed comparison counts as code.
+async function checkOutputOnly(w, t, from, to) {
+  try {
+    const changed = await treeChanges(to.dir, from.tree, to.tree);
+    if (!changed.length) return true;
+    const slash = (p) => String(p).replace(/\\/g, '/');
+    const real = (p) => { try { return slash(fs.realpathSync.native(p)); } catch { return slash(p); } }; // 8.3 names, junctions
+    const root = real(to.dir).toLowerCase().replace(/\/?$/, '/'), tree = treeKey(t.workdir || w.project);
+    // FILES paths are relative to the card's folder, which can be a subfolder of the repository diff-tree lists from.
+    const folder = real(t.workdir || w.project).toLowerCase().replace(/\/?$/, '/'), prefix = folder.startsWith(root) ? folder.slice(root.length) : '';
+    const rel = (p) => {
+      p = slash(p).trim();
+      if (/^(?:[a-z]:|\/\/)/i.test(p)) { p = real(p).toLowerCase(); return p.startsWith(root) ? p.slice(root.length) : p; }
+      return (prefix + p.replace(/^(?:\.\/)+/, '')).toLowerCase();
+    };
+    const theirs = new Set(w.tasks.filter((x) => x !== t && isWriter(x) && x.role !== 'check' && treeKey(x.workdir || w.project) === tree)
+      .flatMap((x) => x.files || []).map(rel).map((p) => p.replace(/\/+$/, '')));
+    // A listed folder covers the files under it.
+    const listed = (p) => { p = p.toLowerCase(); for (let i = p.length; i > 0; i = p.lastIndexOf('/', i - 1)) if (theirs.has(p.slice(0, i))) return true; return false; };
+    return !changed.some(listed);
+  } catch { return false; }
+}
 const versionLabel = (v) => `${v.dir} (${v.head} / ${v.tree})`;
 
 async function staleDependency(w, t) {
@@ -1902,7 +1937,7 @@ async function reportFiles(w, t, dir, before, reported) {
   const root = dir.replace(/\\/g, '/').toLowerCase() + '/';
   const listed = new Set([...reported].map(real).map((p) => p.toLowerCase().startsWith(root) ? p.slice(root.length) : p).map((p) => p.toLowerCase()));
   const missing = changedFiles(before, after).filter((p) => !listed.has(p.toLowerCase()));
-  t.files = [...reported];
+  t.files = [...new Set([...(t.files || []), ...reported])]; // every file this card has listed, across its runs
   if (!missing.length) return;
   log(w, 'studio', 'system', `「${t.title}」這一步有 ${missing.length} 個檔案變動沒有出現在 ${agentName(t.agent)} 回報的 FILES 清單${reported.size ? '' : '（它沒有寫 FILES 行）'}：${missing.slice(0, 10).join('、')}${missing.length > 10 ? ` 等 ${missing.length} 個` : ''}。只記錄，不影響這張卡。`);
   event('card.files', { project: w.project, job: w.run?.id, card: t.id, reported: reported.size, unreported: missing.length });
@@ -2033,7 +2068,9 @@ async function runTask(w, t, failedDependency = false) {
   if (!failedDependency && apiBudgetSpent(w, t.agent)) {
     waitForApiBudget(w, t);
     // A handoff may have reserved the folder for this member before any turn ran; nobody waits behind a card that waits for budget.
-    if (!t.firstStartedAt) { await releaseRejectedReservations(w, t); pump(w); }
+    // pump() skips preparing cards and the card never started, so the reservation goes before the first await: the pump
+    // that called us goes on to the next card with the folder free.
+    if (!t.firstStartedAt) await releaseRejectedReservations(w, t);
     return;
   }
   if (t.ask?.apiBudget) t.ask = null;
@@ -2829,9 +2866,10 @@ ${STATUS_RULES}`;
       if (interrupted()) { park(); return; }
       const start = t.verificationStart;
       // While this run holds the folder a writing check is its only Studio writer, so untracked paths that changed since
-      // it took the folder are its own output; tracked files and HEAD still count, and so does any change from before
-      // (another writer may have had the folder while the card waited). Reviews read alongside writers: everything counts.
-      const ownOutput = isWriter(t) && start && heldFrom && sameVerdictVersion(start, heldFrom) && sameTrackedVersion(heldFrom, version);
+      // it took the folder are its own output; tracked files, HEAD and uncommitted files other writers made still count, and so
+      // does any change from before (another writer may have had the folder while the card waited). Reviews read alongside writers: everything counts.
+      const ownOutput = isWriter(t) && start && heldFrom && sameVerdictVersion(start, heldFrom) && sameTrackedVersion(heldFrom, version)
+        && await checkOutputOnly(w, t, heldFrom, version);
       if (start && version && !ownOutput && !sameVerdictVersion(start, version)) {
         const detail = `驗證開始時是 ${versionLabel(start)}，現在是 ${versionLabel(version)}`;
         t.verdictStale = true;
@@ -2911,7 +2949,7 @@ ${STATUS_RULES}`;
     if (heldFrom && isWriter(t) && t.status !== 'DONE' && t.agent === startAgent && (t.leaseGeneration || 0) === generation
       && t.verificationStart && sameVerdictVersion(t.verificationStart, heldFrom)) {
       const sofar = await verdictVersion(t.workdir || w.project).catch(() => null);
-      if (sofar && sameTrackedVersion(heldFrom, sofar)) {
+      if (sofar && sameTrackedVersion(heldFrom, sofar) && await checkOutputOnly(w, t, heldFrom, sofar)) {
         t.verificationStart = sofar;
         if (w.run === run && (run.active || run.paused)) saveRun(w, run.paused ? 'paused' : 'running'); // a restart must not fall back to the older start
       }

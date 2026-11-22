@@ -1,5 +1,6 @@
 // Real turn/runCard/instruct functions with gated I/O: no providers or filesystem writes.
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Card interrupt');
 const { region } = require('./lifecycle-harness.cjs');
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 
@@ -57,9 +58,6 @@ function setup(stage = 'runtime', { stopConfirmed = true, modelHelper, modelFail
     onStepEnd: fn => { onStepEnd = fn; } };
 }
 
-// An await that never settles lets Node exit 0 without the PASS line; that must fail CI.
-let finished = false;
-process.on('exit', () => { if (!finished && !process.exitCode) { console.error('Card interrupt: ended before the PASS line (an await never settled)'); process.exitCode = 1; } });
 (async () => {
   const { applyTurnModel } = await import('./live-models.mjs');
   // Real helper + real turn + real runCard: cancellation during config I/O must not escalate the card.
@@ -157,6 +155,6 @@ process.on('exit', () => { if (!finished && !process.exitCode) { console.error('
     assert.equal(x.t.status, 'PAUSED', 'unconfirmed stop must retain its safety state');
     assert.equal(x.t.stopUnconfirmed, true); assert.equal(x.run.paused, true); assert.equal(x.applied.length, 0);
   }
-  finished = true;
+  finished();
   console.log('Card interrupt: real turn/runCard/instruct gated startup, idle, response, partial edits, resume, lifecycle/owner guards, unconfirmed stop: PASS');
 })().catch(e => { console.error(e); process.exitCode = 1; });

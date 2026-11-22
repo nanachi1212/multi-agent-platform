@@ -1,5 +1,6 @@
 // Deterministic ownership regressions: no files, providers, servers, or real processes are started.
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Runtime identity');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -157,5 +158,6 @@ const path = require('node:path');
   }
   assert.match(server, /p\.on\('exit', \(c, sig\) => \(BASE \? aionExited\(c, sig\)/, 'exit after ready goes to aionExited');
   assert.ok(server.includes('unavailable: () => aionGone'), 'server wires its exit state into the client');
+  finished();
   console.log('AionCore exit after ready is reported, Studio shutdown is not: PASS');
 })().catch(error => { console.error(error); process.exitCode = 1; });

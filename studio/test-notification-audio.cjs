@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Notification audio');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -83,4 +84,5 @@ function openTab() {
   click();
   assert.equal(contexts[0].state, 'closed', 'the mute click itself cannot unlock a queued chime');
 }
+finished();
 console.log('Notification audio: lazy initialization, both chimes and mute cancellation PASS');

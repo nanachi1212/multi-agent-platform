@@ -1,5 +1,6 @@
 // Pure client regressions: no browser, provider process, network, or file writes.
 const assert = require('node:assert/strict');
+const finished = require.main === module ? require('./test-finish.cjs')('UI safety') : () => {};
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -99,6 +100,7 @@ async function run() {
   assert.equal((html.match(/>收尾者：<\/span>/g) || []).length, 1, 'finisher label occurs once');
   assert.equal((html.match(/>備援者：<\/span>/g) || []).length, 1, 'fallback has its own label');
   assert.ok(!html.includes('const anyActive ='), 'unused helper removed');
+  finished();
   console.log('UI safety regressions: PASS');
 }
 module.exports = run;

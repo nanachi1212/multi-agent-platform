@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Codex provider');
 const path = require('node:path');
 const { region } = require('./lifecycle-harness.cjs');
 
@@ -58,5 +59,6 @@ const { region } = require('./lifecycle-harness.cjs');
   finishDiagnosis('Not logged in'); await pending;
   assert.equal(a.status, 'available', 'an older diagnostic cannot overwrite a newer successful check');
   assert.equal(a.note, '');
+  finished();
   console.log('Codex provider: explicit home, login diagnosis, original failures and concurrent recheck: PASS');
 })().catch(error => { console.error(error); process.exitCode = 1; });

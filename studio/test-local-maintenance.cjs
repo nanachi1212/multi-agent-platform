@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Local maintenance');
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os'), crypto = require('node:crypto');
 const { execFileSync, spawnSync } = require('node:child_process');
 const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
@@ -195,5 +196,6 @@ const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
       assert.match(version, /0\.2\.2/);
       console.log('Official AionCore: pinned ZIP/executable hashes, actual staging install and --version 0.2.2: PASS');
     }
+    finished();
   } finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

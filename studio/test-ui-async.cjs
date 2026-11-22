@@ -1,5 +1,6 @@
 // Async UI and routine cancellation regressions: source extraction, no providers or IO writes.
 const fs = require('node:fs');
+const finished = require.main === module ? require('./test-finish.cjs')('UI async') : () => {};
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
@@ -170,6 +171,7 @@ async function run() {
     assert.equal(plans.length, closed ? 0 : 1, 'closed workspace cannot start a pending routine; open workspace still can');
     assert.equal(!!w.run?.active, !closed);
   }
+  finished();
   console.log('Async UI ordering, draft preservation and closed-routine cancellation: PASS');
 }
 module.exports = run;

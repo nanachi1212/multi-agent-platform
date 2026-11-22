@@ -1,5 +1,6 @@
 // Office markup regressions. No server, model, or provider process is launched.
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Office scene');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -28,4 +29,5 @@ assert.match(asked, /data-detail="t2"/);
 assert.ok(asked.includes('&lt;question&gt;'));
 assert.match(html, /prefers-reduced-motion: reduce/);
 assert.match(html, /\.scene \*, \.scene \*::before, \.scene \*::after \{ animation:none !important/);
+finished();
 console.log('Office scene markup regressions: PASS');

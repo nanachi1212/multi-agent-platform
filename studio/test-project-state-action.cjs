@@ -1,5 +1,6 @@
 // Real browser action helper; network and timers are controlled, no server/provider.
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Project state action');
 const fs = require('node:fs'), path = require('node:path');
 const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 const code = html.slice(html.indexOf('async function post('), html.indexOf('const name = (id)'));
@@ -36,5 +37,5 @@ const tick = () => new Promise(r => setImmediate(r));
   request.resolve({ ok: false, status: 409, json: async () => ({ error: 'late A failure' }) }); await switching;
   assert.equal(error.textContent, 'B message', 'late failure cannot replace another workspace error');
   assert.match(html, /return projectStateAction\(b\)/);
-  await tick(); console.log('Project state action failures, timeout, deduplication and recovery PASS');
+  await tick(); finished(); console.log('Project state action failures, timeout, deduplication and recovery PASS');
 })().catch(e => { console.error(e); process.exitCode = 1; });

@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Live models');
 (async () => {
   const { applyTurnModel, updateModelCatalog } = await import('./live-models.mjs');
   const opts = () => [ { id: 'model/id', category: 'model', current_value: 'old', options: [{ value: 'old' }, { value: 'new', name: 'New' }] }, { id: 'reasoning_effort', category: 'thought_level', current_value: 'low', options: [{ value: 'low' }, { value: 'high' }] } ];
@@ -54,5 +55,6 @@ const assert = require('node:assert/strict');
   const html = fs.readFileSync(__dirname + '/index.html', 'utf8');
   for (const [, script] of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)) new vm.Script(script);
   assert.ok(html.includes('下一步生效')); assert.ok(!html.includes('下一次開始工作生效'));
+  finished();
   console.log('PASS live-model catalog, same conversation update, confirmation, cancellation, UI syntax');
 })().catch((e) => { console.error(e); process.exitCode = 1; });

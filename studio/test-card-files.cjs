@@ -1,6 +1,7 @@
 // A writer card's FILES line versus what the step really changed: Studio records the difference and never acts on it.
 // Run: node studio/test-card-files.cjs   (real git in a temp repository, scripted agent replies, no network)
 const { assert, makeEnv, mkTmp, newW } = require('./lifecycle-harness.cjs');
+const finished = require('./test-finish.cjs')('Card files');
 const fs = require('node:fs'), path = require('node:path');
 const { execFile, execFileSync, spawn } = require('node:child_process');
 
@@ -112,6 +113,7 @@ const { execFile, execFileSync, spawn } = require('node:child_process');
     const msgs = [{ type: 'text', position: 'right', content: { content: 'Task: brief' } }, ...Array.from({ length: 10 }, (_, i) => ({ type: 'text', position: 'left', content: { content: `report ${i} ` + 'x'.repeat(2000) } }))];
     const ex = await makeEnv(() => '', { api: async () => ({ items: msgs }) }).api.handoffExcerpt('c1', 'codex');
     assert.ok(ex.startsWith('(6 earlier messages left out)\n[Codex] report 5 ') && ex.includes('[Codex] report 9 ') && !ex.includes('report 4 ') && ex.length < 12100, 'handoff excerpt: ' + ex.slice(0, 80));
+    finished();
     console.log('card files: listed vs changed, absolute and ./ paths, deletions, ignored output, missing FILES line, read-only cards, step diffs and refs, step undo, rules files, handoff excerpt: PASS');
   } finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 }); }
 })().catch((e) => { console.error('FAIL', e); process.exit(1); });

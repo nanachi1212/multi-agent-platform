@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('State files');
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
 const { spawnSync } = require('node:child_process');
 const { region } = require('./lifecycle-harness.cjs');
@@ -62,6 +63,7 @@ const { region } = require('./lifecycle-harness.cjs');
     for (const text of ['{', '{}', '{"pid":null}']) {
       fs.writeFileSync(lock, text); await assert.rejects(claimRuntime(rt)); assert.strictEqual(fs.readFileSync(lock, 'utf8'), text);
     }
+    finished();
     console.log('state files: atomic settings/history, failed replacement preserves data, runtime exclusion before startup, dead/unknown owner handling: PASS');
   } finally { fs.rmSync(rt, { recursive: true, force: true }); }
 })().catch((e) => { console.error(e); process.exitCode = 1; });

@@ -1,5 +1,6 @@
 // Deterministic Windows query fixtures; no listener/provider/server is started.
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Runtime endpoint');
 const fs = require('node:fs'), path = require('node:path');
 (async () => {
   const source = fs.readFileSync(path.join(__dirname, 'runtime-registry.mjs'), 'utf8');
@@ -33,5 +34,6 @@ const fs = require('node:fs'), path = require('node:path');
     verifyOwnership: async (r) => { const p = await check(r.port, { desiredJobId: r.job_id, desiredDataDir: r.data_dir });
       return { ok: p.owner === 'studio' && p.runtime?.runtime_id === r.runtime_id }; } });
   assert.equal(result.status, 'BLOCKED'); assert.equal(result.ownership_verified, false);
+  finished();
   console.log('Runtime endpoint: IPv4 listener attribution, wildcard ambiguity, query failure, and unrelated health rejection: PASS');
 })().catch(e => { console.error(e); process.exitCode = 1; });

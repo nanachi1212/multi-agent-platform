@@ -2,6 +2,7 @@
 // STALL_EXTENSIONS times; without a running command, or without evidence, it stops exactly as before.
 // Run: node studio/test-turn-stall.cjs   (fake clock, scripted AionCore, no agents)
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Turn stall');
 const { region } = require('./lifecycle-harness.cjs');
 
 (async () => {
@@ -82,5 +83,6 @@ const { region } = require('./lifecycle-harness.cjs');
     assert.deepStrictEqual((await ev({ rows: (n) => [{ ...AION, creationDate: '/Date(5)/' }, proc(2, 1, n * 10)] })).alive, false, 'an AionCore identity that no longer matches owns nothing');
   }
   Date.now = realNow;
+  finished();
   console.log('turn stall evidence: extensions on cpu/child/file evidence, cap, silent model, recovery, session selection, steer: PASS');
 })().catch((e) => { console.error('FAIL', e); process.exit(1); });

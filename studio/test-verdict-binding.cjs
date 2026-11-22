@@ -1,5 +1,6 @@
 // Exercise the card admission and summary paths using real, disposable Git worktrees.
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Verdict binding');
 const fs = require('node:fs');
 const path = require('node:path');
 const { execFile, execFileSync } = require('node:child_process');
@@ -377,6 +378,76 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
       assert.equal(check.verdictStale, tracked);
     }
 
+    // A new file a build card listed in FILES and left uncommitted is code: a check that edits it does not pass. A report the
+    // build card's own test run left (not listed) is output: a check that rewrites it passes, and so does one that edits nothing.
+    for (const edits of ['feature', 'report', 'none']) {
+      const dir = freshRepo();
+      const w = newW(); w.project = w.run.project = dir;
+      w.run.startedAt = new Date().toISOString();
+      const { api, env } = makeEnv((_agent, prompt) => {
+        if (prompt.includes('Every current card has ended')) return '{"needs_user":"ok?"}';
+        if (prompt.includes('Task: build')) {
+          fs.writeFileSync(path.join(dir, 'feature.js'), 'export const x = 1;');
+          fs.mkdirSync(path.join(dir, 'coverage'), { recursive: true });
+          fs.writeFileSync(path.join(dir, 'coverage', 'report.txt'), 'lines 90%');
+          return 'built\nSTATUS: DONE\nFILES: feature.js';
+        }
+        if (prompt.includes('Task: verify')) {
+          if (edits !== 'none') fs.writeFileSync(path.join(dir, 'coverage', 'report.txt'), 'lines 100%');
+          if (edits === 'feature') fs.writeFileSync(path.join(dir, 'feature.js'), 'export const x = 2; // fixed while testing');
+          return 'PASS\nall tests passed\nSTATUS: DONE';
+        }
+        return 'ok\nSTATUS: DONE';
+      }, { execFile });
+      runtimes.push(env.RT); env.S.workspaces.push(w);
+      const build = { id: 'build', title: 'build', instructions: 'add feature.js', role: 'build', agent: 'claude', writes: true, trust: true, status: 'WAITING', after: [] };
+      const check = { id: 'verify', title: 'verify', instructions: 'run tests', role: 'check', agent: 'codex', writes: true, trust: true, status: 'WAITING', after: ['build'] };
+      w.tasks.push(build, check);
+      await api.runTask(w, build);
+      assert.equal(build.status, 'DONE', build.result);
+      assert.deepEqual(build.files, ['feature.js'], 'the build card listed its new module');
+      await api.runTask(w, check);
+      assert.equal(check.status === 'DONE', edits !== 'feature', `${edits}: ${check.result}`);
+      assert.equal(check.verdictStale, edits === 'feature');
+    }
+
+    // The same protection when the project is a subfolder of the repository (FILES paths are relative to the project
+    // folder, diff-tree's to the repository) and the module was listed in the build card's first run only.
+    {
+      const repo = freshRepo(), dir = path.join(repo, 'sub');
+      fs.mkdirSync(dir); fs.writeFileSync(path.join(dir, 'main.js'), 'base'); git(repo, 'add', 'sub'); git(repo, 'commit', '-qm', 'sub');
+      const w = newW(); w.project = w.run.project = dir;
+      w.run.startedAt = new Date().toISOString();
+      let builds = 0;
+      const { api, env } = makeEnv((_agent, prompt) => {
+        if (prompt.includes('Every current card has ended')) return '{"needs_user":"ok?"}';
+        if (prompt.includes('Task: verify')) {
+          fs.writeFileSync(path.join(dir, 'feature.js'), 'export const x = 2; // fixed while testing');
+          return 'PASS\nall tests passed\nSTATUS: DONE';
+        }
+        if (++builds === 1) { fs.writeFileSync(path.join(dir, 'feature.js'), 'export const x = 1;'); return 'added\nSTATUS: NEEDS_USER: also add docs?\nOPTIONS: yes | no\nFILES: ./feature.js'; }
+        fs.writeFileSync(path.join(dir, 'notes.md'), 'docs'); return 'docs added\nSTATUS: DONE\nFILES: notes.md';
+      }, { execFile });
+      runtimes.push(env.RT); env.S.workspaces.push(w);
+      const build = { id: 'build', title: 'build', instructions: 'add feature.js', role: 'build', agent: 'claude', writes: true, trust: true, status: 'WAITING', after: [] };
+      const check = { id: 'verify', title: 'verify', instructions: 'run tests', role: 'check', agent: 'codex', writes: true, trust: true, status: 'WAITING', after: ['build'] };
+      w.tasks.push(build, check);
+      await api.runTask(w, build);
+      assert.equal(build.status, 'NEEDS_USER', build.result);
+      api.answer(w, 'build', 'yes');
+      for (let i = 0; i < 400 && builds < 2; i++) {
+        if (build.status === 'WAITING' && !w.executingSteps.has('build')) await api.runTask(w, build);
+        else await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      await until(() => !w.executingSteps.size && !w.leaderSteps?.size, 'the answered build to settle');
+      assert.equal(build.status, 'DONE', build.result);
+      assert.deepEqual(build.files, ['feature.js', 'notes.md'], 'FILES from both runs are kept');
+      if (check.status === 'WAITING' && !w.executingSteps.has('verify')) await api.runTask(w, check);
+      await until(() => !w.executingSteps.size && !w.leaderSteps?.size, 'the check to settle');
+      assert.notEqual(check.status, 'DONE', check.result);
+      assert.equal(check.verdictStale, true);
+    }
+
     // A writer that edits after the PASS and then fails still changed the tree; one that changed nothing does not.
     for (const edits of [true, false]) {
       const dir = freshRepo();
@@ -462,5 +533,6 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
   } finally {
     for (const dir of [...runtimes, temp]) await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 10 });
   }
+  finished();
   console.log('verdict binding: Stop and interruption during validation, unchanged, dirty tree, HEAD-only change, non-Git, linked worktree, rerun after reassignment, a check\'s own untracked output (new and on re-run) vs a changed tracked file, review sees any change, and summary (incl. a failed writer after the PASS) PASS');
 })().catch(err => { console.error(err); process.exitCode = 1; });

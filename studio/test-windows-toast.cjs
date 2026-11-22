@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Windows toast');
 const { execFileSync } = require('node:child_process');
 const { region } = require('./lifecycle-harness.cjs');
 
@@ -37,4 +38,5 @@ let payload;
 const send = windowsToast((...args) => { payload = readToastPayload(...args); });
 send(title, body, url);
 assert.deepEqual(payload, { title, body, launch: url, attribution: 'Multi-Agent Studio' });
+finished();
 console.log('Windows toast title, body, attribution and project URL PASS');

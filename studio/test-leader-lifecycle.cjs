@@ -1,5 +1,6 @@
 // Leader lifecycle regressions: actual server functions, gated I/O, no provider/network/filesystem writes.
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Leader lifecycle');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const src = fs.readFileSync(require('node:path').join(__dirname, 'server.mjs'), 'utf8');
@@ -168,5 +169,6 @@ function setup(stage = 'create', overrides = {}) {
   const running = turn('claude', 'cid', 'must not send', { w: x.w, lead: true });
   await startup.promise; x.api.pause(x.w); Object.assign(old, { active: true, paused: false }); usage.resolve(null);
   await assert.rejects(running, /執行已停止/); assert.equal(x.prompts.length, 0);
+  finished();
   console.log('Leader lifecycle: pending creation/response drain, Start/Resume isolation, epoch-guarded turn startup: PASS');
 })().catch(e => { console.error(e); process.exitCode = 1; });
