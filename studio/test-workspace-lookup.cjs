@@ -1,5 +1,6 @@
 // workspaceLookup: one git call for a normal repo, the same answers as the step-by-step path for every kind of folder (real git, temp folders).
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Workspace lookup');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), { execFile, execFileSync } = require('node:child_process');
 const src = fs.readFileSync(path.join(__dirname, 'server.mjs'), 'utf8');
 const from = src.indexOf('async function workspaceLookup'), end = src.slice(from).search(/\r?\n\}\r?\n/);
@@ -28,6 +29,7 @@ const g = (cwd, ...a) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.e
     const plain = path.join(root, 'plain'); fs.mkdirSync(plain);
     const p = await lookup(plain);
     assert.deepEqual([p.isGit, p.path, p.branch, p.repo], [false, canonPath(plain), '', '']);
+    finished();
     console.log('workspace lookup: one git call, worktree, repo without commits, plain folder: PASS');
   } finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 })().catch((e) => { console.error(e); process.exitCode = 1; });

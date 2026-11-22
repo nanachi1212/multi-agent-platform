@@ -1,5 +1,6 @@
 // Security F2/F3: /api needs Studio's pass; a worker's card pass opens only its own card's runtime start. No server is started.
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('API token');
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
 const src = fs.readFileSync(path.join(__dirname, 'server.mjs'), 'utf8');
 const code = src.slice(src.indexOf('const cardToken ='), src.indexOf('\n', src.indexOf('|| (route === \'POST /api/runtime/start\'')));
@@ -56,5 +57,6 @@ const { readApiBody, MAX_API_BODY_BYTES } = new Function('Buffer', bodyCode + '\
 (async () => {
   assert.deepEqual(await readApiBody(Readable.from(['{"path":"P"}'])), { path: 'P' });
   await assert.rejects(readApiBody(Readable.from([Buffer.alloc(MAX_API_BODY_BYTES + 1)])), error => error.statusCode === 413 && /too large/.test(error.message));
+  finished();
   console.log('API pass and body limit: page pass, outside claim, card-scoped runtime start, browser token, 1 MiB cap: PASS');
 })().catch(error => { console.error(error); process.exitCode = 1; });

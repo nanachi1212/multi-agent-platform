@@ -1,5 +1,6 @@
 // Exercise Studio's authenticated HTTP routes, settings file and process restart without starting model backends.
 const assert = require('node:assert/strict');
+const finished = require.main === module ? require('./test-finish.cjs')('Workspace settings') : () => {};
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { fork } = require('node:child_process');
 const { once } = require('node:events');
@@ -112,6 +113,7 @@ async function testWorkspaceSettings() {
     assert.deepEqual([oldBudget.apiDailyTokenCap, oldBudget.routines], [123, []]);
     assert.deepEqual(read().workspaces.find(w => w.project === legacy).apiDailyUsage, usage);
     assert.deepEqual(read().closedWorkspaces, {});
+    finished();
     console.log('Workspace settings: HTTP close/reopen/restart, all preferences and schedules, isolation, removed agent and legacy budgets: PASS');
   } finally {
     try { await app?.stop(); } finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }

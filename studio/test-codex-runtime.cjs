@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Codex runtime');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -73,6 +74,7 @@ const path = require('node:path');
       assert.equal(ids.length, 53); assert.ok(!ids.includes('r9') && ids.includes('r10') && ids.includes('r59'), 'oldest cleaned Codex records dropped first');
       assert.ok(['rb', 'rs', 'rx'].every((id) => ids.includes(id)), 'non-terminal and backend records are never trimmed');
     }
+    finished();
     console.log('Codex runtime: session ownership, native restart, subprocess exit proof, PID reuse, query failure and retry, cleaned-record cap: PASS');
   } finally { for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 })().catch((e) => { console.error(e); process.exitCode = 1; });

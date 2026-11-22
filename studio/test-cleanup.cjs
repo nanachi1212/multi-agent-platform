@@ -1,4 +1,5 @@
 const { assert, makeEnv, mkTmp, newW, region } = require('./lifecycle-harness.cjs');
+const finished = require('./test-finish.cjs')('Worktree cleanup');
 const fs = require('node:fs'), path = require('node:path');
 const { execFile, execFileSync } = require('node:child_process');
 
@@ -454,6 +455,7 @@ const { execFile, execFileSync } = require('node:child_process');
     assert.ok(c.t.worktree.kept && E.env.logs.at(-1).text.includes('保留'));
     scenario = 'clean'; await E.api.worktreeCleanupAction(c.w, c.t.id, 'retry');
     assert.ok(c.t.worktree.cleaned && !c.t.worktree.kept && !fs.existsSync(c.path), '重試清理 runs now with a fresh budget');
+    finished();
     console.log('worktree cleanup: dirty/ignored files, failed checks/removal, current PR HEAD, squash merge, moved ref, path containment, .worktreeinclude copy/link and its removal, worktree setup command, retry budget, keep / retry: PASS');
   } finally {
     for (const wt of trees) if (fs.existsSync(wt.path)) git('worktree', 'remove', '--force', wt.path);

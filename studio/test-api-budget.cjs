@@ -1,5 +1,6 @@
 // Actual settings, billing, admission and turn code. Only the provider and Windows notification are simulated.
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('API budget');
 const fs = require('node:fs'), path = require('node:path');
 const { region, mkTmp, makeEnv, newW } = require('./lifecycle-harness.cjs');
 
@@ -115,8 +116,8 @@ const { region, mkTmp, makeEnv, newW } = require('./lifecycle-harness.cjs');
     Object.assign(hw.run, { phase: 'working', startedAt: new Date().toISOString() });
     hw.workers.push('ext'); spent(hw, 100); handed.env.S.workspaces.push(hw);
     const a = { id: 'a', title: 'a', instructions: 'a', role: 'build', agent: 'codex', writes: true, status: 'WAITING', after: [], trust: true };
-    const b = { id: 'b', title: 'b', instructions: 'b', role: 'build', agent: 'claude', writes: true, status: 'WAITING', after: [], trust: true };
-    hw.tasks.push(a, b); // b is queued for the same folder: Studio's own dispatch must start it once the reservation is given back
+    const b = { id: 'b', title: 'b', instructions: 'b', role: 'build', agent: 'claude', writes: true, status: 'WAITING', after: [], trust: true, wakeNote: 'continue' };
+    hw.tasks.push(b, a); // b is woken for the same folder and ahead in line: Studio's own dispatch must start it once the reservation is given back
     await handed.api.handoffWriter(hw, 'ext', 'a');
     await settled(hw, 'a');
     assert.equal(a.agent, 'ext'); assert.equal(a.status, 'NEEDS_USER'); assert.ok(a.ask?.apiBudget);
@@ -130,6 +131,24 @@ const { region, mkTmp, makeEnv, newW } = require('./lifecycle-harness.cjs');
     await settled(hw, 'a');
     assert.equal(a.status, 'DONE', 'after the cap is raised the card takes a fresh lease and finishes');
     assert.equal(handed.env.prompts.filter(p => p.agent === 'ext' && p.text.includes('Task: a')).length, 1);
+
+    // The same line-up with budget left: the card holding the folder's reservation goes first, the other follows it.
+    // Before, the woken card marked itself WORKING, kept the holder from starting and then lost the folder, on every 30 s retry.
+    {
+      const free = makeEnv(() => 'ok\nSTATUS: DONE', { execFile });
+      extra.push(free.env.RT);
+      free.env.AGENTS.ext = { name: 'Ext API', external: true };
+      const fw = newW(); fw.project = fw.run.project = repoAt('handoff-free');
+      Object.assign(fw.run, { phase: 'working', startedAt: new Date().toISOString() });
+      fw.workers.push('ext'); spent(fw, 0); free.env.S.workspaces.push(fw);
+      const ha = { id: 'a', title: 'a', instructions: 'a', role: 'build', agent: 'codex', writes: true, status: 'WAITING', after: [], trust: true };
+      const hb = { id: 'b', title: 'b', instructions: 'b', role: 'build', agent: 'claude', writes: true, status: 'WAITING', after: [], trust: true, wakeNote: 'continue' };
+      fw.tasks.push(hb, ha);
+      await free.api.handoffWriter(fw, 'ext', 'a');
+      for (let i = 0; i < 200 && !(ha.status === 'DONE' && hb.status === 'DONE'); i++) await new Promise(r => setTimeout(r, 25));
+      assert.equal(ha.status, 'DONE', 'the card holding the reservation is not shut out by a writer ahead in line');
+      assert.equal(hb.status, 'DONE', 'the writer ahead in line runs after the holder');
+    }
 
     // A user instruction queued for the next step survives a follow-up turn the budget refuses.
     let calls = 0, refused = false, g;
@@ -189,5 +208,6 @@ const { region, mkTmp, makeEnv, newW } = require('./lifecycle-harness.cjs');
     if (harness) await fs.promises.rm(harness.env.RT, { recursive: true, force: true });
     await fs.promises.rm(rt, { recursive: true, force: true });
   }
+  finished();
   console.log('API budget: subscriptions, handoff usage, daily warning, restart, close/reopen, midnight, admission, in-flight overage, handoff reservation released while over budget and queued instruction kept on a refused turn PASS');
 })().catch(e => { console.error(e); process.exitCode = 1; });

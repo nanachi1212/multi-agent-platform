@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Dependency admission');
 const fs = require('node:fs');
 const path = require('node:path');
 const { execFile, execFileSync } = require('node:child_process');
@@ -142,5 +143,6 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
   } finally {
     for (const dir of [...runtimes, temp]) await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 10 });
   }
+  finished();
   console.log('Dependency admission: continuation, changed worktree, stale siblings and reservation cleanup PASS');
 })().catch(err => { console.error(err); process.exitCode = 1; });

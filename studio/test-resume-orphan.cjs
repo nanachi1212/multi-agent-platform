@@ -1,5 +1,6 @@
 // Real history loading, resume and scheduler; provider/filesystem boundaries are stubbed.
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Resume orphan');
 const { region } = require('./lifecycle-harness.cjs');
 const deferred = () => { let resolve; const promise = new Promise(r => resolve = r); return { promise, resolve }; };
 function setup(status = 'ASK_LEADER', overrides = {}) {
@@ -77,5 +78,6 @@ function setup(status = 'ASK_LEADER', overrides = {}) {
   assert.equal(stopped.w.tasks[0].leaderAsks, 2);
   assert.equal(stopped.w.run.active, false);
   assert.deepEqual(stopped.dispatched, []);
+  finished();
   console.log('resume orphan leader question regressions PASS');
 })().catch(e => { console.error(e); process.exitCode = 1; });

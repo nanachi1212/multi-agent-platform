@@ -1,5 +1,6 @@
 // Optional progress files cannot take down /api/state. No providers, network, or file writes.
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Progress read');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -46,4 +47,5 @@ render({ exists: false, text: '', error: '無法讀取專案進度（EACCES）',
 assert.equal(elements.progressBox.hidden, false); assert.equal(elements.progress.textContent, '無法讀取專案進度（EACCES）');
 assert.equal(elements.progressTitle.title, success.file);
 render(undefined); assert.equal(elements.progressBox.hidden, true);
+finished();
 console.log('Progress read isolation and error display: PASS');

@@ -1,5 +1,6 @@
 // Production start/drain/cleanup logic; OS/provider boundaries are scripted, never real agents.
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Stop retry');
 const crypto = require('node:crypto');
 const { src, region } = require('./lifecycle-harness.cjs');
 const deferred = () => { let resolve; const promise = new Promise(r => resolve = r); return { promise, resolve }; };
@@ -81,5 +82,6 @@ function setup(overrides = {}) {
   assert.equal(timeout.w.run.id, 'old'); assert.equal(retries, 1);
   pendingCleanup.resolve(); await retry;
   assert.notEqual(timeout.w.run.id, 'old'); assert.equal(timeout.api.stillStopping(timeout.w), false);
+  finished();
   console.log('Stopped job cleanup retry PASS');
 })().catch(e => { console.error(e); process.exitCode = 1; });

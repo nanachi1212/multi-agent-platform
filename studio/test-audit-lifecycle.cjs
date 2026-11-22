@@ -1,5 +1,6 @@
 // Ownership transition regressions. Real lifecycle functions, scripted providers; no agents/network.
 const { assert, makeEnv, newW, mkTmp, TMP_DIRS, region } = require('./lifecycle-harness.cjs');
+const finished = require('./test-finish.cjs')('Audit lifecycle');
 const fs = require('node:fs');
 const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
 const environments = [];
@@ -161,6 +162,7 @@ function setup(overrides = {}) {
       await assert.rejects(done.api.handoffWriter(done.w, 'claude', done.t.id), /已完成/);
       assert.equal(done.t.status, 'DONE'); assert.equal(done.t.agent, 'codex'); assert.equal(done.env.prompts.length, 0);
     }
+    finished();
     console.log('Ownership transitions: serialized handoff/read-only/worktree, stale run rejection, history drain guard, completed-card protection: PASS');
   } finally {
     for (const w of environments) { for (const timer of w.lockTimers?.values() || []) clearInterval(timer); clearTimeout(w.retryTimer); }

@@ -1,5 +1,6 @@
 // All scripted lifecycle regressions; no agents or network.
 const { assert, nodeCrypto, src, region, TMP_DIRS, mkTmp, makeEnv, newW, settle } = require('./lifecycle-harness.cjs');
+const finished = require('./test-finish.cjs')('Lifecycle check');
 // A slow CI runner can take longer than one settle() to finish a scripted job: wait for the state instead of a fixed time.
 const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms / 25 && !f(); i++) await new Promise((r) => setTimeout(r, 25)); assert.ok(f(), 'timed out waiting for ' + what); };
 
@@ -1459,4 +1460,5 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
   await require('./test-runtime.cjs').runRuntimeTests();
   await new Promise((r) => setTimeout(r, 300));
   for (const d of [...TMP_DIRS, ...tmpRepos]) { try { require('fs').rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 }); } catch { /* temp folder still in use */ } }
+finished();
 })().catch((e) => { console.error('FAIL', e.message); process.exit(1); });

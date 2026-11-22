@@ -1,5 +1,6 @@
 // Production claimRuntime with deterministic OS identities; real temporary filesystem only.
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('State recovery');
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os'), crypto = require('node:crypto');
 (async () => {
   const source = fs.readFileSync(path.join(__dirname, 'state-files.mjs'), 'utf8');
@@ -41,6 +42,7 @@ const fs = require('node:fs'), path = require('node:path'), os = require('node:o
       return fs.unlinkSync(f);
     } })(rt);
     assert.ok(failed); assert.equal(JSON.parse(fs.readFileSync(file)).pid, process.pid); release();
+    finished();
     console.log('State recovery: concurrent dead-guard reclamation preserves winner token, legacy/reused identities, unknown owners and hard-link failure: PASS');
   } finally { fs.rmSync(rt, { recursive: true, force: true }); }
 })().catch(e => { console.error(e); process.exitCode = 1; });

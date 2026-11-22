@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Aion client');
 
 (async () => {
   const { createAionClient } = await import('./aion-client.mjs');
@@ -46,5 +47,6 @@ const assert = require('node:assert/strict');
       await assert.rejects(slow.api('POST', '/cancel', {}), e => e.stopUnconfirmed === true && /逾時/.test(e.message));
     } finally { clearInterval(keepAlive); }
   }
+  finished();
   console.log('Aion client: auth/CSRF, response envelope, backend exit and both timeout phases: PASS');
 })().catch(e => { console.error(e); process.exitCode = 1; });

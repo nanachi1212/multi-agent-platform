@@ -1,5 +1,6 @@
 // Boot Studio twice on one disposable pre-#87 runtime, stopping before model backends start.
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Stopped upgrade');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { stageStudio, start } = require('./test-workspace-settings.cjs');
 
@@ -65,6 +66,7 @@ async function testStoppedUpgrade() {
     app = await start(file, rt);
     assert.deepEqual(await app.api('history/' + old.record.id), detail, 'restarting twice keeps the original history');
     assert.deepEqual(read(leasesFile), first, 'restarting twice keeps all lease records and timestamps');
+    finished();
     console.log('Stopped job upgrade: failed card and released reservation survive restart; PASS, paused, live, unconfirmed and external owners preserved: PASS');
   } finally {
     try { await app?.stop(); } finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }

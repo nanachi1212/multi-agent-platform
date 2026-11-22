@@ -1,5 +1,6 @@
 // Local filesystem/process fixtures only: no Studio server, provider, or agent is launched.
 const assert = require('node:assert/strict');
+const finished = require('./test-finish.cjs')('Lease recovery');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
@@ -176,6 +177,7 @@ const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { re
     })));
     assert.equal(Number(fs.readFileSync(path.join(concurrent.rt, 'counter'))), 40);
     assert.ok(!fs.existsSync(path.join(concurrent.rt, 'critical')));
+    finished();
     console.log('Lease recovery: immutable successor guards, crash residue, unknown/live owners, race exclusion, bounded chains and hard-link failures: PASS');
   } finally { for (const rt of dirs) fs.rmSync(rt, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 })().catch(e => { console.error(e); process.exitCode = 1; });
