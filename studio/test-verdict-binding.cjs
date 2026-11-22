@@ -411,6 +411,32 @@ const { makeEnv, newW, mkTmp } = require('./lifecycle-harness.cjs');
       assert.equal(check.verdictStale, edits === 'feature');
     }
 
+    // Pause while the check's output is being compared: the PASS is not published, the card is paused.
+    {
+      const dir = freshRepo();
+      const w = newW(); w.project = w.run.project = dir;
+      w.run.startedAt = new Date().toISOString();
+      let compared = false;
+      const { api, env } = makeEnv((_agent, prompt) => {
+        if (prompt.includes('Every current card has ended')) return '{"needs_user":"ok?"}';
+        fs.mkdirSync(path.join(dir, 'coverage'), { recursive: true });
+        fs.writeFileSync(path.join(dir, 'coverage', 'report.txt'), 'lines 100%');
+        return 'PASS\nall tests passed\nSTATUS: DONE';
+      }, {
+        execFile(cmd, args, opts, callback) {
+          if (cmd === 'git' && args.includes('diff-tree') && !compared) { compared = true; Object.assign(w.run, { paused: true, active: false }); }
+          return execFile(cmd, args, opts, callback);
+        },
+      });
+      runtimes.push(env.RT); env.S.workspaces.push(w);
+      const check = { id: 'verify', title: 'verify', instructions: 'run tests', role: 'check', agent: 'codex', writes: true, trust: true, status: 'WAITING', after: [] };
+      w.tasks.push(check);
+      await api.runTask(w, check);
+      assert.ok(compared, 'the check output was compared');
+      assert.equal(check.status, 'PAUSED', check.result);
+      assert.ok(!check.verifiedAt, 'no verdict is bound while paused');
+    }
+
     // The same protection when the project is a subfolder of the repository (FILES paths are relative to the project
     // folder, diff-tree's to the repository) and the module was listed in the build card's first run only.
     {

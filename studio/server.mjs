@@ -2811,10 +2811,14 @@ ${STATUS_RULES}`;
     };
     const dir = isWriter(t) ? (await workspaceOf(t.workdir || w.project)).path : '', before = dir ? await treeFiles(dir).catch(() => null) : null;
     if (dir) snap = { dir, at: nowIso(), before: await snapTree(dir) };
-    const verificationVersion = async () => {
-      const version = await verdictVersion(t.workdir || w.project);
+    // After any await of the verdict: Pause, Stop, a handoff or 立刻打斷 may have come meanwhile.
+    const stillRunning = () => {
       if (!interrupted() && (w.run !== run || !run.active || (run.lifecycleEpoch || 0) !== epoch || t.status !== 'WORKING'
         || t.agent !== startAgent || (t.leaseGeneration || 0) !== generation || t.hold)) throw new Halt('驗證已中斷');
+    };
+    const verificationVersion = async () => {
+      const version = await verdictVersion(t.workdir || w.project);
+      stillRunning();
       return version;
     };
     // The start version is what one reviewer's reading began from. A conversation that gets the full brief
@@ -2870,6 +2874,8 @@ ${STATUS_RULES}`;
       // does any change from before (another writer may have had the folder while the card waited). Reviews read alongside writers: everything counts.
       const ownOutput = isWriter(t) && start && heldFrom && sameVerdictVersion(start, heldFrom) && sameTrackedVersion(heldFrom, version)
         && await checkOutputOnly(w, t, heldFrom, version);
+      stillRunning();
+      if (interrupted()) { park(); return; }
       if (start && version && !ownOutput && !sameVerdictVersion(start, version)) {
         const detail = `驗證開始時是 ${versionLabel(start)}，現在是 ${versionLabel(version)}`;
         t.verdictStale = true;
