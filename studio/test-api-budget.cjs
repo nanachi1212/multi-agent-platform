@@ -13,7 +13,7 @@ const { region, mkTmp, makeEnv, newW } = require('./lifecycle-harness.cjs');
   class Clock extends Date { constructor(...args) { super(...(args.length ? args : [now.getTime()])); } }
   const budgets = region('function tokenLimit(', 'function setBackendPort(');
   const env = { fs, path, RT: rt, AGENTS: agents, Date: Clock, writeJson, validRoutine: () => true,
-    treeKey: p => p.toLowerCase(), refreshState() {}, stillStopping: () => false, preparing: new Map(),
+    treeKey: p => p.toLowerCase(), refreshState() {}, stillStopping: () => false, preparing: new Map(), launchingWs: new Set(),
     event: (type, data) => EVENT.push({ type, ...data }), notify: (...args) => notices.push(args) };
   const load = () => new Function(...Object.keys(env),
     region('const AFTER_DONE =', '// ponytail: reads the newest') + budgets

@@ -25,7 +25,29 @@ const env = withAcpLauncherPath(Object.fromEntries(Object.entries(process.env).f
 Object.assign(env, { USERPROFILE: home, HOME: home, APPDATA: path.join(home, 'AppData', 'Roaming'),
   LOCALAPPDATA: path.join(home, 'AppData', 'Local'), CODEX_HOME: path.join(home, '.codex'), ACP_BATCH_VALUE: 'MUST_NOT_EXPAND' });
 let child, identity, base, output = '';
-const fixturePids = new Set();
+const liveIdentities = [];
+async function waitFor(check, label) {
+  const deadline = Date.now() + 10000;
+  do { if (await check()) return; await new Promise(resolve => setTimeout(resolve, 100)); } while (Date.now() < deadline);
+  assert.fail(typeof label === 'function' ? label() : label);
+}
+// Run before opening the live conversation. Only this probe was given this fixture-specific command.
+async function waitForProbeExit(marker, auditFile) {
+  const probe = fs.readFileSync(auditFile, 'utf8').trim().split('\n').map(JSON.parse).find(e => e.method === 'initialize');
+  assert.ok(probe, 'registration reached the fixture before checking its exit');
+  await waitFor(async () => !(await processSnapshot()).some(row =>
+    row.command.toLowerCase().includes(marker.toLowerCase()) ||
+    ([probe.pid, probe.parentPid].includes(row.pid) && !row.command)),
+  'registration probe did not exit or its process identity could not be verified: ' + marker);
+}
+function rememberLive(rows, pids) {
+  const owned = processTree(rows, rows.find(row => row.pid === child.pid));
+  for (const pid of pids) {
+    const row = owned.find(r => r.pid === pid);
+    assert.ok(row?.creationDate && row.executable, 'capture owned fixture process identity: ' + pid);
+    liveIdentities.push(row);
+  }
+}
 try {
   const password = crypto.randomBytes(24).toString('hex');
   await new Promise((resolve, reject) => {
@@ -62,6 +84,7 @@ try {
     'pinned upstream truncates the unadapted executable path');
   const agent = await api('POST', '/api/agents/custom', { name: 'Studio contract fixture', ...acpBackendCommand(agentExe, agentArgs) });
   assert.equal(typeof agent.id, 'string');
+  await waitForProbeExit(agentExe, audit);
   const conversation = await api('POST', '/api/conversations', { type: 'acp', name: 'Contract test', extra: { agent_id: agent.id, workspace: work } });
   assert.equal(typeof conversation.id, 'string');
   const route = `/api/conversations/${encodeURIComponent(conversation.id)}`;
@@ -73,14 +96,7 @@ try {
   assert.equal(first.runtime.has_task, true);
   assert.equal(first.config_options.find(x => x.category === 'model').current_value, 'contract-small');
   assert.equal(first.config_options.find(x => x.category === 'thought_level').current_value, 'low');
-  const readAudit = () => fs.readFileSync(audit, 'utf8').trim().split('\n').map(line => {
-    const event = JSON.parse(line); fixturePids.add(event.pid); fixturePids.add(event.parentPid); return event;
-  });
-  const waitFor = async (check, label) => {
-    const deadline = Date.now() + 10000;
-    do { if (await check()) return; await new Promise(resolve => setTimeout(resolve, 100)); } while (Date.now() < deadline);
-    assert.fail(label);
-  };
+  const readAudit = () => fs.readFileSync(audit, 'utf8').trim().split('\n').map(JSON.parse);
   async function checkTurns(route, auditFile, pid) {
     const events = () => fs.readFileSync(auditFile, 'utf8').trim().split('\n').map(JSON.parse).filter(x => x.pid === pid);
     const idle = async () => { const { runtime } = await api('GET', route); return runtime.state === 'idle' && !runtime.is_processing; };
@@ -110,9 +126,7 @@ try {
     assert.equal(start.executable.toLowerCase(), agentExe.toLowerCase(), 'probe and live runtime launch the exact executable with spaces');
     assert.deepEqual(start.args, literalArgs, 'argv survives without shell expansion, including empty arguments and quotes');
   }
-  assert.equal(isPidAlive(starts[0].pid), false, 'registration probe leaves no target process');
-  assert.equal(isPidAlive(starts[0].parentPid), false, 'registration probe leaves no launcher process');
-  assert.equal(isPidAlive(starts[1].pid), true, 'live executable is running');
+  rememberLive(await processSnapshot(), [starts[1].pid, starts[1].parentPid]);
   await assert.rejects(api('GET', route + '/config-options'), /404/, 'removed route must not be mocked as successful');
   const catalog = {};
   await applyTurnModel(api, conversation.id, { model: 'contract-large', effort: 'high' }, catalog);
@@ -141,8 +155,7 @@ try {
       'x"&echo BAD>injected.txt&rem "', '"|echo BAD>injected2.txt&rem "', 'a' + '\\'.repeat(3) + '"b'];
     const batchArgs = [path.join(import.meta.dirname, 'fixtures', 'contract-acp.cjs'), batchAudit, ...expectedArgs];
     const custom = await api('POST', '/api/agents/custom', { name: 'Studio ' + extension + ' fixture', ...acpBackendCommand(batch, batchArgs) });
-    const probeRows = await processSnapshot();
-    assert.ok(!probeRows.some(row => row.command?.toLowerCase().includes(batch.toLowerCase())), 'registration probe cleans launcher and cmd.exe: ' + extension);
+    await waitForProbeExit(batchAudit, batchAudit);
     const live = await api('POST', '/api/conversations', { type: 'acp', name: extension + ' contract', extra: { agent_id: custom.id, workspace: work } });
     const runtime = await api('POST', `/api/conversations/${encodeURIComponent(live.id)}/runtime/ensure`, {});
     assert.equal(runtime.runtime.has_task, true);
@@ -150,12 +163,9 @@ try {
     const starts = batchEvents.filter(event => event.method === 'initialize');
     assert.equal(starts.length, 2, 'batch registration probe plus live launch');
     for (const start of starts) {
-      fixturePids.add(start.pid); fixturePids.add(start.parentPid);
       assert.equal(start.executable.toLowerCase(), agentExe.toLowerCase());
       assert.deepEqual(start.args, expectedArgs, 'batch forwards exact argv to the ACP agent');
     }
-    assert.equal(isPidAlive(starts[0].pid), false, 'probe target is stopped');
-    assert.equal(isPidAlive(starts[0].parentPid), false, 'probe cmd.exe is stopped');
     const rows = await processSnapshot();
     const ownedPids = new Set(processTree(rows, rows.find(row => row.pid === child.pid)).map(row => row.pid));
     const owned = rows.filter(row => ownedPids.has(row.pid));
@@ -163,7 +173,7 @@ try {
     const shell = owned.find(row => row.pid === target?.parent);
     const launcher = owned.find(row => row.pid === shell?.parent);
     assert.ok(target && /cmd\.exe$/i.test(shell?.executable) && launcher?.command?.includes('acp-launcher.cjs'), 'launcher, cmd.exe and agent stay in the owned backend tree');
-    for (const row of [target, shell, launcher]) fixturePids.add(row.pid);
+    rememberLive(rows, [target.pid, shell.pid, launcher.pid]);
     assert.ok(batchEvents.every(event => ['initialize', 'session/new'].includes(event.method)), 'batch test invokes no models');
     await checkTurns(`/api/conversations/${encodeURIComponent(live.id)}`, batchAudit, starts[1].pid);
     assert.equal(fs.existsSync(path.join(work, 'injected.txt')), false);
@@ -179,7 +189,14 @@ try {
   if (child?.pid) {
     const cleaned = await killProcessTree(child.pid, undefined, identity);
     assert.equal(cleaned.ok, true, 'fixture process tree must be fully stopped');
-    for (const pid of fixturePids) assert.equal(isPidAlive(pid), false, 'fixture launcher/target must be stopped: ' + pid);
+    let remaining;
+    await waitFor(async () => {
+      const rows = await processSnapshot();
+      remaining = liveIdentities.filter(old => rows.some(row => row.pid === old.pid &&
+        (!row.creationDate || row.creationDate === old.creationDate &&
+          (!row.executable || row.executable.toLowerCase() === old.executable.toLowerCase()))));
+      return remaining.length === 0;
+    }, () => 'Fixture processes still present or unverifiable: ' + JSON.stringify(remaining));
     console.log('AionCore contract fixture process cleanup: PASS');
   }
   fs.rmSync(temp, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });

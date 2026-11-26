@@ -248,7 +248,7 @@ const until = async (f, what = 'state', ms = 10000) => { for (let i = 0; i < ms 
       if (path.endsWith('/messages')) return { items: [{ id: 'm1', type: 'text', position: 'left', status: 'finish', created_at: script.mark(state), content: { content: 'done' } }] };
       return { runtime: { turn_id: 'turn_orphan', ...script.runtime(state) } };
     };
-    const env = { api, sleep: () => new Promise((r) => setTimeout(r, 1)), active: new Map(), S: { workspaces: [], agents: { codex: { working: 0 } } },
+    const env = { api, AGENTS: { codex: {} }, sleep: () => new Promise((r) => setTimeout(r, 1)), active: new Map(), S: { workspaces: [], agents: { codex: { working: 0 } } },
       convAgent: new Map([['c1', 'codex']]), codexRuntime: { prepare: async () => { state.prepares++; }, stop: async () => true },
       answerConfirmations: async () => {}, refreshCodexLimits() {}, Halt: class extends Error {},
       isAskAnswer: (m) => String(m.content?.content || '').toUpperCase().includes('PROGRESS ANSWER:'), clip: (x) => String(x ?? ''), toolText: (c) => String(c?.name || '') };

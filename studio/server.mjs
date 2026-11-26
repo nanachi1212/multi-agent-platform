@@ -61,7 +61,7 @@ const AGENTS = {
 // never the key, so settings.json, /api/state and the logs cannot leak it.
 const EXT_PLATFORMS = ['openai', 'anthropic', 'gemini'];
 function registerExternal(e) {
-  AGENTS[e.id] = { name: e.name, external: true, create: (ws, lead) => ({ type: 'aionrs', model: { provider_id: e.providerId, model: e.model, use_model: e.model }, extra: { workspace: ws, session_mode: lead ? 'plan' : 'yolo' } }) };
+  AGENTS[e.id] = { name: e.name, external: true, checkEndpoint: () => validateExternalUrl(e.baseUrl), create: (ws, lead) => ({ type: 'aionrs', model: { provider_id: e.providerId, model: e.model, use_model: e.model }, extra: { workspace: ws, session_mode: lead ? 'plan' : 'yolo' } }) };
   const a = (S.agents[e.id] ??= { id: e.id, status: 'checking', note: '', working: 0, models: [], efforts: [] });
   Object.assign(a, { name: e.name, external: true, models: [{ value: e.model, name: e.model, description: '' }] });
   S.agentCfg[e.id] ??= { model: '', effort: '' };
@@ -556,6 +556,7 @@ async function sendSteer(w, agent, convId) {
   }
 }
 async function turn(agent, convId, text, { w, lead = false, check = false, allowStart, ask = false, timeout = 25 * 60e3, progressEvery = 30000, bill = lead && !check ? 'lead' : null } = {}) {
+  AGENTS[agent]?.checkEndpoint?.();
   const run = w?.run, epoch = run?.lifecycleEpoch || 0;
   const halted = () => run && (w.run !== run || (run.lifecycleEpoch || 0) !== epoch || run.stopped || run.paused) || allowStart && !allowStart();
   const unsent = (why) => Object.assign(new Halt(why), { unsent: true }); // halted before the message went out: the agent never saw it
@@ -656,21 +657,30 @@ async function turn(agent, convId, text, { w, lead = false, check = false, allow
 const extOf = (id) => S.external.find((x) => x.id === id);
 async function extProvider(id) {
   const e = extOf(id);
+  validateExternalUrl(e?.baseUrl);
   const p = ((await api('GET', '/api/providers')) || []).find((x) => x.id === e?.providerId);
   if (!p) throw new Error('這個外部模型的供應商設定不見了（AionCore 資料被清掉？），請按「編輯」重新輸入 API key');
+  validateExternalUrl(p.base_url);
+  if (p.base_url.replace(/\/+$/, '') !== e.baseUrl.replace(/\/+$/, '')) throw new Error('供應商網址與 Studio 設定不同，請重新設定模型和 API key');
   return p;
 }
 // Error text never carries a key, even when AionCore or the provider echoes it.
 const hideKey = (e, key) => { if (key && key.length > 3) e.message = e.message.split(key).join('***'); return e; };
 const isLocalUrl = (u) => /^(localhost|127\.0\.0\.1|\[::1\])$/i.test(new URL(u).hostname);
 
+function validateExternalUrl(value) {
+  let u;
+  try { u = new URL(value); } catch { throw new Error('Base URL 不是有效的網址'); }
+  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && isLocalUrl(u))) {
+    throw new Error('遠端模型的 Base URL 必須使用 HTTPS；本機 loopback 可使用 HTTP');
+  }
+}
 function extFields(b) {
   const f = { name: String(b.name || '').trim(), platform: String(b.platform || 'openai'), baseUrl: String(b.baseUrl || '').trim().replace(/\/+$/, ''), model: String(b.model || '').trim(), isFullUrl: !!b.isFullUrl };
   if (!f.name) throw new Error('請填顯示名稱');
   if (!f.model) throw new Error('請填模型名稱');
   if (!EXT_PLATFORMS.includes(f.platform)) throw new Error('不支援的 API 格式：' + f.platform);
-  let u; try { u = new URL(f.baseUrl); } catch { throw new Error('Base URL 不是有效的網址（例如 https://api.example.com/v1）'); }
-  if (!/^https?:$/.test(u.protocol)) throw new Error('Base URL 必須是 http:// 或 https://');
+  validateExternalUrl(f.baseUrl);
   return f;
 }
 
@@ -3358,18 +3368,20 @@ async function checkExternal(w, t) {
     if (bare && !repo) throw new Error('找不到專案的 GitHub origin，請提供完整 PR 網址');
     const j = await ghJson(['pr', 'view', String(wait.pr), ...(repo ? ['--repo', repo] : []), '--json', 'url,state,reviewDecision,statusCheckRollup'], w.project);
     if (!current() || t.hold) return;
-    const checks = j.statusCheckRollup || [];
-    const pending = checks.filter((c) => (c.__typename === 'CheckRun' ? c.status !== 'COMPLETED' : ['PENDING', 'EXPECTED'].includes(c.state)));
-    wait.ci = checks.length ? `${checks.length - pending.length}/${checks.length} 個 CI 檢查完成` : '還沒看到 CI 檢查';
+    if (!['OPEN', 'CLOSED', 'MERGED'].includes(j?.state)) throw new Error('缺少可核對的 PR 狀態');
+    const checks = j.statusCheckRollup;
+    const ci = ciOf(checks);
+    if (ci.state === 'unknown') throw new Error('CI 結論缺漏或失效，尚無法確認結果');
+    wait.ci = checks.length ? `${ci.done}/${ci.total} 個 CI 檢查完成` : '還沒看到 CI 檢查';
     wait.checkedAt = new Date().toISOString();
     wait.errors = 0;
     wait.empty = checks.length ? 0 : (wait.empty || 0) + 1;
     // A new PR can take a minute to register its checks: zero checks three times in a row means there are none.
-    if (j.state === 'OPEN' && (pending.length || (!checks.length && wait.empty < 3))) return;
-    const summary = checks.map((c) => `${c.name || c.context || 'check'}: ${c.conclusion || c.state || c.status}`).join(', ') || 'no CI checks found';
+    if (j.state === 'OPEN' && (ci.pending.length || (!checks.length && wait.empty < 3))) return;
+    const summary = checks.map((c) => `${c?.name || c?.context || 'check'}: ${c?.conclusion || c?.state || c?.status || 'unknown'}`).join(', ') || 'no CI checks found';
     const note = `GitHub PR ${j.url}: state ${j.state}, review decision ${j.reviewDecision || 'none'}. CI: ${summary}.`;
     const fin = w.finisher;
-    if (fin && fin !== t.agent && fin !== w.run?.leader && isWriter(t) && available(fin)) { // 收尾者 does the merge / cleanup instead of the strong model
+    if (ci.state !== 'failed' && fin && fin !== t.agent && fin !== w.run?.leader && isWriter(t) && available(fin)) {
       log(w, 'studio', 'system', `PR ${t.wait.pr} 的 CI 跑完了：依「收尾者」設定，「${t.title}」改由 ${agentName(fin)} 接手 merge 與收尾。`);
       try { await handoffWriter(w, fin, t.id, `The result this card was waiting for has arrived:\n${note}`, current); return; }
       catch (e) {
@@ -3416,14 +3428,39 @@ const sh = (cmd, args, cwd, env) => new Promise((res) => execFile(cmd, args, { c
 const GIT_SAFE = ['-c', 'safe.directory=*', '-c', 'core.fsmonitor=false'];
 const git = (cwd, ...args) => sh('git', [...GIT_SAFE, ...args], cwd);
 const PR_FIELDS = 'number,title,state,headRefName,mergedAt,url,statusCheckRollup,reviewDecision,author';
-const UNRESOLVED_Q = 'query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){reviewThreads(first:100){nodes{isResolved}}}}}';
+const UNRESOLVED_Q = 'query($o:String!,$r:String!,$n:Int!,$cursor:String){repository(owner:$o,name:$r){pullRequest(number:$n){reviewThreads(first:100,after:$cursor){nodes{isResolved} pageInfo{hasNextPage endCursor}}}}}';
 
-function ciOf(rollup = []) {
-  const name = (c) => c.name || c.context || 'check';
-  const failed = rollup.filter((c) => ['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED'].includes(c.conclusion || c.state)).map(name);
-  const pending = rollup.filter((c) => (c.__typename === 'CheckRun' ? c.status !== 'COMPLETED' : ['PENDING', 'EXPECTED'].includes(c.state))).map(name);
-  const state = !rollup.length ? 'none' : failed.length ? 'failed' : pending.length ? 'running' : 'passed';
-  return { state, total: rollup.length, done: rollup.length - pending.length, failed, pending };
+async function unresolvedThreads(project, owner, repo, number) {
+  let total = 0, cursor;
+  const seen = new Set();
+  do {
+    const args = ['api', 'graphql', '-f', 'query=' + UNRESOLVED_Q, '-F', 'o=' + owner, '-F', 'r=' + repo, '-F', 'n=' + number];
+    if (cursor) args.push('-f', 'cursor=' + cursor);
+    const response = await ghJson(args, project);
+    const threads = response.data?.repository?.pullRequest?.reviewThreads;
+    if (response.errors?.length || !Array.isArray(threads?.nodes) || typeof threads.pageInfo?.hasNextPage !== 'boolean'
+        || threads.nodes.some(n => typeof n?.isResolved !== 'boolean')) throw new Error('無法確認 PR 審查串');
+    total += threads.nodes.filter(n => !n.isResolved).length;
+    if (!threads.pageInfo.hasNextPage) return total;
+    cursor = threads.pageInfo.endCursor;
+    if (!cursor || seen.has(cursor)) throw new Error('無法取得下一頁 PR 審查串');
+    seen.add(cursor);
+  } while (cursor);
+}
+
+function ciOf(rollup) {
+  if (!Array.isArray(rollup)) return { state: 'unknown', total: 0, done: 0, failed: [], pending: [] };
+  const failed = [], pending = [];
+  let unknown = 0;
+  for (const check of rollup) {
+    const isRun = check?.__typename === 'CheckRun', name = check?.name || check?.context || 'check';
+    const value = isRun ? check.status === 'COMPLETED' ? check.conclusion : check.status : check?.state;
+    if (['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE'].includes(value)) failed.push(name);
+    else if (['PENDING', 'EXPECTED', 'QUEUED', 'REQUESTED', 'WAITING', 'IN_PROGRESS'].includes(value)) pending.push(name);
+    else if (!['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(value)) unknown++;
+  }
+  const state = !rollup.length ? 'none' : failed.length ? 'failed' : unknown ? 'unknown' : pending.length ? 'running' : 'passed';
+  return { state, total: rollup.length, done: rollup.length - pending.length - unknown, failed, pending };
 }
 
 // Reads the folder's real state. prRefs = {n, repo|null} PRs the last job mentioned (repo null = bare #N).
@@ -3440,27 +3477,28 @@ async function readGitState(project, prRefs) {
   if (!repo) return { ...g, error: '沒有 GitHub origin，只能看本機 Git' };
   g.repo = repo;
   const prNums = prRefs.filter((r) => !r.repo || r.repo === repo.toLowerCase()).map((r) => r.n); // a PR of another repo is not ours
-  try { g.mainSha = String(await ghJson(['api', `repos/${repo}/commits/HEAD`, '--jq', '{sha: .sha}'], project).then((x) => x.sha)).slice(0, 7); } catch { g.mainSha = ''; }
+  try { g.mainSha = (await ghJson(['api', `repos/${repo}/commits/HEAD`, '--jq', '{sha: .sha}'], project)).sha?.slice(0, 7); } catch { /* unknown HEAD */ }
+  if (!g.mainSha) g.error = '讀不到 GitHub 預設分支的提交';
   let list;
   try { list = await ghJson(['pr', 'list', '--repo', repo, '--state', 'all', '--limit', '8', '--json', PR_FIELDS], project); }
   catch (e) { return { ...g, error: '讀不到 GitHub（' + e.message + '）' }; }
   for (const n of prNums.filter((n) => !list.some((p) => p.number === n)).slice(0, 3)) {
-    try { list.push(await ghJson(['pr', 'view', String(n), '--repo', repo, '--json', PR_FIELDS], project)); } catch { /* deleted or another repo */ }
+    try { list.push(await ghJson(['pr', 'view', String(n), '--repo', repo, '--json', PR_FIELDS], project)); } catch { g.error = `讀不到工作紀錄中的 PR #${n}`; }
   }
   const [o, r] = repo.split('/');
   // Anyone can open a PR on a public repo: only the repo owner, the signed-in gh user, or a PR a job named is trusted.
   // Others never reach deriveState / the Leader prompt (their title, branch and check names are attacker-controlled text).
   let me = '';
   try { me = String((await ghJson(['api', 'user', '--jq', '{login: .login}'], project)).login || '').toLowerCase(); } catch { /* owner only */ }
+  if (!me) g.error = g.error || '無法確認 GitHub 使用者與相關 PR';
   const trusted = new Set([o.toLowerCase(), me].filter(Boolean));
   list = list.filter((p) => prNums.includes(p.number) || trusted.has(String(p.author?.login || '').toLowerCase()));
   for (const p of list) {
     const pr = { n: p.number, title: p.title, state: p.state, branch: p.headRefName, mergedAt: p.mergedAt, url: p.url, review: p.reviewDecision || '', ci: ciOf(p.statusCheckRollup), mentioned: prNums.includes(p.number) };
     if (pr.state === 'OPEN' || pr.mentioned) {
       try {
-        const q = await ghJson(['api', 'graphql', '-f', 'query=' + UNRESOLVED_Q, '-F', 'o=' + o, '-F', 'r=' + r, '-F', 'n=' + pr.n], project);
-        pr.unresolved = (q.data?.repository?.pullRequest?.reviewThreads?.nodes || []).filter((x) => !x.isResolved).length;
-      } catch { /* threads unknown */ }
+        pr.unresolved = await unresolvedThreads(project, o, r, pr.n);
+      } catch { pr.unresolved = null; }
     }
     g.prs.push(pr);
   }
@@ -3468,7 +3506,7 @@ async function readGitState(project, prRefs) {
 }
 
 const CARD_WORD = { WAITING: '還沒開始', WORKING: '做到一半', PAUSED: '已暫停', INTERRUPTED: '被中斷', FAILED: '沒有完成', WAITING_EXTERNAL: '在等外部結果', WAITING_AGENT: '在等其他 AI', NEEDS_USER: '在等你回覆' };
-const ciWord = (ci) => ({ none: '沒有 CI', passed: `CI 全綠（${ci.total}/${ci.total}）`, failed: `CI 失敗：${ci.failed.join('、')}`, running: `CI 跑到 ${ci.done}/${ci.total}（還在跑：${ci.pending.join('、')}）` })[ci.state];
+const ciWord = (ci) => ({ none: '沒有 CI', unknown: 'CI 結論待確認', passed: `CI 已通過（${ci.total}/${ci.total}）`, failed: `CI 失敗：${ci.failed.join('、')}`, running: `CI 跑到 ${ci.done}/${ci.total}（還在跑：${ci.pending.join('、')}）` })[ci.state];
 
 // Turns the last job + the real Git / GitHub state into what the page and the next Leader need.
 function deriveState(job, g) {
@@ -3490,16 +3528,21 @@ function deriveState(job, g) {
   const ciFail = open.find((p) => p.ci.state === 'failed');
   const review = open.find((p) => p.unresolved || p.review === 'CHANGES_REQUESTED');
   const ciRun = open.find((p) => p.ci.state === 'running');
+  const unverified = open.find(p => p.unresolved == null || p.ci.state === 'unknown') || merged.find(p => p.unresolved === null);
   const ready = open.find((p) => p.ci.state === 'passed' || p.ci.state === 'none');
   const CONT = '按「▶ 接著處理」讓團隊接手';
   const s = ask ? { level: 'need', headline: '需要 Nana', next: '你回覆後，工頭接著安排', you: `回答這個問題：${ask}（按「▶ 接著處理」後在上方回覆）` }
     : ciFail ? { level: 'open', headline: `PR #${ciFail.n} CI 失敗`, next: '工頭派人查 CI 失敗原因並修正', you: CONT }
     : review ? { level: 'open', headline: `PR #${review.n} 有 review 意見還沒解決`, next: '工頭派人處理 review 意見', you: CONT }
+    : g?.repo && g.error ? { level: 'wait', headline: 'GitHub 狀態待確認', next: g.error, you: '重新整理專案狀態後再決定是否收尾' }
     : ciRun ? { level: 'wait', headline: `PR #${ciRun.n} 等待 CI`, next: 'CI 全綠 → 工頭完成 merge 與收尾', you: '☕ 不急：CI 還在跑。按「▶ 接著處理」後，團隊會等 CI 跑完再收尾（Studio 每分鐘檢查）' }
+    : unverified ? { level: 'wait', headline: `PR #${unverified.n} 的審查或 CI 結論待確認`, next: '重新核對審查串與 CI 狀態', you: CONT }
     : ready ? { level: 'open', headline: `PR #${ready.n} ${ready.ci.state === 'passed' ? 'CI 全綠，' : ''}還沒 merge`, next: '工頭確認後完成 merge 與收尾', you: CONT }
     : unfinished.length ? { level: 'open', headline: '上一件工作還沒完成', next: `接著做「${unfinished[0].title}」`, you: CONT }
     : g?.dirty ? { level: 'open', headline: '本機有還沒 commit 的修改', next: '工頭確認這些修改要不要交付', you: CONT + '，或自己處理這些修改' }
-    : run ? { level: 'done', headline: '上一件工作已完成', next: '沒有剩下的事', you: '可以開始新的工作' }
+    : jobDone ? { level: 'done', headline: '上一件工作已完成', next: '沒有剩下的事', you: '可以開始新的工作' }
+    : run?.active ? { level: 'wait', headline: run.phase === 'planning' ? '工頭正在規劃' : '工作進行中', next: '等待團隊回報', you: '可查看目前工作' }
+    : run ? { level: 'open', headline: run.stopped || run.result === 'stopped' ? '上一件工作已停止' : '上一件工作尚未完成', next: '查看工作紀錄並決定是否接續', you: CONT }
     : { level: 'idle', headline: '待命', next: '', you: '在下面說你要什麼，按「交給團隊」' };
   const loose = merged.filter((p) => p.unresolved).map((p) => `PR #${p.n}`);
   if (loose.length && s.level !== 'idle') {
@@ -3527,9 +3570,9 @@ function projectContext(w) {
   return [memory, verified, `Done: ${ps.done.map(t).join('; ') || 'nothing recorded'}`, `Still open: ${ps.current.map(t).join('; ') || 'nothing'}`, `Next action: ${ps.next || 'none'}`].filter(Boolean).join('\n');
 }
 
-const refreshing = new Map(); // project -> promise (one refresh at a time per project)
+const refreshing = new WeakMap(); // an open tab owns its refresh, including when the same folder is reopened
 function refreshState(w) {
-  if (refreshing.has(w.project)) return refreshing.get(w.project);
+  if (refreshing.has(w)) return refreshing.get(w);
   const p = (async () => {
     const job = latestJob(w);
     const nums = job ? knownRefs(job).map((x) => String(x).match(/(?:github\.com\/([^/\s]+\/[^/\s]+)\/pull\/|#)(\d+)/)).filter(Boolean).map((m) => ({ n: +m[2], repo: m[1]?.toLowerCase() || null })).filter((r) => r.n) : [];
@@ -3537,15 +3580,17 @@ function refreshState(w) {
     Object.assign(w, { wsKey: info.key, wsInfo: { path: info.path, branch: info.branch, repo: info.repo } });
     w.pstate = deriveState(job, await readGitState(w.project, nums));
     saveSettings();
-  })().catch((e) => console.error('Project State 讀取失敗：' + e.message)).finally(() => refreshing.delete(w.project));
-  refreshing.set(w.project, p);
+  })().catch((e) => console.error('Project State 讀取失敗：' + e.message)).finally(() => refreshing.delete(w));
+  refreshing.set(w, p);
   return p;
 }
 
 // ▶ 接著處理: refresh the state, then continue the paused job or start a continuation that gets the handoff.
 async function continueProject(w) {
   if (w.run?.active) throw new Error('團隊正在工作中');
+  const run = w.run, epoch = run?.lifecycleEpoch;
   await refreshState(w);
+  if (!S.workspaces.includes(w) || w.run !== run || run?.lifecycleEpoch !== epoch) throw new Error('核對期間專案已關閉或工作已變更，已取消本次接續');
   if (w.run?.paused) {
     w.run.context = projectContext(w);
     return resume(w);
@@ -3926,6 +3971,7 @@ function openWorkspace(p) {
 
 function closeWorkspace(w) {
   if (w.run?.active) throw new Error('這個專案的團隊還在工作，請先暫停或停止');
+  if (launchingWs.has(w)) throw new Error('這個專案正在開始或繼續工作，請稍後再關閉');
   if (stillStopping(w)) throw new Error('這個專案仍在停止或暫停 Agent、工具程序與 runtime，請等清理完成再關閉');
   if ([...preparing.values()].some((e) => e.w === w) || w.tasks.some((t) => t.preparing)) throw new Error('這個專案有工作卡的 worktree 正在準備（設定指令還在跑），請等它完成或先按停止');
   S.closedWorkspaces[treeKey(w.project)] = workspaceSettings(w);

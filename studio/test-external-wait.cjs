@@ -17,7 +17,7 @@ function setup(overrides = {}) {
     log: (...args) => logs.push(args), notify: (...args) => notices.push(args), label: () => 'project',
     isWriter: card => card.writes, available: () => true, agentName: id => id,
     wake: (...args) => wakes.push(args), handoffWriter: async (...args) => handoffs.push(args), ...overrides };
-  const check = vm.runInNewContext(region('async function checkExternal(w, t)', 'function watchExternal()') + '\ncheckExternal;', env);
+  const check = vm.runInNewContext(region('function ciOf(', '// Reads the folder') + region('async function checkExternal(w, t)', 'function watchExternal()') + '\ncheckExternal;', env);
   return { w, t, env, calls, wakes, handoffs, logs, notices, check: () => check(w, t) };
 }
 
@@ -75,6 +75,16 @@ test('only three consecutive successful empty responses mean no CI checks', asyn
   response = pending(); await E.check(); assert.equal(E.t.wait.empty, 0);
   response = pr([]); await E.check(); await E.check(); assert.equal(E.wakes.length, 0);
   await E.check(); assert.equal(E.wakes.length, 1);
+});
+test('missing and stale results require retry; a failed check returns to the current worker', async () => {
+  for (const response of [{state:'OPEN'}, pr([{ __typename:'CheckRun', status:'COMPLETED', conclusion:'STALE' }]), pr([{ __typename:'CheckRun' }])]) {
+    const E = setup({ ghJson: async () => response }); E.w.finisher = 'other';
+    for (let i = 0; i < 3; i++) await E.check();
+    assert.equal(E.t.wait.manual, true); assert.equal(E.wakes.length + E.handoffs.length, 0);
+  }
+  const E = setup({ ghJson: async () => pr([{ __typename:'CheckRun', status:'COMPLETED', conclusion:'STARTUP_FAILURE' }]) });
+  E.w.finisher = 'other'; await E.check();
+  assert.equal(E.handoffs.length, 0); assert.equal(E.wakes.length, 1); assert.match(E.wakes[0][2], /STARTUP_FAILURE/);
 });
 test('a lookup failure breaks the empty-response streak', async () => {
   let failed = false; const E = setup({ ghJson: async () => { if (failed) throw new Error('offline'); return pr([]); } });
