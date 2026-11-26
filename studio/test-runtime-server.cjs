@@ -61,11 +61,13 @@ module.exports = async function () {
     E.runtimes.push(r); return r;
   }
   try {
-    const E = setup(); await acquire(E); addRuntime(E);
+    const E = setup(); await acquire(E);
+    addRuntime(E).shell_job = 'previous-shell-job';
     await E.api.recoverBackendWait(E.w, E.t);
     assert.deepEqual(E.events, ['cleanup:original', 'restart']);
     assert.equal(E.t.status, 'WAITING', 'owned backend wakes original card after readiness and smoke');
     assert.equal(E.runtimes.at(-1).runtime_id, 'replacement');
+    assert.equal(E.runtimes.at(-1).shell_job, null, 'a regular replacement must never inherit the old Windows Job');
 
     // A stale earlier record must never win over the current healthy replacement.
     E.t.status = 'WAITING_EXTERNAL'; E.t.wait = { backendPort: 3018, manual: false };

@@ -28,3 +28,24 @@ jobs:
           }
       - name: Verify the pinned runtime with a loopback provider
         run: node studio/test-external-budget-contract.mjs
+      - name: Prepare packaged PowerShell for the Windows Job test
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = Get-AppxPackage -Name Microsoft.PowerShell
+          if (-not $package) {
+            $bundle = Join-Path $env:RUNNER_TEMP 'PowerShell-7.7.0.msixbundle'
+            curl.exe --fail --silent --show-error --location --output $bundle 'https://github.com/PowerShell/PowerShell/releases/download/v7.7.0/PowerShell-7.7.0.msixbundle'
+            if ($LASTEXITCODE -ne 0) { throw 'PowerShell MSIX download failed' }
+            if ((Get-FileHash -LiteralPath $bundle -Algorithm SHA256).Hash -ne 'e00c349858c2d273f29485541ece91617b435accdd5e3f156d68d5cb97740022') {
+              throw 'PowerShell MSIX digest mismatch'
+            }
+            Add-AppxPackage -Path $bundle
+            $package = Get-AppxPackage -Name Microsoft.PowerShell
+          }
+          if (-not $package -or $package.PublisherId -ne '8wekyb3d8bbwe') { throw 'Microsoft PowerShell package unavailable' }
+          Write-Host "Testing $($package.PackageFullName)"
+      - name: Verify managed shell startup, reconnect and confirmed Job drain
+        env:
+          STUDIO_REQUIRE_STORE_TEST: '1'
+        run: node studio/test-managed-shell.mjs

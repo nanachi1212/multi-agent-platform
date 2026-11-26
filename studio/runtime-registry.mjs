@@ -4,6 +4,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { processSnapshot, processTree } from './codex-runtime.mjs';
+import { stopShellJob } from './managed-shell.mjs';
 import { writeJson } from './state-files.mjs'; // circular with state-files.mjs: only functions cross, none run at load
 
 // ---------- System Process & Port Helpers (Windows-first) ----------
@@ -223,16 +224,23 @@ export async function verifyRuntimeProcess(runtime) {
 }
 
 export async function cleanupRuntime(runtime, { rtDir = null, customRuntimes = null } = {}) {
-  const verified = await verifyRuntimeProcess(runtime);
-  if (!verified.ok) return { ok: false, reason: verified.reason || 'Runtime owner is unknown' };
-  if (verified.alive) {
-    const killed = await killProcessTree(runtime.root_pid, processSnapshot, runtime.process_identity);
-    if (!killed.ok) return { ok: false, reason: `Runtime processes have not stopped: ${killed.remaining.join(', ')}` };
+  let receipt = {};
+  if (runtime.shell_job != null) {
+    if (runtime.created_by !== 'studio') return { ok: false, reason: 'Runtime owner is unknown' };
+    try { receipt = await stopShellJob(runtimeRoot(rtDir), runtime); }
+    catch (e) { return { ok: false, reason: e.message }; }
+  } else {
+    const verified = await verifyRuntimeProcess(runtime);
+    if (!verified.ok) return { ok: false, reason: verified.reason || 'Runtime owner is unknown' };
+    if (verified.alive) {
+      const killed = await killProcessTree(runtime.root_pid, processSnapshot, runtime.process_identity);
+      if (!killed.ok) return { ok: false, reason: `Runtime processes have not stopped: ${killed.remaining.join(', ')}` };
+    }
   }
   if (runtime.temp_dir && isSafeTempDir(runtime.temp_dir)) {
     fs.rmSync(runtime.temp_dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
-  updateRuntime(runtime.runtime_id, { status: 'cleaned' }, { rtDir, customRuntimes });
+  updateRuntime(runtime.runtime_id, { ...receipt, status: 'cleaned' }, { rtDir, customRuntimes });
   return { ok: true };
 }
 
@@ -242,9 +250,10 @@ const STUDIO_INSTANCE = crypto.randomUUID();
 // ---------- Runtime Registry Persistence & Operations ----------
 
 export function runtimesFile(rtDir) {
-  const base = rtDir || process.env.STUDIO_RUNTIME_DIR || path.join(process.cwd(), 'runtime');
-  return path.join(base, 'studio', 'runtimes.json');
+  return path.join(runtimeRoot(rtDir), 'studio', 'runtimes.json');
 }
+
+function runtimeRoot(rtDir) { return rtDir || process.env.STUDIO_RUNTIME_DIR || path.join(process.cwd(), 'runtime'); }
 
 export function loadRuntimes(filePath) {
   if (!fs.existsSync(filePath)) return [];
@@ -283,6 +292,7 @@ export function registerRuntime({
   status = 'running',
   created_by = 'studio',
   restart_safe = false,
+  shell_job = null,
   process_identity = null,
   studio_pid = process.pid,
   rtDir = null,
@@ -316,6 +326,7 @@ export function registerRuntime({
     status,
     created_by: String(created_by || 'unknown'),
     restart_safe: restart_safe === true,
+    ...(shell_job != null ? { shell_job } : {}),
     studio_pid,
     studio_instance: STUDIO_INSTANCE,
     process_identity: process_identity?.creationDate && process_identity?.executable

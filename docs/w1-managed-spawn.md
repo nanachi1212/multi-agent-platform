@@ -2,6 +2,27 @@
 
 **W1 尚未解決。正式 Studio 仍使用官方 AionCore v0.2.2，這份修補不會自動套用或替換正式 binary。**
 
+本文件中的 **Store PowerShell** 指 Microsoft 發行的 MSIX 版 PowerShell 7（`pwsh.exe`）。這描述的是使用者選用的 shell。Studio 可繼續用原有方式執行，無須上架 Microsoft Store。
+
+## Studio 直接啟動的封裝 PowerShell
+
+Windows 上，`POST /api/runtime/start` 與 backend 自動恢復都透過 `spawnManagedProcess`。直接指定 WindowsApps 內的 PowerShell 安裝路徑或已登記的執行別名時，Studio 使用 Windows 隨附的 .NET Framework 編譯一次性的 Job 持有程序。啟動握手透過本機 named pipe，helper 核對 Studio PID，Studio 核對本次隨機交握值，之後才傳入目標參數與環境。登記檔沿用原有的敏感參數省略規則。
+
+持有程序以 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 和 `PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY` 建立使用者指定的 shell。在其主執行緒仍暫停時，以同一程序 handle 確認 Job 成員、映像路徑與建立時間。Studio 記錄實際 shell PID 後才允許執行。缺少編譯器、原生 API、Job 或可驗明的程序身分時，啟動會報錯。這條路徑管得到 Studio 直接建立的 shell；Claude 或其他工具另行建立的 shell 仍待上游處理。[Microsoft 的啟動屬性](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute)
+
+Studio 關閉後，Job 持有程序繼續監看根 shell。收到停止要求或根程序自行結束時，它回收該 Job 的剩餘工作，從原 Job handle 確認 `ActiveProcesses == 0`，再將根 PID 與實際退出碼原子寫入 registry 旁的 `studio/shell-jobs/<uuid>.drained`。重開 Studio 可讀回憑證並回收暫存 helper，再清理工作資料。若異常斷電、helper 提前結束或收據損壞，清理會回報受阻，保留資料與寫入租約；只有原 Job 產生的匹配收據能讓此處自動完成。沒有該證據時須人工核對。本機 registry 與收據沿用 Studio 對同一 Windows 帳號的信任邊界。[Microsoft 的 Job 計數定義](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information)
+
+2026-11-27 在 Windows 本機執行 `node studio/test-managed-shell.mjs`。測試經實際的 managed runtime 啟動處理函式，關閉原 Studio 測試程序後，從第二個程序讀取同一份登記檔確認 loopback port、根 PID 及 Job 所屬。每個 backend 都有一項獨立的背景工作。
+
+| 執行方式 | 已驗證結果 |
+| --- | --- |
+| 傳統 Windows PowerShell 5.1 | 專用原生控制組確認 Job、重連與自然退出碼 42。正常 Studio 對傳統 shell 維持原啟動方式。 |
+| Microsoft Store PowerShell 7.7.0 安裝路徑 | shell 驗明在指定 Job，逐字讀回含空白、Unicode、雙引號與尾端反斜線的獨立 argv。自然退出碼 42；背景工作一併回收。 |
+| 該版本的 WindowsApps 執行別名 | 相同 argv、PID 與 Job 驗證通過。重連後停止 Job，讀回退出碼 1，確認 root 和背景工作均結束。 |
+| 登記失敗或缺收據 | 登記被拒時清除暫存 helper；缺少排空證據時，保留測試資料並回報清理受阻。 |
+
+手動 Windows CI 另列此項驗證。設定 `STUDIO_REQUIRE_STORE_TEST=1` 時，缺少 MSIX 安裝路徑或無法完成該路徑的測試會直接失敗。Runner 沒有註冊別名時單列 `stop-alias NOT TESTED`；Win32 控制組獨立執行。
+
 ## 停用 Studio 的內建 Claude Code
 
 在 PowerShell 設定 `$env:STUDIO_DISABLE_BUILTIN_CLAUDE='1'`，從同一視窗執行 `.\start-studio.cmd`。Studio 啟動時讀取這個值；未設定或設為 `0` 會使用原有席位。啟用後，啟動探測、額度查詢、登入與既有對話送出工作都會被略過或拒絕。以該席位為工頭的定時工作會記錄未啟動原因；歷史工作若還有該席位的未完成卡片，會維持暫停並提示先改派。

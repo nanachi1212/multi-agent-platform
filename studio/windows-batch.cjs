@@ -20,3 +20,4 @@ module.exports = function batchInvocation(command, args) {
   if (line.length > 8000) throw new Error('批次檔啟動指令過長，請縮短參數或改用 .exe');
   return { command: process.env.ComSpec || 'cmd.exe', args: ['/d', '/s', '/v:off', '/c', line], windowsVerbatimArguments: true };
 };
+module.exports.quoteNativeArg = quoteNativeArg;

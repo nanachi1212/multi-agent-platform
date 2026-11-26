@@ -4,6 +4,7 @@ import http from 'node:http';
 import { applyTurnModel, updateModelCatalog } from './live-models.mjs';
 import { AION_RELEASE, createAionClient, readAionrsUsage } from './aion-client.mjs';
 import { acpBackendCommand, withAcpLauncherPath } from './acp-command.mjs';
+import { isPackagedPowerShell, launchPackagedPowerShell, managedExecutableExists, shellJobReceipt } from './managed-shell.mjs';
 import { createWorkspaceLeaseStore } from './workspace-lease.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -4101,7 +4102,7 @@ async function recoverBackendWaitStep(w, t) {
         }
         let replacement;
         try { replacement = await spawnManagedProcess({ ...old, studio_pid: process.pid }); }
-        catch (error) { if (isolated) cleanupIsolatedDir(old.temp_dir); throw error; }
+        catch (error) { if (isolated && !error.shellJobUnconfirmed) cleanupIsolatedDir(old.temp_dir); throw error; }
         wait.replacementId = replacement.runtime_id;
         saveRun(w, 'running');
         return replacement;
@@ -4123,15 +4124,35 @@ async function recoverBackendWaitStep(w, t) {
 
 async function spawnManagedProcess(options) {
   const { launchArgs, ...persisted } = options;
-  const child = spawn(options.executable, launchArgs || options.args, {
-    cwd: options.cwd, env: { ...recoveryEnv(), ...options.env }, windowsHide: true, stdio: 'ignore'
-  });
+  const args = launchArgs || options.args;
+  const processOptions = { cwd: options.cwd, env: { ...recoveryEnv(), ...options.env }, windowsHide: true, stdio: 'ignore' };
+  if (isPackagedPowerShell(options.executable)) {
+    let recorded;
+    const ended = reason => {
+      if (!recorded || listRuntimes({ rtDir: RT }).find(r => r.runtime_id === recorded.runtime_id)?.status !== 'running') return;
+      let receipt;
+      try { receipt = shellJobReceipt(RT, recorded); } catch (error) { reason = error.message; }
+      updateRuntime(recorded.runtime_id, receipt ? { status: 'exited', ...receipt }
+        : { status: 'stale', blocked_reason: reason || 'Windows Job 排空狀態未確認' }, { rtDir: RT });
+    };
+    try {
+      const child = await launchPackagedPowerShell(options.executable, args, { ...processOptions, rtDir: RT }, (pid, shellJob, identity) => {
+        recorded = registerRuntime({ ...persisted, root_pid: pid, shell_job: shellJob, process_identity: identity, child_pids: [], status: 'running', rtDir: RT });
+      });
+      child.exited.then(({ failed }) => ended(failed ? 'Windows Job 程序已中斷' : ''));
+      return recorded;
+    } catch (e) {
+      if (recorded) { ended(e.message); e.shellJobUnconfirmed = true; }
+      throw e;
+    }
+  }
+  const child = spawn(options.executable, args, processOptions);
   let runtime, exited = false;
   child.on('error', (error) => { if (runtime) updateRuntime(runtime.runtime_id, { status: 'exited', blocked_reason: error.message }, { rtDir: RT }); });
   child.once('exit', () => { exited = true; if (runtime) updateRuntime(runtime.runtime_id, { status: 'exited' }, { rtDir: RT }); });
   await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
   try {
-    runtime = registerRuntime({ ...persisted, root_pid: child.pid, process_identity: await getProcessInfo(child.pid),
+    runtime = registerRuntime({ ...persisted, shell_job: null, root_pid: child.pid, process_identity: await getProcessInfo(child.pid),
       child_pids: [], status: exited ? 'exited' : 'running', rtDir: RT });
     return runtime;
   } catch (error) { await killProcessTree(child.pid); throw error; }
@@ -4176,7 +4197,7 @@ async function startManagedRuntimeStep(body) {
   let port = Number(body.port ?? (isolated ? 3020 : 0));
   if (!path.isAbsolute(String(body.executable || '')) || !Array.isArray(args) || args.some((x) => typeof x !== 'string')) throw new Error('runtime executable 必須為絕對路徑，args 必須是字串陣列');
   if (!within(workspace, cwd) || !isolated && (!fs.existsSync(dataDir) || !within(workspace, canonPath(dataDir)))) throw new Error('runtime cwd 與既有 data_dir 必須位於該卡的工作區內');
-  if (!Number.isInteger(port) || port < 1 || port > 65535 || !fs.existsSync(executable)) throw new Error('runtime executable 或 port 不合法');
+  if (!Number.isInteger(port) || port < 1 || port > 65535 || !managedExecutableExists(executable)) throw new Error('runtime executable 或 port 不合法');
   let smoke, runtime;
   try {
     if (isolated) {
@@ -4195,7 +4216,7 @@ async function startManagedRuntimeStep(body) {
     });
     if (!authorized()) { await cleanupRuntime(runtime, { rtDir: RT }); throw new Error('runtime start cancelled: workspace ownership changed'); }
     return { runtime, readiness: await checkBackendReadiness({ ...runtime, rtDir: RT }, { isPidAlive }) };
-  } catch (error) { if (!runtime) smoke?.cleanup(); throw error; }
+  } catch (error) { if (!runtime && !error.shellJobUnconfirmed) smoke?.cleanup(); throw error; }
 }
 
 const routes = {
