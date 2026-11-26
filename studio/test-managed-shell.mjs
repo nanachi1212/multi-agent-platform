@@ -44,7 +44,9 @@ async function startOwner(base, exe, mode) {
   await E.api.acquireWrite(env, t, await E.api.workspaceOf(base));
   const script = fs.readFileSync(new URL('./fixtures/managed-shell-lifecycle.ps1', import.meta.url), 'utf8');
   const argument = mode === 'baseline' ? "'" + example + "'" : '$args[0]';
-  const wrapped = "try { & {\n" + script + "\n} " + argument + " } catch { [IO.File]::WriteAllText((Join-Path $env:DATA_DIR 'fixture-error.txt'), $_.ToString()); exit 2 }";
+  const wrapped = "try { & {\n" + script + "\n} " + argument + " } catch { " +
+    "[IO.File]::WriteAllText([IO.Path]::Combine([Environment]::CurrentDirectory, 'fixture-error.txt'), " +
+    "$_.Exception.GetType().Name + ' line ' + $_.InvocationInfo.ScriptLineNumber); exit 2 }";
   const args = ['-NoLogo', '-NoProfile', '-NonInteractive', ...(mode === 'baseline'
     ? ['-EncodedCommand', Buffer.from(wrapped, 'utf16le').toString('base64')]
     : ['-CommandWithArgs', wrapped, example])];
@@ -81,16 +83,37 @@ async function exercise(exe, mode) {
     assert.deepEqual(runtime.args, []);
     assert.ok(!JSON.stringify(runtime).includes(example));
     const out = path.join(dataDir, 'observed.json');
-    const actual = await waitFor(() => {
-      const error = path.join(dataDir, 'fixture-error.txt');
-      if (fs.existsSync(error)) throw new Error(fs.readFileSync(error, 'utf8'));
-      return fs.existsSync(out) && JSON.parse(fs.readFileSync(out));
-    }, mode + ' shell ready');
+    let actual;
+    try {
+      actual = await waitFor(() => {
+        if (fs.existsSync(out)) return JSON.parse(fs.readFileSync(out));
+        if (fs.existsSync(path.join(base, 'fixture-error.txt')) || shellJobReceipt(rtDir, runtime))
+          throw new Error(mode + ' shell exited before readiness');
+      }, mode + ' shell ready', 45000);
+    } catch (error) {
+      // Never emit registry contents, the target command, environment or exception text.
+      const read = name => {
+        try { return fs.readFileSync(path.join(base, name), 'utf8'); }
+        catch { return ''; }
+      };
+      const stage = read('fixture-stage'), code = read('fixture-error.txt');
+      const completed = shellJobReceipt(rtDir, runtime);
+      const stages = ['entry', 'config-read', 'membership-probe-loaded', 'listener-started', 'worker-started'];
+      console.error('Shell fixture diagnostics:', JSON.stringify({
+        mode, stage: stages.includes(stage) ? stage : 'not observed',
+        exception: /^[A-Za-z]{1,80} line \d{1,4}$/.test(code) ? code : null,
+        rootAlive: registry.isPidAlive(runtime.root_pid), exitCode: completed?.exit_code ?? null,
+        configPresent: fs.existsSync(path.join(dataDir, 'fixture.json')),
+        cwdMatches: fs.realpathSync.native(base).toLowerCase() === fs.realpathSync.native(runtime.cwd).toLowerCase(),
+        dataMatches: fs.realpathSync.native(dataDir).toLowerCase() === fs.realpathSync.native(runtime.data_dir).toLowerCase(),
+      }));
+      throw error;
+    }
     assert.equal(actual.member, true, 'target independently belongs to exact Job');
     assert.equal(actual.pid, runtime.root_pid);
     assert.equal(actual.image.toLowerCase(), runtime.process_identity.executable.toLowerCase());
     assert.equal(actual.argument, example);
-    assert.equal(actual.cwd.toLowerCase(), base.toLowerCase());
+    assert.equal(fs.realpathSync.native(actual.cwd).toLowerCase(), fs.realpathSync.native(base).toLowerCase());
     assert.equal(registry.isPidAlive(actual.child), true);
     const ownership = await registry.checkPortOwnership(port, { rtDir, desiredJobId: runtime.job_id, desiredDataDir: dataDir });
     assert.equal(ownership.status, 'owned_by_current_job', ownership.reason);

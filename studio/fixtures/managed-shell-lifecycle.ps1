@@ -1,6 +1,9 @@
 param([string]$Example)
 $ErrorActionPreference = 'Stop'
+$stageFile = [IO.Path]::Combine([Environment]::CurrentDirectory, 'fixture-stage')
+[IO.File]::WriteAllText($stageFile, 'entry')
 $config = Get-Content -Raw -LiteralPath (Join-Path $env:DATA_DIR 'fixture.json') | ConvertFrom-Json
+[IO.File]::WriteAllText($stageFile, 'config-read')
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -17,8 +20,10 @@ public static class JobMembershipProbe {
   }
 }
 '@
+[IO.File]::WriteAllText($stageFile, 'membership-probe-loaded')
 $listener = New-Object System.Net.Sockets.TcpListener([Net.IPAddress]::Loopback, [int]$env:PORT)
 $listener.Start()
+[IO.File]::WriteAllText($stageFile, 'listener-started')
 try {
   # An ordinary background timer belonging to the managed backend.
   $start = New-Object Diagnostics.ProcessStartInfo
@@ -27,6 +32,7 @@ try {
   $start.UseShellExecute = $false
   $start.CreateNoWindow = $true
   $worker = [Diagnostics.Process]::Start($start)
+  [IO.File]::WriteAllText($stageFile, 'worker-started')
   $status = @{ pid = $PID; member = [JobMembershipProbe]::Member($config.job); child = $worker.Id
     cwd = (Get-Location).Path; argument = $Example; image = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName }
   $json = $status | ConvertTo-Json -Compress
