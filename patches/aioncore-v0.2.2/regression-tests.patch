@@ -1,9 +1,9 @@
 diff --git a/crates/aionui-process/examples/w1_managed_smoke.rs b/crates/aionui-process/examples/w1_managed_smoke.rs
 new file mode 100644
-index 0000000..6f69072
+index 0000000..feec73f
 --- /dev/null
 +++ b/crates/aionui-process/examples/w1_managed_smoke.rs
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,82 @@
 +//! Explicit native smoke executable. Never starts an agent or contacts a model.
 +#[cfg(not(windows))]
 +fn main() {
@@ -19,9 +19,11 @@ index 0000000..6f69072
 +    use aionui_runtime::Builder;
 +    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 +    use std::time::Duration;
-+    use windows_sys::Win32::Foundation::FILETIME;
++    use tokio::io::AsyncBufReadExt;
++    use windows_sys::Win32::Foundation::{FILETIME, WAIT_OBJECT_0, WAIT_TIMEOUT};
 +    use windows_sys::Win32::System::Threading::{
 +        GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
++        WaitForSingleObject, PROCESS_SYNCHRONIZE,
 +    };
 +
 +    let shell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
@@ -52,6 +54,31 @@ index 0000000..6f69072
 +        "image":String::from_utf16_lossy(&name[..length as usize]), "exitCode":status.code(), "modelRequests":0
 +    }));
 +    drop(process);
++    // The child has no subprocesses or tools and will exit on its own after 30 seconds.
++    let child = ManagedProcess::spawn(CommandSpec {
++        command: std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
++            .join("System32/WindowsPowerShell/v1.0/powershell.exe"),
++        args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
++               "Write-Output studio-ready; Start-Sleep -Seconds 30; exit 42"]
++            .into_iter().map(String::from).collect(),
++        env: vec![], cwd: None,
++    }, &[]).await.expect("start owned stop fixture");
++    let (_input, output) = child.take_stdio().await.unwrap();
++    let mut ready = String::new();
++    tokio::time::timeout(Duration::from_secs(8), tokio::io::BufReader::new(output).read_line(&mut ready))
++        .await.expect("ready deadline").unwrap();
++    assert_eq!(ready.trim(), "studio-ready");
++    let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, child.pid()) };
++    assert!(!raw.is_null(), "retain this running child");
++    let owned = unsafe { OwnedHandle::from_raw_handle(raw) };
++    assert_eq!(unsafe { WaitForSingleObject(owned.as_raw_handle(), 0) }, WAIT_TIMEOUT);
++    tokio::time::timeout(Duration::from_secs(8), child.kill(Duration::from_millis(100)))
++        .await.expect("stop deadline").expect("managed stop");
++    assert_eq!(unsafe { WaitForSingleObject(owned.as_raw_handle(), 1000) }, WAIT_OBJECT_0);
++    let stopped = child.exit_status().and_then(|s| s.code()).expect("observed exit code");
++    assert_ne!(stopped, 42, "fixture must stop before its natural exit");
++    println!("W1_MANAGED_STOP pid={} code={} handleSignaled=true modelRequests=0", child.pid(), stopped);
++
 +    let mut ordinary = Builder::clean_cli("cmd.exe");
 +    ordinary.args(["/d", "/c", "echo W1-short-ok"]);
 +    let output = tokio::time::timeout(Duration::from_secs(5), ordinary.output()).await.unwrap().unwrap();

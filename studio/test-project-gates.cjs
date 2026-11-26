@@ -3,6 +3,45 @@ const test = require('node:test');
 const vm = require('node:vm');
 const { region } = require('./lifecycle-harness.cjs');
 
+test('disabling the built-in Claude CLI blocks new and restored work before provider I/O', async () => {
+  const code = region('const AGENTS =', '// ---------- External LLM providers')
+    + region('async function createAgentConv(', '// AionCore pushes')
+    + region('async function turn(agent', '// ---------- External provider operations')
+    + region('const CONTINUE_RE =', 'function leaderStep(w, work)')
+    + region('async function runRoutine(w, r, now)', '// ---------- Plan limits')
+    + region('async function resumeJob(', 'async function reassign(');
+  const events = [];
+  const ctx = { process: { env: {} }, busyConvs: () => [], drainExecution() { throw Error('resume reached drain'); },
+    launching: (_w, fn) => fn(), endLeftSetups() {}, settingUp: () => false, stillStopping: () => false, isDir: () => true,
+    event: kind => events.push(kind), label: () => 'project', notify() {}, saveSettings() {}, api: () => assert.fail('unexpected provider request') };
+  const catalog = () => vm.runInNewContext(region('const AGENTS =', '// ---------- External LLM providers') + '\nAGENTS', { ...ctx });
+  assert.equal(catalog().claude.create('project', true).extra.backend, 'claude');
+  ctx.process.env.STUDIO_DISABLE_BUILTIN_CLAUDE = 'mistyped';
+  assert.throws(catalog, /0 或 1/);
+  ctx.process.env.STUDIO_DISABLE_BUILTIN_CLAUDE = '1';
+  const { AGENTS, createAgentConv, turn, resumeJob, runRoutine } = vm.runInNewContext(code + '\n({ AGENTS, createAgentConv, turn, resumeJob, runRoutine })', ctx);
+  assert.equal(AGENTS.codex.create('project', false).extra.backend, 'codex');
+  assert.equal(AGENTS.antigravity.create('project', true).extra.backend, 'antigravity');
+  const disabled = /已停用內建 Claude Code/;
+  for (const lead of [true, false]) await assert.rejects(createAgentConv('claude', 'project', lead), disabled);
+  await assert.rejects(turn('claude', 'restored-conversation', 'work'), disabled);
+  const scheduled = { leader: 'claude', project: 'project', tasks: [], run: null }, routine = { request: 'scheduled work' };
+  await runRoutine(scheduled, routine, new Date());
+  assert.match(routine.lastResult, disabled);
+  assert.deepEqual(events, ['routine.error']);
+  assert.equal(scheduled.run, null);
+  const w = { leader: 'claude', run: { paused: true, active: false, project: 'project' }, tasks: [] };
+  await assert.rejects(resumeJob(w, {}), /更換工頭/);
+  w.leader = 'codex';
+  w.tasks.push({ title: 'unfinished', status: 'PAUSED', agent: 'claude' });
+  await assert.rejects(resumeJob(w, {}), /先改派「unfinished」/);
+  assert.equal(w.run.paused, true);
+  assert.equal(w.run.active, false);
+  assert.equal(w.tasks[0].status, 'PAUSED');
+  w.tasks[0].status = 'DONE';
+  await assert.rejects(resumeJob(w, {}), /resume reached drain/);
+});
+
 test('continuation belongs to the open tab and the run that requested it', async () => {
   for (const change of ['keep', 'close', 'reopen', 'replace', 'stop']) {
     const w = { project: 'A', tasks: [], run: { stopped: false } };

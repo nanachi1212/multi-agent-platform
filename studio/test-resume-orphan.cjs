@@ -7,6 +7,7 @@ function setup(status = 'ASK_LEADER', overrides = {}) {
   const dispatched = [];
   const w = { project: 'P', leader: 'claude', tasks: [] };
   const env = {
+    AGENTS: { claude: {}, codex: {} },
     S: { workspaces: [w], leases: [] }, convAgent: new Map(), leftSetup: () => { throw Error('unexpected setup'); },
     busyConvs: () => [], endLeftSetups: async () => {},
     workKey: t => t.agent, stopTurn: async () => true, setTimeout, clearTimeout, RT: 'test',

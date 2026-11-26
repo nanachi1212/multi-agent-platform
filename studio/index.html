@@ -747,9 +747,9 @@ function seatHtml(a, w) {
     <div class="seat-last">${esc(lastTxt)}</div>
     ${limitsHtml(a)}
     ${cfgHtml(a, w)}
-    ${a.status === 'unavailable' ? '<button class="btn small" data-recheck title="重新連線並檢查所有 AI 員工">重新連線／重新檢查</button>' : ''}
+    ${a.status === 'unavailable' && !a.disabled ? '<button class="btn small" data-recheck title="重新連線並檢查所有 AI 員工">重新連線／重新檢查</button>' : ''}
     ${a.id === 'codex' && a.status === 'unavailable' ? `<div class="cfg-note">Studio 的 Codex 使用獨立資料夾，不會出現在你平常的 Codex 紀錄。登入一次後按「重新檢查」。</div><button class="btn small" data-codex-login>登入 Codex（Studio 專用）</button>` : ''}
-    ${a.id === 'claude' && a.status === 'unavailable' ? `<div class="cfg-note">Studio 的 Claude 使用你電腦上 Claude Code 的登入。在跳出的視窗登入完成後按「重新檢查」。</div><button class="btn small" data-claude-login>登入 Claude</button>` : ''}
+    ${a.id === 'claude' && a.status === 'unavailable' && !a.disabled ? `<div class="cfg-note">Studio 的 Claude 使用你電腦上 Claude Code 的登入。在跳出的視窗登入完成後按「重新檢查」。</div><button class="btn small" data-claude-login>登入 Claude</button>` : ''}
     ${!w || lead ? '' : `<div class="row"><button class="btn small" data-leader="${a.id}" ${a.status !== 'available' ? 'disabled' : ''}>${busy ? '接手當工頭' : '設為工頭'}</button>
       <button class="btn small ghost" data-worker="${a.id}" data-on="${out ? 1 : 0}" title="只影響這個專案；下一次派工生效">${out ? '讓它參與這個專案' : '這個專案不用它'}</button>
       ${!out && w.tasks.some((t) => t.agent === a.id && OPEN.includes(t.status)) ? `<select data-withdraw="${a.id}" title="例如額度用完：把它移出這個專案，手上還沒做完的卡改派給別人（正在寫入的卡會先停下再交接）"><option value="">⏏ 撤出，卡改派給…</option>${S.agents.filter((x) => x.id !== a.id && x.id !== w.leader && x.status === 'available').map((x) => `<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select>` : ''}</div>`}

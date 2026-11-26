@@ -54,6 +54,12 @@ const AGENTS = {
   codex: { name: 'Codex', create: (ws, lead) => ({ type: 'acp', extra: { backend: 'codex', workspace: ws, session_mode: lead ? 'read-only' : 'auto' } }) },
   antigravity: { name: 'Antigravity', create: (ws, lead) => ({ type: 'antigravity', extra: { backend: 'antigravity', workspace: ws, session_mode: lead ? 'plan' : 'yolo' } }) },
 };
+const disableClaude = process.env.STUDIO_DISABLE_BUILTIN_CLAUDE ?? '0';
+if (!['0', '1'].includes(disableClaude)) throw new Error('STUDIO_DISABLE_BUILTIN_CLAUDE 必須是 0 或 1');
+if (disableClaude === '1') {
+  AGENTS.claude.blockedReason = 'STUDIO_DISABLE_BUILTIN_CLAUDE=1 已停用內建 Claude Code。正式 runtime 尚未驗證完整 Windows 子程序隔離。';
+  AGENTS.claude.checkLaunch = () => { throw new Error(AGENTS.claude.blockedReason); };
+}
 
 // ---------- External LLM providers ----------
 // A provider (name, API format, base URL, API key, model) lives in AionCore, which stores the key encrypted and runs
@@ -61,7 +67,7 @@ const AGENTS = {
 // never the key, so settings.json, /api/state and the logs cannot leak it.
 const EXT_PLATFORMS = ['openai', 'anthropic', 'gemini'];
 function registerExternal(e) {
-  AGENTS[e.id] = { name: e.name, external: true, checkEndpoint: () => validateExternalUrl(e.baseUrl), create: (ws, lead) => ({ type: 'aionrs', model: { provider_id: e.providerId, model: e.model, use_model: e.model }, extra: { workspace: ws, session_mode: lead ? 'plan' : 'yolo' } }) };
+  AGENTS[e.id] = { name: e.name, external: true, checkLaunch: () => validateExternalUrl(e.baseUrl), create: (ws, lead) => ({ type: 'aionrs', model: { provider_id: e.providerId, model: e.model, use_model: e.model }, extra: { workspace: ws, session_mode: lead ? 'plan' : 'yolo' } }) };
   const a = (S.agents[e.id] ??= { id: e.id, status: 'checking', note: '', working: 0, models: [], efforts: [] });
   Object.assign(a, { name: e.name, external: true, models: [{ value: e.model, name: e.model, description: '' }] });
   S.agentCfg[e.id] ??= { model: '', effort: '' };
@@ -109,7 +115,7 @@ function wsOf(p) {
 }
 for (const [id, a] of Object.entries(AGENTS)) {
   // models / efforts are the catalogs the agent itself reports (filled from AionCore events).
-  S.agents[id] = { id, name: a.name, status: 'checking', note: '', working: 0, models: [], efforts: [] };
+  S.agents[id] = { id, name: a.name, status: a.blockedReason ? 'unavailable' : 'checking', note: a.blockedReason || '', disabled: !!a.blockedReason, working: 0, models: [], efforts: [] };
   S.agentCfg[id] = { model: '', effort: '' }; // '' = agent default
 }
 
@@ -120,8 +126,8 @@ const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { retu
 
 try {
   const saved = JSON.parse(fs.readFileSync(SETTINGS, 'utf8'));
-  for (const e of saved.external || []) if (e?.id && e.providerId && e.model) { S.external.push({ id: String(e.id), name: String(e.name || e.model), platform: e.platform, baseUrl: String(e.baseUrl || ''), isFullUrl: !!e.isFullUrl, model: String(e.model), providerId: String(e.providerId) }); registerExternal(S.external.at(-1)); }
-  for (const e of saved.acp || []) if (e?.id && (e.backend || e.agentId)) { S.acp.push({ id: String(e.id), name: String(e.name || e.id), backend: String(e.backend || ''), yolo: String(e.yolo || ''), agentId: String(e.agentId || ''), command: String(e.command || ''), args: (e.args || []).map(String) }); registerAcp(S.acp.at(-1)); }
+  for (const e of saved.external || []) if (e?.id && !Object.hasOwn(AGENTS, e.id) && e.providerId && e.model) { S.external.push({ id: String(e.id), name: String(e.name || e.model), platform: e.platform, baseUrl: String(e.baseUrl || ''), isFullUrl: !!e.isFullUrl, model: String(e.model), providerId: String(e.providerId) }); registerExternal(S.external.at(-1)); }
+  for (const e of saved.acp || []) if (e?.id && !Object.hasOwn(AGENTS, e.id) && (e.backend || e.agentId)) { S.acp.push({ id: String(e.id), name: String(e.name || e.id), backend: String(e.backend || ''), yolo: String(e.yolo || ''), agentId: String(e.agentId || ''), command: String(e.command || ''), args: (e.args || []).map(String) }); registerAcp(S.acp.at(-1)); }
   // Older versions kept only API budgets for closed tabs, keyed by the same physical folder.
   S.closedWorkspaces = { ...saved.closedApiBudgets, ...saved.closedWorkspaces };
   if (AGENTS[saved.leader]) S.leader = saved.leader;
@@ -287,7 +293,7 @@ function aionExited(code, signal) {
   aionGone = 'AionCore 已停止，請重新啟動 Studio';
   console.error(`AionCore 在就緒後自己結束了（exit code ${code ?? '—'}${signal ? '，signal ' + signal : ''}）；之後的 AI 操作都會失敗，請重新啟動 Studio。`);
   event('aioncore.exit', { code, signal });
-  for (const a of Object.values(S.agents)) Object.assign(a, { status: 'unavailable', note: aionGone, checkTok: {} });
+  for (const a of Object.values(S.agents)) if (!a.disabled) Object.assign(a, { status: 'unavailable', note: aionGone, checkTok: {} });
 }
 const codexRuntime = createCodexRuntimeGuard({ rtDir: RT, api, owner: () => aionProcess });
 async function startAion() {
@@ -350,6 +356,7 @@ async function createConv(agent, ws, lead, cfg) {
   return agent === 'codex' ? codexRuntime.create(create) : create();
 }
 async function createAgentConv(agent, ws, lead, cfg) {
+  AGENTS[agent].checkLaunch?.();
   const body = AGENTS[agent].create(ws, lead);
   if (cfg?.model && !AGENTS[agent].external) body.extra.current_model_id = cfg.model;
   if (cfg?.effort) body.extra.thought_level = cfg.effort;
@@ -556,7 +563,7 @@ async function sendSteer(w, agent, convId) {
   }
 }
 async function turn(agent, convId, text, { w, lead = false, check = false, allowStart, ask = false, timeout = 25 * 60e3, progressEvery = 30000, bill = lead && !check ? 'lead' : null } = {}) {
-  AGENTS[agent]?.checkEndpoint?.();
+  AGENTS[agent]?.checkLaunch?.(); // restored conversations skip createAgentConv
   const run = w?.run, epoch = run?.lifecycleEpoch || 0;
   const halted = () => run && (w.run !== run || (run.lifecycleEpoch || 0) !== epoch || run.stopped || run.paused) || allowStart && !allowStart();
   const unsent = (why) => Object.assign(new Halt(why), { unsent: true }); // halted before the message went out: the agent never saw it
@@ -802,6 +809,7 @@ async function codexFailureNote(message) {
 }
 async function checkAgent(id) {
   const a = S.agents[id], tok = (a.checkTok = {}); // a newer check (after an edit or re-test) wins over this one
+  if (a.disabled) return;
   a.status = 'checking';
   a.note = '';
   try {
@@ -1470,6 +1478,7 @@ async function startJob(w, request, cont, inherit) {
   if (!isDir(w.project)) throw new Error('專案資料夾不存在：' + w.project);
   if (!request.trim()) throw new Error('請輸入需求');
   const lead = w.leader;
+  if (AGENTS[lead]?.blockedReason) throw new Error(AGENTS[lead].blockedReason + ' 請更換工頭。');
   if (!available(lead)) throw new Error(`Leader ${agentName(lead)} 目前不可用`);
   if (!workersFor(w, lead).length) throw new Error('這個專案至少需要一位可用的 Worker');
 
@@ -3149,6 +3158,7 @@ function workInfo(w, t) {
 async function askAgent(w, id, text) {
   const t = w.tasks.find((x) => x.id === id);
   if (!t) throw new Error('找不到這張工作卡');
+  AGENTS[t.agent]?.checkLaunch?.();
   if (!ASKABLE.includes(t.status)) throw new Error('這張卡現在沒有在工作，沒有可以詢問的對象');
   const cid = convOf(w, t);
   if (!cid) throw new Error('這位 AI 員工還沒開始這張卡，等它開始後再問');
@@ -3809,6 +3819,9 @@ async function resumeJob(w, opts) {
   if (run?.stopped && !run.paused) throw new Error('這件工作已經停止，不能繼續；按「▶ 接著處理」開新的一輪');
   if (!run?.paused) throw new Error('沒有暫停中的工作');
   if (busyConvs(run).length || w.leaderSteps?.size || w.executingSteps?.size) throw new Error('Agent 還在停下中，請幾秒後再按繼續');
+  if (AGENTS[w.leader]?.blockedReason) throw new Error(AGENTS[w.leader].blockedReason + ' 請更換工頭後再繼續。');
+  const blockedCard = w.tasks.find(t => !['DONE', 'FAILED'].includes(t.status) && AGENTS[t.agent]?.blockedReason);
+  if (blockedCard) throw new Error(AGENTS[blockedCard.agent].blockedReason + ` 請先改派「${blockedCard.title}」再繼續。`);
   await drainExecution(w); // restart may have left an orphan conversation
   await endLeftSetups(w, w.tasks);
   if (!isDir(run.project)) throw new Error('專案資料夾不存在：' + run.project);
@@ -4263,7 +4276,7 @@ const routes = {
   'POST /api/acp/check': (b) => { if (!acpOf(b.id)) throw new Error('找不到這個 ACP agent'); checkAgent(b.id); },
   // One-time login for Studio's separate Codex home, in a visible console window.
   // Claude uses the machine's normal Claude Code login (no separate home).
-  'POST /api/claude-login': () => { spawn('cmd', ['/c', 'start', 'Claude login (Studio)', 'cmd', '/k', 'claude', 'auth', 'login'], { detached: true, stdio: 'ignore' }); },
+  'POST /api/claude-login': () => { AGENTS.claude.checkLaunch?.(); spawn('cmd', ['/c', 'start', 'Claude login (Studio)', 'cmd', '/k', 'claude', 'auth', 'login'], { detached: true, stdio: 'ignore' }); },
   'POST /api/codex-login': () => { spawn('cmd', ['/c', 'start', 'Codex login (Studio)', 'cmd', '/k', 'codex', 'login'], { env: { ...process.env, CODEX_HOME }, detached: true, stdio: 'ignore' }); },
   'GET /api/history': () => listHistory(),
   'GET /api/runtimes': () => refreshRuntimeReadiness(),

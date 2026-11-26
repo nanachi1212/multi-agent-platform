@@ -1,0 +1,30 @@
+name: Studio lifecycle checks (manual)
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    name: Studio dispatch and recovery (simulated providers)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verify seat policy, scheduling and recovery
+        shell: pwsh
+        run: |
+          foreach ($name in @(
+            'test-project-gates', 'test-resume-orphan', 'test-stop-retry',
+            'test-audit-lifecycle', 'test-leader-lifecycle', 'test-card-interrupt',
+            'test-project-state-action', 'test-stopped-upgrade', 'test-workspace-settings'
+          )) {
+            node "studio/$name.cjs"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Verify the pinned runtime with a loopback provider
+        run: node studio/test-external-budget-contract.mjs

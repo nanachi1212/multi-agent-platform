@@ -94,7 +94,7 @@ try {
   env.PATH = ['System32', 'System32/Wbem', 'System32/WindowsPowerShell/v1.0'].map(dir => path.join(process.env.SystemRoot, dir)).join(path.delimiter);
   Object.assign(env, { HOME: home, USERPROFILE: home, APPDATA: path.join(home, 'roaming'), LOCALAPPDATA: path.join(home, 'local'),
     TEMP: path.join(temp, 'tmp'), TMP: path.join(temp, 'tmp'), CODEX_HOME: path.join(home, '.codex'), CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
-    STUDIO_RUNTIME: runtime, STUDIO_PORT: String(studioPort), STUDIO_NO_OPEN: '1' });
+    STUDIO_RUNTIME: runtime, STUDIO_PORT: String(studioPort), STUDIO_NO_OPEN: '1', STUDIO_DISABLE_BUILTIN_CLAUDE: '1' });
   child = spawn(process.execPath, [path.join(temp, 'studio', 'server.mjs')], { cwd: temp, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   child.on('error', error => { startupError = error; });
   child.stderr.resume();
@@ -106,13 +106,18 @@ try {
   });
   identity = await getProcessInfo(child.pid);
   await until(() => studioUrl, 'isolated Studio URL');
-  async function api(route, body) {
+  async function api(route, body, expectedStatus = 200) {
     const response = await fetch(studioUrl.origin + '/api/' + route, { method: body ? 'POST' : 'GET',
       headers: { 'content-type': 'application/json', 'x-studio-token': studioUrl.hash.slice(3) },
       body: JSON.stringify(body), signal: AbortSignal.timeout(15000) });
-    assert.ok(response.ok, 'Studio ' + route + ' returned ' + response.status);
+    assert.equal(response.status, expectedStatus, 'Studio ' + route + ' returned ' + response.status);
     return response.json();
   }
+  const claude = (await api('state')).agents.find(agent => agent.id === 'claude');
+  assert.equal(claude.status, 'unavailable');
+  assert.equal(claude.disabled, true);
+  assert.match(claude.note, /STUDIO_DISABLE_BUILTIN_CLAUDE/);
+  assert.match((await api('claude-login', {}, 400)).error, /已停用內建 Claude Code/);
   const register = model => api('external/save', { name: model, platform: 'openai', model, baseUrl: 'http://127.0.0.1:' + provider.address().port + '/v1' });
   const { id: leaderId } = await register('fixture-planner');
   ({ id: workerId } = await register('fixture-worker'));

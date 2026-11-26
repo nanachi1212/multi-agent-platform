@@ -2,6 +2,31 @@
 
 **W1 尚未解決。正式 Studio 仍使用官方 AionCore v0.2.2，這份修補不會自動套用或替換正式 binary。**
 
+## 停用 Studio 的內建 Claude Code
+
+在 PowerShell 設定 `$env:STUDIO_DISABLE_BUILTIN_CLAUDE='1'`，從同一視窗執行 `.\start-studio.cmd`。Studio 啟動時讀取這個值；未設定或設為 `0` 會使用原有席位。啟用後，啟動探測、額度查詢、登入與既有對話送出工作都會被略過或拒絕。以該席位為工頭的定時工作會記錄未啟動原因；歷史工作若還有該席位的未完成卡片，會維持暫停並提示先改派。
+
+此設定只約束 Studio 內建 Claude 席位。自訂 ACP、專案設定的命令與其他 Agent 仍可啟動其可用的工具。正式 v0.2.2 的命令列提供父程序監看與資源來源選擇；截至 2026-11-27，發行版及其命令列均未提供可據以認定 Store PowerShell 完整隔離的選項。[上游正式版](https://github.com/iOfficeAI/AionCore/releases/tag/v0.2.2)
+
+## 單獨驗證正常直接子程序
+
+在獨立 checkout 的固定版來源依下節順序套用兩個 patch 後，在該 checkout 執行 `cargo +1.95.0 run --locked --release -p aionui-process --example w1_managed_smoke`。這個 example 只啟動傳統 Win32 PowerShell 及一個短命令，不使用模型。它驗證直接子程序正常退出碼為 42，再等另一個子程序輸出就緒訊號，要求停止，並觀察同一個 Windows 程序 handle 在期限內轉為已退出。驗收輸出應包含 `W1_MANAGED_SMOKE`、`W1_MANAGED_STOP` 的 `handleSignaled=true` 和 `W1_ORDINARY_SMOKE PASS`。
+
+這條路徑實際使用修補候選的 release 程序庫。它的覆蓋範圍限於正常直接子程序；Store PowerShell、Claude 本體和重啟後的 session 恢復需要各自取得驗收證據。
+
+### 2026-11-27 完整應用與 ACP 實測
+
+在獨立暫存 checkout 套用兩份 patch，以 Rust 1.95.0、`RUSTFLAGS=-C target-feature=+crt-static` 和 `cargo build --locked --release --target x86_64-pc-windows-msvc -p aionui-app` 建置完整候選。該次 `aioncore.exe` 的 SHA-256 為 `1cec1ffdc525feffb2118f2fe2442ace2369d1f6f6b27a3583fa0a8075e6532d`。所有 ACP 案例均先核對該值，再用全新暫存資料庫、loopback、臨時登入及本機 Node fixture 執行。外部模型請求數為 0。
+
+| 對象 | 實測操作 | 觀察結果 |
+| --- | --- | --- |
+| 完整候選與 Win32 直接子程序 | 登入並讀取 provider 清單，另執行上述 release 程序庫 example | API 回應成功。傳統 PowerShell 正常退出碼 42；另一個子程序輸出就緒後被主動停止，退出碼 1，同一個 Windows handle 確認已退出。 |
+| 既有 `studio/fixtures/contract-acp.cjs` | 建立對話、取得 OK、取消執行中的工作，再用同一 session 要求 OK | 收到 ACP `session/cancel`，狀態回到 idle，原 fixture 程序完成第二次回覆。 |
+| 同一 fixture，未宣告 `loadSession` | 呼叫 `runtime/restart` 後，在原 conversation 送出下一輪；另開新 conversation 作對照 | 舊程序退出、新程序初始化、原兩筆回覆 ID 保留。原 conversation 的下一輪回報 `The selected Agent does not support this operation`，未收到新的 OK。另開的新 conversation 正常回覆 OK。 |
+| 宣告 `loadSession: true` 的暫存 fixture | 記錄一個隨機測試值，重啟 runtime，再請新程序讀回該值 | 新程序收到原 sessionId 的 `session/load`，未收到 `session/new`。回覆與原測試值逐字相符，舊程序已退出、歷史回覆 ID 保留。 |
+
+兩種 ACP 測試結束時，均核對已記錄的測試程序身分並確認退出。上述差異可用於判斷自訂 ACP 的恢復能力。正式 Studio 目前使用官方 SHA-256 `67eb02774bab3855b759ec9756c2e540cd17b64b850407fa4b8bad07fd8a0892`。Store PowerShell 程序隔離、真實 Claude 取消與 session 恢復仍待驗收。
+
 ## 修復邊界
 
 來源固定為 AionCore `47e66d0d151123e973b3fd1e77afcb5671b3f8c5`（v0.2.2）。`patches/aioncore-v0.2.2/` 包含兩個依序套用的 patch：

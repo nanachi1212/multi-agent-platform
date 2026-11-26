@@ -9,7 +9,7 @@ function setup(overrides = {}) {
   const task = { id: 't', agent: 'codex', status: 'FAILED', stopUnconfirmed: true, runtimeStopPending: true };
   const w = { project: 'P', leader: 'claude', tasks: [task], activity: [], run: {
     id: 'old', stopped: true, paused: false, active: false, convs: { codex: 'old-conv' }, runtimeCleanup: Promise.resolve() } };
-  const env = { crypto, setTimeout, clearTimeout, RT: 'fixture',
+  const env = { crypto, setTimeout, clearTimeout, RT: 'fixture', AGENTS: { claude: {}, codex: {} },
     endLeftSetups: async () => {}, settingUp: () => false, stopPreparing: async () => {},
     stop: () => {}, busyConvs: () => [], workKey: t => t.agent,
     stopTurn: async () => { calls++; return canStop; },
