@@ -1130,7 +1130,7 @@ function finish(w, status) {
 // (0 = no limit: it keeps going until the Leader has no next step, a job fails or needs the user, or the user stops it).
 function autoNext(w, run) {
   const next = run.suggestions?.[0];
-  if (w.afterDone !== 'auto' || w.run !== run || !next) return;
+  if (!S.workspaces.includes(w) || w.afterDone !== 'auto' || w.run !== run || !next) return;
   if (w.autoMax && w.autoRounds >= w.autoMax) {
     log(w, 'studio', 'system', `已自動連續做了 ${w.autoMax} 件，先停下來等你。`);
     return notify(`${label(w)}：自動持續開發先停下`, `已連續自動做了 ${w.autoMax} 件，等你看過再繼續`, 'ask', w.project);

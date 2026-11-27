@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const vm = require('node:vm');
-const { region } = require('./lifecycle-harness.cjs');
+const { region, makeEnv, newW, TMP_DIRS } = require('./lifecycle-harness.cjs');
 
 test('disabling the built-in Claude CLI blocks new and restored work before provider I/O', async () => {
   const code = region('const AGENTS =', '// ---------- External LLM providers')
@@ -40,6 +40,32 @@ test('disabling the built-in Claude CLI blocks new and restored work before prov
   assert.equal(w.tasks[0].status, 'PAUSED');
   w.tasks[0].status = 'DONE';
   await assert.rejects(resumeJob(w, {}), /resume reached drain/);
+});
+
+test('a scheduled follow-up dispatch belongs to the tab where the job finished', async t => {
+  const fs = require('node:fs');
+  const prior = TMP_DIRS.length;
+  t.after(() => { for (const dir of TMP_DIRS.splice(prior)) fs.rmSync(dir, { recursive: true, force: true }); });
+  for (const change of ['keep', 'close', 'reopen']) {
+    let followUp;
+    const { env, api } = makeEnv(() => '', { setTimeout: (callback, ms) => {
+      assert.equal(ms, 5000); followUp = callback;
+    } });
+    const w = Object.assign(newW(), { afterDone: 'auto', autoMax: 5, autoRounds: 0 });
+    w.run.suggestions = [{ title: 'next', request: 'test the next step' }];
+    env.S.workspaces.push(w);
+    api.finish(w, 'done');
+    await w.run.runtimeCleanup;
+    if (change !== 'keep') api.closeWorkspace(w);
+    if (change === 'reopen') env.S.workspaces.push({ ...w });
+    const notices = env.notices.length;
+    followUp();
+    const expected = change === 'keep' ? 1 : 0;
+    assert.equal(env.started.length, expected, change);
+    assert.equal(w.autoRounds, expected, change);
+    assert.equal(env.events.filter(x => x.type === 'auto.start').length, expected, change);
+    assert.equal(env.notices.length - notices, expected, change);
+  }
 });
 
 test('continuation belongs to the open tab and the run that requested it', async () => {
