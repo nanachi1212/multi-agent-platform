@@ -23,6 +23,12 @@ Studio 關閉後，Job 持有程序繼續監看根 shell。收到停止要求或
 
 手動 Windows CI 另列此項驗證。設定 `STUDIO_REQUIRE_STORE_TEST=1` 時，缺少 MSIX 安裝路徑或無法完成該路徑的測試會直接失敗。Runner 沒有註冊別名時單列 `stop-alias NOT TESTED`；Win32 控制組獨立執行。
 
+## Windows 內建 Claude 的取消與對話恢復
+
+Windows Studio 取消內建 Claude 工作時，先等同一對話已送出的訊息取得回應，再從 AionCore v0.2.2 的 SQLite 資料庫唯讀取得該對話的 Claude session ID（使用 Node.js 22.13 或更新版本）。Studio 記下 AionCore 直接啟動、帶有該 ID 的原生 `claude.exe` 及當時可辨識的子程序，取消當前回合並只重啟該對話。原 PID 與建立時間都已退出、新 CLI 使用原 ID 的 `--resume` 且對話回到可用的閒置狀態後，才確認停止。待確認紀錄存在 `runtime/studio/claude-stops/`，重試會核對先前看到的程序。身分、送信結果或恢復狀態無法確認時，Studio 保留寫入租約。
+
+自動驗收使用正式 AionCore、隔離的本機模擬 Claude CLI 與兩段獨立對話。它檢查普通 Windows 子程序退出、新 CLI 讀回上一輪的隨機值，以及另一段對話持續可用。獨立的 ACP 測試驗證原訊息 ID 與 `session/load`。這些測試沒有呼叫雲端模型。取消前已脫離可辨識樹的程序、CLI 包裝器，以及真實 Claude 間接啟動的 Store PowerShell 仍缺完整隔離證據；故 #1 維持開啟。
+
 ## 停用 Studio 的內建 Claude Code
 
 在 PowerShell 設定 `$env:STUDIO_DISABLE_BUILTIN_CLAUDE='1'`，從同一視窗執行 `.\start-studio.cmd`。Studio 啟動時讀取這個值；未設定或設為 `0` 會使用原有席位。啟用後，啟動探測、額度查詢、登入與既有對話送出工作都會被略過或拒絕。以該席位為工頭的定時工作會記錄未啟動原因；歷史工作若還有該席位的未完成卡片，會維持暫停並提示先改派。

@@ -21,13 +21,21 @@ jobs:
           foreach ($name in @(
             'test-project-gates', 'test-resume-orphan', 'test-stop-retry',
             'test-audit-lifecycle', 'test-leader-lifecycle', 'test-card-interrupt',
-            'test-project-state-action', 'test-stopped-upgrade', 'test-workspace-settings'
+            'test-project-state-action', 'test-stopped-upgrade', 'test-workspace-settings',
+            'test-codex-runtime', 'test-runtime-server'
           )) {
             node "studio/$name.cjs"
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: Verify the pinned runtime with a loopback provider
         run: node studio/test-external-budget-contract.mjs
+      - name: Verify cancellation and original session recovery without a model
+        shell: pwsh
+        run: |
+          foreach ($test in @('test-claude-stop', 'test-builtin-claude-lifecycle', 'test-session-recovery-contract')) {
+            node "studio/$test.mjs"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       - name: Prepare packaged PowerShell for the Windows Job test
         shell: powershell
         run: |

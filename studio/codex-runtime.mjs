@@ -4,10 +4,12 @@ import { listRuntimes, registerRuntime, updateRuntime } from './runtime-registry
 // Query failures must not look like an empty process tree. Never terminate by name or bare PID.
 export async function processSnapshot() {
   if (process.platform !== 'win32') throw new Error('Codex process confirmation requires Windows');
-  const command = 'Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,CreationDate,UserModeTime,KernelModeTime | ConvertTo-Json -Compress';
+  const command = '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,CreationDate,UserModeTime,KernelModeTime | ConvertTo-Json -Compress';
   const out = await new Promise((resolve, reject) => execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command],
     { windowsHide: true, timeout: 15000, maxBuffer: 8 * 1024 * 1024 }, (error, stdout) => error ? reject(error) : resolve(stdout)));
-  return [].concat(JSON.parse(out)).map((p) => ({ pid: p.ProcessId, parent: p.ParentProcessId,
+  let rows;
+  try { rows = JSON.parse(out); } catch { throw new Error('Windows process snapshot could not be decoded'); }
+  return [].concat(rows).map((p) => ({ pid: p.ProcessId, parent: p.ParentProcessId,
     executable: p.ExecutablePath || '', command: p.CommandLine || '', creationDate: p.CreationDate,
     cpu: Number(p.UserModeTime || 0) + Number(p.KernelModeTime || 0) })); // 100 ns units; only compared with itself
 }

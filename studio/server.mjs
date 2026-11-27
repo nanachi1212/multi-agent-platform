@@ -4,6 +4,7 @@ import http from 'node:http';
 import { applyTurnModel, updateModelCatalog } from './live-models.mjs';
 import { AION_RELEASE, createAionClient, readAionrsUsage } from './aion-client.mjs';
 import { acpBackendCommand, withAcpLauncherPath } from './acp-command.mjs';
+import { sendClaudeMessage, stopClaudeConversation } from './claude-runtime.mjs';
 import { isPackagedPowerShell, launchPackagedPowerShell, managedExecutableExists, shellJobReceipt } from './managed-shell.mjs';
 import { createWorkspaceLeaseStore } from './workspace-lease.mjs';
 import fs from 'node:fs';
@@ -278,7 +279,14 @@ function event(type, data = {}) {
 let BASE;
 const aionDataDir = path.join(RT, 'studio', 'data');
 const aion = createAionClient({ baseUrl: () => BASE, unavailable: () => aionGone });
-const api = aion.api;
+async function api(method, route, body) {
+  const message = method === 'POST' && /^\/api\/conversations\/([^/]+)\/messages$/.exec(route);
+  if (message && isClaudeConv(message[1])) {
+    if (stoppingTurns.has(message[1])) throw Object.assign(new Error('Claude 正在停止'), { stopUnconfirmed: true });
+    return sendClaudeMessage(RT, message[1], aionProcess, () => aion.api(method, route, body));
+  }
+  return aion.api(method, route, body);
+}
 
 async function ensureAion() {
   const result = await ensureVerifiedExecutable({ target: AION, ...AION_RELEASE,
@@ -468,6 +476,9 @@ async function answerConfirmations(w, convId, allow) {
 // Stops whatever the conversation is doing (a step still waiting for a permission answer, a runaway command)
 // and waits until it is idle. Returns false when it will not stop.
 const stoppingTurns = new Map();
+function isClaudeConv(cid) {
+  return process.platform === 'win32' && convAgent.get(cid) === 'claude';
+}
 function isCodexConv(cid) {
   return convAgent.get(cid) === 'codex' || S.workspaces.some((w) => Object.entries(w.run?.convs || {}).some(([key, id]) => id === cid && key.startsWith('codex:')));
 }
@@ -478,6 +489,9 @@ async function stopTurn(convId) {
   try { return await pending; } finally { stoppingTurns.delete(convId); }
 }
 async function stopConversation(convId) {
+  if (isClaudeConv(convId)) {
+    return stopClaudeConversation({ cid: convId, api, owner: () => aionProcess, rtDir: RT, allowRestart: !AGENTS.claude.blockedReason });
+  }
   // An orphan turn (e.g. left by a timed-out step) is not in `active`: ask the conversation which turn is running.
   const turnId = active.get(convId) ?? (await api('GET', `/api/conversations/${convId}`).catch(() => ({}))).runtime?.turn_id;
   await api('POST', `/api/conversations/${convId}/cancel`, { turn_id: turnId }).catch(() => {});
@@ -863,7 +877,8 @@ const busyConvs = (run) => Object.values(run.convs).filter((c) => active.has(c))
 class Halt extends Error {}
 
 const workersFor = (w, lead) => w.workers.filter((id) => id !== lead && available(id));
-const cancelTurn = (cid) => api('POST', `/api/conversations/${cid}/cancel`, { turn_id: active.get(cid) }).catch(() => {});
+const cancelTurn = (cid) => isClaudeConv(cid) ? stopTurn(cid)
+  : api('POST', `/api/conversations/${cid}/cancel`, { turn_id: active.get(cid) }).catch(() => {});
 
 function handoffNote(run) {
   return run.handoffFrom ? `\nYou are taking over as LEADER from ${agentName(run.handoffFrom)}. Continue the same job; do not ask the user to repeat the request.\n` : '';
@@ -2156,7 +2171,7 @@ async function leaseBlocker(w) {
 
 // Runtime ownership hook: stopTurn must confirm cancellation, then all card cleanup must finish.
 function markRuntimeStops(w) {
-  for (const t of w.tasks) if (t.agent === 'codex' && w.run?.convs?.[workKey(t)]) t.runtimeStopPending = true;
+  for (const t of w.tasks) if ((t.agent === 'codex' || (t.agent === 'claude' && w.run?.stopped)) && w.run?.convs?.[workKey(t)]) t.runtimeStopPending = true;
   for (const task of w.tasks) if (w.recoverySteps?.has(task.id) || w.runtimeStarts?.has(task.id)) task.runtimeStopPending = true;
   for (const runtime of listRuntimes({ rtDir: RT })) if (runtime.job_id === w.run?.id && ['running', 'exited', 'stale'].includes(runtime.status)) {
     const task = w.tasks.find((t) => t.id === runtime.card_id);
@@ -2165,10 +2180,11 @@ function markRuntimeStops(w) {
 }
 async function cleanupCardRuntimes(w, cards, jobId = w.run.id, convs = w.run?.convs || {}) {
   for (const t of cards) {
-    const cid = t.agent === 'codex' && convs[workKey(t)];
+    const needsStop = t.agent === 'codex' || (t.agent === 'claude' && (w.run?.paused || w.run?.stopped || t.runtimeStopPending || t.stopUnconfirmed));
+    const cid = needsStop && convs[workKey(t)];
     if (cid && !(await stopTurn(cid))) {
       t.stopUnconfirmed = true;
-      throw new Error('Codex 工具程序尚未確認停止；保留租約');
+      throw new Error(`${t.agent === 'claude' ? 'Claude' : 'Codex'} 工具程序尚未確認停止；保留租約`);
     }
   }
   const result = await cleanupJobRuntimes(jobId, { rtDir: RT, cardIds: cards.map((t) => t.id) });
@@ -2182,7 +2198,8 @@ async function cleanupCardRuntimes(w, cards, jobId = w.run.id, convs = w.run?.co
 async function drainExecution(w, cards = w.tasks) {
   const pending = cards.map((t) => w.executingSteps?.get(t.id)).filter(Boolean);
   const leaders = cards === w.tasks ? [...w.leaderSteps || []] : [];
-  const cids = [...new Set([...(cards === w.tasks ? busyConvs(w.run) : []), ...cards.map((t) => w.run.convs[workKey(t)]).filter(Boolean)])];
+  const claudeLeads = cards === w.tasks ? Object.entries(w.run.convs).filter(([key]) => key.startsWith('claude:lead')).map(([, cid]) => cid) : [];
+  const cids = [...new Set([...(cards === w.tasks ? busyConvs(w.run) : []), ...claudeLeads, ...cards.map((t) => w.run.convs[workKey(t)]).filter(Boolean)])];
   const stopped = await Promise.all(cids.map((cid) => stopTurn(cid)));
   if (stopped.some((ok) => !ok)) throw new Error('Agent 還沒有真的停下來；保留寫入租約');
   let timer;

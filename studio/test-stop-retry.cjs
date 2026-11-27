@@ -45,6 +45,18 @@ function setup(overrides = {}) {
   assert.notEqual(x.w.run, old); assert.equal(x.stats().planned, 1);
   assert.equal(x.task.stopUnconfirmed, false); assert.equal(x.task.runtimeStopPending, false);
   assert.equal(x.stats().released, 1);
+  // A stopped card can look idle before Claude tools exit, including an interrupted leader.
+  const checked = [];
+  let drained = false;
+  const c = setup({ stopTurn: async cid => { checked.push(cid); return drained; } });
+  c.task.agent = 'claude';
+  c.w.run.convs = { claude: 'worker-id', 'claude:lead': 'leader-id' };
+  await assert.rejects(c.api.stopAndDrain(c.w), /保留寫入租約/);
+  assert.deepEqual(new Set(checked), new Set(['worker-id', 'leader-id']));
+  assert.equal(c.stats().released, 0);
+  drained = true;
+  await c.api.stopAndDrain(c.w);
+  assert.equal(c.stats().released, 1);
   // Do not replace records while an existing step/finalizer is still running.
   const y = setup(), gate = deferred(), oldY = y.w.run;
   y.setStop(true); y.w.executingSteps = new Map([['t', { done: gate.promise }]]);

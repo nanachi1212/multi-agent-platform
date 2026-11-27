@@ -245,10 +245,10 @@ module.exports = async function run({ makeEnv, mkTmp, region }) {
 
     // Failed orphan cancellation forbids replacing its conversation with another writer.
     const orphanCode = region('async function stopTurn(convId)', '// Changes whenever');
-    const send = new Function('active', 'api', 'sleep', 'stoppingTurns', 'isCodexConv', orphanCode + '\nreturn sendMessage;')(new Map(), async (method, endpoint) => {
+    const send = new Function('active', 'api', 'sleep', 'stoppingTurns', 'isCodexConv', 'isClaudeConv', orphanCode + '\nreturn sendMessage;')(new Map(), async (method, endpoint) => {
       if (method === 'POST' && endpoint.endsWith('/messages')) throw new Error('CONFLICT already running');
       return method === 'GET' ? { runtime: { state: 'running', is_processing: true, turn_id: 'orphan' } } : {};
-    }, async () => {}, new Map(), () => false);
+    }, async () => {}, new Map(), () => false, () => false);
     await assert.rejects(send('conv', 'resume'), (e) => e.stuck && e.stopUnconfirmed);
     const Unconfirmed = setup(repo().d, { turn: async () => { throw Object.assign(new Error('orphan still running'), { stopUnconfirmed: true }); } });
     Unconfirmed.w.run.active = true; Unconfirmed.w.run.paused = false; Unconfirmed.t.status = 'WAITING';

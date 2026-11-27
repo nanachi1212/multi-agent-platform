@@ -11,7 +11,8 @@ import { writeJson } from './state-files.mjs'; // circular with state-files.mjs:
 
 function execPowerShell(cmd) {
   return new Promise((resolve, reject) => {
-    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', cmd], { windowsHide: true, timeout: 10000 }, (err, stdout, stderr) => {
+    const command = '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ' + cmd;
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], { windowsHide: true, timeout: 10000 }, (err, stdout, stderr) => {
       if (err) return reject(new Error(stderr || err.message));
       resolve(String(stdout || ''));
     });
