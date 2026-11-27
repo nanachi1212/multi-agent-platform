@@ -49,20 +49,23 @@ export async function ensureVerifiedExecutable({ target, url, archiveHash, execu
     if (!response.ok) throw new Error(`AionCore 下載失敗：HTTP ${response.status}`);
     return Buffer.from(await response.arrayBuffer());
   },
-  extract = (zip, dir) => new Promise((resolve, reject) => execFile('tar', ['-xf', zip, '-C', dir],
-    { windowsHide: true, timeout: 120000 }, error => error ? reject(error) : resolve()))
+  extract = (zip, dir) => new Promise((resolve, reject) => execFile('tar', ['-xf', path.basename(zip)],
+    { cwd: dir, windowsHide: true, timeout: 120000 }, error => error ? reject(error) : resolve()))
 } = {}) {
   if (await fileHash(target) === executableHash) return { installed: false };
   fs.mkdirSync(path.dirname(target), { recursive: true });
   // Same volume as the destination: only a complete verified executable is published.
   const stage = fs.mkdtempSync(path.join(path.dirname(target), '.install-'));
   try {
-    let zip = cachedArchive;
-    if (!zip || await fileHash(zip) !== archiveHash) {
+    // Windows tar can lose Unicode paths in argv. Use a fixed archive name in its working directory.
+    const zip = path.join(stage, 'aioncore.zip');
+    if (cachedArchive) {
+      try { fs.copyFileSync(cachedArchive, zip); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    }
+    if (await fileHash(zip) !== archiveHash) {
       const bytes = await download();
       if (digest(bytes) !== archiveHash) throw new Error('AionCore 下載檔 SHA-256 不符，已中止');
-      zip = path.join(stage, 'aioncore.zip');
-      fs.writeFileSync(zip, bytes, { flag: 'wx', flush: true });
+      fs.writeFileSync(zip, bytes, { flush: true });
     }
     await extract(zip, stage);
     const executable = path.join(stage, path.basename(target));

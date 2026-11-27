@@ -39,7 +39,7 @@ const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
     fs.writeFileSync(path.join(payload, 'aioncore.exe'), executable);
     const archive = path.join(root, 'fixture.zip');
     execFileSync('tar', ['-acf', archive, '-C', payload, 'aioncore.exe'], { windowsHide: true });
-    const bytes = fs.readFileSync(archive), destination = path.join(root, 'install', 'aioncore.exe');
+    const bytes = fs.readFileSync(archive), destination = path.join(root, '安裝 測試', 'aioncore.exe');
     const options = { target: destination, url: 'https://example.invalid/fixture.zip', cachedArchive: archive,
       archiveHash: hash(bytes), executableHash: hash(executable) };
     const noNetwork = { download: async () => { throw new Error('unexpected download'); } };
